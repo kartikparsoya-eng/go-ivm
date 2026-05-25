@@ -262,6 +262,22 @@ func (ts *TableSource) Push(change ivm.SourceChange) []ivm.Change {
 			continue
 		}
 
+		// LastPushedEpoch must be set AFTER the connection's Output.Push
+		// returns, not before. Downstream Fetches that fire during the
+		// push need to observe the overlay (sqlite/table_source.go:363
+		// gates on LastPushedEpoch < overlay.Epoch). Bumping it up-front
+		// makes the overlay invisible to the fetch, so downstream sees
+		// the *pre-change* state instead of the just-pushed one — that
+		// produced widespread TS=N vs Go=N-k mismatches when split-edit
+		// fired frequently after the partition-key splitEditKeys fix.
+		//
+		// Each branch sets it at the very end of the work it performs
+		// for this connection. Skipping the bump in any branch leaves
+		// the connection thinking it hasn't seen this epoch yet, so a
+		// subsequent fetch in the SAME source.Push iteration (for a
+		// different conn whose downstream peeks across) would re-apply
+		// the overlay — also a bug, but not the one we hit here.
+
 		// Apply filter — only push if change passes filter
 		if conn.FilterPredicate != nil {
 			if !conn.FilterPredicate(change.Row) {
@@ -271,6 +287,7 @@ func (ts *TableSource) Push(change ivm.SourceChange) []ivm.Change {
 					changes := conn.Output.Push(removeChange, conn.Input)
 					allChanges = append(allChanges, changes...)
 				}
+				conn.LastPushedEpoch = epoch
 				continue
 			}
 			if change.Type == ivm.ChangeTypeEdit && !conn.FilterPredicate(change.OldRow) {
@@ -278,6 +295,7 @@ func (ts *TableSource) Push(change ivm.SourceChange) []ivm.Change {
 				addChange := ivm.MakeAddChange(ivm.Node{Row: change.Row})
 				changes := conn.Output.Push(addChange, conn.Input)
 				allChanges = append(allChanges, changes...)
+				conn.LastPushedEpoch = epoch
 				continue
 			}
 		}
@@ -292,6 +310,7 @@ func (ts *TableSource) Push(change ivm.SourceChange) []ivm.Change {
 				addChange := ivm.MakeAddChange(ivm.Node{Row: change.Row})
 				changes = conn.Output.Push(addChange, conn.Input)
 				allChanges = append(allChanges, changes...)
+				conn.LastPushedEpoch = epoch
 				continue
 			}
 		}
