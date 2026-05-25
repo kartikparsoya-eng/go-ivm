@@ -1,0 +1,75 @@
+{
+  "_comment": "Repro for shadow-mode mismatch seen on xyne-spaces-zero-external (2026-05-25). Tests a conversations query that filters via EXISTS(channel_participants) where the current user is a participant. TS should return 4 conversations (from ch1, ch2); Go should return same. If Go returns 5 (including ch3's), the EXISTS subquery filter isn't being applied.",
+
+  "schema": {
+    "channels": {
+      "columns": {
+        "id": {"type": "string"},
+        "name": {"type": "string"}
+      },
+      "primaryKey": ["id"]
+    },
+    "channel_participants": {
+      "columns": {
+        "id": {"type": "string"},
+        "channelId": {"type": "string"},
+        "userId": {"type": "string"}
+      },
+      "primaryKey": ["id"]
+    },
+    "conversations": {
+      "columns": {
+        "conversationId": {"type": "string"},
+        "channelId": {"type": "string"},
+        "title": {"type": "string"}
+      },
+      "primaryKey": ["conversationId"]
+    }
+  },
+
+  "initialData": {
+    "channels": [
+      {"id": "ch1", "name": "Channel One"},
+      {"id": "ch2", "name": "Channel Two"},
+      {"id": "ch3", "name": "Channel Three (user-A NOT a member)"}
+    ],
+    "channel_participants": [
+      {"id": "p1", "channelId": "ch1", "userId": "user-A"},
+      {"id": "p2", "channelId": "ch2", "userId": "user-A"}
+    ],
+    "conversations": [
+      {"conversationId": "conv-1a", "channelId": "ch1", "title": "Conv 1 in ch1"},
+      {"conversationId": "conv-1b", "channelId": "ch1", "title": "Conv 2 in ch1"},
+      {"conversationId": "conv-2a", "channelId": "ch2", "title": "Conv 1 in ch2"},
+      {"conversationId": "conv-2b", "channelId": "ch2", "title": "Conv 2 in ch2"},
+      {"conversationId": "conv-3a", "channelId": "ch3", "title": "Conv in ch3 (user-A NOT a member; should NOT appear)"}
+    ]
+  },
+
+  "ast": {
+    "table": "conversations",
+    "where": {
+      "type": "correlatedSubquery",
+      "op": "EXISTS",
+      "related": {
+        "correlation": {
+          "parentField": ["channelId"],
+          "childField": ["channelId"]
+        },
+        "subquery": {
+          "table": "channel_participants",
+          "alias": "participants",
+          "where": {
+            "type": "simple",
+            "op": "=",
+            "left": {"type": "column", "name": "userId"},
+            "right": {"type": "literal", "value": "user-A"}
+          }
+        }
+      }
+    },
+    "orderBy": [["conversationId", "asc"]]
+  },
+
+  "mutations": []
+}

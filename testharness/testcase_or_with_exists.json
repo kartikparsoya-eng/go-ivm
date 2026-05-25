@@ -1,0 +1,82 @@
+{
+  "_comment": "Targeted repro from real production AST (queryID 1lbed0jdn1taa). Query: WHERE updatedAt > X AND (visibility = 'PUBLIC' OR EXISTS(channel_participants matching user)). The simple EXISTS test (testcase_exists_membership.json) passes; this version with OR+EXISTS branch is the suspect.",
+
+  "schema": {
+    "channels": {
+      "columns": {
+        "id": {"type": "string"},
+        "visibility": {"type": "string"},
+        "updatedAt": {"type": "number"}
+      },
+      "primaryKey": ["id"]
+    },
+    "channel_participants": {
+      "columns": {
+        "id": {"type": "string"},
+        "channelId": {"type": "string"},
+        "userId": {"type": "string"}
+      },
+      "primaryKey": ["id"]
+    }
+  },
+
+  "initialData": {
+    "channels": [
+      {"id": "ch1", "visibility": "PUBLIC",  "updatedAt": 100},
+      {"id": "ch2", "visibility": "PRIVATE", "updatedAt": 200},
+      {"id": "ch3", "visibility": "PRIVATE", "updatedAt": 300},
+      {"id": "ch4", "visibility": "PRIVATE", "updatedAt": 400}
+    ],
+    "channel_participants": [
+      {"id": "p1", "channelId": "ch2", "userId": "user-A"},
+      {"id": "p2", "channelId": "ch3", "userId": "user-A"}
+    ]
+  },
+
+  "ast": {
+    "table": "channels",
+    "where": {
+      "type": "and",
+      "conditions": [
+        {
+          "type": "simple",
+          "left": {"type": "column", "name": "updatedAt"},
+          "right": {"type": "literal", "value": 0},
+          "op": ">"
+        },
+        {
+          "type": "or",
+          "conditions": [
+            {
+              "type": "simple",
+              "left": {"type": "column", "name": "visibility"},
+              "right": {"type": "literal", "value": "PUBLIC"},
+              "op": "="
+            },
+            {
+              "type": "correlatedSubquery",
+              "op": "EXISTS",
+              "related": {
+                "system": "client",
+                "correlation": {"parentField": ["id"], "childField": ["channelId"]},
+                "subquery": {
+                  "table": "channel_participants",
+                  "alias": "zsubq_participants",
+                  "where": {
+                    "type": "simple",
+                    "left": {"type": "column", "name": "userId"},
+                    "right": {"type": "literal", "value": "user-A"},
+                    "op": "="
+                  }
+                }
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "orderBy": [["id", "asc"]]
+  },
+
+  "mutations": []
+}

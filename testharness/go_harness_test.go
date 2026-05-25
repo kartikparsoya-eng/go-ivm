@@ -459,3 +459,57 @@ func TestFuzzDifferentialHighMutations(t *testing.T) {
 		})
 	}
 }
+
+// TestExistsMembershipFilter reproduces a shadow-mode mismatch observed
+// in production (xyne-spaces-zero-external, 2026-05-25). The query
+// fetches `conversations` filtered by EXISTS(channel_participants matching
+// current user). Symptoms: Go returns conversations from channels the
+// user is NOT a participant in; TS correctly filters them out.
+//
+// Test shape:
+//   - 3 channels: ch1, ch2, ch3
+//   - 2 participants: user-A in (ch1, ch2). NOT in ch3.
+//   - 5 conversations: 2 in ch1, 2 in ch2, 1 in ch3
+//   - Query: conversations WHERE EXISTS(channel_participants on channelId
+//     AND userId = 'user-A')
+//   - Expected (both TS and Go): 4 conversations (from ch1, ch2). The ch3
+//     conversation must be filtered out.
+func TestExistsMembershipFilter(t *testing.T) {
+	projectRoot := findProjectRoot(t)
+	testCaseFile := filepath.Join(projectRoot, "go-ivm", "testharness", "testcase_exists_membership.json")
+	testCaseData, err := os.ReadFile(testCaseFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runDifferential(t, testCaseData)
+}
+
+// TestOrWithExistsBranch is the second iteration of the production repro
+// after pulling the actual AST from xyne-spaces-zero-external (queryID
+// 1lbed0jdn1taa, 2026-05-25). The production query is shaped as:
+//
+//   WHERE updatedAt > X
+//     AND (visibility = 'PUBLIC' OR EXISTS(channel_participants matching user))
+//
+// Difference from TestExistsMembershipFilter: the EXISTS is now one
+// branch of an OR (alongside a column-equality branch), not the entire
+// WHERE clause. The simple-EXISTS test passes; this OR-with-EXISTS shape
+// is what we see drifting in shadow mode.
+//
+// Test shape:
+//   - 4 channels: ch1 (PUBLIC), ch2/ch3 (PRIVATE, user is member),
+//                 ch4 (PRIVATE, user NOT a member)
+//   - 2 participants: user-A in ch2 and ch3
+//   - Expected: 3 channels returned (ch1, ch2, ch3). ch4 must be excluded
+//     (private + user not a participant).
+//   - If Go returns 4 (including ch4), the OR-with-EXISTS evaluation is
+//     broken in Go IVM.
+func TestOrWithExistsBranch(t *testing.T) {
+	projectRoot := findProjectRoot(t)
+	testCaseFile := filepath.Join(projectRoot, "go-ivm", "testharness", "testcase_or_with_exists.json")
+	testCaseData, err := os.ReadFile(testCaseFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runDifferential(t, testCaseData)
+}

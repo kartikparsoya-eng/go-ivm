@@ -155,44 +155,17 @@ func buildPipelineInternal(ast AST, delegate Delegate, p *Pipeline, partitionKey
 	// When there are no CSQs, the source fully applies simple filters via FilterPredicate,
 	// and building a redundant Filter operator causes Take to malfunction.
 	// This matches TS behavior: fullyAppliedFilters=true skips applyWhere.
-	if len(existsJoins) > 0 {
+	if len(existsJoins) > 0 && ast.Where != nil {
 		filterStart := ivm.NewFilterStart(end)
 		p.Edges = append(p.Edges, [2]ivm.InputBase{end, filterStart})
 
-		var filterEnd ivm.FilterInput = filterStart
+		// Walk the original WHERE tree, mirroring TS applyFilter. CSQ
+		// leaves become Exists operators against the relationship rows
+		// produced by the joins above; OR branches that contain a CSQ
+		// produce a FanOut/FanIn so each branch is evaluated against the
+		// same upstream rows and the union of passing rows is forwarded.
+		filterEnd := applyFilter(filterStart, ast.Where, p)
 
-		// Apply simple filter predicate
-		if hasSimpleConditions(ast.Where) {
-			pred := BuildPredicate(stripCSQConditions(ast.Where))
-			filter := ivm.NewFilter(filterEnd, pred)
-			p.Edges = append(p.Edges, [2]ivm.InputBase{filterEnd, filter})
-			filterEnd = filter
-		}
-
-		// Apply Exists operators for non-flipped CSQs
-		for _, csqCond := range existsJoins {
-			if csqCond.Flip || csqCond.Related == nil {
-				continue
-			}
-			relName := csqCond.Related.Subquery.Alias
-			if relName == "" {
-				relName = csqCond.Related.Subquery.Table
-			}
-			existsType := ivm.ExistsTypeExists
-			if csqCond.Op == "NOT EXISTS" {
-				existsType = ivm.ExistsTypeNotExists
-			}
-			exists := ivm.NewExists(
-				filterEnd,
-				relName,
-				csqCond.Related.Correlation.ParentField,
-				existsType,
-			)
-			p.Edges = append(p.Edges, [2]ivm.InputBase{filterEnd, exists})
-			filterEnd = exists
-		}
-
-		// Close the filter chain
 		endOp := ivm.NewFilterEnd(filterStart, filterEnd)
 		p.Edges = append(p.Edges, [2]ivm.InputBase{filterEnd, endOp})
 		end = endOp
@@ -294,7 +267,23 @@ func gatherCSQConditions(cond *Condition) []Condition {
 	return result
 }
 
-// stripCSQConditions removes correlatedSubquery nodes from the condition tree.
+// stripCSQConditions returns the part of the WHERE tree that can be applied
+// at the source level. CSQ branches require the join+Exists machinery built
+// later in the pipeline, so they must be deferred to the post-join filter
+// chain — but how they're deferred depends on the parent boolean operator:
+//
+//   - Under AND: dropping a CSQ branch is safe. The remaining simple
+//     branches are still necessary conditions; rows that fail them can
+//     never satisfy the full AND.
+//
+//   - Under OR: dropping a CSQ branch is UNSAFE. A row may satisfy the OR
+//     solely via the CSQ branch with all simple branches false. Stripping
+//     the CSQ would then incorrectly reject that row at the source. So an
+//     OR that contains any CSQ (at any depth) is deferred entirely — the
+//     post-join filter is responsible for evaluating it.
+//
+// (Source-level filter being a strict superset of the real predicate is
+// the contract: it can drop only rows the full WHERE would also drop.)
 func stripCSQConditions(cond *Condition) *Condition {
 	if cond == nil {
 		return nil
@@ -304,7 +293,7 @@ func stripCSQConditions(cond *Condition) *Condition {
 		return nil
 	case "simple":
 		return cond
-	case "and", "or":
+	case "and":
 		var filtered []Condition
 		for i := range cond.Conditions {
 			stripped := stripCSQConditions(&cond.Conditions[i])
@@ -313,25 +302,45 @@ func stripCSQConditions(cond *Condition) *Condition {
 			}
 		}
 		if len(filtered) == 0 {
-			// Empty AND = TRUE (no-op), can be stripped.
-			// Empty OR = FALSE (deny all), must be preserved.
-			if cond.Type == "or" {
-				return &Condition{
-					Type:       "or",
-					Conditions: []Condition{},
-				}
-			}
 			return nil
 		}
 		if len(filtered) == 1 {
 			return &filtered[0]
 		}
 		return &Condition{
-			Type:       cond.Type,
+			Type:       "and",
 			Conditions: filtered,
 		}
+	case "or":
+		for i := range cond.Conditions {
+			if containsCSQ(&cond.Conditions[i]) {
+				return nil
+			}
+		}
+		return cond
 	}
 	return cond
+}
+
+// containsCSQ reports whether the condition tree contains any
+// correlatedSubquery node at any depth.
+func containsCSQ(cond *Condition) bool {
+	if cond == nil {
+		return false
+	}
+	switch cond.Type {
+	case "correlatedSubquery":
+		return true
+	case "simple":
+		return false
+	case "and", "or":
+		for i := range cond.Conditions {
+			if containsCSQ(&cond.Conditions[i]) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // uniquifyCSQConditionAliases renames CSQ condition aliases to avoid collisions.
@@ -371,34 +380,133 @@ func uniquifyCSQConditionAliases(ast AST) AST {
 	return ast
 }
 
-// hasSimpleConditions returns true if there are any meaningful conditions in the tree.
-// An empty OR (conditions=[]) is meaningful — it evaluates to FALSE (rejects all rows).
-// An empty AND (conditions=[]) evaluates to TRUE (no-op), so it's not meaningful.
-func hasSimpleConditions(cond *Condition) bool {
-	if cond == nil {
-		return false
-	}
+// applyFilter walks the WHERE tree and emits a chain of filter operators.
+// Port of TS applyFilter at mono/packages/zql/src/builder/builder.ts:484.
+// CSQ leaves become Exists operators against the relationship rows produced
+// upstream by the EXISTS-join construction; OR branches containing CSQs
+// produce a FanOut/FanIn so each branch is evaluated independently.
+func applyFilter(input ivm.FilterInput, cond *Condition, p *Pipeline) ivm.FilterInput {
 	switch cond.Type {
+	case "and":
+		return applyAnd(input, cond, p)
+	case "or":
+		return applyOr(input, cond, p)
+	case "correlatedSubquery":
+		return applyCorrelatedSubqueryCondition(input, cond, p)
+	case "simple":
+		return applySimpleFilter(input, cond, p)
+	}
+	panic(fmt.Sprintf("applyFilter: unknown condition type %q", cond.Type))
+}
+
+func applyAnd(input ivm.FilterInput, cond *Condition, p *Pipeline) ivm.FilterInput {
+	for i := range cond.Conditions {
+		input = applyFilter(input, &cond.Conditions[i], p)
+	}
+	return input
+}
+
+// applyOr partitions the disjunction into subquery-containing branches and
+// non-subquery branches. When no branch contains a CSQ a single OR-predicate
+// Filter suffices. Otherwise we fork the input via FanOut and let each
+// subquery branch flow through its own Exists chain; non-subquery branches
+// are merged into one OR-predicate Filter on the fan-out. FanIn unions the
+// passing rows (dedup by node identity) before sending downstream.
+//
+// Port of TS applyOr at mono/packages/zql/src/builder/builder.ts:514.
+func applyOr(input ivm.FilterInput, cond *Condition, p *Pipeline) ivm.FilterInput {
+	subqueryBranches, simpleBranches := groupSubqueryConditions(cond)
+
+	if len(subqueryBranches) == 0 {
+		orCond := &Condition{Type: "or", Conditions: simpleBranches}
+		filter := ivm.NewFilter(input, BuildPredicate(orCond))
+		p.Edges = append(p.Edges, [2]ivm.InputBase{input, filter})
+		return filter
+	}
+
+	fanOut := ivm.NewFanOut(input)
+	p.Edges = append(p.Edges, [2]ivm.InputBase{input, fanOut})
+
+	branches := make([]ivm.FilterInput, 0, len(subqueryBranches)+1)
+	for i := range subqueryBranches {
+		branches = append(branches, applyFilter(fanOut, &subqueryBranches[i], p))
+	}
+	if len(simpleBranches) > 0 {
+		orCond := &Condition{Type: "or", Conditions: simpleBranches}
+		filter := ivm.NewFilter(fanOut, BuildPredicate(orCond))
+		p.Edges = append(p.Edges, [2]ivm.InputBase{fanOut, filter})
+		branches = append(branches, filter)
+	}
+
+	fanIn := ivm.NewFanIn(fanOut, branches)
+	for _, b := range branches {
+		p.Edges = append(p.Edges, [2]ivm.InputBase{b, fanIn})
+	}
+	fanOut.SetFanIn(fanIn)
+	return fanIn
+}
+
+func applySimpleFilter(input ivm.FilterInput, cond *Condition, p *Pipeline) ivm.FilterInput {
+	filter := ivm.NewFilter(input, BuildPredicate(cond))
+	p.Edges = append(p.Edges, [2]ivm.InputBase{input, filter})
+	return filter
+}
+
+// applyCorrelatedSubqueryCondition emits an Exists operator against the
+// relationship rows that the EXISTS-join (built earlier in
+// buildPipelineInternal) attached to each parent node.
+//
+// Flipped CSQs are currently not realized by the Go builder (the
+// corresponding FlippedJoin path from TS is unimplemented); treating them
+// as passthrough preserves the pre-fix behavior — a superset of correct,
+// not a subset — until that path is ported.
+func applyCorrelatedSubqueryCondition(input ivm.FilterInput, cond *Condition, p *Pipeline) ivm.FilterInput {
+	if cond.Flip || cond.Related == nil {
+		return input
+	}
+	relName := cond.Related.Subquery.Alias
+	if relName == "" {
+		relName = cond.Related.Subquery.Table
+	}
+	existsType := ivm.ExistsTypeExists
+	if cond.Op == "NOT EXISTS" {
+		existsType = ivm.ExistsTypeNotExists
+	}
+	exists := ivm.NewExists(input, relName, cond.Related.Correlation.ParentField, existsType)
+	p.Edges = append(p.Edges, [2]ivm.InputBase{input, exists})
+	return exists
+}
+
+// groupSubqueryConditions partitions an OR's children into branches that
+// contain a correlatedSubquery anywhere in their subtree and those that
+// don't. Mirrors TS groupSubqueryConditions / isNotAndDoesNotContainSubquery
+// (mono/packages/zql/src/builder/builder.ts:559).
+func groupSubqueryConditions(cond *Condition) (subquery, simple []Condition) {
+	for _, c := range cond.Conditions {
+		if isNotAndDoesNotContainSubquery(&c) {
+			simple = append(simple, c)
+		} else {
+			subquery = append(subquery, c)
+		}
+	}
+	return
+}
+
+func isNotAndDoesNotContainSubquery(cond *Condition) bool {
+	switch cond.Type {
+	case "correlatedSubquery":
+		return false
 	case "simple":
 		return true
-	case "or":
-		// Empty OR = FALSE, which is a meaningful filter that rejects all rows
-		if len(cond.Conditions) == 0 {
-			return true
-		}
+	case "and", "or":
 		for i := range cond.Conditions {
-			if hasSimpleConditions(&cond.Conditions[i]) {
-				return true
+			if !isNotAndDoesNotContainSubquery(&cond.Conditions[i]) {
+				return false
 			}
 		}
-	case "and":
-		for i := range cond.Conditions {
-			if hasSimpleConditions(&cond.Conditions[i]) {
-				return true
-			}
-		}
+		return true
 	}
-	return false
+	return true
 }
 
 // completeOrdering appends primary key columns to orderBy for deterministic tie-breaking.
