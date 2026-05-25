@@ -3,6 +3,8 @@ package ivm
 import (
 	"encoding/json"
 	"fmt"
+	"sync"
+	"sync/atomic"
 )
 
 // The Exists operator filters data based on whether or not a relationship
@@ -17,6 +19,18 @@ const (
 )
 
 // Exists implements FilterOperator.
+//
+// Concurrency: TS's IVM runs on a single-threaded JS event loop, so its
+// equivalent `#inPush` flag (exists.ts:39, asserted at line 110) catches
+// only logical re-entry through the operator graph. Go's parallel push
+// (parallel.go) fans the same advance out to per-connection goroutines —
+// while distinct connections have distinct Exists instances, a single
+// connection's Exists can still be re-entered concurrently when the
+// caller (e.g. zero-cache's sidecar RPC layer) handles overlapping
+// advance frames or when downstream Fetches happen mid-Push. We
+// serialize Push with a mutex and expose inPush via atomic so Filter
+// (which runs during Fetch on a separate goroutine) sees a coherent
+// read without racing.
 type Exists struct {
 	input            FilterInput
 	relationshipName string
@@ -24,8 +38,10 @@ type Exists struct {
 	parentJoinKey    CompoundKey
 	noSizeReuse      bool
 	cache            map[string]bool
+	cacheMu          sync.Mutex
 	output           FilterOutput
-	inPush           bool
+	inPush           atomic.Bool
+	pushMu           sync.Mutex
 }
 
 func NewExists(
@@ -50,7 +66,6 @@ func NewExists(
 		noSizeReuse:      noSizeReuse,
 		cache:            make(map[string]bool),
 		output:           ThrowFilterOutput,
-		inPush:           false,
 	}
 	input.SetFilterOutput(e)
 	return e
@@ -65,24 +80,32 @@ func (e *Exists) BeginFilter() {
 }
 
 func (e *Exists) EndFilter() {
+	e.cacheMu.Lock()
 	e.cache = make(map[string]bool)
+	e.cacheMu.Unlock()
 	e.output.EndFilter()
 }
 
 // Filter — checks if node's relationship exists/not exists, with caching.
+// Cache access is guarded by cacheMu; inPush is read atomically because
+// it's also written from Push goroutines (see struct doc).
 func (e *Exists) Filter(node Node) bool {
 	var exists bool
 	var hasCached bool
 
-	if !e.noSizeReuse && !e.inPush {
+	if !e.noSizeReuse && !e.inPush.Load() {
 		key := e.getCacheKey(node, e.parentJoinKey)
+		e.cacheMu.Lock()
 		cached, ok := e.cache[key]
+		e.cacheMu.Unlock()
 		if ok {
 			exists = cached
 			hasCached = true
 		} else {
 			exists = e.fetchExists(node)
+			e.cacheMu.Lock()
 			e.cache[key] = exists
+			e.cacheMu.Unlock()
 			hasCached = true
 		}
 	}
@@ -104,12 +127,17 @@ func (e *Exists) GetSchema() *SourceSchema {
 }
 
 // Push — handles incremental changes through the exists filter.
+// pushMu serializes concurrent Push calls on the same Exists (see
+// struct doc); the original `if inPush { panic }` re-entrancy guard
+// was misfiring under Go's parallel push fan-out even though TS
+// (single-threaded) was safe with the same logic. The mutex preserves
+// the invariant the guard was meant to enforce — at most one Push in
+// progress at a time on a given Exists — without the panic.
 func (e *Exists) Push(change Change, pusher InputBase) []Change {
-	if e.inPush {
-		panic("Unexpected re-entrancy")
-	}
-	e.inPush = true
-	defer func() { e.inPush = false }()
+	e.pushMu.Lock()
+	defer e.pushMu.Unlock()
+	e.inPush.Store(true)
+	defer e.inPush.Store(false)
 
 	switch change.Type {
 	case ChangeTypeAdd, ChangeTypeEdit, ChangeTypeRemove:
