@@ -1,0 +1,495 @@
+goroutine 20032 [running]:
+runtime/pprof.writeGoroutineStacks({0x9af5a0, 0x2ba95ed8b40})
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/runtime/pprof/pprof.go:819 +0x6c
+runtime/pprof.writeGoroutine({0x9af5a0?, 0x2ba95ed8b40?}, 0x2ba93fd6dc0?)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/runtime/pprof/pprof.go:782 +0x2c
+runtime/pprof.(*Profile).WriteTo(0x10e13e0?, {0x9af5a0?, 0x2ba95ed8b40?}, 0xc?)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/runtime/pprof/pprof.go:408 +0x144
+net/http/pprof.handler.ServeHTTP({0x2ba91ec5db1, 0x9}, {0x9b5590, 0x2ba95ed8b40}, 0x2ba93fd4640)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/net/http/pprof/pprof.go:273 +0x414
+net/http/pprof.Index({0x9b5590, 0x2ba95ed8b40}, 0x2ba93fd4640)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/net/http/pprof/pprof.go:397 +0xa4
+net/http.HandlerFunc.ServeHTTP(0x1102cc0?, {0x9b5590?, 0x2ba95ed8b40?}, 0x2a5358?)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/net/http/server.go:2286 +0x38
+net/http.(*ServeMux).ServeHTTP(0x0?, {0x9b5590, 0x2ba95ed8b40}, 0x2ba93fd4640)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/net/http/server.go:2828 +0x190
+net/http.serverHandler.ServeHTTP({0x2ba93ff2bc0?}, {0x9b5590?, 0x2ba95ed8b40?}, 0x1?)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/net/http/server.go:3311 +0xb0
+net/http.(*conn).serve(0x2ba93febd40, {0x9b68f8, 0x2ba78d8cb10})
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/net/http/server.go:2073 +0x51c
+created by net/http.(*Server).Serve in goroutine 8
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/net/http/server.go:3464 +0x37c
+
+goroutine 1 [IO wait]:
+internal/poll.runtime_pollWait(0xfffface8ea00, 0x72)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/runtime/netpoll.go:351 +0xa0
+internal/poll.(*pollDesc).wait(0x2ba78d10c00?, 0x2ba78d92260?, 0x0)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/internal/poll/fd_poll_runtime.go:84 +0x28
+internal/poll.(*pollDesc).waitRead(...)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/internal/poll/fd_poll_runtime.go:89
+internal/poll.(*FD).Accept(0x2ba78d10c00)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/internal/poll/fd_unix.go:613 +0x214
+net.(*netFD).accept(0x2ba78d10c00)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/net/fd_unix.go:150 +0x28
+net.(*UnixListener).accept(0x2ba78d5bdf8?)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/net/unixsock_posix.go:172 +0x20
+net.(*UnixListener).Accept(0x2ba78d8c120)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/net/unixsock.go:267 +0x2c
+main.main()
+	/Users/kartik.parsoya/Documents/Go-RS/go-ivm/cmd/sidecar/main.go:1422 +0x39c
+
+goroutine 8 [IO wait]:
+internal/poll.runtime_pollWait(0xfffface8e800, 0x72)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/runtime/netpoll.go:351 +0xa0
+internal/poll.(*pollDesc).wait(0x2ba78d94000?, 0x1183ac?, 0x0)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/internal/poll/fd_poll_runtime.go:84 +0x28
+internal/poll.(*pollDesc).waitRead(...)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/internal/poll/fd_poll_runtime.go:89
+internal/poll.(*FD).Accept(0x2ba78d94000)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/internal/poll/fd_unix.go:613 +0x214
+net.(*netFD).accept(0x2ba78d94000)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/net/fd_unix.go:150 +0x28
+net.(*TCPListener).accept(0x2ba78d9a580)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/net/tcpsock_posix.go:159 +0x24
+net.(*TCPListener).Accept(0x2ba78d9a580)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/net/tcpsock.go:387 +0x2c
+net/http.(*Server).Serve(0x2ba78d88000, {0x9b53a0, 0x2ba78d9a580})
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/net/http/server.go:3434 +0x244
+net/http.(*Server).ListenAndServe(0x2ba78d88000)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/net/http/server.go:3360 +0x80
+net/http.ListenAndServe(...)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/net/http/server.go:3675
+main.main.func1()
+	/Users/kartik.parsoya/Documents/Go-RS/go-ivm/cmd/sidecar/main.go:1354 +0xa4
+created by main.main in goroutine 1
+	/Users/kartik.parsoya/Documents/Go-RS/go-ivm/cmd/sidecar/main.go:1352 +0xe8
+
+goroutine 17 [select]:
+go.opentelemetry.io/otel/sdk/trace.(*batchSpanProcessor).processQueue(0x2ba78dd8000)
+	/Users/kartik.parsoya/go/pkg/mod/go.opentelemetry.io/otel/sdk@v1.43.0/trace/batch_span_processor.go:325 +0xc8
+go.opentelemetry.io/otel/sdk/trace.NewBatchSpanProcessor.func2()
+	/Users/kartik.parsoya/go/pkg/mod/go.opentelemetry.io/otel/sdk@v1.43.0/trace/batch_span_processor.go:127 +0x24
+sync.(*WaitGroup).Go.func1()
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/sync/waitgroup.go:258 +0x48
+created by sync.(*WaitGroup).Go in goroutine 1
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/sync/waitgroup.go:238 +0x70
+
+goroutine 18 [chan receive]:
+main.main.func3()
+	/Users/kartik.parsoya/Documents/Go-RS/go-ivm/cmd/sidecar/main.go:1385 +0x80
+created by main.main in goroutine 1
+	/Users/kartik.parsoya/Documents/Go-RS/go-ivm/cmd/sidecar/main.go:1382 +0x280
+
+goroutine 19 [chan receive]:
+main.main.func4()
+	/Users/kartik.parsoya/Documents/Go-RS/go-ivm/cmd/sidecar/main.go:1398 +0x78
+created by main.main in goroutine 1
+	/Users/kartik.parsoya/Documents/Go-RS/go-ivm/cmd/sidecar/main.go:1395 +0x2c0
+
+goroutine 21 [syscall]:
+os/signal.signal_recv()
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/runtime/sigqueue.go:152 +0x114
+os/signal.loop()
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/os/signal/signal_unix.go:23 +0x1c
+created by os/signal.Notify.func1.1 in goroutine 1
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/os/signal/signal.go:152 +0x28
+
+goroutine 22 [chan receive]:
+main.main.func5()
+	/Users/kartik.parsoya/Documents/Go-RS/go-ivm/cmd/sidecar/main.go:1410 +0x4c
+created by main.main in goroutine 1
+	/Users/kartik.parsoya/Documents/Go-RS/go-ivm/cmd/sidecar/main.go:1409 +0x380
+
+goroutine 23 [IO wait]:
+internal/poll.runtime_pollWait(0xfffface8e600, 0x72)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/runtime/netpoll.go:351 +0xa0
+internal/poll.(*pollDesc).wait(0x2ba78d94380?, 0x2ba78df0000?, 0x0)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/internal/poll/fd_poll_runtime.go:84 +0x28
+internal/poll.(*pollDesc).waitRead(...)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/internal/poll/fd_poll_runtime.go:89
+internal/poll.(*FD).Read(0x2ba78d94380, {0x2ba78df0000, 0x10000, 0x10000})
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/internal/poll/fd_unix.go:165 +0x234
+net.(*netFD).Read(0x2ba78d94380, {0x2ba78df0000?, 0x2ba828c1c38?, 0x31c4d0?})
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/net/fd_posix.go:68 +0x28
+net.(*conn).Read(0x2ba78da8068, {0x2ba78df0000?, 0x2ba828c1c88?, 0x27c68?})
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/net/net.go:196 +0x34
+bufio.(*Reader).Read(0x2ba78daa0c0, {0x2ba95cc6078, 0x4, 0x74c6d8?})
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/bufio/bufio.go:245 +0x188
+io.ReadAtLeast({0x9ae888, 0x2ba78daa0c0}, {0x2ba95cc6078, 0x4, 0x4}, 0x4)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/io/io.go:335 +0x98
+io.ReadFull(...)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/io/io.go:354
+main.readFrame(0x2ba78daa0c0)
+	/Users/kartik.parsoya/Documents/Go-RS/go-ivm/cmd/sidecar/main.go:183 +0x4c
+main.handleConnection({0x9bc860, 0x2ba78da8068}, 0x2ba78d921c0)
+	/Users/kartik.parsoya/Documents/Go-RS/go-ivm/cmd/sidecar/main.go:1294 +0x2d0
+created by main.main in goroutine 1
+	/Users/kartik.parsoya/Documents/Go-RS/go-ivm/cmd/sidecar/main.go:1426 +0x38c
+
+goroutine 24 [chan receive]:
+main.handleConnection.func2()
+	/Users/kartik.parsoya/Documents/Go-RS/go-ivm/cmd/sidecar/main.go:1254 +0x68
+created by main.handleConnection in goroutine 23
+	/Users/kartik.parsoya/Documents/Go-RS/go-ivm/cmd/sidecar/main.go:1252 +0x25c
+
+goroutine 16 [chan receive]:
+main.(*ClientGroup).worker(0x2ba869d0060, 0x2ba78d921c0)
+	/Users/kartik.parsoya/Documents/Go-RS/go-ivm/cmd/sidecar/main.go:538 +0x74
+created by main.(*Server).getGroup in goroutine 23
+	/Users/kartik.parsoya/Documents/Go-RS/go-ivm/cmd/sidecar/main.go:483 +0x270
+
+goroutine 26 [chan receive]:
+main.(*ClientGroup).worker(0x2ba78d8cc30, 0x2ba78d921c0)
+	/Users/kartik.parsoya/Documents/Go-RS/go-ivm/cmd/sidecar/main.go:538 +0x74
+created by main.(*Server).getGroup in goroutine 23
+	/Users/kartik.parsoya/Documents/Go-RS/go-ivm/cmd/sidecar/main.go:483 +0x270
+
+goroutine 29 [chan receive]:
+main.(*ClientGroup).worker(0x2ba78f1d560, 0x2ba78d921c0)
+	/Users/kartik.parsoya/Documents/Go-RS/go-ivm/cmd/sidecar/main.go:538 +0x74
+created by main.(*Server).getGroup in goroutine 23
+	/Users/kartik.parsoya/Documents/Go-RS/go-ivm/cmd/sidecar/main.go:483 +0x270
+
+goroutine 33 [select]:
+database/sql.(*DB).connectionOpener(0x2ba78cbc270, {0x9b6930, 0x2ba78cfa000})
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/database/sql/sql.go:1261 +0x84
+created by database/sql.OpenDB in goroutine 26
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/database/sql/sql.go:841 +0x114
+
+goroutine 31 [select]:
+database/sql.(*DB).connectionOpener(0x2ba78f2ba00, {0x9b6930, 0x2ba78dae320})
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/database/sql/sql.go:1261 +0x84
+created by database/sql.OpenDB in goroutine 29
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/database/sql/sql.go:841 +0x114
+
+goroutine 34 [chan receive]:
+main.(*ClientGroup).worker(0x2ba7945e060, 0x2ba78d921c0)
+	/Users/kartik.parsoya/Documents/Go-RS/go-ivm/cmd/sidecar/main.go:538 +0x74
+created by main.(*Server).getGroup in goroutine 23
+	/Users/kartik.parsoya/Documents/Go-RS/go-ivm/cmd/sidecar/main.go:483 +0x270
+
+goroutine 239 [select]:
+database/sql.(*DB).connectionOpener(0x2ba798aa1a0, {0x9b6930, 0x2ba78d0c230})
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/database/sql/sql.go:1261 +0x84
+created by database/sql.OpenDB in goroutine 237
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/database/sql/sql.go:841 +0x114
+
+goroutine 38 [chan receive]:
+main.(*ClientGroup).worker(0x2ba7923dd70, 0x2ba78d921c0)
+	/Users/kartik.parsoya/Documents/Go-RS/go-ivm/cmd/sidecar/main.go:538 +0x74
+created by main.(*Server).getGroup in goroutine 23
+	/Users/kartik.parsoya/Documents/Go-RS/go-ivm/cmd/sidecar/main.go:483 +0x270
+
+goroutine 36 [select]:
+database/sql.(*DB).connectionOpener(0x2ba78cbc410, {0x9b6930, 0x2ba78cfa050})
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/database/sql/sql.go:1261 +0x84
+created by database/sql.OpenDB in goroutine 34
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/database/sql/sql.go:841 +0x114
+
+goroutine 19834 [chan receive]:
+database/sql.(*Tx).awaitDone(0x2ba91665600)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/database/sql/sql.go:2212 +0x30
+created by database/sql.(*DB).beginDC in goroutine 389
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/database/sql/sql.go:1925 +0x174
+
+goroutine 40 [select]:
+database/sql.(*DB).connectionOpener(0x2ba7924ef70, {0x9b6930, 0x2ba78cfa140})
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/database/sql/sql.go:1261 +0x84
+created by database/sql.OpenDB in goroutine 38
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/database/sql/sql.go:841 +0x114
+
+goroutine 8152 [chan receive]:
+main.(*ClientGroup).worker(0x2ba88780630, 0x2ba78d921c0)
+	/Users/kartik.parsoya/Documents/Go-RS/go-ivm/cmd/sidecar/main.go:538 +0x74
+created by main.(*Server).getGroup in goroutine 23
+	/Users/kartik.parsoya/Documents/Go-RS/go-ivm/cmd/sidecar/main.go:483 +0x270
+
+goroutine 205 [select]:
+database/sql.(*DB).connectionOpener(0x2ba7e7c6000, {0x9b6930, 0x2ba7e7c4000})
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/database/sql/sql.go:1261 +0x84
+created by database/sql.OpenDB in goroutine 96
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/database/sql/sql.go:841 +0x114
+
+goroutine 19784 [chan receive]:
+database/sql.(*Tx).awaitDone(0x2ba92822700)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/database/sql/sql.go:2212 +0x30
+created by database/sql.(*DB).beginDC in goroutine 29
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/database/sql/sql.go:1925 +0x174
+
+goroutine 237 [chan receive]:
+main.(*ClientGroup).worker(0x2ba7dad2090, 0x2ba78d921c0)
+	/Users/kartik.parsoya/Documents/Go-RS/go-ivm/cmd/sidecar/main.go:538 +0x74
+created by main.(*Server).getGroup in goroutine 23
+	/Users/kartik.parsoya/Documents/Go-RS/go-ivm/cmd/sidecar/main.go:483 +0x270
+
+goroutine 144 [chan receive]:
+main.(*ClientGroup).worker(0x2ba7f5910b0, 0x2ba78d921c0)
+	/Users/kartik.parsoya/Documents/Go-RS/go-ivm/cmd/sidecar/main.go:538 +0x74
+created by main.(*Server).getGroup in goroutine 23
+	/Users/kartik.parsoya/Documents/Go-RS/go-ivm/cmd/sidecar/main.go:483 +0x270
+
+goroutine 210 [select]:
+database/sql.(*DB).connectionOpener(0x2ba792c6820, {0x9b6930, 0x2ba78cfa230})
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/database/sql/sql.go:1261 +0x84
+created by database/sql.OpenDB in goroutine 144
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/database/sql/sql.go:841 +0x114
+
+goroutine 12701 [select]:
+database/sql.(*DB).connectionOpener(0x2ba8d75f1e0, {0x9b6930, 0x2ba7be93040})
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/database/sql/sql.go:1261 +0x84
+created by database/sql.OpenDB in goroutine 12699
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/database/sql/sql.go:841 +0x114
+
+goroutine 96 [chan receive]:
+main.(*ClientGroup).worker(0x2ba7f3df320, 0x2ba78d921c0)
+	/Users/kartik.parsoya/Documents/Go-RS/go-ivm/cmd/sidecar/main.go:538 +0x74
+created by main.(*Server).getGroup in goroutine 23
+	/Users/kartik.parsoya/Documents/Go-RS/go-ivm/cmd/sidecar/main.go:483 +0x270
+
+goroutine 540 [select]:
+database/sql.(*DB).connectionOpener(0x2ba79b09790, {0x9b6930, 0x2ba78cfa5f0})
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/database/sql/sql.go:1261 +0x84
+created by database/sql.OpenDB in goroutine 556
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/database/sql/sql.go:841 +0x114
+
+goroutine 207 [chan receive]:
+main.(*ClientGroup).worker(0x2ba7e7df4a0, 0x2ba78d921c0)
+	/Users/kartik.parsoya/Documents/Go-RS/go-ivm/cmd/sidecar/main.go:538 +0x74
+created by main.(*Server).getGroup in goroutine 23
+	/Users/kartik.parsoya/Documents/Go-RS/go-ivm/cmd/sidecar/main.go:483 +0x270
+
+goroutine 6651 [IO wait]:
+internal/poll.runtime_pollWait(0xfffface8e200, 0x72)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/runtime/netpoll.go:351 +0xa0
+internal/poll.(*pollDesc).wait(0x2ba8da8a180?, 0x2ba8daf4000?, 0x0)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/internal/poll/fd_poll_runtime.go:84 +0x28
+internal/poll.(*pollDesc).waitRead(...)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/internal/poll/fd_poll_runtime.go:89
+internal/poll.(*FD).Read(0x2ba8da8a180, {0x2ba8daf4000, 0x1000, 0x1000})
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/internal/poll/fd_unix.go:165 +0x234
+net.(*netFD).Read(0x2ba8da8a180, {0x2ba8daf4000?, 0x80?, 0x8?})
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/net/fd_posix.go:68 +0x28
+net.(*conn).Read(0x2ba8da86060, {0x2ba8daf4000?, 0x0?, 0x2ba8da99d28?})
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/net/net.go:196 +0x34
+net/http.(*persistConn).Read(0x2ba78b92780, {0x2ba8daf4000?, 0x9ae8e8?, 0x10de690?})
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/net/http/transport.go:2174 +0x48
+bufio.(*Reader).fill(0x2ba7d39e420)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/bufio/bufio.go:113 +0xe0
+bufio.(*Reader).Peek(0x2ba7d39e420, 0x1)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/bufio/bufio.go:152 +0x58
+net/http.(*persistConn).readLoop(0x2ba78b92780)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/net/http/transport.go:2330 +0x110
+created by net/http.(*Transport).dialConn in goroutine 6647
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/net/http/transport.go:1994 +0x109c
+
+goroutine 19999 [chan receive]:
+database/sql.(*Tx).awaitDone(0x2ba95a22280)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/database/sql/sql.go:2212 +0x30
+created by database/sql.(*DB).beginDC in goroutine 144
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/database/sql/sql.go:1925 +0x174
+
+goroutine 321 [select]:
+database/sql.(*DB).connectionOpener(0x2ba7e7e9790, {0x9b6930, 0x2ba7e7c40f0})
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/database/sql/sql.go:1261 +0x84
+created by database/sql.OpenDB in goroutine 207
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/database/sql/sql.go:841 +0x114
+
+goroutine 556 [chan receive]:
+main.(*ClientGroup).worker(0x2ba85a600c0, 0x2ba78d921c0)
+	/Users/kartik.parsoya/Documents/Go-RS/go-ivm/cmd/sidecar/main.go:538 +0x74
+created by main.(*Server).getGroup in goroutine 23
+	/Users/kartik.parsoya/Documents/Go-RS/go-ivm/cmd/sidecar/main.go:483 +0x270
+
+goroutine 6652 [select]:
+net/http.(*persistConn).writeLoop(0x2ba78b92780)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/net/http/transport.go:2652 +0x98
+created by net/http.(*Transport).dialConn in goroutine 6647
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/net/http/transport.go:1995 +0x10e4
+
+goroutine 12699 [chan receive]:
+main.(*ClientGroup).worker(0x2ba877180f0, 0x2ba78d921c0)
+	/Users/kartik.parsoya/Documents/Go-RS/go-ivm/cmd/sidecar/main.go:538 +0x74
+created by main.(*Server).getGroup in goroutine 23
+	/Users/kartik.parsoya/Documents/Go-RS/go-ivm/cmd/sidecar/main.go:483 +0x270
+
+goroutine 411 [chan receive]:
+main.(*ClientGroup).worker(0x2ba8016ccf0, 0x2ba78d921c0)
+	/Users/kartik.parsoya/Documents/Go-RS/go-ivm/cmd/sidecar/main.go:538 +0x74
+created by main.(*Server).getGroup in goroutine 23
+	/Users/kartik.parsoya/Documents/Go-RS/go-ivm/cmd/sidecar/main.go:483 +0x270
+
+goroutine 413 [select]:
+database/sql.(*DB).connectionOpener(0x2ba7ef4d110, {0x9b6930, 0x2ba78cfa0f0})
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/database/sql/sql.go:1261 +0x84
+created by database/sql.OpenDB in goroutine 411
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/database/sql/sql.go:841 +0x114
+
+goroutine 19995 [chan receive]:
+database/sql.(*Tx).awaitDone(0x2ba95a22080)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/database/sql/sql.go:2212 +0x30
+created by database/sql.(*DB).beginDC in goroutine 16
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/database/sql/sql.go:1925 +0x174
+
+goroutine 455 [select]:
+database/sql.(*DB).connectionOpener(0x2ba79a58000, {0x9b6930, 0x2ba78cfa2d0})
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/database/sql/sql.go:1261 +0x84
+created by database/sql.OpenDB in goroutine 389
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/database/sql/sql.go:841 +0x114
+
+goroutine 389 [chan receive]:
+main.(*ClientGroup).worker(0x2ba854cfd70, 0x2ba78d921c0)
+	/Users/kartik.parsoya/Documents/Go-RS/go-ivm/cmd/sidecar/main.go:538 +0x74
+created by main.(*Server).getGroup in goroutine 23
+	/Users/kartik.parsoya/Documents/Go-RS/go-ivm/cmd/sidecar/main.go:483 +0x270
+
+goroutine 8154 [select]:
+database/sql.(*DB).connectionOpener(0x2ba86a7c0d0, {0x9b6930, 0x2ba88c86000})
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/database/sql/sql.go:1261 +0x84
+created by database/sql.OpenDB in goroutine 8152
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/database/sql/sql.go:841 +0x114
+
+goroutine 546 [select]:
+database/sql.(*DB).connectionOpener(0x2ba823b2000, {0x9b6930, 0x2ba823aa000})
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/database/sql/sql.go:1261 +0x84
+created by database/sql.OpenDB in goroutine 16
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/database/sql/sql.go:841 +0x114
+
+goroutine 470 [chan receive]:
+main.(*ClientGroup).worker(0x2ba8d482ea0, 0x2ba78d921c0)
+	/Users/kartik.parsoya/Documents/Go-RS/go-ivm/cmd/sidecar/main.go:538 +0x74
+created by main.(*Server).getGroup in goroutine 23
+	/Users/kartik.parsoya/Documents/Go-RS/go-ivm/cmd/sidecar/main.go:483 +0x270
+
+goroutine 5264 [select]:
+database/sql.(*DB).connectionOpener(0x2ba7f3b96c0, {0x9b6930, 0x2ba8aa70f00})
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/database/sql/sql.go:1261 +0x84
+created by database/sql.OpenDB in goroutine 470
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/database/sql/sql.go:841 +0x114
+
+goroutine 20002 [chan receive]:
+database/sql.(*Tx).awaitDone(0x2ba92d18900)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/database/sql/sql.go:2212 +0x30
+created by database/sql.(*DB).beginDC in goroutine 12699
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/database/sql/sql.go:1925 +0x174
+
+goroutine 19839 [chan receive]:
+database/sql.(*Tx).awaitDone(0x2ba91665800)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/database/sql/sql.go:2212 +0x30
+created by database/sql.(*DB).beginDC in goroutine 96
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/database/sql/sql.go:1925 +0x174
+
+goroutine 19860 [chan receive]:
+database/sql.(*Tx).awaitDone(0x2ba91665a80)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/database/sql/sql.go:2212 +0x30
+created by database/sql.(*DB).beginDC in goroutine 470
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/database/sql/sql.go:1925 +0x174
+
+goroutine 19956 [chan receive]:
+database/sql.(*Tx).awaitDone(0x2ba93350380)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/database/sql/sql.go:2212 +0x30
+created by database/sql.(*DB).beginDC in goroutine 8152
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/database/sql/sql.go:1925 +0x174
+
+goroutine 19821 [select]:
+net/http/pprof.sleep(0x2ba92194500, 0x2ba78d28780?)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/net/http/pprof/pprof.go:118 +0x8c
+net/http/pprof.Profile({0x9b5590, 0x2ba78d28780}, 0x2ba92194500)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/net/http/pprof/pprof.go:164 +0x2c8
+net/http.HandlerFunc.ServeHTTP(0x1102cc0?, {0x9b5590?, 0x2ba78d28780?}, 0x2a5358?)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/net/http/server.go:2286 +0x38
+net/http.(*ServeMux).ServeHTTP(0x0?, {0x9b5590, 0x2ba78d28780}, 0x2ba92194500)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/net/http/server.go:2828 +0x190
+net/http.serverHandler.ServeHTTP({0x2ba92d12740?}, {0x9b5590?, 0x2ba78d28780?}, 0x1?)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/net/http/server.go:3311 +0xb0
+net/http.(*conn).serve(0x2ba92d2c6c0, {0x9b68f8, 0x2ba78d8cb10})
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/net/http/server.go:2073 +0x51c
+created by net/http.(*Server).Serve in goroutine 8
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/net/http/server.go:3464 +0x37c
+
+goroutine 19901 [chan receive]:
+database/sql.(*Tx).awaitDone(0x2ba92822d00)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/database/sql/sql.go:2212 +0x30
+created by database/sql.(*DB).beginDC in goroutine 34
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/database/sql/sql.go:1925 +0x174
+
+goroutine 19742 [chan receive]:
+database/sql.(*Tx).awaitDone(0x2ba85235a00)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/database/sql/sql.go:2212 +0x30
+created by database/sql.(*DB).beginDC in goroutine 411
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/database/sql/sql.go:1925 +0x174
+
+goroutine 19343 [chan receive]:
+database/sql.(*Tx).awaitDone(0x2ba78d11d80)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/database/sql/sql.go:2212 +0x30
+created by database/sql.(*DB).beginDC in goroutine 38
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/database/sql/sql.go:1925 +0x174
+
+goroutine 19773 [chan receive]:
+database/sql.(*Tx).awaitDone(0x2ba915ffd80)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/database/sql/sql.go:2212 +0x30
+created by database/sql.(*DB).beginDC in goroutine 207
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/database/sql/sql.go:1925 +0x174
+
+goroutine 19822 [IO wait]:
+internal/poll.runtime_pollWait(0xfffface8e400, 0x72)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/runtime/netpoll.go:351 +0xa0
+internal/poll.(*pollDesc).wait(0x2ba92d18180?, 0x2ba92d12761?, 0x0)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/internal/poll/fd_poll_runtime.go:84 +0x28
+internal/poll.(*pollDesc).waitRead(...)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/internal/poll/fd_poll_runtime.go:89
+internal/poll.(*FD).Read(0x2ba92d18180, {0x2ba92d12761, 0x1, 0x1})
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/internal/poll/fd_unix.go:165 +0x234
+net.(*netFD).Read(0x2ba92d18180, {0x2ba92d12761?, 0x3?, 0x81bb80?})
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/net/fd_posix.go:68 +0x28
+net.(*conn).Read(0x2ba90fc8330, {0x2ba92d12761?, 0x81bb80?, 0x9a9ff0?})
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/net/net.go:196 +0x34
+net/http.(*connReader).backgroundRead(0x2ba92d12740)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/net/http/server.go:702 +0x38
+created by net/http.(*connReader).startBackgroundRead in goroutine 19821
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/net/http/server.go:698 +0xb8
+
+goroutine 19823 [syscall]:
+runtime/pprof.readProfile()
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/runtime/cpuprof.go:251 +0x54
+runtime/pprof.profileWriter({0x9af5a0?, 0x2ba78d28780?})
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/runtime/pprof/pprof.go:930 +0x48
+created by runtime/pprof.StartCPUProfile in goroutine 19821
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/runtime/pprof/pprof.go:911 +0x1e4
+
+goroutine 19969 [chan receive]:
+database/sql.(*Tx).awaitDone(0x2ba91665d00)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/database/sql/sql.go:2212 +0x30
+created by database/sql.(*DB).beginDC in goroutine 556
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/database/sql/sql.go:1925 +0x174
+
+goroutine 20008 [chan receive]:
+database/sql.(*Tx).awaitDone(0x2ba92d18b00)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/database/sql/sql.go:2212 +0x30
+created by database/sql.(*DB).beginDC in goroutine 237
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/database/sql/sql.go:1925 +0x174
+
+goroutine 20014 [chan receive]:
+database/sql.(*Tx).awaitDone(0x2ba92d18d80)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/database/sql/sql.go:2212 +0x30
+created by database/sql.(*DB).beginDC in goroutine 26
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/database/sql/sql.go:1925 +0x174
+
+goroutine 20065 [runnable]:
+syscall.Syscall(0x3f, 0xb, 0x2ba93ff2be1, 0x1)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/syscall/syscall_linux.go:74 +0x20
+syscall.read(0x2ba92823280?, {0x2ba93ff2be1?, 0x890700?, 0x8906e0?})
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/syscall/zsyscall_linux_arm64.go:736 +0x40
+syscall.Read(...)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/syscall/syscall_unix.go:183
+internal/poll.ignoringEINTRIO(...)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/internal/poll/fd_unix.go:738
+internal/poll.(*FD).Read(0x2ba92823280, {0x2ba93ff2be1, 0x1, 0x1})
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/internal/poll/fd_unix.go:161 +0x1a0
+net.(*netFD).Read(0x2ba92823280, {0x2ba93ff2be1?, 0x10e04a0?, 0x2ba93ff2554?})
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/net/fd_posix.go:68 +0x28
+net.(*conn).Read(0x2ba8e267b30, {0x2ba93ff2be1?, 0x81bb80?, 0x9a9ff0?})
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/net/net.go:196 +0x34
+net/http.(*connReader).backgroundRead(0x2ba93ff2bc0)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/net/http/server.go:702 +0x38
+created by net/http.(*connReader).startBackgroundRead in goroutine 20032
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/net/http/server.go:698 +0xb8

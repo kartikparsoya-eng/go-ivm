@@ -1,0 +1,602 @@
+package ivm
+
+// The Take operator implements LIMIT queries. It takes the first N nodes
+// from its input as determined by the input's comparator. It maintains a
+// *bound* of the last accepted item to evaluate new incoming pushes.
+//
+// Take can count rows globally or by unique value of some partition key.
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+)
+
+const maxBoundKey = "maxBound"
+
+// TakeState tracks the size and bound for a given partition.
+type TakeState struct {
+	Size  int
+	Bound Row // nil means no bound
+}
+
+// TakeStorage provides get/set/del for take state keyed by string.
+type TakeStorage interface {
+	GetTakeState(key string) *TakeState
+	SetTakeState(key string, state TakeState)
+	GetMaxBound() Row
+	SetMaxBound(bound Row)
+	Del(key string)
+}
+
+// PartitionKey is a list of column names that define partitioning.
+type PartitionKey = []string
+
+// Take implements Operator.
+type Take struct {
+	input                  Input
+	storage                TakeStorage
+	limit                  int
+	partitionKey           PartitionKey
+	partitionKeyComparator Comparator
+	rowHiddenFromFetch     Row
+	output                 Output
+	DebugLabel             string // optional: set to queryID for debug tracing
+}
+
+func NewTake(input Input, storage TakeStorage, limit int, partitionKey PartitionKey) *Take {
+	if limit < 0 {
+		panic("Limit must be non-negative")
+	}
+	schema := input.GetSchema()
+	if schema.Sort == nil {
+		panic("Take requires sorted input")
+	}
+	t := &Take{
+		input:        input,
+		storage:      storage,
+		limit:        limit,
+		partitionKey: partitionKey,
+		output:       ThrowOutput,
+	}
+	if len(partitionKey) > 0 {
+		t.partitionKeyComparator = MakePartitionKeyComparator(partitionKey)
+	}
+	input.SetOutput(t)
+	return t
+}
+
+func (t *Take) SetOutput(output Output) {
+	t.output = output
+}
+
+func (t *Take) GetSchema() *SourceSchema {
+	return t.input.GetSchema()
+}
+
+func (t *Take) Destroy() {
+	t.input.Destroy()
+}
+
+// Fetch — Source: take.ts line 93-156
+func (t *Take) Fetch(req FetchRequest) []Node {
+	if len(t.partitionKey) == 0 ||
+		(req.Constraint != nil && ConstraintMatchesPartitionKey(req.Constraint, t.partitionKey)) {
+		takeStateKey := GetTakeStateKey(t.partitionKey, constraintToRow(req.Constraint))
+		takeState := t.storage.GetTakeState(takeStateKey)
+		if takeState == nil {
+			return t.initialFetch(req)
+		}
+		if takeState.Bound == nil {
+			return nil
+		}
+		var result []Node
+		for _, inputNode := range t.input.Fetch(req) {
+			if t.GetSchema().CompareRows(takeState.Bound, inputNode.Row) < 0 {
+				break
+			}
+			if t.rowHiddenFromFetch != nil &&
+				t.GetSchema().CompareRows(t.rowHiddenFromFetch, inputNode.Row) == 0 {
+				continue
+			}
+			result = append(result, inputNode)
+		}
+		return result
+	}
+
+	// Partition key exists but fetch not constrained on it
+	maxBound := t.storage.GetMaxBound()
+	if maxBound == nil {
+		return nil
+	}
+	var result []Node
+	for _, inputNode := range t.input.Fetch(req) {
+		if t.GetSchema().CompareRows(inputNode.Row, maxBound) > 0 {
+			break
+		}
+		takeStateKey := GetTakeStateKey(t.partitionKey, inputNode.Row)
+		takeState := t.storage.GetTakeState(takeStateKey)
+		if takeState != nil && takeState.Bound != nil &&
+			t.GetSchema().CompareRows(takeState.Bound, inputNode.Row) >= 0 {
+			result = append(result, inputNode)
+		}
+	}
+	return result
+}
+
+// initialFetch — Source: take.ts line 158-216
+func (t *Take) initialFetch(req FetchRequest) []Node {
+	if t.limit == 0 {
+		return nil
+	}
+
+	takeStateKey := GetTakeStateKey(t.partitionKey, constraintToRow(req.Constraint))
+
+	var result []Node
+	var size int
+	var bound Row
+	for _, inputNode := range t.input.Fetch(req) {
+		result = append(result, inputNode)
+		bound = inputNode.Row
+		size++
+		if size == t.limit {
+			break
+		}
+	}
+
+	t.setTakeState(takeStateKey, size, bound, t.storage.GetMaxBound())
+	return result
+}
+
+// Push — Source: take.ts line 247-430
+func (t *Take) Push(change Change, pusher InputBase) []Change {
+	t.debugf("Push type=%d row=%v", change.Type, change.Node.Row["id"])
+	if change.Type == ChangeTypeEdit {
+		return t.pushEditChange(change)
+	}
+
+	row := change.Node.Row
+	takeStateKey, takeState, maxBound, constraint := t.getStateAndConstraint(row)
+	if takeState == nil {
+		t.debugf("Push type=%d row=%v: takeState==nil, dropping", change.Type, row["id"])
+		return nil
+	}
+
+	compareRows := t.GetSchema().CompareRows
+
+	switch change.Type {
+	case ChangeTypeAdd:
+		if takeState.Size < t.limit {
+			newBound := takeState.Bound
+			if newBound == nil || compareRows(newBound, change.Node.Row) < 0 {
+				newBound = change.Node.Row
+			}
+			t.setTakeState(takeStateKey, takeState.Size+1, newBound, maxBound)
+			t.debugf("Push ADD row=%v: size<limit, added (size=%d→%d)", row["id"], takeState.Size, takeState.Size+1)
+			return t.output.Push(change, t)
+		}
+		// size === limit
+		if takeState.Bound == nil || compareRows(change.Node.Row, takeState.Bound) >= 0 {
+			t.debugf("Push ADD row=%v: DROPPED (outside bound=%v, size=%d)", row["id"], takeState.Bound["id"], takeState.Size)
+			return nil
+		}
+		// added row < bound
+		var beforeBoundNode, boundNode *Node
+		if t.limit == 1 {
+			for _, node := range t.input.Fetch(FetchRequest{
+				Start:      &Start{Row: takeState.Bound, Basis: "at"},
+				Constraint: constraint,
+			}) {
+				n := node
+				boundNode = &n
+				break
+			}
+		} else {
+			for _, node := range t.input.Fetch(FetchRequest{
+				Start:      &Start{Row: takeState.Bound, Basis: "at"},
+				Constraint: constraint,
+				Reverse:    true,
+			}) {
+				n := node
+				if boundNode == nil {
+					boundNode = &n
+				} else {
+					beforeBoundNode = &n
+					break
+				}
+			}
+		}
+		if boundNode == nil {
+			panic("Take: boundNode must be found during fetch")
+		}
+		removeChange := MakeRemoveChange(*boundNode)
+		newBound := change.Node.Row
+		if beforeBoundNode != nil && compareRows(change.Node.Row, beforeBoundNode.Row) <= 0 {
+			newBound = beforeBoundNode.Row
+		}
+		t.setTakeState(takeStateKey, takeState.Size, newBound, maxBound)
+		var results []Change
+		results = append(results, t.pushWithRowHiddenFromFetch(change.Node.Row, removeChange)...)
+		results = append(results, t.output.Push(change, t)...)
+		return results
+
+	case ChangeTypeRemove:
+		if takeState.Bound == nil {
+			t.debugf("Push REMOVE row=%v: bound==nil, dropping", row["id"])
+			return nil
+		}
+		compToBound := compareRows(change.Node.Row, takeState.Bound)
+		if compToBound > 0 {
+			t.debugf("Push REMOVE row=%v: outside bound=%v (cmp=%d), dropping", row["id"], takeState.Bound["id"], compToBound)
+			return nil
+		}
+		t.debugf("Push REMOVE row=%v: inside (cmp=%d), bound=%v size=%d", row["id"], compToBound, takeState.Bound["id"], takeState.Size)
+
+		var beforeBoundNode *Node
+		for _, node := range t.input.Fetch(FetchRequest{
+			Start:      &Start{Row: takeState.Bound, Basis: "after"},
+			Constraint: constraint,
+			Reverse:    true,
+		}) {
+			n := node
+			beforeBoundNode = &n
+			break
+		}
+
+		type newBoundInfo struct {
+			node *Node
+			push bool
+		}
+		var newBound *newBoundInfo
+		if beforeBoundNode != nil {
+			push := compareRows(beforeBoundNode.Row, takeState.Bound) > 0
+			newBound = &newBoundInfo{node: beforeBoundNode, push: push}
+		}
+		if newBound == nil || !newBound.push {
+			for _, node := range t.input.Fetch(FetchRequest{
+				Start:      &Start{Row: takeState.Bound, Basis: "at"},
+				Constraint: constraint,
+			}) {
+				n := node
+				push := compareRows(n.Row, takeState.Bound) > 0
+				newBound = &newBoundInfo{node: &n, push: push}
+				if push {
+					break
+				}
+			}
+		}
+
+		if newBound != nil && newBound.push {
+			var results []Change
+			results = append(results, t.output.Push(change, t)...)
+			t.setTakeState(takeStateKey, takeState.Size, newBound.node.Row, maxBound)
+			results = append(results, t.output.Push(MakeAddChange(*newBound.node), t)...)
+			return results
+		}
+		// If neither fetch found a replacement bound, the partition is empty
+		// from the source's perspective. The previous code wrote
+		// `{Size: takeState.Size-1, Bound: nil}` which violates the Take
+		// invariant `Size > 0 → Bound != nil` whenever Size was >= 2,
+		// causing the next EDIT against this partition to panic at
+		// pushEditChange's `if takeState.Bound == nil` check. Force Size=0
+		// when there's no bound: an unfindable bound means an empty window.
+		var newSize int
+		var boundRow Row
+		if newBound != nil {
+			newSize = takeState.Size - 1
+			boundRow = newBound.node.Row
+		} else {
+			newSize = 0
+		}
+		t.setTakeState(takeStateKey, newSize, boundRow, maxBound)
+		return t.output.Push(change, t)
+
+	case ChangeTypeChild:
+		if takeState.Bound != nil &&
+			compareRows(change.Node.Row, takeState.Bound) <= 0 {
+			return t.output.Push(change, t)
+		}
+		return nil
+	}
+	return nil
+}
+
+// pushEditChange — Source: take.ts line 432-675
+func (t *Take) pushEditChange(change Change) []Change {
+	if t.partitionKeyComparator != nil &&
+		t.partitionKeyComparator(change.OldNode.Row, change.Node.Row) != 0 {
+		panic("Unexpected change of partition key")
+	}
+
+	takeStateKey, takeState, maxBound, constraint := t.getStateAndConstraint(change.OldNode.Row)
+	if takeState == nil {
+		t.debugf("pushEdit row=%v: takeState==nil, dropping", change.Node.Row["id"])
+		return nil
+	}
+	if takeState.Bound == nil {
+		panic("Bound should be set")
+	}
+
+	compareRows := t.GetSchema().CompareRows
+	oldCmp := compareRows(change.OldNode.Row, takeState.Bound)
+	newCmp := compareRows(change.Node.Row, takeState.Bound)
+	t.debugf("pushEdit row=%v oldCmp=%d newCmp=%d bound=%v size=%d", change.Node.Row["id"], oldCmp, newCmp, takeState.Bound["id"], takeState.Size)
+
+	replaceBoundAndForwardChange := func() []Change {
+		t.setTakeState(takeStateKey, takeState.Size, change.Node.Row, maxBound)
+		return t.output.Push(change, t)
+	}
+
+	// Bounds row was changed
+	if oldCmp == 0 {
+		if newCmp == 0 {
+			return t.output.Push(change, t)
+		}
+		if newCmp < 0 {
+			if t.limit == 1 {
+				return replaceBoundAndForwardChange()
+			}
+		var beforeBoundNode *Node
+		for _, node := range t.input.Fetch(FetchRequest{
+			Start:      &Start{Row: takeState.Bound, Basis: "after"},
+			Constraint: constraint,
+			Reverse:    true,
+		}) {
+			n := node
+			beforeBoundNode = &n
+			break
+		}
+		if beforeBoundNode == nil {
+			// Match TS take.ts:502-505 assertion: at this point (oldCmp==0,
+			// newCmp<0, size>1) there must be a row before the bound. If we
+			// reach here something is wrong with bound tracking — panic loudly
+			// rather than silently fall back, so divergence surfaces.
+			// (Porting review HIGH-3.)
+			panic("Take.pushEditChange: beforeBoundNode must be found when oldCmp==0, newCmp<0, size>1")
+		}
+		t.setTakeState(takeStateKey, takeState.Size, beforeBoundNode.Row, maxBound)
+		return t.output.Push(change, t)
+		}
+
+		// newCmp > 0
+		var newBoundNode *Node
+		for _, node := range t.input.Fetch(FetchRequest{
+			Start:      &Start{Row: takeState.Bound, Basis: "at"},
+			Constraint: constraint,
+		}) {
+			n := node
+			newBoundNode = &n
+			break
+		}
+		if newBoundNode == nil {
+			panic("Take: newBoundNode must be found during fetch")
+		}
+		if compareRows(newBoundNode.Row, change.Node.Row) == 0 {
+			return replaceBoundAndForwardChange()
+		}
+		t.setTakeState(takeStateKey, takeState.Size, newBoundNode.Row, maxBound)
+		var results []Change
+		results = append(results, t.pushWithRowHiddenFromFetch(newBoundNode.Row, MakeRemoveChange(*change.OldNode))...)
+		results = append(results, t.output.Push(MakeAddChange(*newBoundNode), t)...)
+		return results
+	}
+
+	if oldCmp > 0 {
+		if newCmp == 0 {
+			panic("Take pushEditChange: newCmp must not be 0 when oldCmp > 0 (duplicate PK)")
+		}
+		if newCmp > 0 {
+			t.debugf("pushEdit DROPPED (both outside) row=%v bound=%v", change.Node.Row["id"], takeState.Bound["id"])
+			return nil
+		}
+		// old outside, new inside
+		var oldBoundNode, newBoundNode *Node
+		for _, node := range t.input.Fetch(FetchRequest{
+			Start:      &Start{Row: takeState.Bound, Basis: "at"},
+			Constraint: constraint,
+			Reverse:    true,
+		}) {
+			n := node
+			if oldBoundNode == nil {
+				oldBoundNode = &n
+			} else {
+				newBoundNode = &n
+				break
+			}
+		}
+		if oldBoundNode == nil {
+			panic("Take: oldBoundNode must be found during fetch")
+		}
+		if newBoundNode == nil {
+			// Edge case: only 1 row at/before bound (size < limit). The new row
+			// enters the window without displacing anything. Bound stays as-is.
+			t.setTakeState(takeStateKey, takeState.Size+1, takeState.Bound, maxBound)
+			return t.output.Push(MakeAddChange(change.Node), t)
+		}
+		t.setTakeState(takeStateKey, takeState.Size, newBoundNode.Row, maxBound)
+		var results []Change
+		results = append(results, t.pushWithRowHiddenFromFetch(change.Node.Row, MakeRemoveChange(*oldBoundNode))...)
+		results = append(results, t.output.Push(MakeAddChange(change.Node), t)...)
+		return results
+	}
+
+	// oldCmp < 0
+	if newCmp == 0 {
+		panic("Take pushEditChange: newCmp must not be 0 when oldCmp < 0 (duplicate PK)")
+	}
+	if newCmp < 0 {
+		return t.output.Push(change, t)
+	}
+	// old inside, new > bound
+	var afterBoundNode *Node
+	for _, node := range t.input.Fetch(FetchRequest{
+		Start:      &Start{Row: takeState.Bound, Basis: "after"},
+		Constraint: constraint,
+	}) {
+		n := node
+		afterBoundNode = &n
+		break
+	}
+	if afterBoundNode == nil {
+		panic("Take: afterBoundNode must be found during fetch")
+	}
+	if compareRows(afterBoundNode.Row, change.Node.Row) == 0 {
+		return replaceBoundAndForwardChange()
+	}
+	var results []Change
+	results = append(results, t.output.Push(MakeRemoveChange(*change.OldNode), t)...)
+	t.setTakeState(takeStateKey, takeState.Size, afterBoundNode.Row, maxBound)
+	results = append(results, t.output.Push(MakeAddChange(*afterBoundNode), t)...)
+	return results
+}
+
+// pushWithRowHiddenFromFetch — Source: take.ts line 677-684
+func (t *Take) pushWithRowHiddenFromFetch(row Row, change Change) []Change {
+	t.rowHiddenFromFetch = row
+	defer func() { t.rowHiddenFromFetch = nil }()
+	return t.output.Push(change, t)
+}
+
+// setTakeState — Source: take.ts line 686-703
+func (t *Take) setTakeState(takeStateKey string, size int, bound Row, maxBound Row) {
+	if t.DebugLabel != "" {
+		var boundID, oldBoundID interface{}
+		if bound != nil {
+			boundID = bound["id"]
+		}
+		oldState := t.storage.GetTakeState(takeStateKey)
+		if oldState != nil && oldState.Bound != nil {
+			oldBoundID = oldState.Bound["id"]
+		}
+		oldSize := 0
+		if oldState != nil {
+			oldSize = oldState.Size
+		}
+		if boundID != oldBoundID || size != oldSize {
+			t.debugf("setState bound=%v→%v size=%d→%d", oldBoundID, boundID, oldSize, size)
+		}
+	}
+	t.storage.SetTakeState(takeStateKey, TakeState{Size: size, Bound: bound})
+	if bound != nil {
+		if maxBound == nil || t.GetSchema().CompareRows(bound, maxBound) > 0 {
+			t.storage.SetMaxBound(bound)
+		}
+	}
+}
+
+// getStateAndConstraint — Source: take.ts line 218-245
+func (t *Take) getStateAndConstraint(row Row) (string, *TakeState, Row, *Constraint) {
+	takeStateKey := GetTakeStateKey(t.partitionKey, row)
+	takeState := t.storage.GetTakeState(takeStateKey)
+	if takeState == nil {
+		return takeStateKey, nil, nil, nil
+	}
+	maxBound := t.storage.GetMaxBound()
+	var constraint *Constraint
+	if len(t.partitionKey) > 0 {
+		c := make(Constraint)
+		for _, key := range t.partitionKey {
+			c[key] = row[key]
+		}
+		constraint = &c
+	}
+	return takeStateKey, takeState, maxBound, constraint
+}
+
+// GetTakeStateKey — Source: take.ts line 710-725
+func GetTakeStateKey(partitionKey PartitionKey, rowOrConstraint Row) string {
+	values := []Value{"take"}
+	if len(partitionKey) > 0 && rowOrConstraint != nil {
+		for _, key := range partitionKey {
+			values = append(values, rowOrConstraint[key])
+		}
+	}
+	b, _ := json.Marshal(values)
+	return string(b)
+}
+
+// ConstraintMatchesPartitionKey — Source: take.ts line 727-743
+func ConstraintMatchesPartitionKey(constraint *Constraint, partitionKey PartitionKey) bool {
+	if constraint == nil && len(partitionKey) == 0 {
+		return true
+	}
+	if constraint == nil || len(partitionKey) == 0 {
+		return false
+	}
+	if len(partitionKey) != len(*constraint) {
+		return false
+	}
+	for _, key := range partitionKey {
+		if _, ok := (*constraint)[key]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// MakePartitionKeyComparator — Source: take.ts line 745-757
+func MakePartitionKeyComparator(partitionKey PartitionKey) Comparator {
+	return func(a, b Row) int {
+		for _, key := range partitionKey {
+			cmp := CompareValues(a[key], b[key])
+			if cmp != 0 {
+				return cmp
+			}
+		}
+		return 0
+	}
+}
+
+// constraintToRow converts a Constraint pointer to a Row for key generation.
+func constraintToRow(c *Constraint) Row {
+	if c == nil {
+		return nil
+	}
+	return Row(*c)
+}
+
+// MemoryTakeStorage is a simple in-memory implementation of TakeStorage.
+type MemoryTakeStorage struct {
+	states   map[string]TakeState
+	maxBound Row
+}
+
+func NewMemoryTakeStorage() *MemoryTakeStorage {
+	return &MemoryTakeStorage{states: make(map[string]TakeState)}
+}
+
+func (s *MemoryTakeStorage) GetTakeState(key string) *TakeState {
+	st, ok := s.states[key]
+	if !ok {
+		return nil
+	}
+	return &st
+}
+
+func (s *MemoryTakeStorage) SetTakeState(key string, state TakeState) {
+	s.states[key] = state
+}
+
+func (s *MemoryTakeStorage) GetMaxBound() Row {
+	return s.maxBound
+}
+
+func (s *MemoryTakeStorage) SetMaxBound(bound Row) {
+	s.maxBound = bound
+}
+
+func (s *MemoryTakeStorage) Del(key string) {
+	delete(s.states, key)
+}
+
+// debugf logs a debug message if DebugLabel is set.
+func (t *Take) debugf(format string, args ...interface{}) {
+	if t.DebugLabel == "" {
+		return
+	}
+	msg := fmt.Sprintf(format, args...)
+	fmt.Fprintf(os.Stderr, "[TAKE-DEBUG][%s] limit=%d %s\n", t.DebugLabel, t.limit, msg)
+}
+
+// Ensure unused import doesn't cause issues
+var _ = fmt.Sprintf

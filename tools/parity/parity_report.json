@@ -1,0 +1,22 @@
+{
+  "timestamp": "2026-05-13T17:59:29.294Z",
+  "seedRange": {
+    "start": 1,
+    "count": 50
+  },
+  "configs": [
+    "SimpleFilter",
+    "FilterWithLimit",
+    "Compound",
+    "Joins",
+    "Exists",
+    "KitchenSink"
+  ],
+  "summary": {
+    "total": 300,
+    "passed": 300,
+    "diverged": 0,
+    "errors": 0
+  },
+  "failures": []
+}

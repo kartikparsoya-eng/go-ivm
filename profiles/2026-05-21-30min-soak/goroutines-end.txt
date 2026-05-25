@@ -1,0 +1,223 @@
+goroutine 12049694 [running]:
+runtime/pprof.writeGoroutineStacks({0x9af5a0, 0x5e129af18870})
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/runtime/pprof/pprof.go:819 +0x6c
+runtime/pprof.writeGoroutine({0x9af5a0?, 0x5e129af18870?}, 0x5e12bda39080?)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/runtime/pprof/pprof.go:782 +0x2c
+runtime/pprof.(*Profile).WriteTo(0x10e13e0?, {0x9af5a0?, 0x5e129af18870?}, 0xc?)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/runtime/pprof/pprof.go:408 +0x144
+net/http/pprof.handler.ServeHTTP({0x5e12e825dc01, 0x9}, {0x9b5590, 0x5e129af18870}, 0x5e12bda36b40)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/net/http/pprof/pprof.go:273 +0x414
+net/http/pprof.Index({0x9b5590, 0x5e129af18870}, 0x5e12bda36b40)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/net/http/pprof/pprof.go:397 +0xa4
+net/http.HandlerFunc.ServeHTTP(0x1102cc0?, {0x9b5590?, 0x5e129af18870?}, 0x2a5358?)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/net/http/server.go:2286 +0x38
+net/http.(*ServeMux).ServeHTTP(0x0?, {0x9b5590, 0x5e129af18870}, 0x5e12bda36b40)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/net/http/server.go:2828 +0x190
+net/http.serverHandler.ServeHTTP({0x5e12b9e99100?}, {0x9b5590?, 0x5e129af18870?}, 0x1?)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/net/http/server.go:3311 +0xb0
+net/http.(*conn).serve(0x5e12c5b65950, {0x9b68f8, 0x5e129ae2c270})
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/net/http/server.go:2073 +0x51c
+created by net/http.(*Server).Serve in goroutine 3
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/net/http/server.go:3464 +0x37c
+
+goroutine 1 [IO wait, 30 minutes]:
+internal/poll.runtime_pollWait(0xffff3da29000, 0x72)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/runtime/netpoll.go:351 +0xa0
+internal/poll.(*pollDesc).wait(0x5e129af00c00?, 0x5e129ae1c0a0?, 0x0)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/internal/poll/fd_poll_runtime.go:84 +0x28
+internal/poll.(*pollDesc).waitRead(...)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/internal/poll/fd_poll_runtime.go:89
+internal/poll.(*FD).Accept(0x5e129af00c00)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/internal/poll/fd_unix.go:613 +0x214
+net.(*netFD).accept(0x5e129af00c00)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/net/fd_unix.go:150 +0x28
+net.(*UnixListener).accept(0x5e129af55df8?)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/net/unixsock_posix.go:172 +0x20
+net.(*UnixListener).Accept(0x5e129af3e750)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/net/unixsock.go:267 +0x2c
+main.main()
+	/Users/kartik.parsoya/Documents/Go-RS/go-ivm/cmd/sidecar/main.go:1422 +0x39c
+
+goroutine 3 [IO wait]:
+internal/poll.runtime_pollWait(0xffff3da28e00, 0x72)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/runtime/netpoll.go:351 +0xa0
+internal/poll.(*pollDesc).wait(0x5e129ae30000?, 0x1183ac?, 0x0)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/internal/poll/fd_poll_runtime.go:84 +0x28
+internal/poll.(*pollDesc).waitRead(...)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/internal/poll/fd_poll_runtime.go:89
+internal/poll.(*FD).Accept(0x5e129ae30000)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/internal/poll/fd_unix.go:613 +0x214
+net.(*netFD).accept(0x5e129ae30000)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/net/fd_unix.go:150 +0x28
+net.(*TCPListener).accept(0x5e129ae32000)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/net/tcpsock_posix.go:159 +0x24
+net.(*TCPListener).Accept(0x5e129ae32000)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/net/tcpsock.go:387 +0x2c
+net/http.(*Server).Serve(0x5e129ae28000, {0x9b53a0, 0x5e129ae32000})
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/net/http/server.go:3434 +0x244
+net/http.(*Server).ListenAndServe(0x5e129ae28000)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/net/http/server.go:3360 +0x80
+net/http.ListenAndServe(...)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/net/http/server.go:3675
+main.main.func1()
+	/Users/kartik.parsoya/Documents/Go-RS/go-ivm/cmd/sidecar/main.go:1354 +0xa4
+created by main.main in goroutine 1
+	/Users/kartik.parsoya/Documents/Go-RS/go-ivm/cmd/sidecar/main.go:1352 +0xe8
+
+goroutine 4 [select]:
+go.opentelemetry.io/otel/sdk/trace.(*batchSpanProcessor).processQueue(0x5e129af1e160)
+	/Users/kartik.parsoya/go/pkg/mod/go.opentelemetry.io/otel/sdk@v1.43.0/trace/batch_span_processor.go:325 +0xc8
+go.opentelemetry.io/otel/sdk/trace.NewBatchSpanProcessor.func2()
+	/Users/kartik.parsoya/go/pkg/mod/go.opentelemetry.io/otel/sdk@v1.43.0/trace/batch_span_processor.go:127 +0x24
+sync.(*WaitGroup).Go.func1()
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/sync/waitgroup.go:258 +0x48
+created by sync.(*WaitGroup).Go in goroutine 1
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/sync/waitgroup.go:238 +0x70
+
+goroutine 5 [chan receive]:
+main.main.func3()
+	/Users/kartik.parsoya/Documents/Go-RS/go-ivm/cmd/sidecar/main.go:1385 +0x80
+created by main.main in goroutine 1
+	/Users/kartik.parsoya/Documents/Go-RS/go-ivm/cmd/sidecar/main.go:1382 +0x280
+
+goroutine 6 [chan receive, 1 minutes]:
+main.main.func4()
+	/Users/kartik.parsoya/Documents/Go-RS/go-ivm/cmd/sidecar/main.go:1398 +0x78
+created by main.main in goroutine 1
+	/Users/kartik.parsoya/Documents/Go-RS/go-ivm/cmd/sidecar/main.go:1395 +0x2c0
+
+goroutine 8 [syscall, 30 minutes]:
+os/signal.signal_recv()
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/runtime/sigqueue.go:152 +0x114
+os/signal.loop()
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/os/signal/signal_unix.go:23 +0x1c
+created by os/signal.Notify.func1.1 in goroutine 1
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/os/signal/signal.go:152 +0x28
+
+goroutine 9 [chan receive, 30 minutes]:
+main.main.func5()
+	/Users/kartik.parsoya/Documents/Go-RS/go-ivm/cmd/sidecar/main.go:1410 +0x4c
+created by main.main in goroutine 1
+	/Users/kartik.parsoya/Documents/Go-RS/go-ivm/cmd/sidecar/main.go:1409 +0x380
+
+goroutine 20 [IO wait]:
+internal/poll.runtime_pollWait(0xffff3da28c00, 0x72)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/runtime/netpoll.go:351 +0xa0
+internal/poll.(*pollDesc).wait(0x5e129ae30100?, 0x5e129aee2000?, 0x0)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/internal/poll/fd_poll_runtime.go:84 +0x28
+internal/poll.(*pollDesc).waitRead(...)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/internal/poll/fd_poll_runtime.go:89
+internal/poll.(*FD).Read(0x5e129ae30100, {0x5e129aee2000, 0x10000, 0x10000})
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/internal/poll/fd_unix.go:165 +0x234
+net.(*netFD).Read(0x5e129ae30100, {0x5e129aee2000?, 0x5e129af0bc18?, 0x27e78?})
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/net/fd_posix.go:68 +0x28
+net.(*conn).Read(0x5e129ae02010, {0x5e129aee2000?, 0x5e129adc1808?, 0x5e12e6283870?})
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/net/net.go:196 +0x34
+bufio.(*Reader).Read(0x5e129aea81e0, {0x5e12e6283870, 0x4, 0x74c6d8?})
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/bufio/bufio.go:245 +0x188
+io.ReadAtLeast({0x9ae888, 0x5e129aea81e0}, {0x5e12e6283870, 0x4, 0x4}, 0x4)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/io/io.go:335 +0x98
+io.ReadFull(...)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/io/io.go:354
+main.readFrame(0x5e129aea81e0)
+	/Users/kartik.parsoya/Documents/Go-RS/go-ivm/cmd/sidecar/main.go:183 +0x4c
+main.handleConnection({0x9bc860, 0x5e129ae02010}, 0x5e129ad630c0)
+	/Users/kartik.parsoya/Documents/Go-RS/go-ivm/cmd/sidecar/main.go:1294 +0x2d0
+created by main.main in goroutine 1
+	/Users/kartik.parsoya/Documents/Go-RS/go-ivm/cmd/sidecar/main.go:1426 +0x38c
+
+goroutine 35 [chan receive]:
+main.handleConnection.func2()
+	/Users/kartik.parsoya/Documents/Go-RS/go-ivm/cmd/sidecar/main.go:1254 +0x68
+created by main.handleConnection in goroutine 20
+	/Users/kartik.parsoya/Documents/Go-RS/go-ivm/cmd/sidecar/main.go:1252 +0x25c
+
+goroutine 69 [IO wait]:
+internal/poll.runtime_pollWait(0xffff3da28a00, 0x72)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/runtime/netpoll.go:351 +0xa0
+internal/poll.(*pollDesc).wait(0x5e129bbec080?, 0x5e129bbf4000?, 0x0)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/internal/poll/fd_poll_runtime.go:84 +0x28
+internal/poll.(*pollDesc).waitRead(...)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/internal/poll/fd_poll_runtime.go:89
+internal/poll.(*FD).Read(0x5e129bbec080, {0x5e129bbf4000, 0x1000, 0x1000})
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/internal/poll/fd_unix.go:165 +0x234
+net.(*netFD).Read(0x5e129bbec080, {0x5e129bbf4000?, 0x80?, 0x8?})
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/net/fd_posix.go:68 +0x28
+net.(*conn).Read(0x5e129b680010, {0x5e129bbf4000?, 0x0?, 0x5e129b087d28?})
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/net/net.go:196 +0x34
+net/http.(*persistConn).Read(0x5e129ad2e640, {0x5e129bbf4000?, 0x9ae8e8?, 0x10de690?})
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/net/http/transport.go:2174 +0x48
+bufio.(*Reader).fill(0x5e129bbf2000)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/bufio/bufio.go:113 +0xe0
+bufio.(*Reader).Peek(0x5e129bbf2000, 0x1)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/bufio/bufio.go:152 +0x58
+net/http.(*persistConn).readLoop(0x5e129ad2e640)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/net/http/transport.go:2330 +0x110
+created by net/http.(*Transport).dialConn in goroutine 130
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/net/http/transport.go:1994 +0x109c
+
+goroutine 70 [select]:
+net/http.(*persistConn).writeLoop(0x5e129ad2e640)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/net/http/transport.go:2652 +0x98
+created by net/http.(*Transport).dialConn in goroutine 130
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/net/http/transport.go:1995 +0x10e4
+
+goroutine 12049691 [select]:
+net/http/pprof.sleep(0x5e12bda36a00, 0x5e129af18780?)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/net/http/pprof/pprof.go:118 +0x8c
+net/http/pprof.Profile({0x9b5590, 0x5e129af18780}, 0x5e12bda36a00)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/net/http/pprof/pprof.go:164 +0x2c8
+net/http.HandlerFunc.ServeHTTP(0x1102cc0?, {0x9b5590?, 0x5e129af18780?}, 0x2a5358?)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/net/http/server.go:2286 +0x38
+net/http.(*ServeMux).ServeHTTP(0x0?, {0x9b5590, 0x5e129af18780}, 0x5e12bda36a00)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/net/http/server.go:2828 +0x190
+net/http.serverHandler.ServeHTTP({0x5e12b9e98f00?}, {0x9b5590?, 0x5e129af18780?}, 0x1?)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/net/http/server.go:3311 +0xb0
+net/http.(*conn).serve(0x5e12c5b65680, {0x9b68f8, 0x5e129ae2c270})
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/net/http/server.go:2073 +0x51c
+created by net/http.(*Server).Serve in goroutine 3
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/net/http/server.go:3464 +0x37c
+
+goroutine 12049695 [IO wait]:
+internal/poll.runtime_pollWait(0xffff3da28600, 0x72)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/runtime/netpoll.go:351 +0xa0
+internal/poll.(*pollDesc).wait(0x5e12bfbbab80?, 0x5e12b9e99121?, 0x0)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/internal/poll/fd_poll_runtime.go:84 +0x28
+internal/poll.(*pollDesc).waitRead(...)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/internal/poll/fd_poll_runtime.go:89
+internal/poll.(*FD).Read(0x5e12bfbbab80, {0x5e12b9e99121, 0x1, 0x1})
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/internal/poll/fd_unix.go:165 +0x234
+net.(*netFD).Read(0x5e12bfbbab80, {0x5e12b9e99121?, 0x5e12c8387788?, 0x36bc20?})
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/net/fd_posix.go:68 +0x28
+net.(*conn).Read(0x5e12ddd19eb8, {0x5e12b9e99121?, 0x81bb01?, 0x0?})
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/net/net.go:196 +0x34
+net/http.(*connReader).backgroundRead(0x5e12b9e99100)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/net/http/server.go:702 +0x38
+created by net/http.(*connReader).startBackgroundRead in goroutine 12049694
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/net/http/server.go:698 +0xb8
+
+goroutine 12049693 [syscall]:
+runtime/pprof.readProfile()
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/runtime/cpuprof.go:251 +0x54
+runtime/pprof.profileWriter({0x9af5a0?, 0x5e129af18780?})
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/runtime/pprof/pprof.go:930 +0x48
+created by runtime/pprof.StartCPUProfile in goroutine 12049691
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/runtime/pprof/pprof.go:911 +0x1e4
+
+goroutine 12049692 [IO wait]:
+internal/poll.runtime_pollWait(0xffff3da28800, 0x72)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/runtime/netpoll.go:351 +0xa0
+internal/poll.(*pollDesc).wait(0x5e12bfbbab00?, 0x5e12b9e98f21?, 0x0)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/internal/poll/fd_poll_runtime.go:84 +0x28
+internal/poll.(*pollDesc).waitRead(...)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/internal/poll/fd_poll_runtime.go:89
+internal/poll.(*FD).Read(0x5e12bfbbab00, {0x5e12b9e98f21, 0x1, 0x1})
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/internal/poll/fd_unix.go:165 +0x234
+net.(*netFD).Read(0x5e12bfbbab00, {0x5e12b9e98f21?, 0x5e12bba80788?, 0x36bc20?})
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/net/fd_posix.go:68 +0x28
+net.(*conn).Read(0x5e12ddd19eb0, {0x5e12b9e98f21?, 0x5e12d05fce01?, 0x5e12bba80770?})
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/net/net.go:196 +0x34
+net/http.(*connReader).backgroundRead(0x5e12b9e98f00)
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/net/http/server.go:702 +0x38
+created by net/http.(*connReader).startBackgroundRead in goroutine 12049691
+	/opt/homebrew/Cellar/go/1.26.3/libexec/src/net/http/server.go:698 +0xb8

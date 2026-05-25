@@ -1,0 +1,35 @@
+# Compiled Go binaries
+sidecar
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Go test outputs
+*.test
+*.out
+coverage.txt
+
+# Node (the client/ and tools/parity/ TS helpers have their own package.json + lockfile;
+# keep those, ignore installed dependencies)
+node_modules/
+.npm
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# pprof scratch (committed profiles live under profiles/<date>/; ignore stray captures
+# at the repo root)
+/cpu.pprof
+/allocs.pprof
+/block.pprof
+/mutex.pprof
+/heap.pprof
+/goroutines.txt
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*.swo

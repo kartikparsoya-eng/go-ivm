@@ -1,0 +1,27 @@
+{
+  "schema": {
+    "users": {
+      "columns": {
+        "id": {"type": "string"},
+        "name": {"type": "string"},
+        "age": {"type": "number"}
+      },
+      "primaryKey": ["id"]
+    }
+  },
+  "initialData": {
+    "users": [
+      {"id": "1", "name": "Alice", "age": 30},
+      {"id": "2", "name": "Bob", "age": 25}
+    ]
+  },
+  "ast": {
+    "table": "users",
+    "orderBy": [["name", "asc"], ["id", "asc"]]
+  },
+  "mutations": [
+    {"type": "add", "table": "users", "row": {"id": "3", "name": "Charlie", "age": 35}},
+    {"type": "remove", "table": "users", "row": {"id": "2", "name": "Bob", "age": 25}},
+    {"type": "edit", "table": "users", "row": {"id": "1", "name": "Alicia", "age": 31}, "oldRow": {"id": "1", "name": "Alice", "age": 30}}
+  ]
+}
