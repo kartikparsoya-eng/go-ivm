@@ -5,6 +5,7 @@ package builder
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/kartikparsoya-eng/go-ivm/ivm"
@@ -155,9 +156,25 @@ func evalOp(op string, left, right ivm.Value) bool {
 	}
 }
 
-// valuesIdentical mirrors TS's `===` for predicate-level equality:
-// null === null is TRUE, otherwise standard equality with cross-type
-// numeric (int64↔float64) coercion to match JS's single Number type.
+// valuesIdentical mirrors the equality semantics the TS path produces.
+// The TS sqlite TableSource translates AST filters into SQL, so cross-
+// type comparisons (e.g. `numeric_col = '5'`) go through SQLite's
+// implicit cast — `'5'` becomes 5 and the row matches. Go's predicate
+// runs in-process and never touches SQL, so it must replicate that
+// coercion here to stay in parity with TS.
+//
+// Rules (in order):
+//  1. null == null is TRUE; null vs anything else is FALSE.
+//  2. Same-type equality (covers strings, identical numeric types, bool).
+//  3. Both numeric → promote both to float64 and compare.
+//  4. One side numeric, the other a string that parses as numeric →
+//     coerce the string and compare. Matches SQLite's CAST behaviour
+//     for `numeric_col = '5'` and inverse.
+//  5. Otherwise FALSE.
+//
+// Discovered via gap-cross-type-num-eq-str in the soak (2026-05-25):
+// `participantCount = '5'` produced TS=1/Go=0 mismatches because Go
+// stopped at rule 3 and rejected the string literal.
 func valuesIdentical(a, b ivm.Value) bool {
 	if a == nil && b == nil {
 		return true
@@ -168,9 +185,23 @@ func valuesIdentical(a, b ivm.Value) bool {
 	if a == b {
 		return true
 	}
-	if af, ok := numericToFloat64(a); ok {
-		if bf, ok := numericToFloat64(b); ok {
-			return af == bf
+	af, aNum := numericToFloat64(a)
+	bf, bNum := numericToFloat64(b)
+	if aNum && bNum {
+		return af == bf
+	}
+	if aNum {
+		if bs, ok := b.(string); ok {
+			if bp, err := strconv.ParseFloat(bs, 64); err == nil {
+				return af == bp
+			}
+		}
+	}
+	if bNum {
+		if as, ok := a.(string); ok {
+			if ap, err := strconv.ParseFloat(as, 64); err == nil {
+				return ap == bf
+			}
 		}
 	}
 	return false
