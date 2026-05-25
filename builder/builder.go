@@ -69,8 +69,27 @@ func buildPipelineInternal(ast AST, delegate Delegate, p *Pipeline, partitionKey
 	// Uniquify CSQ condition aliases to avoid conflicts with Related aliases
 	ast = uniquifyCSQConditionAliases(ast)
 
-	// Collect splitEditKeys from correlations (both where-CSQs and related)
+	// Collect splitEditKeys from correlations (both where-CSQs and related).
+	// Also include this pipeline's partitionKey — when this is built as a
+	// child of a parent CSQ/Related, partitionKey contains the
+	// correlation's ChildField. Edits to those columns are partition-key
+	// changes from the upstream Take's perspective; Take asserts that
+	// partition keys don't change (take.go:307, mirroring TS take.ts:439).
+	// To honor that invariant, the source must split such edits into
+	// Remove(old) + Add(new) before they ever reach Take.
+	//
+	// Discovered via the sandbox soak (2026-05-25): the new H.1/H.2/H.3
+	// mutations (move conv/msg/ticket between parents) edited FK columns
+	// that act as partition keys for nested-related templates, panicking
+	// the sidecar. Sidecar restart recovered each time, but the dropped
+	// changes are correctness-adjacent.
 	splitEditKeys := collectSplitEditKeys(ast)
+	for _, k := range partitionKey {
+		if splitEditKeys == nil {
+			splitEditKeys = map[string]bool{}
+		}
+		splitEditKeys[k] = true
+	}
 
 	// Step 1: Connect to source
 	source := delegate.GetSource(ast.Table)
