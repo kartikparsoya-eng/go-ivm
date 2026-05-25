@@ -1,5 +1,5 @@
-# Compiled Go binaries
-sidecar
+# Compiled Go binaries (top-level only — must not shadow cmd/sidecar/)
+/sidecar
 *.exe
 *.dll
 *.so
