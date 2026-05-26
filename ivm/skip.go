@@ -45,9 +45,48 @@ func (s *Skip) Destroy() {
 }
 
 // shouldBePresent — determines if a row is at or after the bound.
+// Uses partial-cursor comparison: if the bound row is missing a sort
+// column, stop comparing — partial cursors are treated as "any value"
+// for the unspecified columns. Without this, the full-row comparator
+// returned -1 (nil < non-nil) for the rest of the sort key, treating
+// a row at the cursor's createdAt as strictly after the cursor — so
+// Exclusive=true wasn't excluding the cursor row. Drift seen in
+// channelConversationsPaginatedV3 (start={createdAt}, sort by
+// [createdAt, conversationId], inclusive=false): Go included the row
+// at exactly the start's createdAt.
 func (s *Skip) shouldBePresent(row Row) bool {
-	cmp := s.comparator(s.bound.Row, row)
+	cmp := CompareWithPartialBound(s.bound.Row, row, s.input.GetSchema().Sort)
 	return cmp < 0 || (cmp == 0 && !s.bound.Exclusive)
+}
+
+// CompareWithPartialBound returns -1/0/+1 for bound vs row, stopping
+// at the first sort column the bound row doesn't specify (treated as
+// "equal so far"). Caller treats the resulting 0 the same way the full
+// comparator would treat an exact match.
+//
+// TS gets this behavior for free in SQL via three-valued logic
+// (`column > NULL` is NULL → row excluded), and via the same property
+// in the BTree path (RowBound + makeBoundComparator with min/maxValue
+// sentinels). Go's in-memory comparator iterates all sort columns and
+// treats nil < non-nil at -1, which (a) wrongly includes the cursor
+// row when the cursor is partial + basis="after" / exclusive=true,
+// and (b) is symmetric to the wrong direction for "at". Stopping at
+// the first missing-in-bound column matches TS's SQL boundary.
+func CompareWithPartialBound(bound Row, row Row, sort Ordering) int {
+	for _, ord := range sort {
+		field := ord[0]
+		if _, ok := bound[field]; !ok {
+			return 0
+		}
+		comp := CompareValues(bound[field], row[field])
+		if comp != 0 {
+			if ord[1] == "desc" {
+				comp = -comp
+			}
+			return comp
+		}
+	}
+	return 0
 }
 
 // Fetch — fetches nodes respecting the skip bound.

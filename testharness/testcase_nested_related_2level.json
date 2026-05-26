@@ -1,0 +1,84 @@
+{
+  "_comment": "Repro for prod queryID 33dg3td8uhbjz drift (2026-05-26). Query is `conversations WHERE channelId=X` with a 2-level nested related: conversations -> channel -> channel.participants. Shadow logs show Go emitting extra channel_participants Add+Remove on parent-displacement advances (Take + nested relationship). Hypothesis: streamer recursion at depth-2 with shared join key (channel.id <-> channel_participants.channelId) double-emits the shared participant rows when a conversation Add+Remove churn happens.",
+
+  "schema": {
+    "channels": {
+      "columns": {
+        "id": {"type": "string"},
+        "name": {"type": "string"}
+      },
+      "primaryKey": ["id"]
+    },
+    "channel_participants": {
+      "columns": {
+        "id": {"type": "string"},
+        "channelId": {"type": "string"},
+        "userId": {"type": "string"}
+      },
+      "primaryKey": ["id"]
+    },
+    "conversations": {
+      "columns": {
+        "conversationId": {"type": "string"},
+        "channelId": {"type": "string"},
+        "lastActivityAt": {"type": "number"}
+      },
+      "primaryKey": ["conversationId"]
+    }
+  },
+
+  "initialData": {
+    "channels": [
+      {"id": "chA", "name": "Channel A"}
+    ],
+    "channel_participants": [
+      {"id": "pA1", "channelId": "chA", "userId": "user-1"}
+    ],
+    "conversations": [
+      {"conversationId": "c1", "channelId": "chA", "lastActivityAt": 100},
+      {"conversationId": "c2", "channelId": "chA", "lastActivityAt": 200},
+      {"conversationId": "c3", "channelId": "chA", "lastActivityAt": 300}
+    ]
+  },
+
+  "ast": {
+    "table": "conversations",
+    "where": {
+      "type": "simple",
+      "op": "=",
+      "left": {"type": "column", "name": "channelId"},
+      "right": {"type": "literal", "value": "chA"}
+    },
+    "orderBy": [["lastActivityAt", "desc"], ["conversationId", "asc"]],
+    "limit": 2,
+    "related": [
+      {
+        "system": "client",
+        "correlation": {"parentField": ["channelId"], "childField": ["id"]},
+        "subquery": {
+          "table": "channels",
+          "alias": "channel",
+          "related": [
+            {
+              "system": "client",
+              "correlation": {"parentField": ["id"], "childField": ["channelId"]},
+              "subquery": {
+                "table": "channel_participants",
+                "alias": "participants"
+              }
+            }
+          ]
+        }
+      }
+    ]
+  },
+
+  "mutations": [
+    {
+      "_comment": "Add a new conversation with higher lastActivityAt that pushes into the limit=2 window. Old c1 (lastActivityAt=100) should be displaced. If the streamer over-emits the shared channel_participants row for both Add(new) and Remove(c1), we see the production-drift signature.",
+      "type": "add",
+      "table": "conversations",
+      "row": {"conversationId": "c4", "channelId": "chA", "lastActivityAt": 400}
+    }
+  ]
+}

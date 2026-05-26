@@ -386,7 +386,7 @@ func (ts *TableSource) Fetch(req ivm.FetchRequest, conn *TableConnection) []ivm.
 	// Apply start cursor (after overlay, since overlay may insert before cursor)
 	if req.Start != nil && conn.Sort != nil {
 		comparator := ivm.MakeComparator(conn.Sort, req.Reverse)
-		result = applyStart(result, req.Start, comparator)
+		result = applyStart(result, req.Start, comparator, conn.Sort)
 	}
 
 	return result
@@ -633,13 +633,18 @@ func removeByPK(nodes []ivm.Node, row ivm.Row, primaryKey []string) []ivm.Node {
 	return nodes
 }
 
-func applyStart(nodes []ivm.Node, start *ivm.Start, comparator ivm.Comparator) []ivm.Node {
+func applyStart(nodes []ivm.Node, start *ivm.Start, _ ivm.Comparator, sort ivm.Ordering) []ivm.Node {
 	if start == nil {
 		return nodes
 	}
+	// Use partial-cursor compare so a cursor that lacks some sort
+	// columns (e.g. start={createdAt} with sort=[createdAt, conversationId])
+	// excludes the cursor row when basis="after". Full-row comparator
+	// would treat nil < non-nil at -1, breaking the boundary. Matches
+	// TS's SQL three-valued logic behavior. See CompareWithPartialBound.
 	startIdx := 0
 	for i, n := range nodes {
-		cmp := comparator(n.Row, start.Row)
+		cmp := -ivm.CompareWithPartialBound(start.Row, n.Row, sort)
 		if start.Basis == "at" {
 			if cmp >= 0 {
 				startIdx = i

@@ -23,6 +23,13 @@ type SourceSchema struct {
 	PrimaryKey    []string
 	Relationships map[string]*SourceSchema
 	IsHidden      bool
+	// IsScalar marks this relationship as the child side of a scalar
+	// EXISTS condition. TS resolves these via resolveSimpleScalarSubqueries
+	// before building the pipeline, so the join doesn't exist on the TS
+	// side and its child rows are never streamed. Go gets the unresolved
+	// AST, so we build the join — but we mark the relationship IsScalar
+	// so the streamer drops the entire subtree, matching TS.
+	IsScalar      bool
 	System        string // "client" | "permissions" | "server"
 	CompareRows   Comparator
 	Sort          Ordering

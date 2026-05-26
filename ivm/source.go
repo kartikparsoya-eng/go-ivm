@@ -7,6 +7,7 @@ package ivm
 
 import (
 	"encoding/json"
+	"fmt"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -227,11 +228,25 @@ func (ms *MemorySource) genPush(change SourceChange) []Change {
 		}
 	case ChangeTypeRemove:
 		if !ms.has(change.Row) {
-			panic("Row not found")
+			pk := make(map[string]Value, len(ms.primaryKey))
+			for _, c := range ms.primaryKey {
+				pk[c] = change.Row[c]
+			}
+			panic(fmt.Sprintf(
+				"Row not found (Remove): table=%s pk=%v row=%v has_count=%d",
+				ms.tableName, pk, change.Row, len(ms.data),
+			))
 		}
 	case ChangeTypeEdit:
 		if !ms.has(change.OldRow) {
-			panic("Row not found")
+			pk := make(map[string]Value, len(ms.primaryKey))
+			for _, c := range ms.primaryKey {
+				pk[c] = change.OldRow[c]
+			}
+			panic(fmt.Sprintf(
+				"Row not found (Edit): table=%s oldPk=%v oldRow=%v newRow=%v has_count=%d",
+				ms.tableName, pk, change.OldRow, change.Row, len(ms.data),
+			))
 		}
 	}
 
@@ -473,7 +488,7 @@ func (si *SourceInput) Fetch(req FetchRequest) []Node {
 
 	// Apply start
 	if req.Start != nil {
-		nodes = applyStart(nodes, req.Start, compareRows, req.Reverse)
+		nodes = applyStart(nodes, req.Start, compareRows, req.Reverse, conn.Sort)
 	}
 
 	// Apply constraint
@@ -592,18 +607,25 @@ func generateWithOverlayInner(rows []Row, overlays Overlays, compare Comparator)
 // For forward fetch: skip nodes until we reach/pass the start row.
 // For reverse fetch: keep only nodes before (or at) the start row.
 // The caller will reverse the result afterward for reverse fetches.
-func applyStart(nodes []Node, start *Start, compare Comparator, reverse bool) []Node {
+func applyStart(nodes []Node, start *Start, compare Comparator, reverse bool, sort Ordering) []Node {
+	// Use partial-cursor compare for cursor-vs-row (cursor may lack some
+	// sort columns). Use the schema's full compare for row-vs-cursor
+	// inversion-via-negation. See CompareWithPartialBound for rationale.
+	cmpCursorVsRow := func(row Row) int {
+		// CompareWithPartialBound(bound, row) returns -1 if bound < row.
+		// applyStart's existing logic uses compare(node.Row, start.Row),
+		// i.e. row-vs-cursor. Negate to convert.
+		return -CompareWithPartialBound(start.Row, row, sort)
+	}
 	if reverse {
-		// For reverse: keep nodes that are BEFORE the start position.
-		// After this, reverseNodes will put them in descending order.
 		var result []Node
 		for _, node := range nodes {
 			if start.Basis == "at" {
-				if compare(node.Row, start.Row) <= 0 {
+				if cmpCursorVsRow(node.Row) <= 0 {
 					result = append(result, node)
 				}
 			} else { // "after"
-				if compare(node.Row, start.Row) < 0 {
+				if cmpCursorVsRow(node.Row) < 0 {
 					result = append(result, node)
 				}
 			}
@@ -616,11 +638,11 @@ func applyStart(nodes []Node, start *Start, compare Comparator, reverse bool) []
 	for _, node := range nodes {
 		if !started {
 			if start.Basis == "at" {
-				if compare(node.Row, start.Row) >= 0 {
+				if cmpCursorVsRow(node.Row) >= 0 {
 					started = true
 				}
 			} else { // "after"
-				if compare(node.Row, start.Row) > 0 {
+				if cmpCursorVsRow(node.Row) > 0 {
 					started = true
 				}
 			}

@@ -153,7 +153,11 @@ func buildPipelineInternal(ast AST, delegate Delegate, p *Pipeline, partitionKey
 		// Recursively build child pipeline
 		childInput := buildPipelineInternal(childAST, delegate, p, csq.Correlation.ChildField)
 
-		// Create Join
+		// Create Join. Scalar=true on the condition means TS pre-resolved
+		// this EXISTS via resolveSimpleScalarSubqueries and never built the
+		// join. We still build it (we need the EXISTS check at filter time)
+		// but propagate Scalar to the child schema so streamNodes drops
+		// the relationship's row emissions, matching TS output.
 		join := ivm.NewJoin(ivm.JoinArgs{
 			Parent:           end,
 			Child:            childInput,
@@ -161,6 +165,7 @@ func buildPipelineInternal(ast AST, delegate Delegate, p *Pipeline, partitionKey
 			ChildKey:         csq.Correlation.ChildField,
 			RelationshipName: childAlias,
 			Hidden:           csq.Hidden,
+			Scalar:           csqCond.Scalar,
 			System:           csq.System,
 		})
 		p.Edges = append(p.Edges, [2]ivm.InputBase{end, join})

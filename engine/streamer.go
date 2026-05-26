@@ -113,6 +113,20 @@ func streamChanges(queryID string, schema *ivm.SourceSchema, changes []ivm.Chang
 
 // streamNodes produces RowChanges for a node and its relationships.
 func streamNodes(queryID string, schema *ivm.SourceSchema, op int, node ivm.Node) []RowChange {
+	// Skip permission-system rows — mirrors TS pipeline-driver.ts:2101.
+	// streamChanges already guards permissions for top-level Add/Remove, but
+	// the recursive descent into child relationships re-enters streamNodes
+	// with the child schema. If that child is a permission CSQ (e.g. the
+	// channel_participants EXISTS on conversation read policy), without
+	// this guard Go emits those rows to the client while TS correctly
+	// suppresses them.
+	if schema.System == "permissions" {
+		return nil
+	}
+	// IsScalar skip: temporarily disabled — broke the channel relationship
+	// emission on the OUTER whereExists path (it shouldn't, but empirically
+	// did, so reverting to investigate which propagation step over-marks
+	// the channel schema as scalar).
 	var result []RowChange
 
 	// Build rowKey from primary key

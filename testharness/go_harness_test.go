@@ -513,3 +513,33 @@ func TestOrWithExistsBranch(t *testing.T) {
 	}
 	runDifferential(t, testCaseData)
 }
+
+// TestNestedRelated2Level reproduces the dominant prod drift signature
+// (queryID 33dg3td8uhbjz, 2026-05-26): conversations with a 2-level nested
+// related (conversations -> channel -> channel.participants) plus Take/
+// LIMIT-driven displacement. Production logs show Go emitting extra
+// channel_participants Add+Remove on advances where a new conversation
+// pushes an older one out of the LIMIT window.
+func TestNestedRelated2Level(t *testing.T) {
+	projectRoot := findProjectRoot(t)
+	testCaseFile := filepath.Join(projectRoot, "go-ivm", "testharness", "testcase_nested_related_2level.json")
+	testCaseData, err := os.ReadFile(testCaseFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runDifferential(t, testCaseData)
+}
+
+// TestNestedRelatedWithCSQ adds an inner EXISTS condition to the nested
+// 2-level related shape — matching the truncated prod AST pattern. The
+// log shows `WHERE and{channelId=X, {"typ...}}` which we guess is
+// `AND EXISTS(channel_participants WHERE userId=user)` for visibility.
+func TestNestedRelatedWithCSQ(t *testing.T) {
+	projectRoot := findProjectRoot(t)
+	testCaseFile := filepath.Join(projectRoot, "go-ivm", "testharness", "testcase_nested_related_with_csq.json")
+	testCaseData, err := os.ReadFile(testCaseFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runDifferential(t, testCaseData)
+}

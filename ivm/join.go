@@ -11,7 +11,15 @@ type JoinArgs struct {
 	ChildKey         CompoundKey
 	RelationshipName string
 	Hidden           bool
-	System           string
+	// Scalar marks this join as the EXISTS side of a scalar correlated
+	// subquery (csq.Scalar=true in the AST). TS pre-resolves these via
+	// resolveSimpleScalarSubqueries before pipeline construction, so the
+	// child relationship never reaches the TS streamer. We still build
+	// the join (the EXISTS check is needed for filtering) but mark the
+	// child schema IsScalar so the streamer drops its row emissions,
+	// matching TS output.
+	Scalar bool
+	System string
 }
 
 // Join implements Input. It joins parent and child streams hierarchically.
@@ -52,6 +60,7 @@ func NewJoin(args JoinArgs) *Join {
 		PrimaryKey:    childSchema.PrimaryKey,
 		Relationships: childSchema.Relationships,
 		IsHidden:      args.Hidden,
+		IsScalar:      args.Scalar,
 		System:        args.System,
 		CompareRows:   childSchema.CompareRows,
 		Sort:          childSchema.Sort,

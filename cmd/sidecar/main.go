@@ -19,6 +19,7 @@ import (
 	"reflect"
 	"runtime"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -839,6 +840,34 @@ func (s *Server) handleLoadRows(req RPCRequest) RPCResponse {
 		rows = append(rows, row)
 	}
 	ms.BulkInsert(rows)
+
+	// Pattern Z diagnostic (REMOVE after root-cause). Dump table loadRows
+	// counts so we can verify whether channels (and other tables) are
+	// loaded with the expected row set. For channels specifically, dump
+	// first 20 primary keys so we can cross-reference against the channel
+	// IDs that production queries filter on.
+	totalRows := len(ms.Data())
+	if p.Table == "channels" || p.Table == "conversations" || p.Table == "channel_user_status" {
+		pk := ms.PrimaryKey()
+		sampleKeys := make([]string, 0, 20)
+		for i, r := range ms.Data() {
+			if i >= 20 {
+				break
+			}
+			keyVals := make([]string, len(pk))
+			for j, c := range pk {
+				keyVals[j] = fmt.Sprintf("%v", r[c])
+			}
+			sampleKeys = append(sampleKeys, strings.Join(keyVals, "|"))
+		}
+		fmt.Fprintf(os.Stderr,
+			"[GO-IVM][loadRows] cg=%s table=%s batch=%d total=%d firstKeys=%v\n",
+			cgID, p.Table, len(rows), totalRows, sampleKeys)
+	} else {
+		fmt.Fprintf(os.Stderr,
+			"[GO-IVM][loadRows] cg=%s table=%s batch=%d total=%d\n",
+			cgID, p.Table, len(rows), totalRows)
+	}
 
 	return RPCResponse{JSONRPC: "2.0", Result: "ok", ID: req.ID}
 }
