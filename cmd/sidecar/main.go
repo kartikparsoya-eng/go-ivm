@@ -711,7 +711,12 @@ type initParams struct {
 type tableSchemaParams struct {
 	Columns    map[string]sqlite.ColumnSchema `json:"columns"`
 	PrimaryKey []string                       `json:"primaryKey"`
-	Rows       []map[string]interface{}       `json:"rows"` // pre-loaded rows from TS
+	// UniqueKeys: all column sets with a unique index on this table (includes
+	// PrimaryKey). Forwarded from TS-side liteTableSpec.uniqueKeys; consumed
+	// by the scalar-subquery resolver to identify subqueries returning at
+	// most one row. Empty/nil disables the resolver for this table.
+	UniqueKeys [][]string               `json:"uniqueKeys,omitempty"`
+	Rows       []map[string]interface{} `json:"rows"` // pre-loaded rows from TS
 }
 
 func (s *Server) handleInit(req RPCRequest) RPCResponse {
@@ -784,6 +789,13 @@ func (s *Server) handleInit(req RPCRequest) RPCResponse {
 		ms.BulkInsert(rows)
 
 		eng.RegisterMemorySource(ms)
+
+		// Forward unique-key metadata for the scalar-subquery resolver.
+		// Tables without unique keys (or where TS hasn't sent them yet for
+		// backward compat) leave the resolver no-op for that table.
+		if len(schema.UniqueKeys) > 0 {
+			eng.SetTableUniqueKeys(tableName, schema.UniqueKeys)
+		}
 	}
 
 	return RPCResponse{JSONRPC: "2.0", Result: "ok", ID: req.ID}

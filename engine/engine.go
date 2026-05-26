@@ -75,6 +75,26 @@ type pipelineEntry struct {
 	queryID  string
 	pipeline *builder.Pipeline
 	schema   *ivm.SourceSchema
+	// companions are pipelines built for scalar subqueries resolved away by
+	// the AST resolver. Each holds a live Connection to its subquery's
+	// source, so the source's Push fans out to it on every advance — that's
+	// how scalar EXISTS replacement stays live without explicit re-eval.
+	// Tracked here so removeQuery can destroy them alongside the main
+	// pipeline. Empty for queries with no resolved scalar subqueries.
+	companions []*companionEntry
+}
+
+// companionEntry is the Go-side companion record. The TS analogue is
+// CompanionPipeline in pipeline-driver.ts; this version omits the live
+// "scalar value changed" reset because almost all real workloads never
+// change a scalar's child field — they only ADD/REMOVE rows that flip
+// existence. If a value-change case becomes load-bearing, we can add a
+// reset signal here that piggybacks on the engine's existing reset path.
+type companionEntry struct {
+	pipeline   *builder.Pipeline
+	schema     *ivm.SourceSchema
+	matchedRow ivm.Row // captured by the executor at resolve time; nil = no match
+	childField string
 }
 
 // Engine is the IVM engine that manages sources, pipelines, and the advance loop.
@@ -85,6 +105,15 @@ type Engine struct {
 	streamer  *Streamer
 	storage   *sqlite.DatabaseStorage
 	closed    bool // set true by Close; guards against post-Close calls
+
+	// tableUniqueKeys: per-table list of unique key column sets. Used by the
+	// scalar-subquery resolver to detect "simple" subqueries — those whose
+	// WHERE constrains all columns of at least one unique key, guaranteeing
+	// at most one matching row. Set by handleInit from TS-side tableSpecs;
+	// nil/missing for a table means "no known unique keys" (resolver will
+	// treat all that table's scalar subqueries as non-simple and leave the
+	// EXISTS rewrite in place).
+	tableUniqueKeys map[string][][]string
 
 	// parallelThreshold: if a source has more connections than this, fan-out in parallel
 	parallelThreshold int
@@ -120,8 +149,35 @@ func NewEngine(cfg EngineConfig) (*Engine, error) {
 		pipelines:         make(map[string]*pipelineEntry),
 		streamer:          NewStreamer(),
 		storage:           storage,
+		tableUniqueKeys:   make(map[string][][]string),
 		parallelThreshold: threshold,
 	}, nil
+}
+
+// SetTableUniqueKeys registers the unique-key column sets for a table.
+// Called by the sidecar's handleInit per table; consumed by the scalar
+// subquery resolver at query-build time. Safe to call before any
+// pipelines are registered.
+func (e *Engine) SetTableUniqueKeys(tableName string, uniqueKeys [][]string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if uniqueKeys == nil {
+		delete(e.tableUniqueKeys, tableName)
+		return
+	}
+	e.tableUniqueKeys[tableName] = uniqueKeys
+}
+
+// TableUniqueKeys returns a snapshot of the registered unique keys keyed by
+// table name. Returned map is a fresh copy — safe for the caller to retain.
+func (e *Engine) TableUniqueKeys() map[string][][]string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	out := make(map[string][][]string, len(e.tableUniqueKeys))
+	for k, v := range e.tableUniqueKeys {
+		out[k] = v
+	}
+	return out
 }
 
 // Close shuts down the engine: destroys all pipelines, clears sources, and
@@ -140,9 +196,13 @@ func (e *Engine) Close() error {
 	e.closed = true
 	for _, entry := range e.pipelines {
 		entry.pipeline.Input.Destroy()
+		for _, ce := range entry.companions {
+			ce.pipeline.Input.Destroy()
+		}
 	}
 	e.pipelines = nil
 	e.sources = nil
+	e.tableUniqueKeys = nil
 	if e.storage == nil {
 		return nil
 	}
@@ -195,39 +255,108 @@ func (e *Engine) AddQuery(queryID string, ast builder.AST) ([]RowChange, float64
 	// Remove existing pipeline if any
 	e.removeQueryLocked(queryID)
 
-	// Build pipeline
+	entry := e.buildAndRegisterLocked(queryID, ast)
+
+	// Hydrate: fetch current state and return as ADD changes (plus any
+	// resolver-recorded companion rows).
+	start := time.Now()
+	hydration := hydrateEntry(entry)
+	timingMs := float64(time.Since(start).Microseconds()) / 1000.0
+
+	return hydration, timingMs, nil
+}
+
+// buildAndRegisterLocked is the shared body of AddQuery / AddQueries /
+// AddQueriesStream. It resolves scalar EXISTS via the unique-key resolver,
+// builds the main pipeline + any companion sub-pipelines, wires outputs to
+// the streamer (companions emit under the MAIN queryID so their rows reach
+// the same downstream consumer), and stores the entry.
+//
+// Must be called with e.mu held. The caller is responsible for hydration.
+func (e *Engine) buildAndRegisterLocked(queryID string, ast builder.AST) *pipelineEntry {
 	delegate := &engineDelegate{engine: e, queryID: queryID}
-	pipeline := builder.BuildPipeline(ast, delegate)
 
-	// Get the schema from the pipeline input
-	schema := pipeline.Input.GetSchema()
+	// Resolver executor: each call builds a mini-pipeline against the
+	// subquery, fetches at most one row, captures it for hydration, and
+	// returns the childField value. The pipeline is kept alive so the
+	// subquery's source push fans out to it on advance (companion live
+	// tracking is implicit — MemorySource.Push fans to every Connection).
+	var companions []*companionEntry
+	executor := func(subqueryAST builder.AST, childField string) (interface{}, bool) {
+		subPipeline := builder.BuildPipeline(subqueryAST, delegate)
+		subSchema := subPipeline.Input.GetSchema()
+		nodes := subPipeline.Input.Fetch(ivm.FetchRequest{})
+		ce := &companionEntry{
+			pipeline:   subPipeline,
+			schema:     subSchema,
+			childField: childField,
+		}
+		var value interface{}
+		var matched bool
+		if len(nodes) > 0 {
+			ce.matchedRow = nodes[0].Row
+			value = nodes[0].Row[childField]
+			matched = true
+		}
+		companions = append(companions, ce)
+		return value, matched
+	}
 
-	// Store the pipeline entry
+	result := builder.ResolveSimpleScalarSubqueries(ast, e.tableUniqueKeys, executor)
+
+	mainPipeline := builder.BuildPipeline(result.AST, delegate)
+	schema := mainPipeline.Input.GetSchema()
+
 	entry := &pipelineEntry{
-		queryID:  queryID,
-		pipeline: pipeline,
-		schema:   schema,
+		queryID:    queryID,
+		pipeline:   mainPipeline,
+		schema:     schema,
+		companions: companions,
 	}
 	e.pipelines[queryID] = entry
 
-	// Set the output handler — captures IVM changes into the streamer
-	pipeline.Input.SetOutput(&pipelineOutput{
+	mainPipeline.Input.SetOutput(&pipelineOutput{
 		engine:  e,
 		queryID: queryID,
 		schema:  schema,
 	})
 
-	// Hydrate: fetch current state and return as ADD changes
-	start := time.Now()
-	nodes := pipeline.Input.Fetch(ivm.FetchRequest{})
-	var hydration []RowChange
-	for _, node := range nodes {
-		nodeChanges := streamNodes(queryID, schema, RowChangeAdd, node)
-		hydration = append(hydration, nodeChanges...)
+	// Wire each companion's output to the streamer tagged with the MAIN
+	// queryID — when source.Push fans out and the companion's pipeline
+	// produces a Change, it lands in the same accumulated batch the main
+	// query's changes do and ships to the client as a peer row.
+	for _, ce := range companions {
+		ce.pipeline.Input.SetOutput(&pipelineOutput{
+			engine:  e,
+			queryID: queryID,
+			schema:  ce.schema,
+		})
 	}
-	timingMs := float64(time.Since(start).Microseconds()) / 1000.0
 
-	return hydration, timingMs, nil
+	return entry
+}
+
+// hydrateEntry fetches the main pipeline's current state and emits all
+// matched companion rows as ADDs under the same queryID. Caller is
+// responsible for timing.
+func hydrateEntry(entry *pipelineEntry) []RowChange {
+	var hydration []RowChange
+	nodes := entry.pipeline.Input.Fetch(ivm.FetchRequest{})
+	for _, node := range nodes {
+		hydration = append(hydration, streamNodes(entry.queryID, entry.schema, RowChangeAdd, node)...)
+	}
+	// Companion rows: emit each matched subquery row as an ADD so the
+	// client can re-evaluate its own EXISTS against the same data the
+	// resolver saw. Unmatched companions contribute nothing — there is
+	// no row to ship.
+	for _, ce := range entry.companions {
+		if ce.matchedRow == nil {
+			continue
+		}
+		node := ivm.Node{Row: ce.matchedRow}
+		hydration = append(hydration, streamNodes(entry.queryID, ce.schema, RowChangeAdd, node)...)
+	}
+	return hydration
 }
 
 // AddQueries builds multiple pipelines and hydrates them in parallel.
@@ -237,51 +366,23 @@ func (e *Engine) AddQueries(queries []QuerySpec) ([]QueryResult, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	type builtEntry struct {
-		queryID  string
-		pipeline *builder.Pipeline
-		schema   *ivm.SourceSchema
-	}
-
-	// Phase 1: Build all pipelines sequentially (mutates shared state)
-	built := make([]builtEntry, 0, len(queries))
+	// Phase 1: Build all pipelines sequentially (mutates shared state).
+	// Scalar-subquery resolution runs here too — see buildAndRegisterLocked.
+	built := make([]*pipelineEntry, 0, len(queries))
 	for _, q := range queries {
 		e.removeQueryLocked(q.QueryID)
-
-		delegate := &engineDelegate{engine: e, queryID: q.QueryID}
-		pipeline := builder.BuildPipeline(q.AST, delegate)
-
-		schema := pipeline.Input.GetSchema()
-		entry := &pipelineEntry{
-			queryID:  q.QueryID,
-			pipeline: pipeline,
-			schema:   schema,
-		}
-		e.pipelines[q.QueryID] = entry
-
-		pipeline.Input.SetOutput(&pipelineOutput{
-			engine:  e,
-			queryID: q.QueryID,
-			schema:  schema,
-		})
-
-		built = append(built, builtEntry{queryID: q.QueryID, pipeline: pipeline, schema: schema})
+		built = append(built, e.buildAndRegisterLocked(q.QueryID, q.AST))
 	}
 
-	// Phase 2: Hydrate all pipelines in parallel (read-only fetches)
+	// Phase 2: Hydrate all pipelines in parallel (read-only fetches).
 	results := make([]QueryResult, len(built))
 	var wg sync.WaitGroup
 	wg.Add(len(built))
-	for i, b := range built {
-		go func(idx int, entry builtEntry) {
+	for i, entry := range built {
+		go func(idx int, entry *pipelineEntry) {
 			defer wg.Done()
 			start := time.Now()
-			nodes := entry.pipeline.Input.Fetch(ivm.FetchRequest{})
-			var hydration []RowChange
-			for _, node := range nodes {
-				nodeChanges := streamNodes(entry.queryID, entry.schema, RowChangeAdd, node)
-				hydration = append(hydration, nodeChanges...)
-			}
+			hydration := hydrateEntry(entry)
 			timingMs := float64(time.Since(start).Microseconds()) / 1000.0
 			// Non-streaming path: result is the single (final) chunk.
 			results[idx] = QueryResult{
@@ -291,7 +392,7 @@ func (e *Engine) AddQueries(queries []QuerySpec) ([]QueryResult, error) {
 				Final:      true,
 				TimingMs:   timingMs,
 			}
-		}(i, b)
+		}(i, entry)
 	}
 	wg.Wait()
 
@@ -326,35 +427,13 @@ func (e *Engine) AddQueriesStream(
 		return ErrEngineClosed
 	}
 
-	type builtEntry struct {
-		queryID  string
-		pipeline *builder.Pipeline
-		schema   *ivm.SourceSchema
-	}
-
-	// Phase 1: Build all pipelines sequentially (mutates shared state)
-	built := make([]builtEntry, 0, len(queries))
+	// Phase 1: Build all pipelines sequentially (mutates shared state).
+	// Scalar-subquery resolution + companion wiring happens here too —
+	// see buildAndRegisterLocked.
+	built := make([]*pipelineEntry, 0, len(queries))
 	for _, q := range queries {
 		e.removeQueryLocked(q.QueryID)
-
-		delegate := &engineDelegate{engine: e, queryID: q.QueryID}
-		pipeline := builder.BuildPipeline(q.AST, delegate)
-
-		schema := pipeline.Input.GetSchema()
-		entry := &pipelineEntry{
-			queryID:  q.QueryID,
-			pipeline: pipeline,
-			schema:   schema,
-		}
-		e.pipelines[q.QueryID] = entry
-
-		pipeline.Input.SetOutput(&pipelineOutput{
-			engine:  e,
-			queryID: q.QueryID,
-			schema:  schema,
-		})
-
-		built = append(built, builtEntry{queryID: q.QueryID, pipeline: pipeline, schema: schema})
+		built = append(built, e.buildAndRegisterLocked(q.QueryID, q.AST))
 	}
 
 	// Phase 2: Hydrate in parallel, stream per-query results in chunks as
@@ -369,7 +448,7 @@ func (e *Engine) AddQueriesStream(
 	var wg sync.WaitGroup
 	wg.Add(len(built))
 	for _, b := range built {
-		go func(entry builtEntry) {
+		go func(entry *pipelineEntry) {
 			defer wg.Done()
 			start := time.Now()
 			nodes := entry.pipeline.Input.Fetch(ivm.FetchRequest{})
@@ -397,6 +476,23 @@ func (e *Engine) AddQueriesStream(
 
 			for _, node := range nodes {
 				nodeChanges := streamNodes(entry.queryID, entry.schema, RowChangeAdd, node)
+				chunk = append(chunk, nodeChanges...)
+				if len(chunk) >= hydrateChunkSize {
+					flush(false)
+				}
+			}
+			// Emit companion rows after the main pipeline's nodes so the
+			// client receives all rows for one queryID in one logical run.
+			// They're tagged with the same queryID + each companion's own
+			// schema (table name), so the streamer/client demultiplex
+			// correctly. Chunk-bounded so a query with many companions
+			// still respects hydrateChunkSize.
+			for _, ce := range entry.companions {
+				if ce.matchedRow == nil {
+					continue
+				}
+				node := ivm.Node{Row: ce.matchedRow}
+				nodeChanges := streamNodes(entry.queryID, ce.schema, RowChangeAdd, node)
 				chunk = append(chunk, nodeChanges...)
 				if len(chunk) >= hydrateChunkSize {
 					flush(false)
@@ -461,6 +557,12 @@ func (e *Engine) removeQueryLocked(queryID string) {
 		return
 	}
 	entry.pipeline.Input.Destroy()
+	// Tear down companion sub-pipelines; their Connections to the subquery
+	// sources are otherwise leaked and would keep receiving Push fan-outs
+	// after the parent query was removed.
+	for _, ce := range entry.companions {
+		ce.pipeline.Input.Destroy()
+	}
 	delete(e.pipelines, queryID)
 }
 
