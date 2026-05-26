@@ -7,7 +7,6 @@ package ivm
 
 import (
 	"encoding/json"
-	"fmt"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -224,7 +223,14 @@ func (ms *MemorySource) genPush(change SourceChange) []Change {
 	switch change.Type {
 	case ChangeTypeAdd:
 		if ms.has(change.Row) {
-			panic("Row already exists")
+			pk := make(map[string]Value, len(ms.primaryKey))
+			for _, c := range ms.primaryKey {
+				pk[c] = change.Row[c]
+			}
+			// Duplicate Add — Go's in-memory copy already has this row but
+			// an upstream advance is re-adding it. Same drift class as the
+			// missing-row case; recover via re-init from SQLite truth.
+			panic(&DriftError{Table: ms.tableName, Op: "Add", PK: pk, HasCount: len(ms.data)})
 		}
 	case ChangeTypeRemove:
 		if !ms.has(change.Row) {
@@ -232,10 +238,7 @@ func (ms *MemorySource) genPush(change SourceChange) []Change {
 			for _, c := range ms.primaryKey {
 				pk[c] = change.Row[c]
 			}
-			panic(fmt.Sprintf(
-				"Row not found (Remove): table=%s pk=%v row=%v has_count=%d",
-				ms.tableName, pk, change.Row, len(ms.data),
-			))
+			panic(&DriftError{Table: ms.tableName, Op: "Remove", PK: pk, HasCount: len(ms.data)})
 		}
 	case ChangeTypeEdit:
 		if !ms.has(change.OldRow) {
@@ -243,10 +246,7 @@ func (ms *MemorySource) genPush(change SourceChange) []Change {
 			for _, c := range ms.primaryKey {
 				pk[c] = change.OldRow[c]
 			}
-			panic(fmt.Sprintf(
-				"Row not found (Edit): table=%s oldPk=%v oldRow=%v newRow=%v has_count=%d",
-				ms.tableName, pk, change.OldRow, change.Row, len(ms.data),
-			))
+			panic(&DriftError{Table: ms.tableName, Op: "Edit", PK: pk, HasCount: len(ms.data)})
 		}
 	}
 

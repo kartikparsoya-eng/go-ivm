@@ -361,8 +361,8 @@ const defaultSocket = "/tmp/go-ivm.sock"
 // the TS client can refuse to talk to an incompatible sidecar
 // (REVIEW-final MED-CROSS-5).
 const (
-	sidecarVersion     = "0.3.0"
-	sidecarProtocolRev = 3 // bumped: addQueriesStream emits chunked partial frames (chunkIndex + final)
+	sidecarVersion     = "0.4.0"
+	sidecarProtocolRev = 4 // bumped: advance + advanceStream emit drift signal (RPC error -32100 / Final.Drift) for self-heal recovery
 )
 
 // parallelThreshold is the min connection count per MemorySource at which
@@ -405,8 +405,12 @@ type RPCResponse struct {
 }
 
 type RPCError struct {
-	Code    int    `json:"code"`
-	Message string `json:"message"`
+	Code    int         `json:"code"`
+	Message string      `json:"message"`
+	// Data carries an optional structured payload. Used by the drift
+	// signal (code -32100) to ship *ivm.DriftError details — table, op,
+	// PK, has_count — so TS can log specifics before re-init.
+	Data interface{} `json:"data,omitempty"`
 }
 
 // --- ClientGroup: one Engine per client group ---
@@ -1122,6 +1126,13 @@ type advanceResult struct {
 	Timings []engine.TableTiming `json:"timings,omitempty"`
 }
 
+// rpcCodeDrift is the JSON-RPC error code for source-drift detection.
+// TS-side go-ivm-client recognizes this code and triggers re-init via the
+// existing onRestart pipeline, then returns empty results to the caller
+// (matching the post-crash recovery semantics — clients miss exactly one
+// delta and resync against the freshly-loaded state).
+const rpcCodeDrift = -32100
+
 func (s *Server) handleAdvance(req RPCRequest) RPCResponse {
 	var p advanceParams
 	if err := mpUnmarshal(req.Params, &p); err != nil {
@@ -1142,6 +1153,20 @@ func (s *Server) handleAdvance(req RPCRequest) RPCResponse {
 	}
 
 	result := group.eng.Advance(p.Changes)
+	if result.Drift != nil {
+		// Self-heal signal: TS will re-init. Log clearly so prod ops can
+		// see frequency vs the panic line that used to crash the sidecar.
+		fmt.Fprintf(os.Stderr, "[GO-IVM][drift] advance cg=%s %s\n", cgID, result.Drift.Error())
+		return RPCResponse{
+			JSONRPC: "2.0",
+			Error: &RPCError{
+				Code:    rpcCodeDrift,
+				Message: result.Drift.Error(),
+				Data:    result.Drift,
+			},
+			ID: req.ID,
+		}
+	}
 	return RPCResponse{JSONRPC: "2.0", Result: advanceResult{Changes: result.Changes, Timings: result.Timings}, ID: req.ID}
 }
 
@@ -1163,6 +1188,10 @@ type advanceStreamPartial struct {
 	ChunkIndex int                  `json:"chunkIndex"`
 	Final      bool                 `json:"final"`
 	Timings    []engine.TableTiming `json:"timings,omitempty"`
+	// Drift is non-nil only on the Final frame and only when MemorySource
+	// raised *ivm.DriftError mid-advance. TS client treats this as a
+	// signal to discard the whole stream + trigger re-init.
+	Drift *ivm.DriftError `json:"drift,omitempty"`
 }
 
 func (s *Server) handleAdvanceStream(req RPCRequest, streamW streamWriter) RPCResponse {
@@ -1190,7 +1219,11 @@ func (s *Server) handleAdvanceStream(req RPCRequest, streamW streamWriter) RPCRe
 			ChunkIndex: r.ChunkIndex,
 			Final:      r.Final,
 			Timings:    r.Timings,
+			Drift:      r.Drift,
 		})
+		if r.Drift != nil {
+			fmt.Fprintf(os.Stderr, "[GO-IVM][drift] advanceStream cg=%s %s\n", cgID, r.Drift.Error())
+		}
 		// One advanceStream call → one record on the terminal frame.
 		// Final's ChunkIndex+1 is the total chunk count for this call.
 		if r.Final {

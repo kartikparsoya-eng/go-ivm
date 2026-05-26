@@ -13,19 +13,33 @@ import "sync"
 // Each connection's pipeline runs in its own goroutine.
 // Results are collected and returned in connection order (deterministic).
 func (ms *MemorySource) GenPushParallel(change SourceChange) []Change {
-	// Validate (same as sequential)
+	// Validate (same as sequential). Typed *DriftError panics so
+	// engine.Advance can recover them without conflating with programmer
+	// bugs (which still abort the process). See ivm/drift.go.
 	switch change.Type {
 	case ChangeTypeAdd:
 		if ms.has(change.Row) {
-			panic("Row already exists")
+			pk := make(map[string]Value, len(ms.primaryKey))
+			for _, c := range ms.primaryKey {
+				pk[c] = change.Row[c]
+			}
+			panic(&DriftError{Table: ms.tableName, Op: "Add", PK: pk, HasCount: len(ms.data)})
 		}
 	case ChangeTypeRemove:
 		if !ms.has(change.Row) {
-			panic("Row not found")
+			pk := make(map[string]Value, len(ms.primaryKey))
+			for _, c := range ms.primaryKey {
+				pk[c] = change.Row[c]
+			}
+			panic(&DriftError{Table: ms.tableName, Op: "Remove", PK: pk, HasCount: len(ms.data)})
 		}
 	case ChangeTypeEdit:
 		if !ms.has(change.OldRow) {
-			panic("Row not found")
+			pk := make(map[string]Value, len(ms.primaryKey))
+			for _, c := range ms.primaryKey {
+				pk[c] = change.OldRow[c]
+			}
+			panic(&DriftError{Table: ms.tableName, Op: "Edit", PK: pk, HasCount: len(ms.data)})
 		}
 	}
 

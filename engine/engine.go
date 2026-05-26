@@ -57,9 +57,16 @@ type SnapshotChange struct {
 // Timings is one entry per (table, sourceChange) — the same granularity TS
 // records to its `ivm.advance-time` histogram. Lets TS attribute wall time to
 // the responsible table/op instead of seeing a single opaque RPC duration.
+//
+// Drift is non-nil iff the engine recovered an *ivm.DriftError mid-advance.
+// In that case Changes is empty (any partial output is dropped — TS will
+// re-init from current SQLite truth so re-applying partial output risks
+// double-application) and Timings holds whatever was measured before the
+// drift was detected (useful for diagnostics, harmless to ship).
 type AdvanceResult struct {
 	Changes []RowChange
 	Timings []TableTiming
+	Drift   *ivm.DriftError
 }
 
 // TableTiming reports the wall time spent processing a single source change
@@ -568,41 +575,68 @@ func (e *Engine) removeQueryLocked(queryID string) {
 
 // Advance processes a batch of snapshot changes through all affected sources.
 // Returns flat RowChanges representing the effect on all registered pipelines.
+//
+// Drift recovery: if MemorySource's pre-Push validation detects an Edit/Remove
+// against a missing row (or duplicate Add), it panics with *ivm.DriftError —
+// raised BEFORE any state mutation, so we can recover cleanly. On drift we
+// drop the entire advance: clear the streamer (it may hold valid output
+// from earlier source.Push calls in this loop, but TS will re-init from
+// fresh SQLite truth, so applying those would risk double-application),
+// and return a result with Drift set so the sidecar can signal TS.
 func (e *Engine) Advance(changes []SnapshotChange) *AdvanceResult {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
 	var allRowChanges []RowChange
 	var timings []TableTiming
+	var drift *ivm.DriftError
 
-	// Group changes by table for potential cross-table parallelism (future)
-	for _, change := range changes {
-		source, ok := e.sources[change.Table]
-		if !ok {
-			continue // no pipelines read this table
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				if d, ok := r.(*ivm.DriftError); ok {
+					drift = d
+					// Drain any accumulated output the streamer is holding from
+					// earlier successful Push calls in this loop — we won't
+					// surface them.
+					_ = e.streamer.Stream()
+					return
+				}
+				panic(r) // re-raise non-drift panics
+			}
+		}()
+
+		// Group changes by table for potential cross-table parallelism (future)
+		for _, change := range changes {
+			source, ok := e.sources[change.Table]
+			if !ok {
+				continue // no pipelines read this table
+			}
+
+			sourceChanges := snapshotToSourceChanges(change, source)
+
+			// Push each source change and collect streamer output. Time each
+			// one individually so TS can attribute wall time to the
+			// responsible (table, op) pair — matches the granularity of TS's
+			// #advanceTime histogram (pipeline-driver.ts:1351).
+			for _, sc := range sourceChanges {
+				start := time.Now()
+				source.Push(sc)
+				rowChanges := e.streamer.Stream()
+				ms := float64(time.Since(start).Microseconds()) / 1000.0
+				allRowChanges = append(allRowChanges, rowChanges...)
+				timings = append(timings, TableTiming{
+					Table:   change.Table,
+					ChangeT: int(sc.Type),
+					Ms:      ms,
+				})
+			}
 		}
+	}()
 
-		// Determine source changes from the snapshot change
-		sourceChanges := snapshotToSourceChanges(change, source)
-
-		// Push each source change and collect streamer output. Time each one
-		// individually so TS can attribute wall time to the responsible
-		// (table, op) pair — matches the granularity of TS's #advanceTime
-		// histogram (pipeline-driver.ts:1351).
-		for _, sc := range sourceChanges {
-			start := time.Now()
-			source.Push(sc)
-			rowChanges := e.streamer.Stream()
-			ms := float64(time.Since(start).Microseconds()) / 1000.0
-			allRowChanges = append(allRowChanges, rowChanges...)
-			timings = append(timings, TableTiming{
-				Table:   change.Table,
-				ChangeT: int(sc.Type),
-				Ms:      ms,
-			})
-		}
+	if drift != nil {
+		return &AdvanceResult{Timings: timings, Drift: drift}
 	}
-
 	return &AdvanceResult{Changes: allRowChanges, Timings: timings}
 }
 
@@ -612,12 +646,18 @@ func (e *Engine) Advance(changes []SnapshotChange) *AdvanceResult {
 // caller can record per-(table,op) histogram entries once, atomically with
 // the completion signal.
 //
+// Drift is non-nil only on the Final frame and only when MemorySource
+// raised *ivm.DriftError mid-advance. The TS client must discard ALL
+// partial frames received for this stream (their data is overlapping with
+// what the post-drift re-init will replay) and trigger sidecar re-init.
+//
 // See Engine.AdvanceStream for the chunking contract.
 type AdvanceStreamPartial struct {
-	Changes    []RowChange   `json:"changes"`
-	ChunkIndex int           `json:"chunkIndex"`
-	Final      bool          `json:"final"`
-	Timings    []TableTiming `json:"timings,omitempty"`
+	Changes    []RowChange      `json:"changes"`
+	ChunkIndex int              `json:"chunkIndex"`
+	Final      bool             `json:"final"`
+	Timings    []TableTiming    `json:"timings,omitempty"`
+	Drift      *ivm.DriftError  `json:"drift,omitempty"`
 }
 
 // advanceChunkSize is the max number of RowChanges per partial frame in
@@ -667,6 +707,7 @@ func (e *Engine) AdvanceStream(
 	var pending []RowChange
 	var timings []TableTiming
 	chunkIndex := 0
+	var drift *ivm.DriftError
 
 	flush := func(final bool) {
 		var t []TableTiming
@@ -678,45 +719,63 @@ func (e *Engine) AdvanceStream(
 			ChunkIndex: chunkIndex,
 			Final:      final,
 			Timings:    t,
+			Drift:      drift, // nil unless this is the terminal drift signal
 		})
 		pending = nil
 		chunkIndex++
 	}
 
-	for _, change := range changes {
-		source, ok := e.sources[change.Table]
-		if !ok {
-			continue // no pipelines read this table
-		}
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				if d, ok := r.(*ivm.DriftError); ok {
+					drift = d
+					// Drop any accumulated output from earlier successful
+					// pushes in this advance — TS will discard the whole
+					// stream and re-init from fresh SQLite truth.
+					pending = nil
+					_ = e.streamer.Stream() // drain residual
+					return
+				}
+				panic(r) // re-raise non-drift panics
+			}
+		}()
 
-		sourceChanges := snapshotToSourceChanges(change, source)
+		for _, change := range changes {
+			source, ok := e.sources[change.Table]
+			if !ok {
+				continue // no pipelines read this table
+			}
 
-		for _, sc := range sourceChanges {
-			start := time.Now()
-			source.Push(sc)
-			rowChanges := e.streamer.Stream()
-			ms := float64(time.Since(start).Microseconds()) / 1000.0
-			pending = append(pending, rowChanges...)
-			timings = append(timings, TableTiming{
-				Table:   change.Table,
-				ChangeT: int(sc.Type),
-				Ms:      ms,
-			})
+			sourceChanges := snapshotToSourceChanges(change, source)
 
-			// Flush mid-batch if we've crossed the chunk threshold. We
-			// only check AFTER appending so a single source-change that
-			// produces >chunkSize rows still ships in one frame (we don't
-			// split an individual source-change's RowChange list — that
-			// would require operator-level chunking).
-			if len(pending) >= advanceChunkSize {
-				flush(false)
+			for _, sc := range sourceChanges {
+				start := time.Now()
+				source.Push(sc)
+				rowChanges := e.streamer.Stream()
+				ms := float64(time.Since(start).Microseconds()) / 1000.0
+				pending = append(pending, rowChanges...)
+				timings = append(timings, TableTiming{
+					Table:   change.Table,
+					ChangeT: int(sc.Type),
+					Ms:      ms,
+				})
+
+				// Flush mid-batch if we've crossed the chunk threshold. We
+				// only check AFTER appending so a single source-change that
+				// produces >chunkSize rows still ships in one frame (we
+				// don't split an individual source-change's RowChange list
+				// — that would require operator-level chunking).
+				if len(pending) >= advanceChunkSize {
+					flush(false)
+				}
 			}
 		}
-	}
+	}()
 
-	// Always emit a terminal frame with Final=true and the cumulative
-	// timings, even when no changes accumulated (empty advance) or the
-	// final source change exactly hit the chunk threshold.
+	// Always emit a terminal Final frame. Carries cumulative timings on
+	// success; carries Drift + empty Changes on drift recovery (TS
+	// discards the whole stream and re-inits).
 	flush(true)
 	return nil
 }
