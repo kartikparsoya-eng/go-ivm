@@ -360,9 +360,16 @@ const defaultSocket = "/tmp/go-ivm.sock"
 // the TS client can refuse to talk to an incompatible sidecar
 // (REVIEW-final MED-CROSS-5).
 const (
-	sidecarVersion     = "0.4.0"
-	sidecarProtocolRev = 4 // bumped: advance + advanceStream emit drift signal (RPC error -32100 / Final.Drift) for self-heal recovery
+	sidecarVersion     = "0.5.0"
+	sidecarProtocolRev = 5 // bumped: mutating RPCs carry initEpoch; stale callers rejected with -32101 to prevent cross-instance state corruption (multi-CG soak surfaced doubled loadRows from torn-down view-syncer)
 )
+
+// rpcCodeStaleInitEpoch signals that a mutating RPC arrived with an
+// initEpoch that doesn't match the cgID's current epoch. Caller is from a
+// torn-down view-syncer instance and must not be allowed to mutate engine
+// state. The TS client treats this as a no-op (the live instance will
+// reconcile via its own init+loadRows).
+const rpcCodeStaleInitEpoch = -32101
 
 // parallelThreshold is the min connection count per MemorySource at which
 // genPushAndWriteParallel kicks in. 0 means "use the engine default". Read
@@ -428,6 +435,13 @@ type ClientGroup struct {
 	eng    *engine.Engine
 	reqC   chan clientGroupReq // ordered request queue
 	closed bool                // set true under mu when reqC is closed
+	// initEpoch monotonically increments on every handleInit (under mu).
+	// Mutating RPCs (loadRows / addQuery* / advance*) carry the epoch they
+	// were issued under; mismatch → rejected with rpcCodeStaleInitEpoch.
+	// This catches a torn-down view-syncer instance whose late-arriving
+	// loadRows would otherwise mix old-snapshot rows into the freshly
+	// init'd engine of a new instance for the same cgID.
+	initEpoch uint64
 	// lastUsedNs is set on every request arrival; the idle reaper compares
 	// against `now - groupIdleTimeout` to garbage-collect abandoned groups
 	// (REVIEW-final HIGH-CROSS-2 / HIGH-CROSS-3). Accessed via atomic so the
@@ -743,6 +757,11 @@ func (s *Server) handleInit(req RPCRequest) RPCResponse {
 		group.eng.Close()
 	}
 
+	// Bump epoch BEFORE we create the new engine so any in-flight loadRows
+	// from the prior epoch is rejected even if it races the engine swap.
+	group.initEpoch++
+	currentEpoch := group.initEpoch
+
 	// Storage path (per client group)
 	storagePath := p.Storage
 	if storagePath == "" {
@@ -801,7 +820,14 @@ func (s *Server) handleInit(req RPCRequest) RPCResponse {
 		}
 	}
 
-	return RPCResponse{JSONRPC: "2.0", Result: "ok", ID: req.ID}
+	return RPCResponse{
+		JSONRPC: "2.0",
+		Result: map[string]interface{}{
+			"status":    "ok",
+			"initEpoch": currentEpoch,
+		},
+		ID: req.ID,
+	}
 }
 
 // --- loadRows: append a chunked batch of rows to a registered MemorySource ---
@@ -815,6 +841,24 @@ type loadRowsParams struct {
 	ClientGroupID string                   `json:"clientGroupID"`
 	Table         string                   `json:"table"`
 	Rows          []map[string]interface{} `json:"rows"`
+	// InitEpoch must match the cgID's current epoch (returned by handleInit).
+	// Stale callers (torn-down view-syncer whose loadRows raced past the
+	// init from a new instance for the same cgID) are rejected with
+	// rpcCodeStaleInitEpoch instead of corrupting the new engine's state.
+	// 0 = caller didn't send one (pre-protocolRev-5 client) → reject.
+	InitEpoch uint64 `json:"initEpoch"`
+}
+
+// checkInitEpoch verifies the caller's epoch matches the cg's current
+// epoch under group.mu. Caller must already hold group.mu. Returns
+// an RPCResponse with rpcCodeStaleInitEpoch if stale, else (response, false).
+func checkInitEpoch(group *ClientGroup, reqID interface{}, callerEpoch uint64) (RPCResponse, bool) {
+	if callerEpoch != group.initEpoch {
+		return rpcError(reqID, rpcCodeStaleInitEpoch,
+			fmt.Sprintf("stale init epoch: caller=%d current=%d", callerEpoch, group.initEpoch),
+		), true
+	}
+	return RPCResponse{}, false
 }
 
 func (s *Server) handleLoadRows(req RPCRequest) RPCResponse {
@@ -834,6 +878,9 @@ func (s *Server) handleLoadRows(req RPCRequest) RPCResponse {
 
 	if group.eng == nil {
 		return rpcError(req.ID, -32000, "engine not initialized (call init first)")
+	}
+	if resp, stale := checkInitEpoch(group, req.ID, p.InitEpoch); stale {
+		return resp
 	}
 
 	ms := group.eng.GetMemorySource(p.Table)
@@ -864,6 +911,7 @@ type addQueryParams struct {
 	ClientGroupID string      `json:"clientGroupID"`
 	QueryID       string      `json:"queryID"`
 	AST           builder.AST `json:"ast"`
+	InitEpoch     uint64      `json:"initEpoch"`
 }
 
 type addQueryResult struct {
@@ -896,6 +944,9 @@ func (s *Server) handleAddQuery(req RPCRequest) RPCResponse {
 	if group.eng == nil {
 		return rpcError(req.ID, -32000, "engine not initialized (call init first)")
 	}
+	if resp, stale := checkInitEpoch(group, req.ID, p.InitEpoch); stale {
+		return resp
+	}
 
 	changes, timingMs, err := group.eng.AddQuery(p.QueryID, p.AST)
 	if err != nil {
@@ -914,6 +965,7 @@ type addQueriesParams struct {
 		QueryID string      `json:"queryID"`
 		AST     builder.AST `json:"ast"`
 	} `json:"queries"`
+	InitEpoch uint64 `json:"initEpoch"`
 }
 
 type addQueriesResult struct {
@@ -961,6 +1013,9 @@ func (s *Server) handleAddQueries(req RPCRequest) RPCResponse {
 
 	if group.eng == nil {
 		return rpcError(req.ID, -32000, "engine not initialized (call init first)")
+	}
+	if resp, stale := checkInitEpoch(group, req.ID, p.InitEpoch); stale {
+		return resp
 	}
 
 	specs := make([]engine.QuerySpec, len(p.Queries))
@@ -1024,6 +1079,9 @@ func (s *Server) handleAddQueriesStream(req RPCRequest, streamW streamWriter) RP
 	if group.eng == nil {
 		return rpcError(req.ID, -32000, "engine not initialized (call init first)")
 	}
+	if resp, stale := checkInitEpoch(group, req.ID, p.InitEpoch); stale {
+		return resp
+	}
 
 	specs := make([]engine.QuerySpec, len(p.Queries))
 	for i, q := range p.Queries {
@@ -1059,6 +1117,7 @@ func (s *Server) handleAddQueriesStream(req RPCRequest, streamW streamWriter) RP
 type removeQueryParams struct {
 	ClientGroupID string `json:"clientGroupID"`
 	QueryID       string `json:"queryID"`
+	InitEpoch     uint64 `json:"initEpoch"`
 }
 
 func (s *Server) handleRemoveQuery(req RPCRequest) RPCResponse {
@@ -1079,6 +1138,9 @@ func (s *Server) handleRemoveQuery(req RPCRequest) RPCResponse {
 	if group.eng == nil {
 		return rpcError(req.ID, -32000, "engine not initialized")
 	}
+	if resp, stale := checkInitEpoch(group, req.ID, p.InitEpoch); stale {
+		return resp
+	}
 
 	group.eng.RemoveQuery(p.QueryID)
 	return RPCResponse{JSONRPC: "2.0", Result: "ok", ID: req.ID}
@@ -1089,6 +1151,7 @@ func (s *Server) handleRemoveQuery(req RPCRequest) RPCResponse {
 type advanceParams struct {
 	ClientGroupID string                  `json:"clientGroupID"`
 	Changes       []engine.SnapshotChange `json:"changes"`
+	InitEpoch     uint64                  `json:"initEpoch"`
 }
 
 type advanceResult struct {
@@ -1120,6 +1183,9 @@ func (s *Server) handleAdvance(req RPCRequest) RPCResponse {
 
 	if group.eng == nil {
 		return rpcError(req.ID, -32000, "engine not initialized")
+	}
+	if resp, stale := checkInitEpoch(group, req.ID, p.InitEpoch); stale {
+		return resp
 	}
 
 	result := group.eng.Advance(p.Changes)
@@ -1181,6 +1247,9 @@ func (s *Server) handleAdvanceStream(req RPCRequest, streamW streamWriter) RPCRe
 
 	if group.eng == nil {
 		return rpcError(req.ID, -32000, "engine not initialized")
+	}
+	if resp, stale := checkInitEpoch(group, req.ID, p.InitEpoch); stale {
+		return resp
 	}
 
 	err := group.eng.AdvanceStream(p.Changes, func(r engine.AdvanceStreamPartial) {
