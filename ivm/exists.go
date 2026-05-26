@@ -3,7 +3,6 @@ package ivm
 import (
 	"encoding/json"
 	"fmt"
-	"os"
 	"sync"
 	"sync/atomic"
 )
@@ -233,20 +232,6 @@ func (e *Exists) pushWithFilter(change Change, exists *bool) []Change {
 	}
 	if e.filterWithExists(change.Node, ex) {
 		return e.output.Push(change, e)
-	}
-	// Pattern Z diagnostic (REMOVE after root-cause). Log when an Add gets
-	// filtered out by the EXISTS check — this is exactly the silent under-
-	// produce mode where TS emits the row and Go doesn't. Gated to Add to
-	// keep noise down (Edit/Remove drops are mostly expected once parent
-	// rows have already been filtered out previously).
-	if change.Type == ChangeTypeAdd {
-		pk := make(map[string]Value, len(e.parentJoinKey))
-		for _, c := range e.parentJoinKey {
-			pk[c] = change.Node.Row[c]
-		}
-		fmt.Fprintf(os.Stderr,
-			"[GO-IVM][exists-drop] rel=%s not=%v parentKey=%v exists=%v change=Add\n",
-			e.relationshipName, e.not, pk, ex)
 	}
 	return nil
 }
