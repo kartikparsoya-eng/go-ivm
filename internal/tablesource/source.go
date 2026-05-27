@@ -221,20 +221,16 @@ func (s *Source) disconnect(c *connection) {
 
 // fetchForConn runs the SELECT for conn and returns the resulting nodes.
 //
-// Phase 2a coverage:
+// Coverage:
 //   - ORDER BY from conn.sort (or PK ascending if nil)
-//   - Filter predicate applied post-scan
 //   - Reverse → DESC order
+//   - Filter predicate applied post-scan
+//   - Constraint → WHERE eq pushdown (Phase 2b)
 //
-// Phase 2b/2c will add: Constraint (WHERE eq), Start cursor (WHERE
-// lexicographic). For now constraint / start in the request are
-// rejected so callers don't silently get wrong results.
+// Phase 2c will add: Start cursor (WHERE lexicographic compare).
 func (s *Source) fetchForConn(req ivm.FetchRequest, conn *connection) []ivm.Node {
-	if req.Constraint != nil {
-		panic("tablesource.Source.Fetch: Constraint not implemented in Phase 2a")
-	}
 	if req.Start != nil {
-		panic("tablesource.Source.Fetch: Start cursor not implemented in Phase 2a")
+		panic("tablesource.Source.Fetch: Start cursor not implemented in Phase 2b")
 	}
 
 	// ORDER BY clause from connection sort (PK ascending if unset).
@@ -257,6 +253,36 @@ func (s *Source) fetchForConn(req ivm.FetchRequest, conn *connection) []ivm.Node
 	}
 	sb.WriteString(" FROM ")
 	sb.WriteString(quoteIdent(s.tableName))
+
+	// WHERE from constraint. Keys are sorted so the SQL is deterministic
+	// (matters for any future statement-cache keying and for log diffing).
+	var params []interface{}
+	if req.Constraint != nil && len(*req.Constraint) > 0 {
+		keys := make([]string, 0, len(*req.Constraint))
+		for k := range *req.Constraint {
+			keys = append(keys, k)
+		}
+		for i := 1; i < len(keys); i++ {
+			for j := i; j > 0 && keys[j-1] > keys[j]; j-- {
+				keys[j-1], keys[j] = keys[j], keys[j-1]
+			}
+		}
+		sb.WriteString(" WHERE ")
+		for i, k := range keys {
+			if i > 0 {
+				sb.WriteString(" AND ")
+			}
+			sb.WriteString(quoteIdent(k))
+			sb.WriteString(" = ?")
+			cs, ok := s.columns[k]
+			colType := ""
+			if ok {
+				colType = cs.Type
+			}
+			params = append(params, sqlite.ToSQLiteType((*req.Constraint)[k], colType))
+		}
+	}
+
 	sb.WriteString(" ORDER BY ")
 	for i, ord := range order {
 		if i > 0 {
@@ -275,7 +301,7 @@ func (s *Source) fetchForConn(req ivm.FetchRequest, conn *connection) []ivm.Node
 		sb.WriteString(dir)
 	}
 
-	rows, err := s.db.Query(sb.String())
+	rows, err := s.db.Query(sb.String(), params...)
 	if err != nil {
 		panic(fmt.Sprintf("tablesource.Source.Fetch %s: query: %v\nSQL: %s",
 			s.tableName, err, sb.String()))

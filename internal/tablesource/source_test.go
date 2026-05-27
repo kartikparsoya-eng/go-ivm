@@ -224,18 +224,70 @@ func TestPushPanicsPhase2a(t *testing.T) {
 	src.Push(ivm.MakeSourceChangeAdd(ivm.Row{"id": float64(99)}))
 }
 
-func TestFetchPanicsOnConstraint(t *testing.T) {
+func TestFetchConstraintEquality(t *testing.T) {
 	src, db := newUserSource(t)
 	defer db.Close()
 
 	in := src.Connect(nil, nil, nil)
-	defer func() {
-		if r := recover(); r == nil {
-			t.Fatalf("Fetch with Constraint did not panic; Phase 2a must fail loud")
+	c := ivm.Constraint{"id": float64(2)}
+	nodes := in.Fetch(ivm.FetchRequest{Constraint: &c})
+	if len(nodes) != 1 {
+		t.Fatalf("got %d rows, want 1", len(nodes))
+	}
+	if nodes[0].Row["name"] != "bob" {
+		t.Fatalf("row.name = %#v, want bob", nodes[0].Row["name"])
+	}
+}
+
+func TestFetchConstraintMultiKey(t *testing.T) {
+	src, db := newUserSource(t)
+	defer db.Close()
+
+	in := src.Connect(nil, nil, nil)
+	// score=80 AND active=false → only bob
+	c := ivm.Constraint{"score": float64(80), "active": false}
+	nodes := in.Fetch(ivm.FetchRequest{Constraint: &c})
+	if len(nodes) != 1 {
+		t.Fatalf("got %d rows, want 1", len(nodes))
+	}
+	if nodes[0].Row["id"] != float64(2) {
+		t.Fatalf("row.id = %#v, want 2", nodes[0].Row["id"])
+	}
+}
+
+func TestFetchConstraintNoMatch(t *testing.T) {
+	src, db := newUserSource(t)
+	defer db.Close()
+
+	in := src.Connect(nil, nil, nil)
+	c := ivm.Constraint{"id": float64(999)}
+	nodes := in.Fetch(ivm.FetchRequest{Constraint: &c})
+	if len(nodes) != 0 {
+		t.Fatalf("got %d rows, want 0 (no match)", len(nodes))
+	}
+}
+
+func TestFetchConstraintWithFilterAndSort(t *testing.T) {
+	src, db := newUserSource(t)
+	defer db.Close()
+
+	// active=true users (cuts bob), sorted DESC by score → carol then alice
+	in := src.Connect(
+		ivm.Ordering{{"score", "asc"}},
+		func(r ivm.Row) bool { v, _ := r["active"].(bool); return v },
+		nil,
+	)
+	c := ivm.Constraint{"active": true}
+	nodes := in.Fetch(ivm.FetchRequest{Constraint: &c, Reverse: true})
+	wantIDs := []float64{1, 3} // score 90 then 70 (DESC of asc = DESC)
+	if len(nodes) != 2 {
+		t.Fatalf("got %d rows, want 2", len(nodes))
+	}
+	for i, n := range nodes {
+		if n.Row["id"] != wantIDs[i] {
+			t.Errorf("row[%d].id = %#v, want %v", i, n.Row["id"], wantIDs[i])
 		}
-	}()
-	c := ivm.Constraint{"id": float64(1)}
-	in.Fetch(ivm.FetchRequest{Constraint: &c})
+	}
 }
 
 func TestFetchPanicsOnStart(t *testing.T) {
