@@ -221,19 +221,23 @@ func (s *Source) disconnect(c *connection) {
 
 // fetchForConn runs the SELECT for conn and returns the resulting nodes.
 //
+// SQL generation is delegated to sqlite.BuildSelectQuery — the same
+// builder the legacy in-process sqlite.TableSource uses, so cursor
+// lexicographic semantics, NULL-aware comparisons, and constraint
+// emission are byte-identical between the two source variants.
+//
 // Coverage:
 //   - ORDER BY from conn.sort (or PK ascending if nil)
-//   - Reverse → DESC order
-//   - Filter predicate applied post-scan
-//   - Constraint → WHERE eq pushdown (Phase 2b)
+//   - Reverse flips ASC↔DESC
+//   - Constraint → WHERE eq pushdown
+//   - Start cursor → WHERE lexicographic compare
+//   - Filter predicate applied post-scan (per-connection Go closure;
+//     can't be pushed to SQL because it's an opaque func)
 //
-// Phase 2c will add: Start cursor (WHERE lexicographic compare).
+// Phase 2d adds Push fanout + overlay handling on top of this.
 func (s *Source) fetchForConn(req ivm.FetchRequest, conn *connection) []ivm.Node {
-	if req.Start != nil {
-		panic("tablesource.Source.Fetch: Start cursor not implemented in Phase 2b")
-	}
-
 	// ORDER BY clause from connection sort (PK ascending if unset).
+	// Always non-nil so cursor / orderBy paths in BuildSelectQuery work.
 	order := conn.sort
 	if order == nil {
 		order = make(ivm.Ordering, len(s.primaryKey))
@@ -242,69 +246,20 @@ func (s *Source) fetchForConn(req ivm.FetchRequest, conn *connection) []ivm.Node
 		}
 	}
 
-	cols := s.columnList()
-	var sb strings.Builder
-	sb.WriteString("SELECT ")
-	for i, c := range cols {
-		if i > 0 {
-			sb.WriteByte(',')
-		}
-		sb.WriteString(quoteIdent(c))
-	}
-	sb.WriteString(" FROM ")
-	sb.WriteString(quoteIdent(s.tableName))
+	q := sqlite.BuildSelectQuery(
+		s.tableName,
+		s.columns,
+		req.Constraint,
+		nil, // filter pushdown via *Condition unused — we only have the Go predicate
+		order,
+		req.Reverse,
+		req.Start,
+	)
 
-	// WHERE from constraint. Keys are sorted so the SQL is deterministic
-	// (matters for any future statement-cache keying and for log diffing).
-	var params []interface{}
-	if req.Constraint != nil && len(*req.Constraint) > 0 {
-		keys := make([]string, 0, len(*req.Constraint))
-		for k := range *req.Constraint {
-			keys = append(keys, k)
-		}
-		for i := 1; i < len(keys); i++ {
-			for j := i; j > 0 && keys[j-1] > keys[j]; j-- {
-				keys[j-1], keys[j] = keys[j], keys[j-1]
-			}
-		}
-		sb.WriteString(" WHERE ")
-		for i, k := range keys {
-			if i > 0 {
-				sb.WriteString(" AND ")
-			}
-			sb.WriteString(quoteIdent(k))
-			sb.WriteString(" = ?")
-			cs, ok := s.columns[k]
-			colType := ""
-			if ok {
-				colType = cs.Type
-			}
-			params = append(params, sqlite.ToSQLiteType((*req.Constraint)[k], colType))
-		}
-	}
-
-	sb.WriteString(" ORDER BY ")
-	for i, ord := range order {
-		if i > 0 {
-			sb.WriteByte(',')
-		}
-		sb.WriteString(quoteIdent(ord[0]))
-		dir := strings.ToUpper(ord[1])
-		if req.Reverse {
-			if dir == "ASC" {
-				dir = "DESC"
-			} else {
-				dir = "ASC"
-			}
-		}
-		sb.WriteByte(' ')
-		sb.WriteString(dir)
-	}
-
-	rows, err := s.db.Query(sb.String(), params...)
+	rows, err := s.db.Query(q.SQL, q.Params...)
 	if err != nil {
 		panic(fmt.Sprintf("tablesource.Source.Fetch %s: query: %v\nSQL: %s",
-			s.tableName, err, sb.String()))
+			s.tableName, err, q.SQL))
 	}
 	defer rows.Close()
 
@@ -343,23 +298,6 @@ func (s *Source) fetchForConn(req ivm.FetchRequest, conn *connection) []ivm.Node
 			s.tableName, err))
 	}
 	return out
-}
-
-// columnList returns column names in a stable order so generated SQL is
-// deterministic (helps with logging + future query-plan caching).
-func (s *Source) columnList() []string {
-	names := make([]string, 0, len(s.columns))
-	for k := range s.columns {
-		names = append(names, k)
-	}
-	// Sort lexicographically — stable + lets test fixtures predict the
-	// returned column order.
-	for i := 1; i < len(names); i++ {
-		for j := i; j > 0 && names[j-1] > names[j]; j-- {
-			names[j-1], names[j] = names[j], names[j-1]
-		}
-	}
-	return names
 }
 
 // quoteIdent escapes a SQL identifier (table or column name) by doubling

@@ -290,17 +290,95 @@ func TestFetchConstraintWithFilterAndSort(t *testing.T) {
 	}
 }
 
-func TestFetchPanicsOnStart(t *testing.T) {
+func TestFetchStartAtInclusive(t *testing.T) {
 	src, db := newUserSource(t)
 	defer db.Close()
 
+	// PK ASC, cursor at id=2 "at" basis → rows from 2 onward, inclusive.
 	in := src.Connect(nil, nil, nil)
-	defer func() {
-		if r := recover(); r == nil {
-			t.Fatalf("Fetch with Start did not panic; Phase 2a must fail loud")
+	nodes := in.Fetch(ivm.FetchRequest{
+		Start: &ivm.Start{Row: ivm.Row{"id": float64(2)}, Basis: "at"},
+	})
+	wantIDs := []float64{2, 3}
+	if len(nodes) != 2 {
+		t.Fatalf("got %d rows, want 2", len(nodes))
+	}
+	for i, n := range nodes {
+		if n.Row["id"] != wantIDs[i] {
+			t.Errorf("row[%d].id = %#v, want %v", i, n.Row["id"], wantIDs[i])
 		}
-	}()
-	in.Fetch(ivm.FetchRequest{Start: &ivm.Start{Row: ivm.Row{"id": float64(1)}, Basis: "at"}})
+	}
+}
+
+func TestFetchStartAfterExclusive(t *testing.T) {
+	src, db := newUserSource(t)
+	defer db.Close()
+
+	// PK ASC, cursor at id=2 "after" → only id=3.
+	in := src.Connect(nil, nil, nil)
+	nodes := in.Fetch(ivm.FetchRequest{
+		Start: &ivm.Start{Row: ivm.Row{"id": float64(2)}, Basis: "after"},
+	})
+	if len(nodes) != 1 || nodes[0].Row["id"] != float64(3) {
+		t.Fatalf("got %v, want single row id=3", nodes)
+	}
+}
+
+func TestFetchStartReverseFromTop(t *testing.T) {
+	src, db := newUserSource(t)
+	defer db.Close()
+
+	// PK ASC + Reverse → effective DESC.
+	// Cursor at id=2 "after" in DESC direction = strictly less than 2 = id=1.
+	in := src.Connect(nil, nil, nil)
+	nodes := in.Fetch(ivm.FetchRequest{
+		Start:   &ivm.Start{Row: ivm.Row{"id": float64(2)}, Basis: "after"},
+		Reverse: true,
+	})
+	if len(nodes) != 1 || nodes[0].Row["id"] != float64(1) {
+		t.Fatalf("got %v, want single row id=1", nodes)
+	}
+}
+
+func TestFetchStartMultiColumnOrder(t *testing.T) {
+	src, db := newUserSource(t)
+	defer db.Close()
+
+	// ORDER BY score ASC, id ASC. Rows in that order: (70,3), (80,2), (90,1).
+	// Cursor at (score=80, id=2) "after" → (90, 1) only.
+	in := src.Connect(
+		ivm.Ordering{{"score", "asc"}, {"id", "asc"}},
+		nil, nil,
+	)
+	nodes := in.Fetch(ivm.FetchRequest{
+		Start: &ivm.Start{
+			Row:   ivm.Row{"score": float64(80), "id": float64(2)},
+			Basis: "after",
+		},
+	})
+	if len(nodes) != 1 || nodes[0].Row["id"] != float64(1) {
+		t.Fatalf("got %v, want single row id=1 (score 90)", nodes)
+	}
+}
+
+func TestFetchStartCombinedWithConstraintAndFilter(t *testing.T) {
+	src, db := newUserSource(t)
+	defer db.Close()
+
+	// active=true rows: id=1 (score 90), id=3 (score 70).
+	// PK ASC, cursor id=1 "after" → id=3 only.
+	in := src.Connect(nil, func(r ivm.Row) bool {
+		v, _ := r["active"].(bool)
+		return v
+	}, nil)
+	c := ivm.Constraint{"active": true}
+	nodes := in.Fetch(ivm.FetchRequest{
+		Constraint: &c,
+		Start:      &ivm.Start{Row: ivm.Row{"id": float64(1)}, Basis: "after"},
+	})
+	if len(nodes) != 1 || nodes[0].Row["id"] != float64(3) {
+		t.Fatalf("got %v, want single row id=3", nodes)
+	}
 }
 
 func TestDestroyRemovesConnection(t *testing.T) {
