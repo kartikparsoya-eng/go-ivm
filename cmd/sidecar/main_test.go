@@ -24,8 +24,8 @@ func TestMultiGroupParallel(t *testing.T) {
 	defer listener.Close()
 	defer os.Remove(socketPath)
 
-	// Test uses MemorySource (the legacy default) — no replica DB needed.
-	server := NewServer(tablesource.ModeMemory, nil)
+	// Test uses MemorySource (the legacy default) — no replica path needed.
+	server := NewServer(tablesource.ModeMemory, "")
 	go func() {
 		for {
 			conn, err := listener.Accept()

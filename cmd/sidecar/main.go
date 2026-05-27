@@ -476,15 +476,63 @@ type Server struct {
 	// tablesource.Source per (cg, table) over replicaDB and treats
 	// loadRows as a no-op (the SQLite file is already authoritative).
 	sourceMode tablesource.Mode
-	replicaDB  *sql.DB // non-nil iff sourceMode == ModeTable
+
+	// Path-and-lazy-open for the read-side replica pool. In table mode
+	// we keep main()'s accept loop unblocked by deferring the actual
+	// open until the first init RPC — by that time the TS replicator
+	// has finished writing the SQLite header. getReplicaDB serializes
+	// concurrent first-init races and retries with backoff up to 60s.
+	replicaPath  string
+	replicaMu    sync.Mutex
+	replicaDB    *sql.DB // populated on first successful getReplicaDB
 }
 
-func NewServer(mode tablesource.Mode, replicaDB *sql.DB) *Server {
+func NewServer(mode tablesource.Mode, replicaPath string) *Server {
 	return &Server{
-		groups:     make(map[string]*ClientGroup),
-		sourceMode: mode,
-		replicaDB:  replicaDB,
+		groups:      make(map[string]*ClientGroup),
+		sourceMode:  mode,
+		replicaPath: replicaPath,
 	}
+}
+
+// getReplicaDB opens the SQLite replica on first call and caches the
+// *sql.DB. Subsequent calls return the cached pool. Internal retry of
+// up to 60s with progressive backoff handles the cold-start race where
+// the TS replicator is still laying down the SQLite header when the
+// sidecar's first init RPC arrives. Returns an error if the deadline
+// is hit so the calling handler can surface the fallback to TS.
+func (s *Server) getReplicaDB() (*sql.DB, error) {
+	s.replicaMu.Lock()
+	defer s.replicaMu.Unlock()
+	if s.replicaDB != nil {
+		return s.replicaDB, nil
+	}
+	if s.replicaPath == "" {
+		return nil, fmt.Errorf("getReplicaDB: replicaPath unset (sourceMode=%s)", s.sourceMode)
+	}
+	const openTimeout = 60 * time.Second
+	deadline := time.Now().Add(openTimeout)
+	backoff := 500 * time.Millisecond
+	var lastErr error
+	for time.Now().Before(deadline) {
+		db, err := tablesource.Open(s.replicaPath, tablesource.OpenOptions{})
+		if err == nil {
+			s.replicaDB = db
+			fmt.Fprintf(os.Stderr,
+				"[GO-IVM] opened replica %s (WAL mode, query_only)\n",
+				s.replicaPath)
+			return db, nil
+		}
+		lastErr = err
+		fmt.Fprintf(os.Stderr,
+			"[GO-IVM] replica not ready yet (%v) — retrying in %v\n",
+			err, backoff)
+		time.Sleep(backoff)
+		if backoff < 5*time.Second {
+			backoff *= 2
+		}
+	}
+	return nil, fmt.Errorf("getReplicaDB: gave up after %v: %w", openTimeout, lastErr)
 }
 
 // getOrCreateGroup returns the ClientGroup for the given ID, creating if needed.
@@ -799,7 +847,12 @@ func (s *Server) handleInit(req RPCRequest) RPCResponse {
 		}
 
 		if s.sourceMode == tablesource.ModeTable {
-			src, err := tablesource.New(s.replicaDB, tableName, schema.Columns, schema.PrimaryKey)
+			db, err := s.getReplicaDB()
+			if err != nil {
+				return rpcError(req.ID, -32000,
+					"replica not ready: "+err.Error())
+			}
+			src, err := tablesource.New(db, tableName, schema.Columns, schema.PrimaryKey)
 			if err != nil {
 				return rpcError(req.ID, -32000,
 					"tablesource.New for "+tableName+": "+err.Error())
@@ -1531,55 +1584,33 @@ func main() {
 	// the TxCache's job, not the pool's). Refuse to start if the path
 	// is missing or the file isn't in WAL — failing fast here beats a
 	// confusing per-CG init error later.
-	var replicaDB *sql.DB
+	// In table mode, validate that the path is set but DO NOT open the
+	// replica synchronously. The TS replicator takes 5-30s to finish
+	// initializing replica.db in a cold-start container; blocking here
+	// would also block this process from servicing the TS ping that the
+	// view-syncer worker sends to verify the sidecar is alive. The
+	// listener wouldn't accept until the open returns, ping times out,
+	// TS falls back to TS-only path for the lifetime of the container.
+	//
+	// Instead, the path is stashed on the Server and the first init RPC
+	// for a table-mode CG triggers a synchronous (per-call) open with
+	// retry. By that time the replicator is definitely done.
+	var replicaPath string
 	if sourceMode == tablesource.ModeTable {
-		path := os.Getenv("GO_IVM_REPLICA_DB_PATH")
-		if path == "" {
+		replicaPath = os.Getenv("GO_IVM_REPLICA_DB_PATH")
+		if replicaPath == "" {
 			fmt.Fprintln(os.Stderr,
 				"[GO-IVM] GO_IVM_SOURCE_MODE=table but GO_IVM_REPLICA_DB_PATH is unset — refusing to start")
 			os.Exit(1)
 		}
-		// Retry the open: in a shared container, our entrypoint spawns
-		// us before the TS replicator finishes initializing the replica
-		// file. The first few Open attempts will fail with
-		// "unable to open database file" or "journal_mode not wal" until
-		// the replicator has written the WAL header. Up to ~60s budget
-		// with progressive backoff so cold-restarts don't false-fail.
-		const replicaOpenTimeout = 60 * time.Second
-		deadline := time.Now().Add(replicaOpenTimeout)
-		backoff := 500 * time.Millisecond
-		var (
-			db      *sql.DB
-			openErr error
-		)
-		for time.Now().Before(deadline) {
-			db, openErr = tablesource.Open(path, tablesource.OpenOptions{})
-			if openErr == nil {
-				break
-			}
-			fmt.Fprintf(os.Stderr,
-				"[GO-IVM] replica not ready yet (%v) — retrying in %v\n",
-				openErr, backoff)
-			time.Sleep(backoff)
-			if backoff < 5*time.Second {
-				backoff *= 2
-			}
-		}
-		if openErr != nil {
-			fmt.Fprintf(os.Stderr,
-				"[GO-IVM] giving up on replica %q after %v: %v\n",
-				path, replicaOpenTimeout, openErr)
-			os.Exit(1)
-		}
-		replicaDB = db
-		defer replicaDB.Close()
 		fmt.Fprintf(os.Stderr,
-			"[GO-IVM] opened replica %s (WAL mode, query_only)\n", path)
+			"[GO-IVM] table mode armed; replica %s will open lazily on first init\n",
+			replicaPath)
 	}
 	fmt.Printf("Go IVM sidecar listening on %s (multi-engine, source=%s)\n",
 		socketPath, sourceMode)
 
-	server := NewServer(sourceMode, replicaDB)
+	server := NewServer(sourceMode, replicaPath)
 
 	// Start periodic metrics reporter
 	go func() {
