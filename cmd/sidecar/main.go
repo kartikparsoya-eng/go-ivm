@@ -26,6 +26,7 @@ import (
 
 	"github.com/kartikparsoya-eng/go-ivm/builder"
 	"github.com/kartikparsoya-eng/go-ivm/engine"
+	"github.com/kartikparsoya-eng/go-ivm/internal/tablesource"
 	"github.com/kartikparsoya-eng/go-ivm/ivm"
 	"github.com/kartikparsoya-eng/go-ivm/sqlite"
 	"github.com/vmihailenco/msgpack/v5"
@@ -1487,7 +1488,18 @@ func main() {
 		otelShutdown = func(context.Context) error { return nil }
 	}
 
-	fmt.Printf("Go IVM sidecar listening on %s (multi-engine)\n", socketPath)
+	// Leaf-source selector (Phase 0 of the TableSource port — see
+	// DESIGN-tablesource-port.md). Unknown / empty values default to
+	// memory so misconfiguration cannot silently activate unfinished code.
+	sourceMode := tablesource.ParseMode()
+	if sourceMode == tablesource.ModeTable {
+		fmt.Fprintln(os.Stderr,
+			"[GO-IVM] GO_IVM_SOURCE_MODE=table requested, but TableSource "+
+				"is not yet wired (Phase 0); continuing with MemorySource.")
+	}
+
+	fmt.Printf("Go IVM sidecar listening on %s (multi-engine, source=%s)\n",
+		socketPath, sourceMode)
 
 	server := NewServer()
 
