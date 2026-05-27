@@ -7,6 +7,8 @@ import (
 	"os"
 	"sync"
 	"testing"
+
+	"github.com/kartikparsoya-eng/go-ivm/internal/tablesource"
 )
 
 // TestMultiGroupParallel verifies that multiple client groups can
@@ -22,7 +24,8 @@ func TestMultiGroupParallel(t *testing.T) {
 	defer listener.Close()
 	defer os.Remove(socketPath)
 
-	server := NewServer()
+	// Test uses MemorySource (the legacy default) — no replica DB needed.
+	server := NewServer(tablesource.ModeMemory, nil)
 	go func() {
 		for {
 			conn, err := listener.Accept()

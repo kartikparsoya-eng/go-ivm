@@ -470,11 +470,20 @@ type streamWriter func(reqID interface{}, partial interface{})
 type Server struct {
 	mu     sync.RWMutex
 	groups map[string]*ClientGroup // clientGroupID → ClientGroup
+
+	// Leaf-source mode for this sidecar process. ModeMemory uses the
+	// classic loadRows-populated MemorySource; ModeTable constructs a
+	// tablesource.Source per (cg, table) over replicaDB and treats
+	// loadRows as a no-op (the SQLite file is already authoritative).
+	sourceMode tablesource.Mode
+	replicaDB  *sql.DB // non-nil iff sourceMode == ModeTable
 }
 
-func NewServer() *Server {
+func NewServer(mode tablesource.Mode, replicaDB *sql.DB) *Server {
 	return &Server{
-		groups: make(map[string]*ClientGroup),
+		groups:     make(map[string]*ClientGroup),
+		sourceMode: mode,
+		replicaDB:  replicaDB,
 	}
 }
 
@@ -779,44 +788,56 @@ func (s *Server) handleInit(req RPCRequest) RPCResponse {
 	}
 	group.eng = eng
 
-	// For each table: create MemorySource, load pre-sent rows, register
+	// For each table: register the leaf source. In ModeMemory we build a
+	// MemorySource and bulk-load the rows TS sent in the init payload.
+	// In ModeTable we build a tablesource.Source over the shared replica
+	// pool — schema.Rows is ignored (the SQLite file is authoritative).
 	for tableName, schema := range p.Tables {
 		columns := make(map[string]string, len(schema.Columns))
 		for col, cs := range schema.Columns {
 			columns[col] = cs.Type
 		}
 
-		// Inject FromSQLiteType as the column converter so MemorySource.NormalizeRow
-		// (called on every advance / loadRows row) produces the same type shapes
-		// as the init path for ALL column types — including json/string/blob,
-		// which the legacy partial converter missed. REVIEW-ts-integration CRITICAL-3.
-		ms := ivm.NewMemorySourceWithConverter(
-			tableName, columns, schema.PrimaryKey,
-			func(v interface{}, colType string) ivm.Value {
-				return sqlite.FromSQLiteType(v, colType)
-			},
-		)
-
-		// Convert raw JSON rows to typed ivm.Row using column schemas
-		rows := make([]ivm.Row, 0, len(schema.Rows))
-		for _, rawRow := range schema.Rows {
-			row := make(ivm.Row, len(rawRow))
-			for col, val := range rawRow {
-				if cs, ok := schema.Columns[col]; ok {
-					row[col] = sqlite.FromSQLiteType(val, cs.Type)
-				} else {
-					row[col] = val
-				}
+		if s.sourceMode == tablesource.ModeTable {
+			src, err := tablesource.New(s.replicaDB, tableName, schema.Columns, schema.PrimaryKey)
+			if err != nil {
+				return rpcError(req.ID, -32000,
+					"tablesource.New for "+tableName+": "+err.Error())
 			}
-			rows = append(rows, row)
-		}
-		ms.BulkInsert(rows)
+			eng.RegisterSource(src)
+		} else {
+			// Inject FromSQLiteType as the column converter so MemorySource.NormalizeRow
+			// (called on every advance / loadRows row) produces the same type shapes
+			// as the init path for ALL column types — including json/string/blob,
+			// which the legacy partial converter missed. REVIEW-ts-integration CRITICAL-3.
+			ms := ivm.NewMemorySourceWithConverter(
+				tableName, columns, schema.PrimaryKey,
+				func(v interface{}, colType string) ivm.Value {
+					return sqlite.FromSQLiteType(v, colType)
+				},
+			)
 
-		eng.RegisterMemorySource(ms)
+			// Convert raw JSON rows to typed ivm.Row using column schemas
+			rows := make([]ivm.Row, 0, len(schema.Rows))
+			for _, rawRow := range schema.Rows {
+				row := make(ivm.Row, len(rawRow))
+				for col, val := range rawRow {
+					if cs, ok := schema.Columns[col]; ok {
+						row[col] = sqlite.FromSQLiteType(val, cs.Type)
+					} else {
+						row[col] = val
+					}
+				}
+				rows = append(rows, row)
+			}
+			ms.BulkInsert(rows)
+
+			eng.RegisterMemorySource(ms)
+		}
 
 		// Forward unique-key metadata for the scalar-subquery resolver.
-		// Tables without unique keys (or where TS hasn't sent them yet for
-		// backward compat) leave the resolver no-op for that table.
+		// Same call for both source modes (scalar resolution is upstream
+		// of the leaf source).
 		if len(schema.UniqueKeys) > 0 {
 			eng.SetTableUniqueKeys(tableName, schema.UniqueKeys)
 		}
@@ -867,6 +888,17 @@ func (s *Server) handleLoadRows(req RPCRequest) RPCResponse {
 	var p loadRowsParams
 	if err := mpUnmarshal(req.Params, &p); err != nil {
 		return rpcError(req.ID, -32602, err.Error())
+	}
+
+	// In table mode the SQLite replica is authoritative — TS still sends
+	// loadRows for protocol compatibility, but we have nothing to do
+	// with the rows. Return success without touching engine state.
+	if s.sourceMode == tablesource.ModeTable {
+		return RPCResponse{
+			JSONRPC: "2.0",
+			Result:  map[string]interface{}{"status": "ok"},
+			ID:      req.ID,
+		}
 	}
 
 	cgID := p.ClientGroupID
@@ -1517,12 +1549,10 @@ func main() {
 		defer replicaDB.Close()
 		fmt.Fprintf(os.Stderr, "[GO-IVM] opened replica %s (WAL mode, query_only)\n", path)
 	}
-	_ = replicaDB // 3b will pass this into handleInit when constructing sources
-
 	fmt.Printf("Go IVM sidecar listening on %s (multi-engine, source=%s)\n",
 		socketPath, sourceMode)
 
-	server := NewServer()
+	server := NewServer(sourceMode, replicaDB)
 
 	// Start periodic metrics reporter
 	go func() {
