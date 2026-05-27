@@ -140,6 +140,26 @@ func (s *Source) Close() error {
 	return s.txCache.Close()
 }
 
+// RefreshSnapshot bumps snapshotEpoch so the next Fetch rolls the pinned
+// read tx to the current WAL frame. Called externally (e.g., by the
+// drift audit) when the caller needs Go's reads to compare against the
+// replica's latest committed state rather than the snapshot held since
+// the last Push.
+//
+// No-op while a Push is in progress (overlay != nil) — rolling the tx
+// mid-fanout would invalidate the snapshot-consistency guarantee that
+// downstream Fetches inside Output.Push depend on. Once the Push
+// completes, its own deferred snapshotEpoch++ takes care of the roll
+// and a subsequent RefreshSnapshot can move us forward further.
+func (s *Source) RefreshSnapshot() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.overlay != nil {
+		return
+	}
+	s.snapshotEpoch++
+}
+
 // TableName / PrimaryKey / NormalizeRow satisfy engine.Source.
 
 func (s *Source) TableName() string { return s.tableName }

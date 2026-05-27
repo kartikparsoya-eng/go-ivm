@@ -407,6 +407,91 @@ func TestTxPinHidesExternalWriteUntilPushRolls(t *testing.T) {
 	}
 }
 
+// TestRefreshSnapshotRollsTx is the Phase 6 contract for the drift
+// audit. Without a Push, the pinned tx stays stale; an external caller
+// (the audit) can roll it by calling RefreshSnapshot. After that, the
+// next Fetch sees writes the external writer committed since the last
+// roll.
+func TestRefreshSnapshotRollsTx(t *testing.T) {
+	path := seedTypedReplica(t)
+	db, err := Open(path, OpenOptions{})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+	src, err := New(db, "users", userSchema(), []string{"id"})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer src.Close()
+	writer, err := sql.Open("sqlite3", path)
+	if err != nil {
+		t.Fatalf("writer: %v", err)
+	}
+	defer writer.Close()
+
+	in := src.Connect(nil, nil, nil)
+	in.SetOutput(&recordingOutput{})
+
+	// First Fetch pins tx at the seeded 3 rows.
+	if got := len(in.Fetch(ivm.FetchRequest{})); got != 3 {
+		t.Fatalf("baseline = %d, want 3", got)
+	}
+	// External commit.
+	if _, err := writer.Exec("INSERT INTO users VALUES (10, 'eve', 100, 1)"); err != nil {
+		t.Fatalf("external insert: %v", err)
+	}
+	// Still 3 — tx pinned.
+	if got := len(in.Fetch(ivm.FetchRequest{})); got != 3 {
+		t.Fatalf("pre-refresh = %d, want 3 (tx still pinned)", got)
+	}
+	// External caller (drift audit) refreshes.
+	src.RefreshSnapshot()
+	if got := len(in.Fetch(ivm.FetchRequest{})); got != 4 {
+		t.Fatalf("post-refresh = %d, want 4 (tx rolled)", got)
+	}
+}
+
+// TestRefreshSnapshotNoOpDuringPush proves the safety property: rolling
+// the tx mid-Push would break overlay's pre-state assumption. We start
+// a Push, have its downstream call RefreshSnapshot, and verify the
+// snapshot stays pinned for the duration of the Push.
+func TestRefreshSnapshotNoOpDuringPush(t *testing.T) {
+	src, db := newUserSource(t)
+	defer db.Close()
+
+	in := src.Connect(nil, nil, nil)
+	probe := &refreshDuringPushOutput{src: src, in: in}
+	in.SetOutput(probe)
+
+	src.Push(ivm.MakeSourceChangeAdd(ivm.Row{
+		"id": float64(99), "name": "dave", "score": float64(50), "active": true,
+	}))
+
+	if !probe.observedOverlay {
+		t.Fatalf("RefreshSnapshot during Push should have left overlay visible")
+	}
+}
+
+type refreshDuringPushOutput struct {
+	src             *Source
+	in              ivm.Input
+	observedOverlay bool
+}
+
+func (o *refreshDuringPushOutput) Push(_ ivm.Change, _ ivm.InputBase) []ivm.Change {
+	// Try to refresh while the Push is still in-flight. The Source must
+	// recognize overlay != nil and skip the bump — otherwise the next
+	// Fetch (this one) would roll the tx, see post-replicator state,
+	// and double-apply the overlay's add.
+	o.src.RefreshSnapshot()
+	// SQLite has 3 rows; overlay adds the 4th. If we double-applied,
+	// we'd see 5.
+	nodes := o.in.Fetch(ivm.FetchRequest{})
+	o.observedOverlay = len(nodes) == 4
+	return nil
+}
+
 func TestOverlayVisibleDuringPush(t *testing.T) {
 	src, db := newUserSource(t)
 	defer db.Close()

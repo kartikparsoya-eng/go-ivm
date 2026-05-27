@@ -362,8 +362,8 @@ const defaultSocket = "/tmp/go-ivm.sock"
 // the TS client can refuse to talk to an incompatible sidecar
 // (REVIEW-final MED-CROSS-5).
 const (
-	sidecarVersion     = "0.5.0"
-	sidecarProtocolRev = 5 // bumped: mutating RPCs carry initEpoch; stale callers rejected with -32101 to prevent cross-instance state corruption (multi-CG soak surfaced doubled loadRows from torn-down view-syncer)
+	sidecarVersion     = "0.6.0"
+	sidecarProtocolRev = 6 // bumped: refreshSnapshot RPC added (rolls TableSource pinned tx — drift audit calls it to align comparison reads with Go's view; safe to call against MemorySource too as it's a no-op there).
 )
 
 // rpcCodeStaleInitEpoch signals that a mutating RPC arrived with an
@@ -766,6 +766,8 @@ func (s *Server) handleRequest(req RPCRequest) (resp RPCResponse) {
 		return s.handleAdvance(req)
 	case "destroy":
 		return s.handleDestroy(req)
+	case "refreshSnapshot":
+		return s.handleRefreshSnapshot(req)
 	default:
 		return RPCResponse{
 			JSONRPC: "2.0",
@@ -1383,6 +1385,43 @@ func (s *Server) handleDestroy(req RPCRequest) RPCResponse {
 	}
 
 	s.removeGroup(cgID)
+	return RPCResponse{JSONRPC: "2.0", Result: "ok", ID: req.ID}
+}
+
+// refreshSnapshotParams shares the clientGroupID-only shape with other
+// per-CG RPCs.
+type refreshSnapshotParams struct {
+	ClientGroupID string `json:"clientGroupID"`
+	InitEpoch     uint64 `json:"initEpoch"`
+}
+
+// handleRefreshSnapshot rolls each registered Source's pinned snapshot
+// (no-op for MemorySource). Used by the TS drift audit so its
+// comparison reads see Go's view of the current replica state, not the
+// snapshot pinned since the last Push — which would otherwise produce
+// transient set differences during sustained writes.
+//
+// initEpoch guard matches the other mutating RPCs: a stale audit from a
+// torn-down view-syncer must not roll the new instance's tx.
+func (s *Server) handleRefreshSnapshot(req RPCRequest) RPCResponse {
+	var p refreshSnapshotParams
+	if err := mpUnmarshal(req.Params, &p); err != nil {
+		return rpcError(req.ID, -32602, err.Error())
+	}
+	cgID := p.ClientGroupID
+	if cgID == "" {
+		cgID = "default"
+	}
+	group := s.getGroup(cgID)
+	group.mu.Lock()
+	defer group.mu.Unlock()
+	if group.eng == nil {
+		return rpcError(req.ID, -32000, "engine not initialized (call init first)")
+	}
+	if resp, stale := checkInitEpoch(group, req.ID, p.InitEpoch); stale {
+		return resp
+	}
+	group.eng.RefreshAllSources()
 	return RPCResponse{JSONRPC: "2.0", Result: "ok", ID: req.ID}
 }
 

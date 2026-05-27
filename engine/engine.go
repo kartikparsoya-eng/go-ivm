@@ -225,6 +225,23 @@ func (e *Engine) RegisterSource(source Source) {
 	e.sources[source.TableName()] = source
 }
 
+// RefreshAllSources rolls each source's pinned snapshot (if any) to the
+// current backing storage state. Sources without pinned snapshots
+// (MemorySource) are silently skipped. Used by the drift audit so its
+// comparison reads are at the same point in time as the underlying
+// replica writer, rather than against a snapshot pinned by the last
+// Push (which would show transient set differences during sustained
+// writes).
+func (e *Engine) RefreshAllSources() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for _, src := range e.sources {
+		if r, ok := src.(interface{ RefreshSnapshot() }); ok {
+			r.RefreshSnapshot()
+		}
+	}
+}
+
 // RegisterMemorySource registers a MemorySource directly.
 // Enables parallel fan-out if the engine's parallelThreshold > 0.
 func (e *Engine) RegisterMemorySource(ms *ivm.MemorySource) {
