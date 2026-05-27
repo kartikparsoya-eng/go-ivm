@@ -26,6 +26,13 @@ import (
 	"github.com/kartikparsoya-eng/go-ivm/sqlite"
 )
 
+// queryRunner is the subset of *sql.DB and *sql.Tx that fetchForConn
+// uses. Lets fetchForConn pick the right read path (pool or
+// snapshot-pinned tx) without branching the actual query call.
+type queryRunner interface {
+	Query(query string, args ...any) (*sql.Rows, error)
+}
+
 // Source is the read-only TableSource leaf. One instance per (CG, table).
 type Source struct {
 	db         *sql.DB
@@ -46,32 +53,21 @@ type Source struct {
 	// MemorySource's overlay field. nil when no Push is in flight.
 	overlay *ivm.Overlay
 
-	// snapshotEpoch keys the per-Source TxCache. It is bumped AFTER
-	// Push fanout completes (in the deferred cleanup), NOT before. The
-	// two-epoch dance is what makes read-from-replica correct:
-	//
-	//   pushEpoch  — bumped before fanout. Drives overlay visibility
-	//                via conn.lastPushedEpoch < overlay.Epoch gate.
-	//   snapshotEpoch — bumped after fanout. Drives TxCache.Acquire —
-	//                a bump here is what tells the cache to roll the
-	//                pinned read tx to a fresh WAL frame.
-	//
-	// During Push fanout, a downstream Fetch sees snapshotEpoch
-	// UNCHANGED → cache returns the still-pinned (pre-replicator-
-	// commit) tx → query yields the pre-commit state → overlay
-	// splices in the change → result is the post-commit view. After
-	// fanout, snapshotEpoch++ → next Fetch's Acquire rolls the tx →
-	// new tx pins to the now-current WAL frame.
-	//
-	// See DESIGN-tablesource-port.md "Phase 4" for the full rationale.
-	snapshotEpoch uint64
+	// snapMu protects currentSnapshot. R-locked on the Fetch hot path
+	// (so concurrent reads don't serialize); W-locked on Push and
+	// RefreshSnapshot when we rotate the snapshot. The snapshot itself
+	// is goroutine-safe to pass to OpenAtSnapshot from many callers.
+	snapMu          sync.RWMutex
+	currentSnapshot *Snapshot
 
-	// txCache holds at most one pinned read tx for this Source. Per-
-	// Source (not shared) — each table is its own cache entry under a
-	// stable key (the table name). The TxCache's internal mutex
-	// serializes concurrent Fetches on the same Source, which is
-	// required because *sql.Tx is not goroutine-safe.
-	txCache *TxCache
+	// snapshotDisabled latches true if CaptureSnapshot ever returns an
+	// error (e.g., stub build without libsqlite3, or SQLite version
+	// without SQLITE_ENABLE_SNAPSHOT). When true, fetchForConn skips
+	// the snapshot path entirely and reads via db.Query directly,
+	// recovering Fetch concurrency at the cost of cross-Fetch snapshot
+	// consistency outside of Push. Single-flight: set once, never
+	// reset within a Source's lifetime.
+	snapshotDisabled bool
 }
 
 // connection is one downstream pipeline subscribed to this source.
@@ -126,18 +122,52 @@ func New(db *sql.DB, tableName string, columns map[string]sqlite.ColumnSchema, p
 		tableName:  tableName,
 		primaryKey: primaryKey,
 		columns:    columns,
-		txCache:    NewTxCache(db),
 	}, nil
 }
 
-// Close releases the pinned read transaction (if any). The underlying
-// *sql.DB pool is NOT closed — that's owned by the sidecar's process-
-// level lifecycle, not by individual sources. Idempotent.
+// Close releases the pinned snapshot (if any). The underlying *sql.DB
+// pool is NOT closed — that's owned by the sidecar's process-level
+// lifecycle, not by individual sources. Idempotent.
 func (s *Source) Close() error {
-	if s.txCache == nil {
-		return nil
+	s.snapMu.Lock()
+	old := s.currentSnapshot
+	s.currentSnapshot = nil
+	s.snapMu.Unlock()
+	if old != nil {
+		old.Free()
 	}
-	return s.txCache.Close()
+	return nil
+}
+
+// rotateSnapshot frees the existing snapshot (if any) and captures a
+// fresh one. Called from Push (after fanout) and RefreshSnapshot. If
+// the capture errors — most commonly because the build lacks the
+// libsqlite3 tag and we got the stub — we latch snapshotDisabled and
+// return; subsequent fetchForConn calls take the snapshot-less path
+// and just read via db.Query.
+//
+// Caller must NOT hold snapMu — this method acquires it internally.
+func (s *Source) rotateSnapshot() {
+	s.snapMu.Lock()
+	if s.snapshotDisabled {
+		s.snapMu.Unlock()
+		return
+	}
+	old := s.currentSnapshot
+	s.currentSnapshot = nil
+	s.snapMu.Unlock()
+	if old != nil {
+		old.Free()
+	}
+
+	fresh, err := CaptureSnapshot(context.Background(), s.db)
+	s.snapMu.Lock()
+	defer s.snapMu.Unlock()
+	if err != nil {
+		s.snapshotDisabled = true
+		return
+	}
+	s.currentSnapshot = fresh
 }
 
 // RefreshSnapshot bumps snapshotEpoch so the next Fetch rolls the pinned
@@ -153,11 +183,12 @@ func (s *Source) Close() error {
 // and a subsequent RefreshSnapshot can move us forward further.
 func (s *Source) RefreshSnapshot() {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.overlay != nil {
+	pushInFlight := s.overlay != nil
+	s.mu.Unlock()
+	if pushInFlight {
 		return
 	}
-	s.snapshotEpoch++
+	s.rotateSnapshot()
 }
 
 // TableName / PrimaryKey / NormalizeRow satisfy engine.Source.
@@ -255,8 +286,13 @@ func (s *Source) Push(change ivm.SourceChange) []ivm.Change {
 	defer func() {
 		s.mu.Lock()
 		s.overlay = nil
-		s.snapshotEpoch++
 		s.mu.Unlock()
+		// Rotate the snapshot AFTER the fanout completes. Downstream
+		// Fetches inside Output.Push read the PRE-rotation snapshot
+		// (which sees pre-replicator-commit state) + overlay → correct
+		// post-commit view. Once fanout is done, the next Fetch picks
+		// up the NEW snapshot (which sees the now-current WAL frame).
+		s.rotateSnapshot()
 	}()
 
 	var out []ivm.Change
@@ -399,23 +435,62 @@ func (s *Source) fetchForConn(req ivm.FetchRequest, conn *connection) []ivm.Node
 		req.Start,
 	)
 
-	// Snapshot epoch read under s.mu — bumped only by Push's deferred
-	// cleanup, so during a Push fanout it's stable and the cache hands
-	// back the same pre-commit tx. Between advances it bumps once per
-	// Push, so the cache rolls the tx to a fresh WAL frame for the
-	// next round.
-	s.mu.Lock()
-	epoch := s.snapshotEpoch
-	s.mu.Unlock()
+	// Read path selection: if a snapshot is held, every concurrent
+	// Fetch grabs its own conn from the pool and pins it via
+	// snapshot_open — independent *sql.Tx per goroutine, shared WAL
+	// frame, no mutex contention. If we don't have a snapshot (stub
+	// build without libsqlite3, or first Fetch before any Push has
+	// rotated us into a snapshot), fall back to a plain pool read —
+	// each Fetch sees whatever's currently in SQLite. The fallback
+	// loses cross-Fetch snapshot consistency outside of Push but the
+	// per-row hot path stays fast.
+	s.snapMu.RLock()
+	snap := s.currentSnapshot
+	s.snapMu.RUnlock()
 
-	tx, release, err := s.txCache.Acquire(context.Background(), s.tableName, epoch)
-	if err != nil {
-		panic(fmt.Sprintf("tablesource.Source.Fetch %s: tx acquire: %v",
-			s.tableName, err))
+	var (
+		rows    *sql.Rows
+		queryDB queryRunner = s.db
+		txOwned *sql.Tx
+		cnOwned *sql.Conn
+	)
+	if snap != nil {
+		tx, cn, err := OpenAtSnapshot(context.Background(), s.db, snap)
+		if err != nil {
+			// Snapshot may have been freed by a concurrent rotation —
+			// transparent retry against the current state via the pool.
+			// Operator semantics aren't affected; just lose the pin for
+			// this Fetch.
+			s.snapMu.RLock()
+			snap = s.currentSnapshot
+			s.snapMu.RUnlock()
+			if snap != nil {
+				tx, cn, err = OpenAtSnapshot(context.Background(), s.db, snap)
+			}
+			if err != nil {
+				queryDB = s.db
+			} else {
+				queryDB = tx
+				txOwned = tx
+				cnOwned = cn
+			}
+		} else {
+			queryDB = tx
+			txOwned = tx
+			cnOwned = cn
+		}
 	}
-	defer release()
+	defer func() {
+		if txOwned != nil {
+			_ = txOwned.Rollback()
+		}
+		if cnOwned != nil {
+			_ = cnOwned.Close()
+		}
+	}()
 
-	rows, err := tx.Query(q.SQL, q.Params...)
+	var err error
+	rows, err = queryDB.Query(q.SQL, q.Params...)
 	if err != nil {
 		panic(fmt.Sprintf("tablesource.Source.Fetch %s: query: %v\nSQL: %s",
 			s.tableName, err, q.SQL))

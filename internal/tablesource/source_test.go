@@ -1,6 +1,7 @@
 package tablesource
 
 import (
+	"context"
 	"database/sql"
 	"path/filepath"
 	"reflect"
@@ -346,12 +347,15 @@ func (o *overlayProbingOutput) Push(_ ivm.Change, _ ivm.InputBase) []ivm.Change 
 	return nil
 }
 
-// TestTxPinHidesExternalWriteUntilPushRolls is the Phase 4 contract.
-// An external writer (modeling the TS replicator) commits a new row.
-// Fetches via Source MUST NOT see it until a Push has rolled the
-// pinned read tx — that's the snapshot-consistency guarantee that
-// lets overlay produce a correct post-push view inside a Push fanout.
+// TestTxPinHidesExternalWriteUntilPushRolls is the Phase 4/7 snapshot
+// contract. Requires the libsqlite3 build tag (real snapshot impl);
+// the default-build stub reads live from the pool and would see the
+// external write immediately. The full contract is only meaningful
+// when the snapshot path is wired.
 func TestTxPinHidesExternalWriteUntilPushRolls(t *testing.T) {
+	if !snapshotAvailable(t) {
+		t.Skip("snapshot unavailable in this build (rebuild with -tags libsqlite3)")
+	}
 	path := seedTypedReplica(t)
 
 	// Our read-side pool (query_only, WAL).
@@ -408,11 +412,13 @@ func TestTxPinHidesExternalWriteUntilPushRolls(t *testing.T) {
 }
 
 // TestRefreshSnapshotRollsTx is the Phase 6 contract for the drift
-// audit. Without a Push, the pinned tx stays stale; an external caller
-// (the audit) can roll it by calling RefreshSnapshot. After that, the
-// next Fetch sees writes the external writer committed since the last
-// roll.
+// audit, gated on the real-snapshot impl. The stub build reads live
+// from the pool so RefreshSnapshot is a no-op for the user-visible
+// data — same skip pattern as TestTxPinHidesExternalWriteUntilPushRolls.
 func TestRefreshSnapshotRollsTx(t *testing.T) {
+	if !snapshotAvailable(t) {
+		t.Skip("snapshot unavailable in this build (rebuild with -tags libsqlite3)")
+	}
 	path := seedTypedReplica(t)
 	db, err := Open(path, OpenOptions{})
 	if err != nil {
@@ -692,4 +698,22 @@ func TestDestroyRemovesConnection(t *testing.T) {
 	if after != 0 {
 		t.Fatalf("connections after destroy = %d, want 0", after)
 	}
+}
+
+// snapshotAvailable probes whether the build supports SQLite's
+// sqlite3_snapshot_get (real impl) or stubs out (default impl).
+// Tests that depend on snapshot-pinning semantics skip on stub builds.
+func snapshotAvailable(t *testing.T) bool {
+	t.Helper()
+	db, err := Open(seedTypedReplica(t), OpenOptions{})
+	if err != nil {
+		t.Fatalf("snapshotAvailable: Open: %v", err)
+	}
+	defer db.Close()
+	snap, err := CaptureSnapshot(context.Background(), db)
+	if err != nil {
+		return false
+	}
+	snap.Free()
+	return true
 }

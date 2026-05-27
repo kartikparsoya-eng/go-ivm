@@ -1,7 +1,6 @@
 package tablesource
 
 import (
-	"context"
 	"database/sql"
 	"fmt"
 	"path/filepath"
@@ -165,34 +164,8 @@ func BenchmarkConcurrentReaders(b *testing.B) {
 	})
 }
 
-// BenchmarkTxCacheAcquire measures the per-CG-tx overhead (mutex + map
-// lookup, no SQL). Same epoch / same CG every call — should be cheap
-// since the tx is reused.
-func BenchmarkTxCacheAcquire(b *testing.B) {
-	path := seedReplicaLarge(b, 10)
-	db, err := Open(path, OpenOptions{})
-	if err != nil {
-		b.Fatalf("Open: %v", err)
-	}
-	defer db.Close()
-	cache := NewTxCache(db)
-	defer cache.Close()
-	ctx := context.Background()
-
-	// Prime the cache so the first Acquire (which BEGINs a tx) doesn't
-	// pollute the measurement.
-	_, rel, err := cache.Acquire(ctx, "cg-a", 1)
-	if err != nil {
-		b.Fatalf("prime: %v", err)
-	}
-	rel()
-	b.ResetTimer()
-	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
-		_, rel, err := cache.Acquire(ctx, "cg-a", 1)
-		if err != nil {
-			b.Fatalf("Acquire: %v", err)
-		}
-		rel()
-	}
-}
+// TxCache benchmark removed in Phase 7b — TxCache is retired in favor
+// of the snapshot-pinning model (see DESIGN-snapshot-open.md). Per-
+// Source mutex contention was the bottleneck identified by the Phase 6
+// profile; the new model replaces it with per-call conn from the pool
+// pinned via sqlite3_snapshot_open, eliminating the mutex entirely.
