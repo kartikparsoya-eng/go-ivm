@@ -212,16 +212,163 @@ func TestFetchFilterPredicate(t *testing.T) {
 	}
 }
 
-func TestPushPanicsPhase2a(t *testing.T) {
+// recordingOutput is a test sink that records every Change it gets
+// pushed and returns no downstream changes. Used to verify Push fanout
+// hits the right connections with the right Change shape.
+type recordingOutput struct {
+	pushed []ivm.Change
+}
+
+func (r *recordingOutput) Push(c ivm.Change, _ ivm.InputBase) []ivm.Change {
+	r.pushed = append(r.pushed, c)
+	return nil
+}
+
+func TestPushFanoutAddToConnection(t *testing.T) {
 	src, db := newUserSource(t)
 	defer db.Close()
 
-	defer func() {
-		if r := recover(); r == nil {
-			t.Fatalf("Push did not panic; Phase 2a must fail loud")
-		}
-	}()
-	src.Push(ivm.MakeSourceChangeAdd(ivm.Row{"id": float64(99)}))
+	in := src.Connect(nil, nil, nil)
+	rec := &recordingOutput{}
+	in.SetOutput(rec)
+
+	row := ivm.Row{"id": float64(99), "name": "dave", "score": float64(50), "active": true}
+	src.Push(ivm.MakeSourceChangeAdd(row))
+
+	if len(rec.pushed) != 1 {
+		t.Fatalf("got %d pushed changes, want 1", len(rec.pushed))
+	}
+	if rec.pushed[0].Type != ivm.ChangeTypeAdd {
+		t.Errorf("change.Type = %v, want Add", rec.pushed[0].Type)
+	}
+	if rec.pushed[0].Node.Row["id"] != float64(99) {
+		t.Errorf("change.Node.Row.id = %#v, want 99", rec.pushed[0].Node.Row["id"])
+	}
+}
+
+func TestPushFilterDropsRow(t *testing.T) {
+	src, db := newUserSource(t)
+	defer db.Close()
+
+	in := src.Connect(nil, func(r ivm.Row) bool { v, _ := r["active"].(bool); return v }, nil)
+	rec := &recordingOutput{}
+	in.SetOutput(rec)
+
+	// active=false row → should be dropped by the filter, no Push downstream
+	row := ivm.Row{"id": float64(99), "name": "dave", "score": float64(50), "active": false}
+	src.Push(ivm.MakeSourceChangeAdd(row))
+
+	if len(rec.pushed) != 0 {
+		t.Fatalf("filter should have dropped row, got %d pushed", len(rec.pushed))
+	}
+}
+
+func TestPushEditFilterTransitionEmitsRemove(t *testing.T) {
+	src, db := newUserSource(t)
+	defer db.Close()
+
+	in := src.Connect(nil, func(r ivm.Row) bool { v, _ := r["active"].(bool); return v }, nil)
+	rec := &recordingOutput{}
+	in.SetOutput(rec)
+
+	// Edit alice (active=true → active=false). Old passed filter, new doesn't:
+	// downstream sees Remove for the old row.
+	oldRow := ivm.Row{"id": float64(1), "name": "alice", "score": float64(90), "active": true}
+	newRow := ivm.Row{"id": float64(1), "name": "alice", "score": float64(90), "active": false}
+	src.Push(ivm.MakeSourceChangeEdit(newRow, oldRow))
+
+	if len(rec.pushed) != 1 {
+		t.Fatalf("got %d pushed, want 1 (Remove)", len(rec.pushed))
+	}
+	if rec.pushed[0].Type != ivm.ChangeTypeRemove {
+		t.Errorf("change.Type = %v, want Remove", rec.pushed[0].Type)
+	}
+}
+
+func TestPushEditFilterTransitionEmitsAdd(t *testing.T) {
+	src, db := newUserSource(t)
+	defer db.Close()
+
+	in := src.Connect(nil, func(r ivm.Row) bool { v, _ := r["active"].(bool); return v }, nil)
+	rec := &recordingOutput{}
+	in.SetOutput(rec)
+
+	// Edit bob (active=false → active=true). Old failed filter, new passes:
+	// downstream sees Add for the new row.
+	oldRow := ivm.Row{"id": float64(2), "name": "bob", "score": float64(80), "active": false}
+	newRow := ivm.Row{"id": float64(2), "name": "bob", "score": float64(80), "active": true}
+	src.Push(ivm.MakeSourceChangeEdit(newRow, oldRow))
+
+	if len(rec.pushed) != 1 {
+		t.Fatalf("got %d pushed, want 1 (Add)", len(rec.pushed))
+	}
+	if rec.pushed[0].Type != ivm.ChangeTypeAdd {
+		t.Errorf("change.Type = %v, want Add", rec.pushed[0].Type)
+	}
+}
+
+func TestPushSplitEditEmitsRemoveAdd(t *testing.T) {
+	src, db := newUserSource(t)
+	defer db.Close()
+
+	splitKeys := map[string]bool{"score": true}
+	in := src.Connect(nil, nil, splitKeys)
+	rec := &recordingOutput{}
+	in.SetOutput(rec)
+
+	// Edit alice score 90 → 100. score is a split key, so emit Remove+Add.
+	oldRow := ivm.Row{"id": float64(1), "name": "alice", "score": float64(90), "active": true}
+	newRow := ivm.Row{"id": float64(1), "name": "alice", "score": float64(100), "active": true}
+	src.Push(ivm.MakeSourceChangeEdit(newRow, oldRow))
+
+	if len(rec.pushed) != 2 {
+		t.Fatalf("got %d pushed, want 2 (Remove+Add)", len(rec.pushed))
+	}
+	if rec.pushed[0].Type != ivm.ChangeTypeRemove {
+		t.Errorf("change[0].Type = %v, want Remove", rec.pushed[0].Type)
+	}
+	if rec.pushed[1].Type != ivm.ChangeTypeAdd {
+		t.Errorf("change[1].Type = %v, want Add", rec.pushed[1].Type)
+	}
+}
+
+// overlayProbingOutput re-fetches from the same Source during Push so we
+// can assert that the overlay is visible to a downstream Fetch fired
+// from inside Output.Push (the contract the legacy MemorySource holds).
+type overlayProbingOutput struct {
+	in            ivm.Input
+	observedAfter int // node count seen by the re-fetch
+}
+
+func (o *overlayProbingOutput) Push(_ ivm.Change, _ ivm.InputBase) []ivm.Change {
+	nodes := o.in.Fetch(ivm.FetchRequest{})
+	o.observedAfter = len(nodes)
+	return nil
+}
+
+func TestOverlayVisibleDuringPush(t *testing.T) {
+	src, db := newUserSource(t)
+	defer db.Close()
+
+	in := src.Connect(nil, nil, nil)
+	probe := &overlayProbingOutput{in: in}
+	in.SetOutput(probe)
+
+	// Before push: SQLite has 3 rows. Push an Add via overlay (no SQLite
+	// write). The probe's re-fetch during Push should see 4 (SQL's 3 +
+	// the overlay's add).
+	row := ivm.Row{"id": float64(99), "name": "dave", "score": float64(50), "active": true}
+	src.Push(ivm.MakeSourceChangeAdd(row))
+
+	if probe.observedAfter != 4 {
+		t.Fatalf("overlay not visible during push: observed %d nodes, want 4",
+			probe.observedAfter)
+	}
+
+	// After push completes, overlay clears; re-fetch should be back to 3.
+	if got := len(in.Fetch(ivm.FetchRequest{})); got != 3 {
+		t.Fatalf("overlay should clear post-Push: got %d nodes, want 3", got)
+	}
 }
 
 func TestFetchConstraintEquality(t *testing.T) {

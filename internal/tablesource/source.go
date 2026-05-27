@@ -38,6 +38,12 @@ type Source struct {
 	mu          sync.Mutex
 	connections []*connection
 	pushEpoch   int
+
+	// overlay is the pending Push that hasn't finished fanning out yet.
+	// Concurrent Fetches whose lastPushedEpoch < overlay.Epoch splice
+	// this in so they see the post-push state — same contract as
+	// MemorySource's overlay field. nil when no Push is in flight.
+	overlay *ivm.Overlay
 }
 
 // connection is one downstream pipeline subscribed to this source.
@@ -161,13 +167,85 @@ func (s *Source) Connect(
 	return in
 }
 
-// Push fans the change through every connection and rolls the source's
-// snapshot epoch. NOT yet implemented — Phase 2d. Panics fast so an
-// accidental wiring of this source into the engine surfaces at the
-// first SourceChange instead of producing silently-wrong IVM output.
+// Push fans the change through every subscribed connection. Unlike the
+// legacy in-process sqlite.TableSource, we do NOT write to the database
+// here — the TS replicator owns the file and has already written by
+// the time advance() reaches us. This source is a pure read-side
+// adapter; Push is fanout + overlay only.
+//
+// Edit / split-edit / filter-transition handling mirrors the existing
+// sqlite.TableSource.Push contract so downstream operators see
+// identical change sequences regardless of which leaf is in use.
 func (s *Source) Push(change ivm.SourceChange) []ivm.Change {
-	panic("tablesource.Source.Push: not implemented in Phase 2a " +
-		"(see DESIGN-tablesource-port.md — Phase 2d adds push fanout)")
+	s.mu.Lock()
+	s.pushEpoch++
+	epoch := s.pushEpoch
+	s.overlay = &ivm.Overlay{Epoch: epoch, Change: change}
+	conns := make([]*connection, len(s.connections))
+	copy(conns, s.connections)
+	s.mu.Unlock()
+
+	// Defer overlay clear to the end of the fan-out. Downstream
+	// operators may call Fetch back into us during their Output.Push;
+	// those Fetches need to see the overlay until we're done.
+	defer func() {
+		s.mu.Lock()
+		s.overlay = nil
+		s.mu.Unlock()
+	}()
+
+	var out []ivm.Change
+
+	for _, conn := range conns {
+		if conn.output == nil {
+			continue
+		}
+
+		// Filter-transition handling:
+		//  - row fails filter → either remove (if Edit and old passed)
+		//    or skip
+		//  - Edit where only old passed filter → emit Remove
+		//  - Edit where only new passes filter → emit Add
+		if conn.filterPredicate != nil {
+			if !conn.filterPredicate(change.Row) {
+				if change.Type == ivm.ChangeTypeEdit && conn.filterPredicate(change.OldRow) {
+					rm := ivm.MakeRemoveChange(ivm.Node{Row: change.OldRow})
+					out = append(out, conn.output.Push(rm, conn.input)...)
+				}
+				conn.lastPushedEpoch = epoch
+				continue
+			}
+			if change.Type == ivm.ChangeTypeEdit && !conn.filterPredicate(change.OldRow) {
+				ad := ivm.MakeAddChange(ivm.Node{Row: change.Row})
+				out = append(out, conn.output.Push(ad, conn.input)...)
+				conn.lastPushedEpoch = epoch
+				continue
+			}
+		}
+
+		// Split-edit: when an Edit changes a partition key the connection
+		// cares about (per splitEditKeys), the downstream needs to see
+		// the edit as a Remove + Add so its IVM state stays consistent
+		// with the partitioning.
+		if change.Type == ivm.ChangeTypeEdit && conn.splitEditKeys != nil &&
+			editChangesSplitKeys(change, conn.splitEditKeys) {
+			rm := ivm.MakeRemoveChange(ivm.Node{Row: change.OldRow})
+			out = append(out, conn.output.Push(rm, conn.input)...)
+			ad := ivm.MakeAddChange(ivm.Node{Row: change.Row})
+			out = append(out, conn.output.Push(ad, conn.input)...)
+			conn.lastPushedEpoch = epoch
+			continue
+		}
+
+		ivmChange := sourceChangeToChange(change)
+		if ivmChange == nil {
+			continue
+		}
+		out = append(out, conn.output.Push(*ivmChange, conn.input)...)
+		conn.lastPushedEpoch = epoch
+	}
+
+	return out
 }
 
 // columnsAsTypeMap returns the column → type-name map used by the
@@ -296,6 +374,29 @@ func (s *Source) fetchForConn(req ivm.FetchRequest, conn *connection) []ivm.Node
 	if err := rows.Err(); err != nil {
 		panic(fmt.Sprintf("tablesource.Source.Fetch %s: rows: %v",
 			s.tableName, err))
+	}
+
+	// Apply pending Push overlay so a downstream Fetch fired mid-Push
+	// sees the change as if it had landed. Gate is the same as
+	// MemorySource: conn.lastPushedEpoch < overlay.Epoch means this
+	// connection hasn't yet observed the overlay's change via its own
+	// Output.Push, so we splice it in. Overlay rows are also subjected
+	// to the connection's filter predicate — they're indistinguishable
+	// from SQL-sourced rows downstream.
+	s.mu.Lock()
+	overlay := s.overlay
+	s.mu.Unlock()
+	if overlay != nil && conn.lastPushedEpoch < overlay.Epoch {
+		out = applyOverlay(out, overlay.Change, conn.compareRows, req.Constraint, s.primaryKey)
+		if conn.filterPredicate != nil {
+			filtered := out[:0]
+			for _, n := range out {
+				if conn.filterPredicate(n.Row) {
+					filtered = append(filtered, n)
+				}
+			}
+			out = filtered
+		}
 	}
 	return out
 }
