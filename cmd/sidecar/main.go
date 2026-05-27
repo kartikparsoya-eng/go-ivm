@@ -8,6 +8,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -1488,15 +1489,35 @@ func main() {
 		otelShutdown = func(context.Context) error { return nil }
 	}
 
-	// Leaf-source selector (Phase 0 of the TableSource port — see
-	// DESIGN-tablesource-port.md). Unknown / empty values default to
-	// memory so misconfiguration cannot silently activate unfinished code.
+	// Leaf-source selector (see DESIGN-tablesource-port.md). Unknown /
+	// empty values default to memory so misconfiguration cannot silently
+	// activate the read-from-replica path.
 	sourceMode := tablesource.ParseMode()
+
+	// When in table mode, open the TS replica file once for the whole
+	// process — pool is shared across CGs (per-CG read-tx isolation is
+	// the TxCache's job, not the pool's). Refuse to start if the path
+	// is missing or the file isn't in WAL — failing fast here beats a
+	// confusing per-CG init error later.
+	var replicaDB *sql.DB
 	if sourceMode == tablesource.ModeTable {
-		fmt.Fprintln(os.Stderr,
-			"[GO-IVM] GO_IVM_SOURCE_MODE=table requested, but TableSource "+
-				"is not yet wired (Phase 0); continuing with MemorySource.")
+		path := os.Getenv("GO_IVM_REPLICA_DB_PATH")
+		if path == "" {
+			fmt.Fprintln(os.Stderr,
+				"[GO-IVM] GO_IVM_SOURCE_MODE=table but GO_IVM_REPLICA_DB_PATH is unset — refusing to start")
+			os.Exit(1)
+		}
+		db, err := tablesource.Open(path, tablesource.OpenOptions{})
+		if err != nil {
+			fmt.Fprintf(os.Stderr,
+				"[GO-IVM] failed to open replica %q: %v\n", path, err)
+			os.Exit(1)
+		}
+		replicaDB = db
+		defer replicaDB.Close()
+		fmt.Fprintf(os.Stderr, "[GO-IVM] opened replica %s (WAL mode, query_only)\n", path)
 	}
+	_ = replicaDB // 3b will pass this into handleInit when constructing sources
 
 	fmt.Printf("Go IVM sidecar listening on %s (multi-engine, source=%s)\n",
 		socketPath, sourceMode)
