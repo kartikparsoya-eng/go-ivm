@@ -16,6 +16,7 @@ package tablesource
 // pure source-substitution rather than dragging schema discovery in too.
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"strings"
@@ -44,6 +45,33 @@ type Source struct {
 	// this in so they see the post-push state — same contract as
 	// MemorySource's overlay field. nil when no Push is in flight.
 	overlay *ivm.Overlay
+
+	// snapshotEpoch keys the per-Source TxCache. It is bumped AFTER
+	// Push fanout completes (in the deferred cleanup), NOT before. The
+	// two-epoch dance is what makes read-from-replica correct:
+	//
+	//   pushEpoch  — bumped before fanout. Drives overlay visibility
+	//                via conn.lastPushedEpoch < overlay.Epoch gate.
+	//   snapshotEpoch — bumped after fanout. Drives TxCache.Acquire —
+	//                a bump here is what tells the cache to roll the
+	//                pinned read tx to a fresh WAL frame.
+	//
+	// During Push fanout, a downstream Fetch sees snapshotEpoch
+	// UNCHANGED → cache returns the still-pinned (pre-replicator-
+	// commit) tx → query yields the pre-commit state → overlay
+	// splices in the change → result is the post-commit view. After
+	// fanout, snapshotEpoch++ → next Fetch's Acquire rolls the tx →
+	// new tx pins to the now-current WAL frame.
+	//
+	// See DESIGN-tablesource-port.md "Phase 4" for the full rationale.
+	snapshotEpoch uint64
+
+	// txCache holds at most one pinned read tx for this Source. Per-
+	// Source (not shared) — each table is its own cache entry under a
+	// stable key (the table name). The TxCache's internal mutex
+	// serializes concurrent Fetches on the same Source, which is
+	// required because *sql.Tx is not goroutine-safe.
+	txCache *TxCache
 }
 
 // connection is one downstream pipeline subscribed to this source.
@@ -98,7 +126,18 @@ func New(db *sql.DB, tableName string, columns map[string]sqlite.ColumnSchema, p
 		tableName:  tableName,
 		primaryKey: primaryKey,
 		columns:    columns,
+		txCache:    NewTxCache(db),
 	}, nil
+}
+
+// Close releases the pinned read transaction (if any). The underlying
+// *sql.DB pool is NOT closed — that's owned by the sidecar's process-
+// level lifecycle, not by individual sources. Idempotent.
+func (s *Source) Close() error {
+	if s.txCache == nil {
+		return nil
+	}
+	return s.txCache.Close()
 }
 
 // TableName / PrimaryKey / NormalizeRow satisfy engine.Source.
@@ -185,12 +224,18 @@ func (s *Source) Push(change ivm.SourceChange) []ivm.Change {
 	copy(conns, s.connections)
 	s.mu.Unlock()
 
-	// Defer overlay clear to the end of the fan-out. Downstream
-	// operators may call Fetch back into us during their Output.Push;
-	// those Fetches need to see the overlay until we're done.
+	// Defer overlay clear AND snapshotEpoch bump to the end of fan-out.
+	// Bump order matters: snapshotEpoch++ is what tells the next
+	// Fetch's TxCache.Acquire to roll the pinned read tx to a fresh
+	// WAL frame. Doing this BEFORE fanout would roll the tx mid-Push,
+	// then Fetches inside the fanout would see post-replicator-commit
+	// state AND the overlay → double-application. Doing it AFTER means
+	// the tx stays pinned through the whole fanout, so Fetch sees pre-
+	// commit + overlay = correct post-commit view.
 	defer func() {
 		s.mu.Lock()
 		s.overlay = nil
+		s.snapshotEpoch++
 		s.mu.Unlock()
 	}()
 
@@ -334,7 +379,23 @@ func (s *Source) fetchForConn(req ivm.FetchRequest, conn *connection) []ivm.Node
 		req.Start,
 	)
 
-	rows, err := s.db.Query(q.SQL, q.Params...)
+	// Snapshot epoch read under s.mu — bumped only by Push's deferred
+	// cleanup, so during a Push fanout it's stable and the cache hands
+	// back the same pre-commit tx. Between advances it bumps once per
+	// Push, so the cache rolls the tx to a fresh WAL frame for the
+	// next round.
+	s.mu.Lock()
+	epoch := s.snapshotEpoch
+	s.mu.Unlock()
+
+	tx, release, err := s.txCache.Acquire(context.Background(), s.tableName, epoch)
+	if err != nil {
+		panic(fmt.Sprintf("tablesource.Source.Fetch %s: tx acquire: %v",
+			s.tableName, err))
+	}
+	defer release()
+
+	rows, err := tx.Query(q.SQL, q.Params...)
 	if err != nil {
 		panic(fmt.Sprintf("tablesource.Source.Fetch %s: query: %v\nSQL: %s",
 			s.tableName, err, q.SQL))

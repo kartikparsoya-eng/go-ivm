@@ -346,6 +346,67 @@ func (o *overlayProbingOutput) Push(_ ivm.Change, _ ivm.InputBase) []ivm.Change 
 	return nil
 }
 
+// TestTxPinHidesExternalWriteUntilPushRolls is the Phase 4 contract.
+// An external writer (modeling the TS replicator) commits a new row.
+// Fetches via Source MUST NOT see it until a Push has rolled the
+// pinned read tx — that's the snapshot-consistency guarantee that
+// lets overlay produce a correct post-push view inside a Push fanout.
+func TestTxPinHidesExternalWriteUntilPushRolls(t *testing.T) {
+	path := seedTypedReplica(t)
+
+	// Our read-side pool (query_only, WAL).
+	db, err := Open(path, OpenOptions{})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+	src, err := New(db, "users", userSchema(), []string{"id"})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer src.Close()
+
+	// Separate writer connection — models the TS replicator. NOT
+	// query_only, so it can actually INSERT.
+	writer, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("writer open: %v", err)
+	}
+	defer writer.Close()
+
+	in := src.Connect(nil, nil, nil)
+	in.SetOutput(&recordingOutput{}) // discard, just need a wired output
+
+	// Step 1: first Fetch pins the read tx at the current WAL frame (3 rows).
+	if got := len(in.Fetch(ivm.FetchRequest{})); got != 3 {
+		t.Fatalf("baseline fetch = %d rows, want 3", got)
+	}
+
+	// Step 2: external writer commits a new row.
+	if _, err := writer.Exec("INSERT INTO users VALUES (10, 'eve', 100, 1)"); err != nil {
+		t.Fatalf("external insert: %v", err)
+	}
+
+	// Step 3: re-fetch via Source — pinned tx should still see 3.
+	// If the tx weren't pinned, we'd see 4 here and overlay would
+	// double-apply during the next Push.
+	if got := len(in.Fetch(ivm.FetchRequest{})); got != 3 {
+		t.Fatalf("post-external-write fetch = %d rows, want 3 (tx must be pinned)", got)
+	}
+
+	// Step 4: trigger a Push so snapshotEpoch bumps in the deferred cleanup.
+	// The Push's change itself is irrelevant — what matters is that the
+	// deferred snapshotEpoch++ runs and the cache rolls the tx.
+	src.Push(ivm.MakeSourceChangeAdd(ivm.Row{
+		"id": float64(99), "name": "dave", "score": float64(50), "active": true,
+	}))
+
+	// Step 5: re-fetch — tx must have rolled, now sees external writer's row.
+	if got := len(in.Fetch(ivm.FetchRequest{})); got != 4 {
+		t.Fatalf("post-Push fetch = %d rows, want 4 (tx must have rolled)", got)
+	}
+}
+
 func TestOverlayVisibleDuringPush(t *testing.T) {
 	src, db := newUserSource(t)
 	defer db.Close()
