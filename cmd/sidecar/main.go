@@ -1544,8 +1544,15 @@ func handleConnection(conn net.Conn, server *Server) {
 		// Preserve FIFO ordering per client group: enqueue SYNCHRONOUSLY
 		// (in read-loop order). The writer goroutine drains responses in
 		// the same order.
+		//
+		// refreshSnapshot bypasses the per-CG worker FIFO. It only bumps
+		// per-source mutexes and is a no-op when overlay!=nil, so
+		// running concurrently with the CG's advance/hydrate is safe.
+		// Routing it through the FIFO meant queueing behind multi-second
+		// hydrates, and the audit's 30s/120s RPC budget couldn't absorb
+		// that under sustained multi-CG load.
 		cgID := extractClientGroupID(req)
-		if cgID != "" {
+		if cgID != "" && req.Method != "refreshSnapshot" {
 			group := server.getGroup(cgID)
 			respCh := make(chan RPCResponse, 1)
 			// Streaming methods get a streamWriter; non-streaming methods
