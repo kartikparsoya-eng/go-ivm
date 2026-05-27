@@ -96,19 +96,22 @@ func Open(path string, opts OpenOptions) (*sql.DB, error) {
 	return db, nil
 }
 
-// assertWAL fails-closed if the database is not in WAL mode. WAL is set by
-// the TS replicator (writer); this side just verifies. Doing the check
-// here means a misconfigured replica is caught at startup, not in the
-// middle of a query.
+// assertWAL fails-closed if the database is not in a multi-reader-capable
+// journal mode. Accepts plain "wal" (upstream SQLite) and "wal2"
+// (rocicorp's checkpoint-without-stall patch). Both give the
+// snapshot-pinning guarantees our TxCache relies on; rollback or
+// memory journals would serialize readers behind any writer and break
+// the parallelism the design doc commits to.
 func assertWAL(db *sql.DB) error {
 	var mode string
 	if err := db.QueryRow("PRAGMA journal_mode").Scan(&mode); err != nil {
 		return fmt.Errorf("tablesource.Open: read journal_mode: %w", err)
 	}
-	if mode != "wal" {
+	if mode != "wal" && mode != "wal2" {
 		return fmt.Errorf(
-			"tablesource.Open: database is in journal_mode=%q, want wal "+
-				"(WAL is required for multi-reader concurrency)", mode)
+			"tablesource.Open: database is in journal_mode=%q, "+
+				"want wal or wal2 (required for multi-reader concurrency)",
+			mode)
 	}
 	return nil
 }
