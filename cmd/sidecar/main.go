@@ -1539,15 +1539,42 @@ func main() {
 				"[GO-IVM] GO_IVM_SOURCE_MODE=table but GO_IVM_REPLICA_DB_PATH is unset — refusing to start")
 			os.Exit(1)
 		}
-		db, err := tablesource.Open(path, tablesource.OpenOptions{})
-		if err != nil {
+		// Retry the open: in a shared container, our entrypoint spawns
+		// us before the TS replicator finishes initializing the replica
+		// file. The first few Open attempts will fail with
+		// "unable to open database file" or "journal_mode not wal" until
+		// the replicator has written the WAL header. Up to ~60s budget
+		// with progressive backoff so cold-restarts don't false-fail.
+		const replicaOpenTimeout = 60 * time.Second
+		deadline := time.Now().Add(replicaOpenTimeout)
+		backoff := 500 * time.Millisecond
+		var (
+			db      *sql.DB
+			openErr error
+		)
+		for time.Now().Before(deadline) {
+			db, openErr = tablesource.Open(path, tablesource.OpenOptions{})
+			if openErr == nil {
+				break
+			}
 			fmt.Fprintf(os.Stderr,
-				"[GO-IVM] failed to open replica %q: %v\n", path, err)
+				"[GO-IVM] replica not ready yet (%v) — retrying in %v\n",
+				openErr, backoff)
+			time.Sleep(backoff)
+			if backoff < 5*time.Second {
+				backoff *= 2
+			}
+		}
+		if openErr != nil {
+			fmt.Fprintf(os.Stderr,
+				"[GO-IVM] giving up on replica %q after %v: %v\n",
+				path, replicaOpenTimeout, openErr)
 			os.Exit(1)
 		}
 		replicaDB = db
 		defer replicaDB.Close()
-		fmt.Fprintf(os.Stderr, "[GO-IVM] opened replica %s (WAL mode, query_only)\n", path)
+		fmt.Fprintf(os.Stderr,
+			"[GO-IVM] opened replica %s (WAL mode, query_only)\n", path)
 	}
 	fmt.Printf("Go IVM sidecar listening on %s (multi-engine, source=%s)\n",
 		socketPath, sourceMode)
