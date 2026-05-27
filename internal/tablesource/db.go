@@ -10,13 +10,20 @@ package tablesource
 // to write to the -shm and -wal sidecar files; mode=ro forbids that and
 // causes "attempt to write a readonly database" on connect. query_only=ON
 // gives equivalent safety at the SQL layer without breaking WAL.
+//
+// Driver: mattn/go-sqlite3 (CGO). With -tags libsqlite3 at build time,
+// links against the system libsqlite3.so, which the deployment makes
+// rocicorp's patched build (the same library zero-cache writes the
+// replica with — required to read the wal2 journal_mode it produces).
+// Without the tag, mattn falls back to its bundled upstream SQLite,
+// which is fine for tests that produce plain-WAL files.
 
 import (
 	"database/sql"
 	"fmt"
 	"strconv"
 
-	_ "modernc.org/sqlite"
+	_ "github.com/mattn/go-sqlite3"
 )
 
 // Defaults chosen to match the design doc (parallelization is a hard
@@ -66,20 +73,16 @@ func Open(path string, opts OpenOptions) (*sql.DB, error) {
 		maxIdle = defaultMaxIdleConns
 	}
 
-	// modernc.org/sqlite honors SQLite URI form when the DSN starts with
-	// "file:". The _pragma=... params run on every new connection the
-	// pool opens, so multi-conn parallelism still sees the per-conn
-	// pragmas (vs. running PRAGMA on the pool via db.Exec, which would
-	// only land on whichever connection serviced the call).
-	//
-	// Hand-built query string — url.Values.Encode percent-encodes the
-	// parentheses in `busy_timeout(5000)`, which the SQLite URI parser
-	// rejects as a malformed pragma argument.
+	// mattn/go-sqlite3 honors SQLite URI form when DSN starts with
+	// "file:". Per-conn pragmas use direct query params (not the
+	// _pragma=KEY(VAL) form modernc used) so every new connection the
+	// pool opens applies them — multi-conn parallelism keeps the
+	// pragma guarantees on each backing connection.
 	dsn := "file:" + path +
-		"?_pragma=busy_timeout(" + strconv.Itoa(busyMs) + ")" +
-		"&_pragma=query_only(true)"
+		"?_busy_timeout=" + strconv.Itoa(busyMs) +
+		"&_query_only=true"
 
-	db, err := sql.Open("sqlite", dsn)
+	db, err := sql.Open("sqlite3", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("tablesource.Open: sql.Open: %w", err)
 	}

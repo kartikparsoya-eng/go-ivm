@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	_ "modernc.org/sqlite"
+	_ "github.com/mattn/go-sqlite3"
 )
 
 // seedReplicaLarge builds a WAL-mode database with `rows` rows so bench
@@ -16,7 +16,7 @@ import (
 func seedReplicaLarge(b *testing.B, rows int) string {
 	b.Helper()
 	path := filepath.Join(b.TempDir(), "replica.sqlite")
-	w, err := sql.Open("sqlite", path)
+	w, err := sql.Open("sqlite3", path)
 	if err != nil {
 		b.Fatalf("seed open: %v", err)
 	}

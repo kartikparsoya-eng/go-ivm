@@ -7,7 +7,7 @@ import (
 	"sync"
 	"testing"
 
-	_ "modernc.org/sqlite"
+	_ "github.com/mattn/go-sqlite3"
 )
 
 // seedReplica creates a WAL-mode SQLite file at a temp path, writes a
@@ -16,7 +16,7 @@ import (
 func seedReplica(t *testing.T) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "replica.sqlite")
-	writer, err := sql.Open("sqlite", path)
+	writer, err := sql.Open("sqlite3", path)
 	if err != nil {
 		t.Fatalf("seed open: %v", err)
 	}
@@ -53,7 +53,7 @@ func TestOpenSucceedsOnWALReplica(t *testing.T) {
 func TestOpenRejectsNonWALDatabase(t *testing.T) {
 	// Build a journal-mode database — no WAL switch.
 	path := filepath.Join(t.TempDir(), "rollback.sqlite")
-	w, err := sql.Open("sqlite", path)
+	w, err := sql.Open("sqlite3", path)
 	if err != nil {
 		t.Fatalf("seed open: %v", err)
 	}

@@ -9,7 +9,7 @@ import (
 	"github.com/kartikparsoya-eng/go-ivm/ivm"
 	"github.com/kartikparsoya-eng/go-ivm/sqlite"
 
-	_ "modernc.org/sqlite"
+	_ "github.com/mattn/go-sqlite3"
 )
 
 // seedTypedReplica builds a WAL-mode SQLite with a typed table the Source
@@ -18,7 +18,7 @@ import (
 func seedTypedReplica(t *testing.T) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "replica.sqlite")
-	w, err := sql.Open("sqlite", path)
+	w, err := sql.Open("sqlite3", path)
 	if err != nil {
 		t.Fatalf("seed open: %v", err)
 	}
@@ -368,7 +368,7 @@ func TestTxPinHidesExternalWriteUntilPushRolls(t *testing.T) {
 
 	// Separate writer connection — models the TS replicator. NOT
 	// query_only, so it can actually INSERT.
-	writer, err := sql.Open("sqlite", path)
+	writer, err := sql.Open("sqlite3", path)
 	if err != nil {
 		t.Fatalf("writer open: %v", err)
 	}
