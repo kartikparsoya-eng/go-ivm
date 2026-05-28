@@ -421,7 +421,13 @@ func (t *Take) pushEditChange(change Change) []Change {
 				"stale-bound (oldCmp>0, newCmp==0): edit row.id=%v sort=%v→%v bound.id=%v boundSort=%v size=%d",
 				change.Node.Row["id"], change.OldNode.Row[t.sortColName()], change.Node.Row[t.sortColName()],
 				takeState.Bound["id"], takeState.Bound[t.sortColName()], takeState.Size))
-			panic("Take pushEditChange: newCmp must not be 0 when oldCmp > 0 (duplicate PK)")
+			// Self-heal: engine.Advance recovers *DriftError, drops the advance,
+			// and TS re-inits the engine from current SQLite truth — bound is
+			// repopulated by the fresh hydrate. Replaces the prior crash-the-
+			// sidecar behavior that turned a recoverable state corruption into
+			// a total outage. Flight recorder above carries the leading-up
+			// event sequence for offline root-cause work.
+			panic(t.staleBoundDriftError(change, "oldCmp>0, newCmp==0"))
 		}
 		if newCmp > 0 {
 			t.debugf("pushEdit DROPPED (both outside) row=%v bound=%v", change.Node.Row["id"], takeState.Bound["id"])
@@ -464,7 +470,7 @@ func (t *Take) pushEditChange(change Change) []Change {
 			"stale-bound (oldCmp<0, newCmp==0): edit row.id=%v sort=%v→%v bound.id=%v boundSort=%v size=%d",
 			change.Node.Row["id"], change.OldNode.Row[t.sortColName()], change.Node.Row[t.sortColName()],
 			takeState.Bound["id"], takeState.Bound[t.sortColName()], takeState.Size))
-		panic("Take pushEditChange: newCmp must not be 0 when oldCmp < 0 (duplicate PK)")
+		panic(t.staleBoundDriftError(change, "oldCmp<0, newCmp==0"))
 	}
 	if newCmp < 0 {
 		return t.output.Push(change, t)
@@ -578,6 +584,31 @@ func ifNotNil(row Row, col string) interface{} {
 		return nil
 	}
 	return row[col]
+}
+
+// staleBoundDriftError constructs a *DriftError that the engine's recover
+// will treat as a recoverable signal (drop in-flight advance, re-init from
+// SQLite truth) rather than a crash-the-sidecar panic. Op="Edit-stale-bound"
+// distinguishes Take's invariant violation from the MemorySource Add/Edit/
+// Remove drift cases.
+func (t *Take) staleBoundDriftError(change Change, marker string) *DriftError {
+	schema := t.input.GetSchema()
+	pk := map[string]Value{}
+	if schema != nil && change.OldNode != nil {
+		for _, col := range schema.PrimaryKey {
+			pk[col] = change.OldNode.Row[col]
+		}
+	}
+	table := ""
+	if schema != nil {
+		table = schema.TableName
+	}
+	return &DriftError{
+		Table:    table,
+		Op:       "Edit-stale-bound (" + marker + ")",
+		PK:       pk,
+		HasCount: -1, // not meaningful for Take-level drift
+	}
 }
 
 // getStateAndConstraint — Source: take.ts line 218-245
