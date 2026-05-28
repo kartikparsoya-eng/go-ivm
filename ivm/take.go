@@ -42,6 +42,27 @@ type Take struct {
 	rowHiddenFromFetch     Row
 	output                 Output
 	DebugLabel             string // optional: set to queryID for debug tracing
+
+	// flightRecorder: ring buffer of recent Push + setTakeState events.
+	// Dumped on stale-bound panics to identify what corrupted state.
+	// Always-on, small bound (32 events) to cap memory cost.
+	flightRecorder    [takeFlightRecorderSize]takeEvent
+	flightRecorderIdx int
+}
+
+const takeFlightRecorderSize = 32
+
+// takeEvent is one entry in Take's flight recorder ring buffer.
+type takeEvent struct {
+	op       string // "push-add", "push-rem", "push-edit", "set-state"
+	rowID    interface{}
+	rowSort  interface{} // primary sort-key value (e.g., updatedAt)
+	oldRowID interface{}
+	oldSort  interface{}
+	boundID  interface{}
+	boundSort interface{}
+	size     int
+	cmpInfo  string // free-form annotation (oldCmp, newCmp values)
 }
 
 func NewTake(input Input, storage TakeStorage, limit int, partitionKey PartitionKey) *Take {
@@ -152,10 +173,23 @@ func (t *Take) initialFetch(req FetchRequest) []Node {
 func (t *Take) Push(change Change, pusher InputBase) []Change {
 	t.debugf("Push type=%d row=%v", change.Type, change.Node.Row["id"])
 	if change.Type == ChangeTypeEdit {
+		t.recordEvent(takeEvent{
+			op:       "push-edit",
+			rowID:    change.Node.Row["id"],
+			rowSort:  change.Node.Row[t.sortColName()],
+			oldRowID: change.OldNode.Row["id"],
+			oldSort:  change.OldNode.Row[t.sortColName()],
+		})
 		return t.pushEditChange(change)
 	}
 
 	row := change.Node.Row
+	switch change.Type {
+	case ChangeTypeAdd:
+		t.recordEvent(takeEvent{op: "push-add", rowID: row["id"], rowSort: row[t.sortColName()]})
+	case ChangeTypeRemove:
+		t.recordEvent(takeEvent{op: "push-rem", rowID: row["id"], rowSort: row[t.sortColName()]})
+	}
 	takeStateKey, takeState, maxBound, constraint := t.getStateAndConstraint(row)
 	if takeState == nil {
 		t.debugf("Push type=%d row=%v: takeState==nil, dropping", change.Type, row["id"])
@@ -383,6 +417,10 @@ func (t *Take) pushEditChange(change Change) []Change {
 
 	if oldCmp > 0 {
 		if newCmp == 0 {
+			t.dumpFlightRecorder(fmt.Sprintf(
+				"stale-bound (oldCmp>0, newCmp==0): edit row.id=%v sort=%v→%v bound.id=%v boundSort=%v size=%d",
+				change.Node.Row["id"], change.OldNode.Row[t.sortColName()], change.Node.Row[t.sortColName()],
+				takeState.Bound["id"], takeState.Bound[t.sortColName()], takeState.Size))
 			panic("Take pushEditChange: newCmp must not be 0 when oldCmp > 0 (duplicate PK)")
 		}
 		if newCmp > 0 {
@@ -422,6 +460,10 @@ func (t *Take) pushEditChange(change Change) []Change {
 
 	// oldCmp < 0
 	if newCmp == 0 {
+		t.dumpFlightRecorder(fmt.Sprintf(
+			"stale-bound (oldCmp<0, newCmp==0): edit row.id=%v sort=%v→%v bound.id=%v boundSort=%v size=%d",
+			change.Node.Row["id"], change.OldNode.Row[t.sortColName()], change.Node.Row[t.sortColName()],
+			takeState.Bound["id"], takeState.Bound[t.sortColName()], takeState.Size))
 		panic("Take pushEditChange: newCmp must not be 0 when oldCmp < 0 (duplicate PK)")
 	}
 	if newCmp < 0 {
@@ -476,12 +518,66 @@ func (t *Take) setTakeState(takeStateKey string, size int, bound Row, maxBound R
 			t.debugf("setState bound=%v→%v size=%d→%d", oldBoundID, boundID, oldSize, size)
 		}
 	}
+	// Flight recorder: record the new state for post-mortem on stale-bound panics.
+	t.recordEvent(takeEvent{
+		op:        "set-state",
+		boundID:   ifNotNil(bound, "id"),
+		boundSort: ifNotNil(bound, t.sortColName()),
+		size:      size,
+	})
 	t.storage.SetTakeState(takeStateKey, TakeState{Size: size, Bound: bound})
 	if bound != nil {
 		if maxBound == nil || t.GetSchema().CompareRows(bound, maxBound) > 0 {
 			t.storage.SetMaxBound(bound)
 		}
 	}
+}
+
+// recordEvent appends to the per-Take flight recorder ring buffer. Cheap (no
+// allocation) so it's safe to run unconditionally on every Push.
+func (t *Take) recordEvent(ev takeEvent) {
+	t.flightRecorder[t.flightRecorderIdx%takeFlightRecorderSize] = ev
+	t.flightRecorderIdx++
+}
+
+// dumpFlightRecorder writes the recent event history to stderr, ordered from
+// oldest to newest. Called from the stale-bound panic sites so the failure log
+// carries enough state to identify the corrupting sequence.
+func (t *Take) dumpFlightRecorder(label string) {
+	fmt.Fprintf(os.Stderr, "\n[TAKE-FLIGHT-RECORDER] panic-context: %s\n", label)
+	fmt.Fprintf(os.Stderr, "  limit=%d partitionKey=%v\n", t.limit, t.partitionKey)
+	n := takeFlightRecorderSize
+	if t.flightRecorderIdx < n {
+		n = t.flightRecorderIdx
+	}
+	start := t.flightRecorderIdx - n
+	for i := 0; i < n; i++ {
+		ev := t.flightRecorder[(start+i)%takeFlightRecorderSize]
+		fmt.Fprintf(os.Stderr,
+			"  [%2d] op=%-10s row=%v sort=%v old=%v oldSort=%v bound=%v boundSort=%v size=%d %s\n",
+			i, ev.op, ev.rowID, ev.rowSort, ev.oldRowID, ev.oldSort,
+			ev.boundID, ev.boundSort, ev.size, ev.cmpInfo)
+	}
+	fmt.Fprintf(os.Stderr, "[TAKE-FLIGHT-RECORDER] end\n\n")
+}
+
+// sortColName returns the primary sort column for this Take (first column in
+// the schema's Sort). Used by the flight recorder to capture sort-key values
+// alongside row IDs. Falls back to empty string if Sort is missing.
+func (t *Take) sortColName() string {
+	if schema := t.input.GetSchema(); schema != nil && len(schema.Sort) > 0 {
+		return schema.Sort[0][0]
+	}
+	return ""
+}
+
+// ifNotNil returns row[col] if row != nil, else nil. Helper for the flight
+// recorder so it doesn't NPE on nil-bound transitions.
+func ifNotNil(row Row, col string) interface{} {
+	if row == nil {
+		return nil
+	}
+	return row[col]
 }
 
 // getStateAndConstraint — Source: take.ts line 218-245
