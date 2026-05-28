@@ -8,6 +8,8 @@ package engine
 import (
 	"errors"
 	"fmt"
+	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -16,6 +18,22 @@ import (
 	"github.com/kartikparsoya-eng/go-ivm/ivm"
 	"github.com/kartikparsoya-eng/go-ivm/sqlite"
 )
+
+// envChunkSize reads name from env and returns its int value, or def if
+// unset/unparseable/non-positive. Used to make hydrateChunkSize and
+// advanceChunkSize tunable at deploy time without a code change (e.g., to
+// 100 to exercise multi-frame streaming on a small sandbox dataset).
+func envChunkSize(name string, def int) int {
+	v := os.Getenv(name)
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		return def
+	}
+	return n
+}
 
 // ErrEngineClosed is returned by Engine methods invoked after Close().
 // Streaming methods (AddQueriesStream, AdvanceStream) check this so a
@@ -566,7 +584,7 @@ type QueryResult struct {
 //
 // Declared as var (not const) so tests can shrink it to exercise chunk
 // boundaries without allocating 10k-row payloads per case.
-var hydrateChunkSize = 10000
+var hydrateChunkSize = envChunkSize("GO_IVM_HYDRATE_CHUNK_SIZE", 10000)
 
 // RemoveQuery destroys a pipeline.
 func (e *Engine) RemoveQuery(queryID string) {
@@ -681,7 +699,7 @@ type AdvanceStreamPartial struct {
 // AdvanceStream. Matches hydrateChunkSize and the TS view-syncer's
 // CURSOR_PAGE_SIZE so chunks align with the downstream poke-batching
 // boundary. Var (not const) for test override.
-var advanceChunkSize = 10000
+var advanceChunkSize = envChunkSize("GO_IVM_ADVANCE_CHUNK_SIZE", 10000)
 
 // AdvanceStream is the streaming variant of Advance: same source-push +
 // streamer-drain loop, but flushes a partial frame every advanceChunkSize
