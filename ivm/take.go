@@ -516,6 +516,20 @@ func GetTakeStateKey(partitionKey PartitionKey, rowOrConstraint Row) string {
 }
 
 // ConstraintMatchesPartitionKey — Source: take.ts line 727-743
+//
+// Note on duplicate-column compound correlations: a correlation like
+// parentField:["id","id"] + childField:["channelId","channelId"] (the
+// "compositeKey" alias Zero emits for composite-key tables) reaches Take
+// with partitionKey=["channelId","channelId"] — duplicated. The matching
+// constraint comes from BuildJoinConstraint, which writes through a
+// map[string]Value so it deduplicates to {"channelId": v}. A raw length
+// compare (len(partitionKey)=2 vs len(constraint)=1) used to return false
+// here, causing Take.Fetch to skip its takeState path and fall through to
+// the maxBound branch which returns nil on first hydrate — producing 0
+// child rows in the Join, EXISTS false on every parent, and the channels
+// MISMATCH observed in the 2026-05-27 shadow-tablesrc soak. The fix is to
+// compare against the DISTINCT column set, matching what BuildJoinConstraint
+// produces.
 func ConstraintMatchesPartitionKey(constraint *Constraint, partitionKey PartitionKey) bool {
 	if constraint == nil && len(partitionKey) == 0 {
 		return true
@@ -523,10 +537,14 @@ func ConstraintMatchesPartitionKey(constraint *Constraint, partitionKey Partitio
 	if constraint == nil || len(partitionKey) == 0 {
 		return false
 	}
-	if len(partitionKey) != len(*constraint) {
+	distinct := make(map[string]struct{}, len(partitionKey))
+	for _, key := range partitionKey {
+		distinct[key] = struct{}{}
+	}
+	if len(distinct) != len(*constraint) {
 		return false
 	}
-	for _, key := range partitionKey {
+	for key := range distinct {
 		if _, ok := (*constraint)[key]; !ok {
 			return false
 		}
