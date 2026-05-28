@@ -298,27 +298,14 @@ func TestTableSourceExistsSingleKey_HydratesMatchingChannel(t *testing.T) {
 // participant at hydrate time. Without the take.go fix the advance would
 // drop the EXISTS-now-true delta.
 func TestTableSourceExistsCompoundKey_AdvanceEmitsNewlyMatchingChannel(t *testing.T) {
-	// Known follow-up: this test exposes a SEPARATE bug from the hydrate
-	// one fixed in take.go. The mechanics:
-	//   * The local Go test toolchain doesn't link sqlite3_snapshot_*
-	//     (no libsqlite3 build tag), so tablesource.CaptureSnapshot
-	//     returns an error → Source.snapshotDisabled latches true →
-	//     fetchForConn falls through to direct pool reads.
-	//   * During Source.Push, the overlay is set BEFORE fanout and the
-	//     snapshot rotation is deferred. fetchForConn inside the fanout
-	//     reads via the pool (current SQLite state already has the
-	//     inserted row) AND applies the overlay → the new row is
-	//     counted twice in Take.Fetch.
-	//   * fetchSize returns 2, Exists size==1 transition path is missed,
-	//     no Add(parent) is emitted on the EXISTS-now-true event.
-	// In production (Dockerfile build with -DSQLITE_ENABLE_SNAPSHOT),
-	// snapshot pinning works so fetches inside the fanout see PRE-commit
-	// state; the overlay is the only source of the new row → no double-
-	// count → Exists transitions correctly. Worth porting a regression
-	// test that exercises this with the libsqlite3 tag (CI build), but
-	// the failure mode is build-config-specific, not a correctness bug
-	// in the production path.
-	t.Skip("known follow-up: overlay double-count when snapshotDisabled (no libsqlite3 build); production path uses snapshot_open and is correct")
+	// Regression test for the snapshotDisabled overlay double-count bug
+	// (source.go: readViaSnapshot gate added 2026-05-28). Without that
+	// fix this test would fail because the local test build doesn't link
+	// sqlite3_snapshot_* → snapshotDisabled latches → pool reads return
+	// post-commit state → applying overlay double-counted the new row →
+	// fetchSize returned 2 → Exists missed size==1 transition → no
+	// Add(parent) emitted. Production path uses snapshot_open and gets
+	// the same correctness via the snapshot pinning route.
 
 	// Seed only the channel — no participant yet. Hydrate should produce
 	// 0 changes (EXISTS is false because no participant).

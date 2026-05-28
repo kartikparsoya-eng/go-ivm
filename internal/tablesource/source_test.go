@@ -462,9 +462,17 @@ func TestRefreshSnapshotRollsTx(t *testing.T) {
 // the tx mid-Push would break overlay's pre-state assumption. We start
 // a Push, have its downstream call RefreshSnapshot, and verify the
 // snapshot stays pinned for the duration of the Push.
+//
+// Requires the snapshot pinning path to be available — the readViaSnapshot
+// gate on overlay (source.go) skips overlay when the pool-fallback is
+// used, so the in-process test must have snapshot capability for this
+// test to exercise the overlay code path at all.
 func TestRefreshSnapshotNoOpDuringPush(t *testing.T) {
 	src, db := newUserSource(t)
 	defer db.Close()
+	if !snapshotAvailable(t) {
+		t.Skip("requires libsqlite3 build with SQLITE_ENABLE_SNAPSHOT — fallback path skips overlay by design")
+	}
 
 	in := src.Connect(nil, nil, nil)
 	probe := &refreshDuringPushOutput{src: src, in: in}
@@ -501,6 +509,16 @@ func (o *refreshDuringPushOutput) Push(_ ivm.Change, _ ivm.InputBase) []ivm.Chan
 func TestOverlayVisibleDuringPush(t *testing.T) {
 	src, db := newUserSource(t)
 	defer db.Close()
+
+	// Overlay is gated on readViaSnapshot (source.go): only applied when
+	// the Fetch read from a pinned pre-Push snapshot. Without snapshot
+	// capability the pool returns post-replicator-commit state directly,
+	// so applying overlay would double-count. This test mimics the
+	// MemorySource-equivalence path that only holds for the snapshot
+	// production build.
+	if !snapshotAvailable(t) {
+		t.Skip("requires libsqlite3 build with SQLITE_ENABLE_SNAPSHOT — fallback path skips overlay by design")
+	}
 
 	in := src.Connect(nil, nil, nil)
 	probe := &overlayProbingOutput{in: in}

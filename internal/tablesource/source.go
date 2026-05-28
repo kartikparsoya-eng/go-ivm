@@ -453,6 +453,17 @@ func (s *Source) fetchForConn(req ivm.FetchRequest, conn *connection) []ivm.Node
 		queryDB queryRunner = s.db
 		txOwned *sql.Tx
 		cnOwned *sql.Conn
+		// readViaSnapshot: did this Fetch read from a pinned snapshot
+		// (pre-current-Push WAL frame) rather than via the live pool
+		// (post-replicator-commit state)? Matters for overlay handling
+		// below — the overlay represents the change being processed
+		// THIS Push, which is also already in SQLite by the time we
+		// fetch. The MemorySource-equivalence model (Push sets overlay
+		// before any state mutation) only holds if SQL returns
+		// pre-Push state, which is true ONLY when we read via a
+		// snapshot. Reading via the pool returns post-Push state, so
+		// applying overlay on top would double-count the change.
+		readViaSnapshot bool
 	)
 	if snap != nil {
 		tx, cn, err := OpenAtSnapshot(context.Background(), s.db, snap)
@@ -473,11 +484,13 @@ func (s *Source) fetchForConn(req ivm.FetchRequest, conn *connection) []ivm.Node
 				queryDB = tx
 				txOwned = tx
 				cnOwned = cn
+				readViaSnapshot = true
 			}
 		} else {
 			queryDB = tx
 			txOwned = tx
 			cnOwned = cn
+			readViaSnapshot = true
 		}
 	}
 	defer func() {
@@ -539,10 +552,24 @@ func (s *Source) fetchForConn(req ivm.FetchRequest, conn *connection) []ivm.Node
 	// Output.Push, so we splice it in. Overlay rows are also subjected
 	// to the connection's filter predicate — they're indistinguishable
 	// from SQL-sourced rows downstream.
+	//
+	// IMPORTANT: only apply overlay when we read via a pinned snapshot
+	// (pre-Push WAL frame). When the fallback pool read returns
+	// post-replicator-commit state (snap was nil, e.g., first Push or
+	// snapshotDisabled latched), SQLite already has the row from the
+	// current Push and applying overlay would double-count it. Concretely:
+	// a child-side Fetch inside an EXISTS join would see fetchSize=2
+	// instead of 1 on an EXISTS-false→true transition, the Exists
+	// operator would miss the size==1 branch and never emit Add(parent).
+	// Discovered while writing the advance-side compound-key gap test on
+	// 2026-05-28; the production path uses snapshot_open so this branch
+	// is normally hit and the bug is invisible — but any deploy that
+	// falls back (snapshot capture failure, no libsqlite3 build) would
+	// silently lose IVM updates.
 	s.mu.Lock()
 	overlay := s.overlay
 	s.mu.Unlock()
-	if overlay != nil && conn.lastPushedEpoch < overlay.Epoch {
+	if overlay != nil && conn.lastPushedEpoch < overlay.Epoch && readViaSnapshot {
 		out = applyOverlay(out, overlay.Change, conn.compareRows, req.Constraint, s.primaryKey)
 		if conn.filterPredicate != nil {
 			filtered := out[:0]
