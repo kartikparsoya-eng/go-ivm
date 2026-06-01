@@ -1643,10 +1643,18 @@ func main() {
 	// retry. By that time the replicator is definitely done.
 	var replicaPath string
 	if sourceMode == tablesource.ModeTable {
+		// Prefer the dedicated override so callers can point Go at a
+		// different replica than TS for testing. In normal deploys both
+		// processes share the same SQLite file, so fall back to the TS
+		// replica path — saves operators from setting the same value twice
+		// and from the silent-misconfigure trap when one is forgotten.
 		replicaPath = os.Getenv("GO_IVM_REPLICA_DB_PATH")
 		if replicaPath == "" {
+			replicaPath = os.Getenv("ZERO_REPLICA_FILE")
+		}
+		if replicaPath == "" {
 			fmt.Fprintln(os.Stderr,
-				"[GO-IVM] GO_IVM_SOURCE_MODE=table but GO_IVM_REPLICA_DB_PATH is unset — refusing to start")
+				"[GO-IVM] GO_IVM_SOURCE_MODE=table but neither GO_IVM_REPLICA_DB_PATH nor ZERO_REPLICA_FILE is set — refusing to start")
 			os.Exit(1)
 		}
 		fmt.Fprintf(os.Stderr,
