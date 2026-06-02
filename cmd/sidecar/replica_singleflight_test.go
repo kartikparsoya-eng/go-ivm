@@ -110,7 +110,11 @@ func TestGetReplicaDB_ConcurrentCallersShareProbe(t *testing.T) {
 		t.Errorf("expected concurrent callers to share probe (finish within ~probe-broadcast-time); "+
 			"gap=%v (would be ~%v×N if not shared)", gap, 60*time.Second)
 	}
-	_ = probeRegistrations // (unused — kept for future tightening)
+	// probeRegistrations is reserved for a future tightening (assert that
+	// the counter never exceeds 1). For now timing is the load-bearing pin.
+	// Read via .Load() — assigning to _ would trip vet's copylocks check
+	// (atomic.Int32 contains noCopy).
+	_ = probeRegistrations.Load()
 }
 
 // TestGetReplicaDB_NextCallerAfterFailureCanProbe confirms that after a
