@@ -173,26 +173,14 @@ func buildPipelineInternal(ast AST, delegate Delegate, p *Pipeline, partitionKey
 		end = join
 	}
 
-	// Step 4: Apply WHERE filter + Exists operators
-	// The filter chain requires FilterStart → filters → FilterEnd to bridge Input→FilterInput→Input
-	// Note: Only build the filter operator chain when there are EXISTS joins (CSQ conditions).
-	// When there are no CSQs, the source fully applies simple filters via FilterPredicate,
-	// and building a redundant Filter operator causes Take to malfunction.
-	// This matches TS behavior: fullyAppliedFilters=true skips applyWhere.
+	// Step 4: Apply WHERE filter, Exists operators, and FlippedJoin for any
+	// flipped EXISTS conditions. Only invoked when there's at least one CSQ
+	// (existsJoins covers both flipped and non-flipped). When there are no
+	// CSQs the source fully applies simple filters via FilterPredicate, and
+	// building a redundant Filter operator causes Take to malfunction. This
+	// matches TS behavior: fullyAppliedFilters=true skips applyWhere.
 	if len(existsJoins) > 0 && ast.Where != nil {
-		filterStart := ivm.NewFilterStart(end)
-		p.Edges = append(p.Edges, [2]ivm.InputBase{end, filterStart})
-
-		// Walk the original WHERE tree, mirroring TS applyFilter. CSQ
-		// leaves become Exists operators against the relationship rows
-		// produced by the joins above; OR branches that contain a CSQ
-		// produce a FanOut/FanIn so each branch is evaluated against the
-		// same upstream rows and the union of passing rows is forwarded.
-		filterEnd := applyFilter(filterStart, ast.Where, p)
-
-		endOp := ivm.NewFilterEnd(filterStart, filterEnd)
-		p.Edges = append(p.Edges, [2]ivm.InputBase{filterEnd, endOp})
-		end = endOp
+		end = applyWhere(end, ast.Where, delegate, p)
 	}
 
 	// Step 5: Take (LIMIT)
@@ -480,12 +468,15 @@ func applySimpleFilter(input ivm.FilterInput, cond *Condition, p *Pipeline) ivm.
 // relationship rows that the EXISTS-join (built earlier in
 // buildPipelineInternal) attached to each parent node.
 //
-// Flipped CSQs are currently not realized by the Go builder (the
-// corresponding FlippedJoin path from TS is unimplemented); treating them
-// as passthrough preserves the pre-fix behavior — a superset of correct,
-// not a subset — until that path is ported.
+// Flipped CSQs must be routed via applyFilterWithFlips, which constructs a
+// FlippedJoin (child-side-first inner join) + UnionFanOut/UnionFanIn merge
+// for any enclosing OR. Reaching this path with cond.Flip set is a routing
+// bug.
 func applyCorrelatedSubqueryCondition(input ivm.FilterInput, cond *Condition, p *Pipeline) ivm.FilterInput {
-	if cond.Flip || cond.Related == nil {
+	if cond.Flip {
+		panic("applyCorrelatedSubqueryCondition: flipped CSQ should be routed via applyFilterWithFlips")
+	}
+	if cond.Related == nil {
 		return input
 	}
 	relName := cond.Related.Subquery.Alias
@@ -499,6 +490,135 @@ func applyCorrelatedSubqueryCondition(input ivm.FilterInput, cond *Condition, p 
 	exists := ivm.NewExists(input, relName, cond.Related.Correlation.ParentField, existsType)
 	p.Edges = append(p.Edges, [2]ivm.InputBase{input, exists})
 	return exists
+}
+
+// applyWhere is the Input→Input bridge that routes a WHERE clause through
+// either the standard filter chain or, when any flipped CSQ is present,
+// applyFilterWithFlips. Port of TS applyWhere
+// (mono/packages/zql/src/builder/builder.ts:371).
+func applyWhere(input ivm.Input, cond *Condition, delegate Delegate, p *Pipeline) ivm.Input {
+	if !conditionIncludesFlippedSubquery(cond) {
+		return wrapInFilter(input, cond, p)
+	}
+	return applyFilterWithFlips(input, cond, delegate, p)
+}
+
+// wrapInFilter applies a (non-flipped) condition through the
+// FilterStart → applyFilter → FilterEnd bridge.
+func wrapInFilter(input ivm.Input, cond *Condition, p *Pipeline) ivm.Input {
+	filterStart := ivm.NewFilterStart(input)
+	p.Edges = append(p.Edges, [2]ivm.InputBase{input, filterStart})
+	filterEnd := applyFilter(filterStart, cond, p)
+	endOp := ivm.NewFilterEnd(filterStart, filterEnd)
+	p.Edges = append(p.Edges, [2]ivm.InputBase{filterEnd, endOp})
+	return endOp
+}
+
+// applyFilterWithFlips handles WHERE clauses containing flipped CSQs.
+// AND branches partition into non-flipped (normal filter chain) and flipped
+// (recursive FlippedJoin). OR branches partition the same way but converge
+// through UnionFanOut/UnionFanIn so per-branch outputs are merged with
+// first-occurrence-wins dedup — matching TS's branch-order semantics so a
+// branch with no nested relationship beats one with the same row plus an
+// added inner relationship (the H18 case).
+//
+// Port of TS applyFilterWithFlips
+// (mono/packages/zql/src/builder/builder.ts:386).
+func applyFilterWithFlips(input ivm.Input, cond *Condition, delegate Delegate, p *Pipeline) ivm.Input {
+	switch cond.Type {
+	case "simple":
+		panic("applyFilterWithFlips: simple conditions cannot have flips")
+	case "and":
+		var withFlipped, withoutFlipped []Condition
+		for _, c := range cond.Conditions {
+			if conditionIncludesFlippedSubquery(&c) {
+				withFlipped = append(withFlipped, c)
+			} else {
+				withoutFlipped = append(withoutFlipped, c)
+			}
+		}
+		end := input
+		if len(withoutFlipped) > 0 {
+			end = wrapInFilter(end, &Condition{Type: "and", Conditions: withoutFlipped}, p)
+		}
+		if len(withFlipped) == 0 {
+			panic("applyFilterWithFlips(and): no flipped branches but routed here")
+		}
+		for i := range withFlipped {
+			end = applyFilterWithFlips(end, &withFlipped[i], delegate, p)
+		}
+		return end
+	case "or":
+		var withFlipped, withoutFlipped []Condition
+		for _, c := range cond.Conditions {
+			if conditionIncludesFlippedSubquery(&c) {
+				withFlipped = append(withFlipped, c)
+			} else {
+				withoutFlipped = append(withoutFlipped, c)
+			}
+		}
+		if len(withFlipped) == 0 {
+			panic("applyFilterWithFlips(or): no flipped branches but routed here")
+		}
+		ufo := ivm.NewUnionFanOut(input)
+		p.Edges = append(p.Edges, [2]ivm.InputBase{input, ufo})
+
+		var branches []ivm.Input
+		if len(withoutFlipped) > 0 {
+			branches = append(branches, wrapInFilter(ufo, &Condition{Type: "or", Conditions: withoutFlipped}, p))
+		}
+		for i := range withFlipped {
+			branches = append(branches, applyFilterWithFlips(ufo, &withFlipped[i], delegate, p))
+		}
+		ufi := ivm.NewUnionFanIn(ufo, branches)
+		for _, b := range branches {
+			p.Edges = append(p.Edges, [2]ivm.InputBase{b, ufi})
+		}
+		return ufi
+	case "correlatedSubquery":
+		if cond.Related == nil {
+			return input
+		}
+		csq := cond.Related
+		childAlias := csq.Subquery.Alias
+		if childAlias == "" {
+			childAlias = csq.Subquery.Table
+		}
+		childInput := buildPipelineInternal(csq.Subquery, delegate, p, csq.Correlation.ChildField)
+		flippedJoin := ivm.NewFlippedJoin(ivm.FlippedJoinArgs{
+			Parent:           input,
+			Child:            childInput,
+			ParentKey:        csq.Correlation.ParentField,
+			ChildKey:         csq.Correlation.ChildField,
+			RelationshipName: childAlias,
+			Hidden:           csq.Hidden,
+			System:           csq.System,
+		})
+		p.Edges = append(p.Edges, [2]ivm.InputBase{input, flippedJoin})
+		p.Edges = append(p.Edges, [2]ivm.InputBase{childInput, flippedJoin})
+		return flippedJoin
+	}
+	panic(fmt.Sprintf("applyFilterWithFlips: unknown condition type %q", cond.Type))
+}
+
+// conditionIncludesFlippedSubquery reports whether the condition tree
+// contains any flipped correlatedSubquery at any depth. Port of TS
+// conditionIncludesFlippedSubqueryAtAnyLevel.
+func conditionIncludesFlippedSubquery(cond *Condition) bool {
+	if cond == nil {
+		return false
+	}
+	switch cond.Type {
+	case "correlatedSubquery":
+		return cond.Flip
+	case "and", "or":
+		for i := range cond.Conditions {
+			if conditionIncludesFlippedSubquery(&cond.Conditions[i]) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // groupSubqueryConditions partitions an OR's children into branches that

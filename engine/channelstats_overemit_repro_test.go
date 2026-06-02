@@ -3,19 +3,26 @@ package engine
 // Reproduces the H18 over-emission found by the shadow-tablesrc soak on 2026-06-02:
 //
 //   Query:  channelStats(channelId=X) with WHERE
-//             EXISTS(channels WHERE id=channelId AND
+//             flipped-EXISTS(channels WHERE id=channelId AND
 //                     (visibility='PUBLIC' OR
-//                      EXISTS(channel_participants WHERE channelId=channels.id AND userId=Y)))
+//                      flipped-EXISTS(channel_participants WHERE channelId=channels.id AND userId=Y)))
 //   TS produced 2 RowChanges (channel_stats + channels)
 //   Go produced 3 RowChanges (channel_stats + channels + EXTRA channel_participants)
 //
-// The extra row is the inner-CSQ participants row that satisfies the OR branch.
-// TS suppresses it; Go emits it. The fix should make Go drop emission of rows
-// from filter-only CSQ relationships nested inside a satisfied EXISTS branch.
+// Both EXISTS clauses are flipped (whereExists(..., {flip: true}) in the
+// production query layer), which routes TS through applyFilterWithFlips:
+// the inner OR becomes UnionFanOut/UnionFanIn with branch-order-aware
+// merge-with-dedup. First-occurrence wins, so the visibility=PUBLIC branch's
+// channels node (no inner relationship) shadows the FlippedJoin branch's
+// channels node (with the channel_participants relationship attached). The
+// merged channels node has no inner relationship, so the streamer never
+// recurses into participants.
 //
-// This test reproduces the count divergence in isolation against MemorySource
-// (no SQLite / TableSource needed) so the diagnosis can iterate without
-// re-running the full soak stack.
+// Go's builder previously skipped flipped CSQs entirely (passthrough at
+// applyCorrelatedSubqueryCondition) so the inner OR didn't go through Union
+// at all and the participant row leaked to the wire. This test pins that
+// behavior; it should pass once the FlippedJoin path is wired through
+// applyFilterWithFlips.
 
 import (
 	"testing"
@@ -25,8 +32,6 @@ import (
 )
 
 func TestChannelStats_DoesNotOverEmitNestedExistsRow(t *testing.T) {
-	t.Skip("H18: reproducer for pre-existing CSQ over-emission. Skipped while " +
-		"investigation is open — un-skip and run to verify the fix once landed.")
 	const channelID = "ch-public-1"
 	const userID = "user-soak-1"
 
@@ -102,6 +107,7 @@ func TestChannelStats_DoesNotOverEmitNestedExistsRow(t *testing.T) {
 				{
 					Type: "correlatedSubquery",
 					Op:   "EXISTS",
+					Flip: true,
 					Related: &builder.CorrelatedSubquery{
 						System: "client",
 						Correlation: builder.Correlation{
@@ -123,6 +129,7 @@ func TestChannelStats_DoesNotOverEmitNestedExistsRow(t *testing.T) {
 									{
 										Type: "correlatedSubquery",
 										Op:   "EXISTS",
+										Flip: true,
 										Related: &builder.CorrelatedSubquery{
 											System: "client",
 											Correlation: builder.Correlation{

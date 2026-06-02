@@ -135,18 +135,17 @@ func streamNodes(queryID string, schema *ivm.SourceSchema, op int, node ivm.Node
 	if schema.System == "permissions" {
 		return nil
 	}
-	// H18: IsScalar skip — when a CSQ was pre-resolved by the scalar
-	// resolver as a companion subquery, the join's relationship is still
-	// built (the EXISTS check is needed) but its row emissions are
-	// suppressed at the wire so they don't double-count with the companion's
-	// own emissions. Mirrors TS's pattern where pre-resolved scalar CSQs
-	// don't add a relationship to the streamed node.
+	// IsScalar skip — when a CSQ was pre-resolved by the scalar resolver as
+	// a companion subquery, the join's relationship is still built (the
+	// EXISTS check is needed) but its row emissions are suppressed at the
+	// wire so they don't double-count with the companion's own emissions.
+	// Mirrors TS's pattern where pre-resolved scalar CSQs don't add a
+	// relationship to the streamed node.
 	if schema.IsScalar {
 		return nil
 	}
 	var result []RowChange
 
-	// Build rowKey from primary key
 	rowKey := make(map[string]interface{}, len(schema.PrimaryKey))
 	for _, pk := range schema.PrimaryKey {
 		rowKey[pk] = node.Row[pk]
@@ -163,15 +162,13 @@ func streamNodes(queryID string, schema *ivm.SourceSchema, op int, node ivm.Node
 	}
 	result = append(result, rc)
 
-	// Recursively stream child relationships
 	if node.Relationships != nil && schema.Relationships != nil {
 		for relName, childFn := range node.Relationships {
 			childSchema := schema.Relationships[relName]
 			if childSchema == nil {
 				continue
 			}
-			childNodes := childFn()
-			for _, childNode := range childNodes {
+			for _, childNode := range childFn() {
 				result = append(result, streamNodes(queryID, childSchema, op, childNode)...)
 			}
 		}
