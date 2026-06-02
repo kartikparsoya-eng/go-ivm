@@ -178,6 +178,17 @@ func numericToFloat64(rv reflect.Value) (float64, bool) {
 	return 0, false
 }
 
+// minFrameSize is the smallest legal RPC frame body. A 0-byte body would
+// mean "no payload at all" — there's no valid msgpack encoding for that.
+// 1 byte is the smallest msgpack value (fixmap0 / nil / etc.); a real
+// RPCRequest object always serializes to ~15+ bytes, but we use 1 to avoid
+// false-rejects if the protocol ever adds a minimal pong-style frame.
+// Pre-fix readFrame accepted len=0 and io.ReadFull happily returned a
+// zero-length data slice; unmarshal would then throw and tight-loop
+// against a stream of 4-byte-zero prefixes (DoS amplifier with cheap
+// upstream cost). Reject early so the connection closes deterministically.
+const minFrameSize = 1
+
 // readFrame reads one length-prefixed frame from r. Returns io.EOF on clean
 // connection close.
 func readFrame(r *bufio.Reader) ([]byte, error) {
@@ -186,6 +197,9 @@ func readFrame(r *bufio.Reader) ([]byte, error) {
 		return nil, err
 	}
 	n := binary.BigEndian.Uint32(lenBuf[:])
+	if n < minFrameSize {
+		return nil, fmt.Errorf("frame too small: %d < %d (protocol violation)", n, minFrameSize)
+	}
 	if n > maxFrameSize {
 		return nil, fmt.Errorf("frame too large: %d > %d", n, maxFrameSize)
 	}
@@ -1720,10 +1734,20 @@ func handleConnection(conn net.Conn, server *Server) {
 	// serialize. TS uses ID-based response correlation (see go-ivm-client.ts
 	// #onData), so out-of-order responses on the wire are safe.
 	//
-	// Goroutines remain bounded: outC has capacity 1024, so the read loop
-	// blocks on submit once that many requests are in flight — applying
-	// backpressure all the way back to the Node side. Total writer-side
-	// goroutines is therefore at most ~outC-cap.
+	// Goroutine bound (writerSem, cap maxWriterGoroutines): pre-fix this
+	// site claimed bounded by outC.cap=1024 — but that only bounded the
+	// reader→dispatcher queue. Each item dispatcher reads spawns a goroutine
+	// that lives until respCh fires; the reader can keep pushing new items
+	// (and dispatcher keeps spawning new goroutines) while existing ones
+	// wait on slow handlers. Under sustained adversarial load N CGs each
+	// with a slow handler, writer-goroutine count grows to N regardless of
+	// outC.cap. With the semaphore the dispatcher blocks on a full sem,
+	// which transitively blocks the reader at outC, applying real
+	// backpressure to the Node side. 4096 is generous for typical
+	// per-connection concurrency (one conn per worker; thousands of
+	// in-flight RPCs is already a hot worker).
+	const maxWriterGoroutines = 4096
+	writerSem := make(chan struct{}, maxWriterGoroutines)
 	var writeMu sync.Mutex
 	writeFrameLocked := func(resp RPCResponse) {
 		data, err := mpMarshal(resp)
@@ -1747,10 +1771,15 @@ func handleConnection(conn net.Conn, server *Server) {
 	go func() {
 		defer close(dispatchDone)
 		for p := range outC {
+			// Acquire sem before spawning. Blocks when maxWriterGoroutines
+			// are already in flight; the reader sees outC fill (cap 1024)
+			// and itself blocks on enqueue, applying TCP backpressure.
+			writerSem <- struct{}{}
 			if p.immediate != nil {
 				writerWg.Add(1)
 				go func(resp RPCResponse) {
 					defer writerWg.Done()
+					defer func() { <-writerSem }()
 					writeFrameLocked(resp)
 				}(*p.immediate)
 				continue
@@ -1758,6 +1787,7 @@ func handleConnection(conn net.Conn, server *Server) {
 			writerWg.Add(1)
 			go func(respCh chan RPCResponse) {
 				defer writerWg.Done()
+				defer func() { <-writerSem }()
 				resp := <-respCh
 				writeFrameLocked(resp)
 			}(p.respCh)

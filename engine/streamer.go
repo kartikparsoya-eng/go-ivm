@@ -27,6 +27,18 @@ type RowChange struct {
 
 // Streamer accumulates IVM changes and flattens them to RowChanges.
 // Thread-safe: Accumulate may be called concurrently from parallel pipelines.
+//
+// Ordering contract (D8):
+//   - Changes within a single Accumulate call preserve their input slice
+//     order in the Stream() output.
+//   - Order ACROSS Accumulate calls follows the order Accumulate acquired
+//     the mutex. Under sequential genPush this is deterministic (pipelines
+//     emit in registration order). Under GenPushParallel — where many
+//     pipelines push concurrently — cross-queryID order is determined by
+//     the lock-acquisition race and is therefore non-deterministic.
+//   - Callers requiring deterministic global order (e.g., wire-shadow
+//     comparators) MUST sort by a stable key (queryID, table, rowKey, type
+//     in TS's #shadowCompare).
 type Streamer struct {
 	mu          sync.Mutex
 	accumulated []accEntry
