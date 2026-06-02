@@ -283,3 +283,59 @@ Go parallel fan-out). Both sides normalize via sort on
 `(queryID, table, rowKey, type)`. As long as the SET of changes matches,
 the comparison passes regardless of per-side emission order. Verified by
 the matching counts in soak.
+
+---
+
+## Relationship to Go-primary drift audit (D14)
+
+This doc covers shadow mode (`ZERO_GO_SIDECAR_SHADOW_MODE=true`), where
+**every** advance/hydrate runs both backends in parallel and compares.
+Once a port graduates out of shadow mode into **Go-primary**
+(`ZERO_GO_SIDECAR_ENABLED=true` + `ZERO_GO_SIDECAR_SHADOW_MODE=false`),
+the per-call comparison is no longer affordable — TS doesn't even build
+user-query pipelines (only internal-query stubs), so there's nothing to
+compare against on the hot path.
+
+The replacement is the **sampled drift audit** in
+`PipelineDriver.#runDriftAudit` (see `pipeline-driver.ts:1314` for the
+entry point, REVIEW-final HIGH-CROSS-1 for the rationale). Every
+`ZERO_GO_SIDECAR_DRIFT_AUDIT_INTERVAL_MS` (default 60s), one random
+active query is hydrated on both TS and Go from the current snapshot
+and compared with the same `#shadowCompare` machinery this doc audits.
+The audit also performs a SQL-ground-truth comparison
+(`#sqlGroundTruthCompare`) so Go-vs-SQL set drift is caught directly,
+not just Go-vs-TS-audit.
+
+Shadow-mode findings apply to the audit verbatim — the comparator is
+the same — but the audit adds three guards that shadow mode doesn't
+need because shadow mode runs synchronously inside the advance:
+
+1. **Snapshotter version check** before and after the audit, to skip
+   the comparison if a fresh mutation landed mid-audit and TS/Go now
+   see different snapshots.
+2. **TableSources version check** to catch the `#goAdvance` window
+   where Snapshotter has bumped past the version the TS TableSources
+   still query against.
+3. **SidecarManager epoch check** to catch a sidecar restart
+   mid-audit, which would silently re-init Go to a newer snapshot.
+
+The triple guard is the price the audit pays for running asynchronously
+during normal Go-primary operation. Shadow mode runs synchronously and
+doesn't need them.
+
+Behavior cross-reference:
+- `ivm.drift-audit-runs` — successful comparisons (analogous to
+  shadow mode's per-call compare).
+- `ivm.drift-audit-mismatches` — diverged sets (analogous to
+  shadow-mode mismatch logs).
+- `ivm.drift-audit-skips` — bumped when one of the three guards fired;
+  no shadow-mode analog (shadow always runs).
+- `ivm.drift-audit-ticks` — timer fires (the audit-machinery-alive
+  signal); no shadow-mode analog.
+- `ivm.drift-audit-freezes` — Go has fewer registered pipelines than
+  TS (C2 defense-in-depth); detects state-loss bugs that shadow mode
+  wouldn't see because TS-side stubs don't carry user pipelines.
+
+If you're auditing the drift-audit code path, treat this entire doc as
+the comparator-correctness reference and add the three-guard analysis
+on top.

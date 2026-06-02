@@ -54,10 +54,41 @@ from `pipeline-driver.ts`).
 ### 3. Replicator coordination MUST stay one-way
 
 TS replicator writes; Go reads. Never the other way around. The sidecar
-opens SQLite read-only (`mode=ro`) so we cannot accidentally write.
+opens SQLite with **`query_only=ON`** (NOT `mode=ro`, despite an earlier
+draft of this doc). WAL mode requires the reader process to write the
+`-shm` / `-wal` sidecar files; `mode=ro` forbids that and would cause
+"attempt to write a readonly database" on every connect.
+`query_only=ON` gives equivalent SQL-layer safety against accidental
+writes without breaking WAL. See `internal/tablesource/db.go` for the
+DSN. **(D15 doc fix.)**
+
 Replicator restart → sidecar's open read-tx becomes stale at next epoch
 bump → sidecar releases + re-`BEGIN`s. No two-phase commit, no leader
 election.
+
+#### Concurrency hazard: replicaMu serialization (D16)
+
+Pre-singleflight (C13), the per-replica connection pool was guarded by
+a single `replicaMu sync.Mutex` held across the **entire 60-second
+retry loop** in `cmd/sidecar/main.go`. Under cold start with N
+concurrent first-init callers, this serialized every CG behind the
+first probe; each failed open's deadline expiration forced the next
+waiter to redo a fresh 60s loop from scratch — so a chronic
+replica-unreachable condition multiplied init latency by N.
+
+Current design (C13 fix): `replicaMu` is held only for tiny critical
+sections — check cache, register probe, store result. The probe itself
+runs OUTSIDE the lock, with a `replicaProbe chan struct{}` rendezvous
+so concurrent first-init callers join the in-flight probe instead of
+queueing. Failed probes leave `replicaErr` populated under the lock so
+subsequent waiters fail fast against the cached error; the next caller
+after a probe failure can register a fresh probe (the `replicaProbe`
+channel being non-nil is the in-flight indicator, not the failure
+state).
+
+Callers MUST NOT hold `replicaMu` across any slow operation. The lock
+is contended by every `init` request; any per-CG work behind it
+quadratically slows multi-CG cold start.
 
 ### 4. Build complexity MUST stay manageable
 
