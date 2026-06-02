@@ -1,11 +1,26 @@
-# H18 follow-up: channelStats over-emission with no flip
+# H18 follow-up: channelStats over-emission — RESOLVED
 
 ## Status
 
-Open. Distinct from the FlippedJoin port shipped in commit
-`fix(builder): wire flipped CSQs through FlippedJoin + Union path (H18)`.
-That fix correctly handles `flip:true` ASTs but the production over-
-emission affects a query whose AST has neither `flip` nor `scalar`.
+**Resolved 2026-06-02.** Both halves of the H18 work shipped:
+
+1. **go-ivm side** — `fix(builder): wire flipped CSQs through FlippedJoin
+   + Union path (H18)`. Adds applyFilterWithFlips routing so OR-with-
+   flipped-CSQ builds UnionFanOut + [filter branches, FlippedJoin] +
+   UnionFanIn merge-with-dedup.
+
+2. **mono side** — `fix(zero-cache): plan AST before Go dispatch to
+   match TS pipeline (H18-cont)`. TS's `buildPipeline` runs the cost-
+   model planner (`planQuery`) internally; the planner annotates CSQs
+   with `flip: true` based on cost analysis. The AST sent to Go via
+   the four `hydrateMany*` dispatches was the *raw* (un-planned) AST,
+   so Go's builder never saw `flip` and the streamer over-emitted the
+   inner CSQ row. Adding `#planAstForGo` (completeOrdering + planQuery)
+   and applying it at every Go dispatch site makes the flag actually
+   reach Go, where the FlippedJoin path above does the right thing.
+
+Validated by 3 CG × 3 min shadow soak against rust-test sandbox:
+**0 mismatches** across 18 shadow batches (was 6 mismatches before).
 
 ## Observed mismatch
 
