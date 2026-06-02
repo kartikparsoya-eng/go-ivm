@@ -10,7 +10,10 @@ import (
 	"github.com/kartikparsoya-eng/go-ivm/ivm"
 )
 
-const existsLimit = 3
+const (
+	existsLimit            = 3
+	permissionsExistsLimit = 1
+)
 
 // Source is the interface for a table data source.
 // In production this is *sqlite.TableSource.
@@ -140,8 +143,26 @@ func buildPipelineInternal(ast AST, delegate Delegate, p *Pipeline, partitionKey
 			continue
 		}
 
-		// Limit subquery for exists check
+		// limit-0 EXISTS short-circuit (mirrors TS applyCorrelatedSubQuery's
+		// `subquery.limit === 0 && fromCondition` check at builder.ts:621):
+		// a `.limit(0)` subquery can never match, so the Join is dead weight.
+		// applyCorrelatedSubqueryCondition (G3 below) emits a constant-false
+		// Filter for this case, so we don't need the relationship attached
+		// either. The ast.Related loop intentionally still builds the Join
+		// because user-facing `related[]` with limit(0) should yield an empty
+		// array on the client.
+		if csq.Subquery.Limit != nil && *csq.Subquery.Limit == 0 {
+			continue
+		}
+
+		// Limit subquery for exists check. system='permissions' CSQs use a
+		// tighter limit (1) because the auth machinery only ever needs to
+		// know "is there any matching row?" — fetching 3 wastes inner
+		// pipeline work. Mirrors TS PERMISSIONS_EXISTS_LIMIT (builder.ts:224).
 		existLim := existsLimit
+		if csqCond.Related != nil && csqCond.Related.System == "permissions" {
+			existLim = permissionsExistsLimit
+		}
 		childAST := csq.Subquery
 		childAST.Limit = &existLim
 
@@ -480,6 +501,23 @@ func applyCorrelatedSubqueryCondition(input ivm.FilterInput, cond *Condition, p 
 	}
 	if cond.Related == nil {
 		return input
+	}
+	// limit-0 EXISTS / NOT EXISTS short-circuit (mirrors TS
+	// applyCorrelatedSubqueryCondition at builder.ts:659-668): a `.limit(0)`
+	// subquery can never produce a matching row, so EXISTS is provably false
+	// and NOT EXISTS provably true. Emitting a constant Filter skips the
+	// (always-empty) relationship lookup and lets downstream operators
+	// short-circuit accordingly.
+	if cond.Related.Subquery.Limit != nil && *cond.Related.Subquery.Limit == 0 {
+		var predicate func(row ivm.Row) bool
+		if cond.Op == "EXISTS" {
+			predicate = func(_ ivm.Row) bool { return false }
+		} else {
+			predicate = func(_ ivm.Row) bool { return true }
+		}
+		filter := ivm.NewFilter(input, predicate)
+		p.Edges = append(p.Edges, [2]ivm.InputBase{input, filter})
+		return filter
 	}
 	relName := cond.Related.Subquery.Alias
 	if relName == "" {
