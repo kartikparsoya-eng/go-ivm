@@ -495,11 +495,23 @@ type Server struct {
 	// Path-and-lazy-open for the read-side replica pool. In table mode
 	// we keep main()'s accept loop unblocked by deferring the actual
 	// open until the first init RPC — by that time the TS replicator
-	// has finished writing the SQLite header. getReplicaDB serializes
-	// concurrent first-init races and retries with backoff up to 60s.
+	// has finished writing the SQLite header.
+	//
+	// Singleflight design (C13): pre-fix this used a single mutex held
+	// across the entire 60-second retry loop. N concurrent first-init
+	// callers serialized behind the first; each failed open's deadline
+	// expiration forced the next waiter to redo a fresh 60s loop from
+	// scratch — so a chronic replica-unreachable condition multiplied
+	// init latency by N. Now exactly one goroutine probes at a time;
+	// others wait on a channel that closes when the probe completes,
+	// then read the result under the mutex. The mutex is only held
+	// for tiny critical sections (check cache, register probe, store
+	// result) — never across the slow retry loop.
 	replicaPath  string
 	replicaMu    sync.Mutex
-	replicaDB    *sql.DB // populated on first successful getReplicaDB
+	replicaDB    *sql.DB       // populated on successful probe (under replicaMu)
+	replicaProbe chan struct{} // non-nil while a probe is in flight; closed when done
+	replicaErr   error         // last probe's terminal error (under replicaMu)
 }
 
 func NewServer(mode tablesource.Mode, replicaPath string) *Server {
@@ -517,26 +529,59 @@ func NewServer(mode tablesource.Mode, replicaPath string) *Server {
 // sidecar's first init RPC arrives. Returns an error if the deadline
 // is hit so the calling handler can surface the fallback to TS.
 func (s *Server) getReplicaDB() (*sql.DB, error) {
+	// Phase 1: fast path — cache hit OR another goroutine is already
+	// probing, in which case we wait for it instead of starting our own.
 	s.replicaMu.Lock()
-	defer s.replicaMu.Unlock()
 	if s.replicaDB != nil {
-		return s.replicaDB, nil
+		db := s.replicaDB
+		s.replicaMu.Unlock()
+		return db, nil
 	}
 	if s.replicaPath == "" {
+		s.replicaMu.Unlock()
 		return nil, fmt.Errorf("getReplicaDB: replicaPath unset (sourceMode=%s)", s.sourceMode)
 	}
+	if s.replicaProbe != nil {
+		// A probe is already in flight. Wait for it to finish, then
+		// re-check the cache + last error.
+		probe := s.replicaProbe
+		s.replicaMu.Unlock()
+		<-probe
+		s.replicaMu.Lock()
+		if s.replicaDB != nil {
+			db := s.replicaDB
+			s.replicaMu.Unlock()
+			return db, nil
+		}
+		err := s.replicaErr
+		s.replicaMu.Unlock()
+		if err == nil {
+			err = fmt.Errorf("getReplicaDB: probe completed with no result")
+		}
+		return nil, err
+	}
+
+	// Phase 2: I'm the prober. Register intent under mu, then release
+	// before doing the slow open so concurrent callers can wait on the
+	// channel rather than blocking on the mutex during retries.
+	probe := make(chan struct{})
+	s.replicaProbe = probe
+	s.replicaErr = nil
+	s.replicaMu.Unlock()
+
 	const openTimeout = 60 * time.Second
 	deadline := time.Now().Add(openTimeout)
 	backoff := 500 * time.Millisecond
+	var db *sql.DB
 	var lastErr error
 	for time.Now().Before(deadline) {
-		db, err := tablesource.Open(s.replicaPath, tablesource.OpenOptions{})
+		var err error
+		db, err = tablesource.Open(s.replicaPath, tablesource.OpenOptions{})
 		if err == nil {
-			s.replicaDB = db
 			fmt.Fprintf(os.Stderr,
 				"[GO-IVM] opened replica %s (WAL mode, query_only)\n",
 				s.replicaPath)
-			return db, nil
+			break
 		}
 		lastErr = err
 		fmt.Fprintf(os.Stderr,
@@ -546,8 +591,29 @@ func (s *Server) getReplicaDB() (*sql.DB, error) {
 		if backoff < 5*time.Second {
 			backoff *= 2
 		}
+		db = nil
 	}
-	return nil, fmt.Errorf("getReplicaDB: gave up after %v: %w", openTimeout, lastErr)
+
+	// Phase 3: publish result under mu, signal waiters, and clear the
+	// probe registration so future callers can probe again (e.g., the
+	// next caller after a deadline-expiration retry).
+	s.replicaMu.Lock()
+	if db != nil {
+		s.replicaDB = db
+		s.replicaErr = nil
+	} else if lastErr != nil {
+		s.replicaErr = fmt.Errorf("getReplicaDB: gave up after %v: %w", openTimeout, lastErr)
+	} else {
+		s.replicaErr = fmt.Errorf("getReplicaDB: deadline expired with no attempts")
+	}
+	s.replicaProbe = nil
+	s.replicaMu.Unlock()
+	close(probe)
+
+	if db != nil {
+		return db, nil
+	}
+	return nil, s.replicaErr
 }
 
 // getOrCreateGroup returns the ClientGroup for the given ID, creating if needed.
