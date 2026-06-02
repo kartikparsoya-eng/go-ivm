@@ -429,14 +429,22 @@ type RPCError struct {
 // Different groups run fully in parallel.
 //
 // Lifecycle: created lazily in getGroup; destroyed in removeGroup/closeAll
-// which close reqC (signalling the worker goroutine to exit). Senders use
-// trySendReq which checks `closed` under mu to avoid sending on a closed
-// channel.
+// which close `done` (signalling senders to bail out and the worker
+// goroutine to exit). reqC is NEVER closed — closing it would race with
+// concurrent trySendReq calls and panic on send-after-close. The
+// `done` channel decouples shutdown signalling from the data channel,
+// eliminating both that panic risk and the previous pattern where
+// trySendReq held g.mu during a blocking channel send (which serialized
+// the connection reader across slow CGs and delayed shutdownGroup until
+// the worker finished its current handler).
 type ClientGroup struct {
-	mu     sync.Mutex
-	eng    *engine.Engine
-	reqC   chan clientGroupReq // ordered request queue
-	closed bool                // set true under mu when reqC is closed
+	mu   sync.Mutex
+	eng  *engine.Engine
+	reqC chan clientGroupReq // ordered request queue, never closed
+	done chan struct{}       // closed by shutdownGroup to signal teardown
+	// closeOnce guards close(done) so concurrent shutdownGroup / closeAll
+	// calls don't panic on double-close.
+	closeOnce sync.Once
 	// initEpoch monotonically increments on every handleInit (under mu).
 	// Mutating RPCs (loadRows / addQuery* / advance*) carry the epoch they
 	// were issued under; mismatch → rejected with rpcCodeStaleInitEpoch.
@@ -458,6 +466,13 @@ type clientGroupReq struct {
 	// The handler emits partial frames via streamW; the final frame still
 	// goes through respCh and the per-request writer goroutine.
 	streamW streamWriter
+	// group is the *ClientGroup the reader resolved when dispatching.
+	// Handlers MUST use this rather than re-resolving via s.getGroup(cgID)
+	// — concurrent removeGroup between dispatch and handler invocation
+	// would otherwise spawn an orphan empty ClientGroup (and a leaked
+	// worker goroutine) that handlers would then fail against and the
+	// 30-min reaper would only collect much later.
+	group *ClientGroup
 }
 
 // streamWriter writes a partial frame carrying part of a streaming RPC
@@ -537,12 +552,24 @@ func (s *Server) getReplicaDB() (*sql.DB, error) {
 
 // getOrCreateGroup returns the ClientGroup for the given ID, creating if needed.
 // Each group has a dedicated worker goroutine that processes requests in FIFO order.
-func (s *Server) getGroup(id string) *ClientGroup {
+// getGroup returns the existing ClientGroup for id, or creates one if
+// createIfMissing is true. Non-init handlers MUST pass createIfMissing=false
+// — without that guard, a handler mid-flight whose group was concurrently
+// destroyed by removeGroup would silently spawn an orphan empty ClientGroup
+// (plus a leaked worker goroutine that lives until the 30-min reaper).
+// The orphan would then fail every subsequent RPC with "engine not
+// initialized" until the reaper finally collected it.
+//
+// Returns nil when the group is absent and createIfMissing=false.
+func (s *Server) getGroup(id string, createIfMissing bool) *ClientGroup {
 	s.mu.RLock()
 	g := s.groups[id]
 	s.mu.RUnlock()
 	if g != nil {
 		return g
+	}
+	if !createIfMissing {
+		return nil
 	}
 
 	s.mu.Lock()
@@ -553,6 +580,7 @@ func (s *Server) getGroup(id string) *ClientGroup {
 	}
 	g = &ClientGroup{
 		reqC: make(chan clientGroupReq, 64),
+		done: make(chan struct{}),
 	}
 	g.lastUsedNs.Store(time.Now().UnixNano())
 	s.groups[id] = g
@@ -611,8 +639,39 @@ func (s *Server) reapIdleGroups(cutoff time.Time) int {
 }
 
 // worker processes requests for this client group sequentially in FIFO order.
+// Exits when `done` is closed; on exit, drains any remaining buffered requests
+// in reqC and responds to each with a "group destroyed" error so respCh
+// readers don't hang.
 func (g *ClientGroup) worker(s *Server) {
-	for req := range g.reqC {
+	for {
+		var req clientGroupReq
+		select {
+		case req = <-g.reqC:
+			// fall through to handle
+		case <-g.done:
+			// Drain buffered requests with an error so respCh readers
+			// unblock. The grace deadline absorbs a small race window:
+			// a trySendReq whose select observed done-not-closed AND
+			// reqC-has-space can commit to the reqC send case AFTER we
+			// noticed done was closed. Without the grace period we'd
+			// exit on `default` and orphan that send (respCh hangs
+			// forever). 50ms is far longer than the goroutine commits
+			// involved, so any racy sender lands in time.
+			deadline := time.NewTimer(50 * time.Millisecond)
+			defer deadline.Stop()
+			for {
+				select {
+				case r := <-g.reqC:
+					r.respCh <- RPCResponse{
+						JSONRPC: "2.0",
+						Error:   &RPCError{Code: -32000, Message: "client group destroyed"},
+						ID:      r.req.ID,
+					}
+				case <-deadline.C:
+					return
+				}
+			}
+		}
 		g.lastUsedNs.Store(time.Now().UnixNano())
 		var start time.Time
 		method := req.req.Method
@@ -668,21 +727,47 @@ func (g *ClientGroup) worker(s *Server) {
 }
 
 // trySendReq enqueues req on the group's request channel. Returns false if
-// the group has been destroyed (channel closed) — caller should respond with
-// an error.
+// the group has been destroyed — caller should respond with an error.
+//
+// The select-with-done pattern replaces the previous mutex-guarded send:
+//  1. No g.mu contention. The connection reader no longer serializes
+//     across slow CGs on the same connection.
+//  2. No send-on-closed-channel risk. reqC is never closed; teardown
+//     signals via close(done) which is safe to read in parallel.
+//  3. shutdownGroup completes immediately even if a handler is mid-flight,
+//     instead of blocking until the worker finishes its current request.
+//
+// If the buffer is full AND done is not closed, this blocks waiting for
+// the worker to drain. That's intentional backpressure on a single CG;
+// the connection's outer dispatcher is free to handle other CGs since
+// it no longer holds g.mu while waiting here.
+//
+// We pre-check done with a non-blocking select so a caller that arrives
+// after shutdown is deterministically rejected. Without this, Go's select
+// would pick randomly between "send on reqC (buffer has space)" and
+// "<-g.done (closed)" — so half the time a post-shutdown send would
+// succeed and the worker's drain (with bounded grace) might still miss it.
+// The pre-check + bounded drain together guarantee no orphaned respCh.
+//
+// lastUsedNs is stamped on arrival, BEFORE the send. The previous design
+// only refreshed it on worker dequeue — so a long handler holding the
+// worker meant queued reqs didn't keep the group alive, and the reaper
+// could destroy a group with live work still pending. With this stamp
+// the reaper's double-check (under s.mu in reapIdleGroups) sees the
+// fresh timestamp and skips eviction.
 func (g *ClientGroup) trySendReq(req clientGroupReq) bool {
-	g.mu.Lock()
-	if g.closed {
-		g.mu.Unlock()
+	select {
+	case <-g.done:
+		return false
+	default:
+	}
+	g.lastUsedNs.Store(time.Now().UnixNano())
+	select {
+	case g.reqC <- req:
+		return true
+	case <-g.done:
 		return false
 	}
-	// We hold mu while sending. The worker reads from the channel, NOT under
-	// mu, so sending under mu doesn't deadlock. The buffered channel (cap 64)
-	// also means most sends don't block — but if it does block, we hold mu
-	// briefly, which is acceptable (worker doesn't need mu to drain).
-	g.reqC <- req
-	g.mu.Unlock()
-	return true
 }
 
 // removeGroup destroys a client group and its engine. Closes reqC so the
@@ -698,17 +783,24 @@ func (s *Server) removeGroup(id string) {
 	}
 }
 
-// shutdownGroup performs the per-group teardown: marks closed, closes the
-// request channel, closes the engine. Must be called with no locks held; it
-// takes g.mu briefly.
+// shutdownGroup performs the per-group teardown: signals the worker to
+// exit via close(done), then closes the engine. Idempotent via closeOnce
+// so concurrent removeGroup / closeAll don't race on the close.
+//
+// Does NOT close reqC — closing the data channel would race with concurrent
+// trySendReq calls and panic on send-after-close. The worker treats `done`
+// as the exit signal and drains any remaining buffered requests with an
+// error response before returning. New senders past this point see done
+// closed and bail out without touching reqC.
 func (s *Server) shutdownGroup(g *ClientGroup) {
+	g.closeOnce.Do(func() {
+		close(g.done)
+	})
+	// Engine cleanup needs g.mu because handlers also take it (and we may
+	// race with a handler that just dequeued before done was closed; the
+	// handler will finish and respCh-send before re-entering the worker
+	// loop, at which point the drain branch fires).
 	g.mu.Lock()
-	if g.closed {
-		g.mu.Unlock()
-		return
-	}
-	g.closed = true
-	close(g.reqC) // worker's `for req := range g.reqC` now exits
 	if g.eng != nil {
 		g.eng.Close()
 		g.eng = nil
@@ -768,6 +860,8 @@ func (s *Server) handleRequest(req RPCRequest) (resp RPCResponse) {
 		return s.handleDestroy(req)
 	case "refreshSnapshot":
 		return s.handleRefreshSnapshot(req)
+	case "pipelineCount":
+		return s.handlePipelineCount(req)
 	default:
 		return RPCResponse{
 			JSONRPC: "2.0",
@@ -809,7 +903,10 @@ func (s *Server) handleInit(req RPCRequest) RPCResponse {
 		cgID = "default"
 	}
 
-	group := s.getGroup(cgID)
+	// Init is the only handler that creates the group; non-init handlers
+	// pass createIfMissing=false so a concurrent removeGroup can't be
+	// papered over by an orphan empty-engine ClientGroup spawn.
+	group := s.getGroup(cgID, true)
 	group.mu.Lock()
 	defer group.mu.Unlock()
 
@@ -961,7 +1058,10 @@ func (s *Server) handleLoadRows(req RPCRequest) RPCResponse {
 		cgID = "default"
 	}
 
-	group := s.getGroup(cgID)
+	group := s.getGroup(cgID, false)
+	if group == nil {
+		return rpcError(req.ID, -32000, "engine not initialized (call init first)")
+	}
 	group.mu.Lock()
 	defer group.mu.Unlock()
 
@@ -1026,7 +1126,10 @@ func (s *Server) handleAddQuery(req RPCRequest) RPCResponse {
 		cgID = "default"
 	}
 
-	group := s.getGroup(cgID)
+	group := s.getGroup(cgID, false)
+	if group == nil {
+		return rpcError(req.ID, -32000, "engine not initialized (call init first)")
+	}
 	group.mu.Lock()
 	defer group.mu.Unlock()
 
@@ -1096,7 +1199,10 @@ func (s *Server) handleAddQueries(req RPCRequest) RPCResponse {
 		cgID = "default"
 	}
 
-	group := s.getGroup(cgID)
+	group := s.getGroup(cgID, false)
+	if group == nil {
+		return rpcError(req.ID, -32000, "engine not initialized (call init first)")
+	}
 	group.mu.Lock()
 	defer group.mu.Unlock()
 
@@ -1161,7 +1267,10 @@ func (s *Server) handleAddQueriesStream(req RPCRequest, streamW streamWriter) RP
 		cgID = "default"
 	}
 
-	group := s.getGroup(cgID)
+	group := s.getGroup(cgID, false)
+	if group == nil {
+		return rpcError(req.ID, -32000, "engine not initialized (call init first)")
+	}
 	group.mu.Lock()
 	defer group.mu.Unlock()
 
@@ -1220,7 +1329,10 @@ func (s *Server) handleRemoveQuery(req RPCRequest) RPCResponse {
 		cgID = "default"
 	}
 
-	group := s.getGroup(cgID)
+	group := s.getGroup(cgID, false)
+	if group == nil {
+		return rpcError(req.ID, -32000, "engine not initialized (call init first)")
+	}
 	group.mu.Lock()
 	defer group.mu.Unlock()
 
@@ -1266,7 +1378,10 @@ func (s *Server) handleAdvance(req RPCRequest) RPCResponse {
 		cgID = "default"
 	}
 
-	group := s.getGroup(cgID)
+	group := s.getGroup(cgID, false)
+	if group == nil {
+		return rpcError(req.ID, -32000, "engine not initialized (call init first)")
+	}
 	group.mu.Lock()
 	defer group.mu.Unlock()
 
@@ -1330,7 +1445,10 @@ func (s *Server) handleAdvanceStream(req RPCRequest, streamW streamWriter) RPCRe
 		cgID = "default"
 	}
 
-	group := s.getGroup(cgID)
+	group := s.getGroup(cgID, false)
+	if group == nil {
+		return rpcError(req.ID, -32000, "engine not initialized (call init first)")
+	}
 	group.mu.Lock()
 	defer group.mu.Unlock()
 
@@ -1395,6 +1513,45 @@ type refreshSnapshotParams struct {
 	InitEpoch     uint64 `json:"initEpoch"`
 }
 
+// pipelineCountParams: cgID-only health probe, no initEpoch (we want this
+// to succeed during/after recovery to detect freeze, not be rejected as
+// stale).
+type pipelineCountParams struct {
+	ClientGroupID string `json:"clientGroupID"`
+}
+
+// handlePipelineCount returns the number of queries currently registered
+// on this CG's engine. Drift audit uses it to detect the C2 freeze: TS
+// believes N queries are active, Go reports 0 → per-CG recovery dropped
+// pipeline state somewhere along the way. Returns 0 (not an error) when
+// the engine isn't initialized — the absence-of-engine is the answer,
+// and forcing the audit to handle an error response would just add noise.
+func (s *Server) handlePipelineCount(req RPCRequest) RPCResponse {
+	var p pipelineCountParams
+	if err := mpUnmarshal(req.Params, &p); err != nil {
+		return rpcError(req.ID, -32602, err.Error())
+	}
+	cgID := p.ClientGroupID
+	if cgID == "" {
+		cgID = "default"
+	}
+	group := s.getGroup(cgID, false)
+	if group == nil {
+		// pipelineCount is a health probe; an absent group is a valid
+		// answer (0 pipelines), not an error. Returning rpcError would
+		// surface as a generic Error in TS and bypass the freeze-
+		// detection path that compares numbers.
+		return RPCResponse{JSONRPC: "2.0", Result: 0, ID: req.ID}
+	}
+	group.mu.Lock()
+	defer group.mu.Unlock()
+	count := 0
+	if group.eng != nil {
+		count = group.eng.PipelineCount()
+	}
+	return RPCResponse{JSONRPC: "2.0", Result: count, ID: req.ID}
+}
+
 // handleRefreshSnapshot rolls each registered Source's pinned snapshot
 // (no-op for MemorySource). Used by the TS drift audit so its
 // comparison reads see Go's view of the current replica state, not the
@@ -1412,7 +1569,10 @@ func (s *Server) handleRefreshSnapshot(req RPCRequest) RPCResponse {
 	if cgID == "" {
 		cgID = "default"
 	}
-	group := s.getGroup(cgID)
+	group := s.getGroup(cgID, false)
+	if group == nil {
+		return rpcError(req.ID, -32000, "engine not initialized (call init first)")
+	}
 	group.mu.Lock()
 	defer group.mu.Unlock()
 	if group.eng == nil {
@@ -1553,7 +1713,16 @@ func handleConnection(conn net.Conn, server *Server) {
 		// that under sustained multi-CG load.
 		cgID := extractClientGroupID(req)
 		if cgID != "" && req.Method != "refreshSnapshot" {
-			group := server.getGroup(cgID)
+			// Only init can create a new group. Non-init RPCs for an absent
+			// group are rejected at dispatch time so the reader never spawns
+			// an orphan empty ClientGroup whose only purpose is to fail
+			// every subsequent handler and wait for the 30-min reaper.
+			createIfMissing := req.Method == "init"
+			group := server.getGroup(cgID, createIfMissing)
+			if group == nil {
+				enqueueImmediate(rpcError(req.ID, -32000, "engine not initialized (call init first)"))
+				continue
+			}
 			respCh := make(chan RPCResponse, 1)
 			// Streaming methods get a streamWriter; non-streaming methods
 			// don't (streamW field stays nil).
@@ -1561,7 +1730,7 @@ func handleConnection(conn net.Conn, server *Server) {
 			if req.Method == "addQueriesStream" || req.Method == "advanceStream" {
 				sw = streamW
 			}
-			if !group.trySendReq(clientGroupReq{req: req, respCh: respCh, streamW: sw}) {
+			if !group.trySendReq(clientGroupReq{req: req, respCh: respCh, streamW: sw, group: group}) {
 				enqueueImmediate(rpcError(req.ID, -32000, "client group destroyed"))
 			} else {
 				outC <- pendingResp{respCh: respCh}

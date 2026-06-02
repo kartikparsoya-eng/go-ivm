@@ -193,6 +193,19 @@ func (e *Engine) SetTableUniqueKeys(tableName string, uniqueKeys [][]string) {
 	e.tableUniqueKeys[tableName] = uniqueKeys
 }
 
+// PipelineCount returns the number of registered queries (pipelines) on
+// this engine. Used by the TS drift audit as a cross-validation signal:
+// if TS sees N registered queries but Go reports 0, the per-CG recovery
+// machinery has silently dropped Go's pipeline state (the C2 freeze
+// condition) — every advance will return empty changes and the client
+// view is permanently divergent until reconnect. The audit logs an
+// error + triggers resetEngine when this happens.
+func (e *Engine) PipelineCount() int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return len(e.pipelines)
+}
+
 // TableUniqueKeys returns a snapshot of the registered unique keys keyed by
 // table name. Returned map is a fresh copy — safe for the caller to retain.
 func (e *Engine) TableUniqueKeys() map[string][][]string {

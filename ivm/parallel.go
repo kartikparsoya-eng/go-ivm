@@ -74,25 +74,75 @@ func (ms *MemorySource) GenPushParallel(change SourceChange) []Change {
 		return FilterPush(outputChange, conn.Output, conn.Input, conn.FilterPredicate)
 	}
 
-	// Fan-out to goroutines. wg.Wait happens-before the read of `ordered`,
-	// so direct-slot writes from each goroutine are safe without a channel.
+	// Fan-out to goroutines. wg.Wait happens-before the read of `ordered`
+	// and `panics`, so direct-slot writes from each goroutine are safe
+	// without a channel.
+	//
+	// Per-goroutine recover is load-bearing: a panic on a spawned goroutine
+	// terminates the entire Go runtime (panic-on-goroutine is fatal — no
+	// outer caller's recover can catch it). Without this, a Take stale-bound
+	// *DriftError panic — which engine.Advance's outer recover is designed
+	// to catch and translate into a drift result — would crash the shared
+	// sidecar process instead, taking down every CG. See e9d4946 (Take
+	// stale-bound → DriftError) which introduced the recoverable panic
+	// contract that this site has to honor.
+	//
+	// We split captured panics by type:
+	//   - *DriftError → routed to engine.Advance's recover (self-healable)
+	//   - everything else → re-raised so programmer-bug signals still abort
+	//
+	// Priority on re-raise: non-Drift > Drift. If any connection saw a real
+	// programmer bug it must surface, even if other connections concurrently
+	// raised drift on the same change.
 	ordered := make([][]Change, len(activeConns))
+	panics := make([]goroutinePanic, len(activeConns))
 	var wg sync.WaitGroup
 	for i, conn := range activeConns {
 		wg.Add(1)
 		go func(idx int, c *Connection) {
 			defer wg.Done()
+			defer func() {
+				if r := recover(); r != nil {
+					if d, ok := r.(*DriftError); ok {
+						panics[idx].drift = d
+					} else {
+						panics[idx].other = r
+					}
+				}
+			}()
 			outputChange := ms.sourceChangeToChange(change)
 			ordered[idx] = FilterPush(outputChange, c.Output, c.Input, c.FilterPredicate)
 		}(i, conn)
 	}
 	wg.Wait()
 
+	// Re-raise on the caller's goroutine so engine.Advance's recover (or the
+	// process-abort path for programmer bugs) sees the panic in the right
+	// scope. defer ms.overlay.Store(nil) above still runs.
+	for _, p := range panics {
+		if p.other != nil {
+			panic(p.other)
+		}
+	}
+	for _, p := range panics {
+		if p.drift != nil {
+			panic(p.drift)
+		}
+	}
+
 	var allResults []Change
 	for _, changes := range ordered {
 		allResults = append(allResults, changes...)
 	}
 	return allResults
+}
+
+// goroutinePanic stores a recovered panic from a fan-out goroutine so the
+// caller can re-raise it in its own scope after wg.Wait. drift and other
+// are mutually exclusive per goroutine.
+type goroutinePanic struct {
+	drift *DriftError
+	other any
 }
 
 // SetParallel enables or disables parallel push on this source.
