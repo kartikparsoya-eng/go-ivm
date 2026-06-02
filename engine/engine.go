@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/kartikparsoya-eng/go-ivm/builder"
@@ -123,10 +124,24 @@ type companionEntry struct {
 }
 
 // Engine is the IVM engine that manages sources, pipelines, and the advance loop.
+//
+// sources concurrency: held as atomic.Pointer to a map snapshot (copy-on-write).
+// Mutators (RegisterSource / Close) take e.mu, build a new map, and Store the
+// new pointer atomically. Readers — including the drift-audit's
+// RefreshAllSources path which deliberately bypasses the per-CG worker FIFO —
+// Load the pointer without taking any lock. This is what makes the bypass
+// actually bypass: pre-fix, RefreshAllSources took e.mu and serialized behind
+// multi-second AddQueriesStream / Advance holders, so the audit's 30s/120s
+// budget couldn't absorb sustained multi-CG load. With COW, refresh proceeds
+// concurrently regardless of how long other handlers run.
+//
+// The map snapshot itself is treated as immutable after Store — never mutated
+// in place. Reads via sourcesView() return the live snapshot pointer; iterating
+// it under no lock is safe because no writer ever mutates it.
 type Engine struct {
 	mu        sync.Mutex
-	sources   map[string]Source         // table name → source
-	pipelines map[string]*pipelineEntry // query ID → pipeline
+	sources   atomic.Pointer[map[string]Source] // immutable snapshots; updated COW under e.mu
+	pipelines map[string]*pipelineEntry         // query ID → pipeline
 	streamer  *Streamer
 	storage   *sqlite.DatabaseStorage
 	closed    bool // set true by Close; guards against post-Close calls
@@ -169,14 +184,28 @@ func NewEngine(cfg EngineConfig) (*Engine, error) {
 		threshold = 2
 	}
 
-	return &Engine{
-		sources:           make(map[string]Source),
+	e := &Engine{
 		pipelines:         make(map[string]*pipelineEntry),
 		streamer:          NewStreamer(),
 		storage:           storage,
 		tableUniqueKeys:   make(map[string][][]string),
 		parallelThreshold: threshold,
-	}, nil
+	}
+	empty := make(map[string]Source)
+	e.sources.Store(&empty)
+	return e, nil
+}
+
+// sourcesView returns the current sources snapshot. Caller MUST NOT mutate
+// the returned map — it's the live snapshot that may be observed by other
+// goroutines. Mutators must build a fresh map and Store it (see RegisterSource).
+// Returns nil after Close.
+func (e *Engine) sourcesView() map[string]Source {
+	p := e.sources.Load()
+	if p == nil {
+		return nil
+	}
+	return *p
 }
 
 // SetTableUniqueKeys registers the unique-key column sets for a table.
@@ -239,7 +268,7 @@ func (e *Engine) Close() error {
 		}
 	}
 	e.pipelines = nil
-	e.sources = nil
+	e.sources.Store(nil)
 	e.tableUniqueKeys = nil
 	if e.storage == nil {
 		return nil
@@ -249,11 +278,22 @@ func (e *Engine) Close() error {
 	return err
 }
 
-// RegisterSource registers a Source for a given table.
+// RegisterSource registers a Source for a given table. Copy-on-write: builds a
+// fresh map and atomically stores the new pointer so concurrent lock-free
+// readers always see a complete snapshot.
 func (e *Engine) RegisterSource(source Source) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	e.sources[source.TableName()] = source
+	if e.closed {
+		return
+	}
+	cur := e.sourcesView()
+	next := make(map[string]Source, len(cur)+1)
+	for k, v := range cur {
+		next[k] = v
+	}
+	next[source.TableName()] = source
+	e.sources.Store(&next)
 }
 
 // RefreshAllSources rolls each source's pinned snapshot (if any) to the
@@ -264,9 +304,12 @@ func (e *Engine) RegisterSource(source Source) {
 // Push (which would show transient set differences during sustained
 // writes).
 func (e *Engine) RefreshAllSources() {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	for _, src := range e.sources {
+	// Lock-free read of the sources snapshot — this is the load-bearing part
+	// of the refreshSnapshot FIFO-bypass. See the type Engine doc comment for
+	// the full rationale. Per-source RefreshSnapshot is independently safe
+	// to invoke concurrently with the source's Push (see source.go's
+	// "No-op while a Push is in progress" guard).
+	for _, src := range e.sourcesView() {
 		if r, ok := src.(interface{ RefreshSnapshot() }); ok {
 			r.RefreshSnapshot()
 		}
@@ -287,9 +330,7 @@ func (e *Engine) RegisterMemorySource(ms *ivm.MemorySource) {
 // not a MemorySource. Used by the sidecar's loadRows handler to append rows
 // to an existing source after init.
 func (e *Engine) GetMemorySource(tableName string) *ivm.MemorySource {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	s, ok := e.sources[tableName]
+	s, ok := e.sourcesView()[tableName]
 	if !ok {
 		return nil
 	}
@@ -654,9 +695,12 @@ func (e *Engine) Advance(changes []SnapshotChange) *AdvanceResult {
 			}
 		}()
 
+		// Snapshot sources once; COW + atomic.Pointer guarantees this slice
+		// stays consistent for the duration of the advance loop.
+		sources := e.sourcesView()
 		// Group changes by table for potential cross-table parallelism (future)
 		for _, change := range changes {
-			source, ok := e.sources[change.Table]
+			source, ok := sources[change.Table]
 			if !ok {
 				continue // no pipelines read this table
 			}
@@ -807,8 +851,11 @@ func (e *Engine) AdvanceStream(
 			}
 		}()
 
+		// Snapshot sources once; COW + atomic.Pointer guarantees this slice
+		// stays consistent for the duration of the advance loop.
+		sources := e.sourcesView()
 		for _, change := range changes {
-			source, ok := e.sources[change.Table]
+			source, ok := sources[change.Table]
 			if !ok {
 				continue // no pipelines read this table
 			}
@@ -971,8 +1018,12 @@ type engineDelegate struct {
 	cgs     *sqlite.ClientGroupStorage
 }
 
+// GetSource resolves a table name to a builder.Source for use during pipeline
+// build. Reads the engine's sources snapshot lock-free — the snapshot pointer
+// is COW-updated by RegisterSource so iteration is always against a consistent
+// post-Store view (see type Engine doc comment).
 func (d *engineDelegate) GetSource(tableName string) builder.Source {
-	source, ok := d.engine.sources[tableName]
+	source, ok := d.engine.sourcesView()[tableName]
 	if !ok {
 		return nil
 	}

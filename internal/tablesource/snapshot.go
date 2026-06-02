@@ -46,6 +46,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"sync"
 	"unsafe"
 
 	sqlite3 "github.com/mattn/go-sqlite3"
@@ -56,11 +57,20 @@ import (
 // is what actually anchors the WAL frame) doesn't close out from under
 // the snapshot. Free MUST be called exactly once or the WAL will grow
 // without bound — SQLite can't checkpoint past a referenced frame.
+//
+// mu serializes OpenAtSnapshot vs Free so a concurrent rotateSnapshot
+// (which calls Free on the previous handle) can't yank the C handle out
+// from under an in-flight sqlite3_snapshot_open. Without this lock the
+// race is a use-after-free at the C boundary: OpenAtSnapshot loads
+// snap.handle into a local, Free zeroes the C handle, then
+// sqlite3_snapshot_open dereferences the dangling pointer. Mutex hold
+// times are bounded by the C API calls themselves (microseconds).
 type Snapshot struct {
-	handle  *C.sqlite3_snapshot
-	conn    *sql.Conn // originating conn — kept open to anchor the frame
-	tx      *sql.Tx   // originating read tx — committed on Free
-	freed   bool
+	mu     sync.Mutex
+	handle *C.sqlite3_snapshot
+	conn   *sql.Conn // originating conn — kept open to anchor the frame
+	tx     *sql.Tx   // originating read tx — committed on Free
+	freed  bool
 }
 
 // CaptureSnapshot opens a fresh read tx on db, captures the current WAL
@@ -119,8 +129,8 @@ func CaptureSnapshot(ctx context.Context, db *sql.DB) (*Snapshot, error) {
 // each call gets its own conn + tx (no shared state), and the snap
 // handle itself is treated as read-only by SQLite.
 func OpenAtSnapshot(ctx context.Context, db *sql.DB, snap *Snapshot) (*sql.Tx, *sql.Conn, error) {
-	if snap == nil || snap.freed {
-		return nil, nil, errors.New("OpenAtSnapshot: snapshot is nil or freed")
+	if snap == nil {
+		return nil, nil, errors.New("OpenAtSnapshot: snapshot is nil")
 	}
 	conn, err := db.Conn(ctx)
 	if err != nil {
@@ -138,6 +148,14 @@ func OpenAtSnapshot(ctx context.Context, db *sql.DB, snap *Snapshot) (*sql.Tx, *
 		}
 		schema := C.CString("main")
 		defer C.free(unsafe.Pointer(schema))
+		// Hold mu across the freed check + C call so a concurrent Free
+		// can't release the handle mid-call (use-after-free at the C
+		// boundary). The C call itself is fast.
+		snap.mu.Lock()
+		defer snap.mu.Unlock()
+		if snap.freed {
+			return errors.New("OpenAtSnapshot: snapshot is freed")
+		}
 		rc := C.sqlite3_snapshot_open(raw, schema, snap.handle)
 		if rc != 0 {
 			return fmt.Errorf("sqlite3_snapshot_open rc=%d", int(rc))
@@ -158,8 +176,19 @@ func OpenAtSnapshot(ctx context.Context, db *sql.DB, snap *Snapshot) (*sql.Tx, *
 // own read-tx holds the frame for them.
 //
 // Idempotent — second call is a no-op.
+//
+// mu serializes against OpenAtSnapshot: a Free racing with an in-flight
+// sqlite3_snapshot_open would otherwise release the C handle while
+// snapshot_open is still dereferencing it. Pre-fix the freed/handle/tx/conn
+// fields were touched without any synchronization — Go's race detector
+// flagged this under sustained concurrent rotateSnapshot + fetchForConn.
 func (s *Snapshot) Free() {
-	if s == nil || s.freed {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.freed {
 		return
 	}
 	s.freed = true

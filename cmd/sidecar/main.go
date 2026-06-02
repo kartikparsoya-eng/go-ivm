@@ -1650,15 +1650,34 @@ func (s *Server) handleRefreshSnapshot(req RPCRequest) RPCResponse {
 	if group == nil {
 		return rpcError(req.ID, -32000, "engine not initialized (call init first)")
 	}
+	// Snapshot eng + initEpoch under a brief mu hold, then release before
+	// the (potentially slow) RefreshAllSources call. Pre-fix this held
+	// group.mu for the whole RefreshAllSources duration, serializing with
+	// the per-CG worker's currently-running handler — which defeated the
+	// reader-loop's deliberate decision to route this RPC AROUND the FIFO
+	// (see the routing comment in handleConnection). Holding mu briefly
+	// keeps eng+epoch read race-free; releasing before the call lets
+	// engine.RefreshAllSources execute concurrently with whatever the
+	// worker is doing (advance/hydrate). RefreshAllSources is itself
+	// lock-free against e.mu after the atomic.Pointer COW refactor, so
+	// no contention remains at any level.
+	//
+	// Lifecycle safety: once we hold a non-nil eng pointer locally, Go's
+	// GC keeps the engine alive even if shutdownGroup races and nils
+	// group.eng concurrently. RefreshAllSources called on a closed engine
+	// is a no-op (sources.Load() returns nil after Close).
 	group.mu.Lock()
-	defer group.mu.Unlock()
-	if group.eng == nil {
+	eng := group.eng
+	if eng == nil {
+		group.mu.Unlock()
 		return rpcError(req.ID, -32000, "engine not initialized (call init first)")
 	}
-	if resp, stale := checkInitEpoch(group, req.ID, p.InitEpoch); stale {
+	resp, stale := checkInitEpoch(group, req.ID, p.InitEpoch)
+	group.mu.Unlock()
+	if stale {
 		return resp
 	}
-	group.eng.RefreshAllSources()
+	eng.RefreshAllSources()
 	return RPCResponse{JSONRPC: "2.0", Result: "ok", ID: req.ID}
 }
 
