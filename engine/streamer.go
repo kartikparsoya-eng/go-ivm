@@ -135,10 +135,15 @@ func streamNodes(queryID string, schema *ivm.SourceSchema, op int, node ivm.Node
 	if schema.System == "permissions" {
 		return nil
 	}
-	// IsScalar skip: temporarily disabled — broke the channel relationship
-	// emission on the OUTER whereExists path (it shouldn't, but empirically
-	// did, so reverting to investigate which propagation step over-marks
-	// the channel schema as scalar).
+	// H18: IsScalar skip — when a CSQ was pre-resolved by the scalar
+	// resolver as a companion subquery, the join's relationship is still
+	// built (the EXISTS check is needed) but its row emissions are
+	// suppressed at the wire so they don't double-count with the companion's
+	// own emissions. Mirrors TS's pattern where pre-resolved scalar CSQs
+	// don't add a relationship to the streamed node.
+	if schema.IsScalar {
+		return nil
+	}
 	var result []RowChange
 
 	// Build rowKey from primary key
