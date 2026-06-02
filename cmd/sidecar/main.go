@@ -953,8 +953,17 @@ type tableSchemaParams struct {
 	// PrimaryKey). Forwarded from TS-side liteTableSpec.uniqueKeys; consumed
 	// by the scalar-subquery resolver to identify subqueries returning at
 	// most one row. Empty/nil disables the resolver for this table.
-	UniqueKeys [][]string               `json:"uniqueKeys,omitempty"`
-	Rows       []map[string]interface{} `json:"rows"` // pre-loaded rows from TS
+	UniqueKeys [][]string `json:"uniqueKeys,omitempty"`
+	// Rows are typed as ivm.Row (not []map[string]interface{}) so the custom
+	// Row.DecodeMsgpack runs at decode time — performing the in-place
+	// int->float64 coercion that the SnapshotChange path already gets via
+	// engine.SnapshotChange.PrevValues being typed as ivm.Row. Without this
+	// the init/loadRows paths produce int* values that survive into
+	// downstream comparisons in MemorySource mode; the FromSQLiteType
+	// coercion below catches schema-mapped columns but the no-schema
+	// fallback (e.g. json columns) leaves the raw decoded type asymmetric
+	// vs the advance path. Audit's latent ModeMemory<->ModeTable divergence.
+	Rows []ivm.Row `json:"rows"`
 }
 
 func (s *Server) handleInit(req RPCRequest) RPCResponse {
@@ -1079,9 +1088,11 @@ func (s *Server) handleInit(req RPCRequest) RPCResponse {
 // REVIEW-ts-integration CRITICAL-2.
 
 type loadRowsParams struct {
-	ClientGroupID string                   `json:"clientGroupID"`
-	Table         string                   `json:"table"`
-	Rows          []map[string]interface{} `json:"rows"`
+	ClientGroupID string `json:"clientGroupID"`
+	Table         string `json:"table"`
+	// Rows typed as ivm.Row so Row.DecodeMsgpack runs uniformly with the
+	// SnapshotChange path; see tableSchemaParams.Rows for full rationale.
+	Rows []ivm.Row `json:"rows"`
 	// InitEpoch must match the cgID's current epoch (returned by handleInit).
 	// Stale callers (torn-down view-syncer whose loadRows raced past the
 	// init from a new instance for the same cgID) are rejected with

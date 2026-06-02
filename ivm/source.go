@@ -174,8 +174,19 @@ func (ms *MemorySource) Disconnect(si *SourceInput) {
 
 // Push applies a source change: pushes to all connections, then writes.
 // If parallel mode is enabled and there are enough connections, uses goroutine fan-out.
+//
+// The parallel-threshold check below reads len(ms.connections) without
+// connsMu. Safe today because all Push callers hold engine.mu, which
+// also gates Connect/Disconnect — so connections can't be mutated
+// concurrently. We take RLock anyway: the invariant lives in the
+// engine layer (not visible here), and one tiny RLock per Push is
+// cheaper than a future regression where someone adds a Disconnect
+// path outside engine.mu and silently races a slice-header read.
 func (ms *MemorySource) Push(change SourceChange) []Change {
-	if ms.parallel && len(ms.connections) >= ms.parallelThreshold {
+	ms.connsMu.RLock()
+	useParallel := ms.parallel && len(ms.connections) >= ms.parallelThreshold
+	ms.connsMu.RUnlock()
+	if useParallel {
 		return ms.genPushAndWriteParallel(change)
 	}
 	return ms.genPushAndWriteWithSplitEdit(change)
@@ -185,6 +196,10 @@ func (ms *MemorySource) Push(change SourceChange) []Change {
 func (ms *MemorySource) genPushAndWriteWithSplitEdit(change SourceChange) []Change {
 	shouldSplit := false
 	if change.Type == ChangeTypeEdit {
+		// connsMu guards the slice header against Connect/Disconnect
+		// torn-reads; even with the engine.mu invariant in production,
+		// defensive locking here keeps the function self-correct.
+		ms.connsMu.RLock()
 		for _, conn := range ms.connections {
 			if conn.SplitEditKeys != nil {
 				for key := range conn.SplitEditKeys {
@@ -198,6 +213,7 @@ func (ms *MemorySource) genPushAndWriteWithSplitEdit(change SourceChange) []Chan
 				break
 			}
 		}
+		ms.connsMu.RUnlock()
 	}
 
 	if change.Type == ChangeTypeEdit && shouldSplit {

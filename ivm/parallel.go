@@ -162,9 +162,16 @@ func (ms *MemorySource) PushWithMode(change SourceChange) []Change {
 }
 
 func (ms *MemorySource) genPushAndWriteParallel(change SourceChange) []Change {
-	// Handle split-edit same as sequential
+	// Handle split-edit same as sequential.
+	// connsMu guards the slice header against Connect/Disconnect
+	// torn-reads — see genPushAndWriteWithSplitEdit for the full
+	// rationale on why the engine.mu invariant isn't sufficient on its
+	// own. GenPushParallel's own iteration already takes RLock when it
+	// reaches its own activeConns snapshot; this pre-scan was missed
+	// in the original parallelism patch.
 	shouldSplit := false
 	if change.Type == ChangeTypeEdit {
+		ms.connsMu.RLock()
 		for _, conn := range ms.connections {
 			if conn.SplitEditKeys != nil {
 				for key := range conn.SplitEditKeys {
@@ -178,6 +185,7 @@ func (ms *MemorySource) genPushAndWriteParallel(change SourceChange) []Change {
 				break
 			}
 		}
+		ms.connsMu.RUnlock()
 	}
 
 	if change.Type == ChangeTypeEdit && shouldSplit {

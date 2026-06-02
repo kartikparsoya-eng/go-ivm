@@ -773,6 +773,15 @@ func (e *Engine) AdvanceStream(
 		chunkIndex++
 	}
 
+	// Non-Drift panic capture: pre-fix this re-raised inline (panic(r)
+	// in the deferred recover), skipping the terminal flush(true) below
+	// and leaving the TS-side accumulator throwing
+	// "finished without a final chunk". That cascaded to C5's protocol-
+	// violation path which treats the wire as corrupted. By capturing
+	// the panic and re-raising AFTER flush(true), TS always sees a
+	// clean terminal frame — empty changes signal "advance abandoned"
+	// rather than wire protocol corruption.
+	var nonDriftPanic any
 	func() {
 		defer func() {
 			if r := recover(); r != nil {
@@ -785,7 +794,16 @@ func (e *Engine) AdvanceStream(
 					_ = e.streamer.Stream() // drain residual
 					return
 				}
-				panic(r) // re-raise non-drift panics
+				// Capture non-Drift panic for re-raise after flush.
+				nonDriftPanic = r
+				// Drop partial output: an unrecovered panic mid-loop
+				// means Go's state may have advanced partially; sending
+				// only the partial diff to TS would leave the CVR
+				// out of sync with Go. Safer to send empty Final and
+				// let the caller's restart machinery rebuild from
+				// scratch.
+				pending = nil
+				_ = e.streamer.Stream()
 			}
 		}()
 
@@ -823,8 +841,18 @@ func (e *Engine) AdvanceStream(
 
 	// Always emit a terminal Final frame. Carries cumulative timings on
 	// success; carries Drift + empty Changes on drift recovery (TS
-	// discards the whole stream and re-inits).
+	// discards the whole stream and re-inits); carries empty Changes
+	// on non-Drift panic (caller's restart machinery rebuilds).
 	flush(true)
+
+	// Re-raise non-Drift panic AFTER flush so TS sees a clean wire.
+	// engine.Advance's caller (sidecar RPC handler) has its own
+	// recover that converts panic to an error response — the wire
+	// already carries the Final marker so TS doesn't trip the
+	// protocol-violation path.
+	if nonDriftPanic != nil {
+		panic(nonDriftPanic)
+	}
 	return nil
 }
 
