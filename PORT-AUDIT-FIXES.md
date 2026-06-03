@@ -52,7 +52,41 @@ Symptom this list is rooted in: Go's Take operator emits a different displaced r
     view-syncer re-hydrates (`memory-source.ts:531`). Symmetric for
     REMOVE/EDIT of a missing row.
   - Fix: exists-check (or catch UNIQUE) and raise `DriftError` so the engine
-    recovers cleanly + re-hydrates, matching TS.
+    recovers cleanly + re-hydrates, matching TS. ✅ DONE (commit 3c70e2d,
+    driftCheckLocked).
+
+## Session results — 2026-06-03 (cont.)
+
+- [x] **Reverse-aware overlay comparator + start filter** ✅ (commit 4e95bed)
+  - fetchForConn applied the overlay with the FORWARD comparator; TS uses
+    makeComparator(sort, req.reverse) + overlaysForStartAt. Fixed → shadow
+    soak row-pick ("at index") mismatches **27 → 0**. This was the real
+    Take-bound correctness divergence (the original symptom).
+- [x] **Eager prev-tx re-pin in OnAdvanceEnd** ✅ (commit 4e95bed)
+  - Lazy re-pin pinned the prev tx after the next batch was already
+    committed → false drift. Eager re-pin (matches resetToHead timing)
+    reduces but does not fully eliminate frame-timing drift (residual
+    replicator-race; see note below).
+- [x] **I.** Internal-query filter in Go reset re-registration ✅
+  (mono commit — pipeline-driver.ts)
+  - resetEngine re-registered internal (clients/permissions/mutations)
+    queries; Go has no Source for those → AddQueries panic "no source for
+    table ...clients" → resetEngine threw → drift recovery cascaded into
+    client-connection closures. Added the !#isInternalQueryID &&
+    !#isInternalTable filter the other dispatch sites already use. Shadow
+    soak: resetFail + no-source panics **→ 0**; drift now self-heals.
+
+### Residual: frame-timing false drift (fundamental, self-healing)
+The Go TableSource reads the shared replica file; the replicator commits a
+batch BEFORE sending its advance RPC, and can race further ahead during
+advance processing. The single prev-tx can't pin at exactly TS's
+prev.version frame, so some ADDs see their own freshly-committed row →
+DriftError. This is PRE-EXISTING (the old snapshot_get arch had it too)
+and now SELF-HEALS via resetEngine (correct end state; in shadow mode the
+single drifted advance still logs as TS=N/Go=0). Eliminating it entirely
+needs TS to communicate prev.version to Go (protocol change) or a true
+two-snapshot leapfrog pinned at RPC-arrival. Deferred — not a correctness
+bug given self-heal.
 
 ---
 
