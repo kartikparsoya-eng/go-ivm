@@ -4,6 +4,7 @@ package engine
 // for relationships) into one RowChange per affected row.
 
 import (
+	"sort"
 	"sync"
 
 	"github.com/kartikparsoya-eng/go-ivm/ivm"
@@ -163,12 +164,27 @@ func streamNodes(queryID string, schema *ivm.SourceSchema, op int, node ivm.Node
 	result = append(result, rc)
 
 	if node.Relationships != nil && schema.Relationships != nil {
-		for relName, childFn := range node.Relationships {
+		// Iterate relationships in a STABLE order. TS streams them in
+		// Object.entries insertion order (pipeline-driver.ts:3189), which is
+		// deterministic; Go's map range is randomized per iteration, so the
+		// wire order of sibling-relationship child rows varied run-to-run.
+		// Sorting by relationship name restores determinism. (Exact parity
+		// with TS's insertion order would require threading an ordered
+		// relationship list through every Join/Exists/FlippedJoin schema
+		// merge — high cost; sibling order is semantically irrelevant since
+		// the client buckets child rows per relationship, and the shadow
+		// comparator is order-tolerant across relationships.)
+		relNames := make([]string, 0, len(node.Relationships))
+		for relName := range node.Relationships {
+			relNames = append(relNames, relName)
+		}
+		sort.Strings(relNames)
+		for _, relName := range relNames {
 			childSchema := schema.Relationships[relName]
 			if childSchema == nil {
 				continue
 			}
-			for _, childNode := range childFn() {
+			for _, childNode := range node.Relationships[relName]() {
 				result = append(result, streamNodes(queryID, childSchema, op, childNode)...)
 			}
 		}
