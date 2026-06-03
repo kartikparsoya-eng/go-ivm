@@ -163,21 +163,57 @@ the real fix is in the deep-dive section at the bottom of this file
     ResetPipelinesSignal). Acceptable given scalar-value changes are rare; a dedicated
     reset-signal type + protocol field would separate the metrics if it ever matters.
 
-## Observability (won't cause runtime mismatch)
+## Go-primary readiness sweep — K–W disposition (2026-06-03)
 
-- [ ] **K.** Streamer's `minRowVersion` bump is TS-only (`pipeline-driver.ts:3147-3155` vs `streamer.go:127-178`)
-- [ ] **L.** Go-side per-table advance timings dropped (`pipeline-driver.ts:2239` discards `r.timings`)
-- [ ] **M.** hydrationTime histogram measures emit+flush wall-clock in Go-primary vs hydrate-only in TS-prod
-- [ ] **N.** Slow-query warning fires on wrong elapsed in Go-primary
-- [ ] **O.** MeasurePushOperator instrumentation absent in Go-primary
-- [ ] **P.** No advancement circuit-breaker in Go-primary
-- [ ] **Q.** Drift-audit freeze detection uses inconsistent count basis
-- [ ] **R.** REMOVE-row fallback hides Go-side wire bugs (`pipeline-driver.ts:2336`)
-- [ ] **S.** Stale `setHydrationTime()` reference (`pipeline-driver.ts:2030`)
-- [ ] **T.** Phantom TableSources from `#planAstForGo`
-- [ ] **U.** Relationship-emission order non-deterministic on Go (`streamer.go:165-175` iterates Go map)
-- [ ] **V.** MemorySource re-sorts on every Fetch (perf)
-- [ ] **W.** MemorySource applyStart vs TS scanStart — direction-aware partial cursor handling
+Full pass for Go-primary readiness. Outcome: 3 real fixes (K, L, U) + 2
+diagnostics (R, S); the rest are non-divergences, already-covered, MemorySource-
+only (not in the ModeTable Go-primary path), or telemetry that's a non-bug /
+not portable across the RPC boundary.
+
+- [x] **K.** minRowVersion bump ✅ **FIXED** — ported TS streamNodes
+  (pipeline-driver.ts:3172-3178). TS now forwards `minRowVersion` per table
+  (`#currentTablesForGo` → `TableData.minRowVersion` → init payload). Go stores it
+  (`Engine.SetMinRowVersions` from handleInit) and `bumpRowVersions` rewrites an
+  emitted non-REMOVE row's `_0_version` up to minRowVersion when below, applied at
+  every RowChange output point (Advance, AdvanceStream, AddQuery/AddQueries/
+  AddQueriesStream). Copy-on-bump (never mutates source rows); no-op when no
+  minRowVersions set (steady state). Test: `TestBumpRowVersions`. Go + TS green.
+- [x] **L.** Go advance timings ✅ **FIXED** — `#goPrimaryAdvance` now records Go's
+  `r.timings` (per-(table,op) TableTiming) into the `#advanceTime` histogram
+  instead of discarding them. (mono)
+- [x] **R.** REMOVE-row fallback ✅ **FIXED** — `#goRowChangeToRowChange` logs at
+  error level when an ADD/EDIT arrives without a row (Go wire bug) before the
+  rowKey fallback, instead of silently shipping a PK-only row. (mono)
+- [x] **S.** Stale `setHydrationTime()` ✅ **FIXED** — removed the dead
+  comment reference (no such method); documented hydrationTimeMs's real basis. (mono)
+- [x] **U.** Relationship emission order ✅ **FIXED** (committed earlier) —
+  streamNodes sorts relationship names for determinism (Go map range was randomized).
+- [?] **T.** Phantom TableSources — **already fixed.** `#addQueryDispatch` gates on
+  `whenRecovered()` (pipeline-driver.ts:952, go-compute-backend.ts:455); the comment
+  documents the phantom as a past bug now resolved. No change.
+- [?] **P.** Advancement circuit-breaker — **hang-safety already covered** by the 120s
+  per-call RPC timeout (go-ivm-client.ts:592-647). TS's `advancement-timeout` is an
+  early-abort latency heuristic (re-hydrate-is-cheaper) that doesn't run in Go-primary
+  and is marginal for the fast Go path. No change.
+- [?] **M.** hydrationTime basis — **non-bug.** Go-primary's `goResult.timingMs` is
+  Go's actual end-to-end hydrate time (what the client waits on) — the legitimate
+  measure. No change.
+- [?] **N.** Slow-hydrate warning — **debug-only + not portable.** TS warning is gated
+  on `trackRowCountsVended` and uses TS-side `debugDelegate` vended counts that don't
+  exist in Go-primary. Disproportionate to replicate. No change.
+- [?] **O.** MeasurePushOperator — **not portable.** Per-operator timing can't cross
+  the RPC boundary (operators live in the sidecar). Go reports per-(table,op), which
+  L now wires — the achievable parity. No change.
+- [?] **Q.** Drift-audit freeze count basis — **defense-in-depth; safe failure mode.**
+  Root cause (C2) already fixed; a count-basis mismatch at worst triggers a spurious
+  (safe) resetEngine. Not worth the churn. No change.
+- [?] **V.** MemorySource re-sort / **W.** MemorySource applyStart — **N/A to
+  Go-primary.** Both are MemorySource-only (ModeMemory). Go-primary runs ModeTable
+  (main.go:1065-1081) where the leaf is `tablesource.Source` and SQLite handles
+  ordering/indexing — no Go-slice re-sort, no `applyStart`. (W also re-examined as
+  not-a-correctness-divergence: Go materializes+filters the full sorted slice, so it
+  can't miss rows the way a mis-positioned btree scan could — same equivalence class
+  as item D.)
 
 ---
 
