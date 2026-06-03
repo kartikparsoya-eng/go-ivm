@@ -335,15 +335,19 @@ func FromSQLiteType(v interface{}, colType string) ivm.Value {
 		case float64:
 			return val != 0
 		case string:
-			// modernc.org/sqlite may return as "1.0", "0.0", "1", "0", "true", "false"
-			if val == "1" || val == "1.0" || val == "true" {
-				return true
-			}
-			// Try parsing as float for other numeric string representations
-			if f, err := strconv.ParseFloat(val, 64); err == nil {
-				return f != 0
-			}
-			return false
+			// MED-1 (types): TS coerces booleans with `!!v` (table-source.ts:618),
+			// i.e. pure JS truthiness of the RAW value — so ANY non-empty string is
+			// true, including "0", "0.0" and "false". The old literal-list +
+			// ParseFloat check gave the opposite answer for those ("0"→false), a
+			// silent TS/Go divergence. Match JS exactly: empty string → false,
+			// everything else → true. (Boolean columns are stored as 0/1 INTEGER in
+			// the replica so this string branch is defensive, but it must still
+			// agree with TS to keep init-vs-advance shape parity — CRIT-6.)
+			return val != ""
+		case []byte:
+			// A SQLite blob in a boolean column never happens in practice, but JS
+			// treats any Buffer as truthy; mirror "non-empty → true".
+			return len(val) != 0
 		case bool:
 			return val
 		default:

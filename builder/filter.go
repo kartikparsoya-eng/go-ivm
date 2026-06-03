@@ -126,13 +126,13 @@ func evalOp(op string, left, right ivm.Value) bool {
 	case "!=":
 		return !valuesIdentical(left, right)
 	case "<":
-		return ivm.CompareValues(left, right) < 0
+		return compareForOrder(left, right) < 0
 	case ">":
-		return ivm.CompareValues(left, right) > 0
+		return compareForOrder(left, right) > 0
 	case "<=":
-		return ivm.CompareValues(left, right) <= 0
+		return compareForOrder(left, right) <= 0
 	case ">=":
-		return ivm.CompareValues(left, right) >= 0
+		return compareForOrder(left, right) >= 0
 	case "LIKE":
 		return matchLike(fmt.Sprintf("%v", left), fmt.Sprintf("%v", right), false)
 	case "NOT LIKE":
@@ -222,6 +222,56 @@ func numericToFloat64(v ivm.Value) (float64, bool) {
 	return 0, false
 }
 
+// compareForOrder orders two values for </>/<=/>= predicates. It first applies
+// the same cross-type numeric coercion valuesIdentical uses for =/!=, then
+// falls back to ivm.CompareValues for same-type (string/bool) ordering.
+//
+// Operators MED-8: HIGH-2 taught =/!= to coerce a numeric column compared
+// against a numeric-string literal (e.g. `count > '5'`) so Go matches the TS
+// path, which evaluates filters through SQLite's implicit cast. The ordered
+// operators were left calling ivm.CompareValues directly, which PANICS on the
+// float-vs-numeric-string pair — an asymmetric divergence (=/!= returned a
+// clean bool, </> crashed). This restores symmetry.
+func compareForOrder(a, b ivm.Value) int {
+	if c, ok := numericCmpCoerced(a, b); ok {
+		return c
+	}
+	return ivm.CompareValues(a, b)
+}
+
+// numericCmpCoerced returns (cmp, true) when a numeric ordering applies after
+// the valuesIdentical-style coercion (both numeric, or one numeric + the other
+// a numeric-parseable string). Returns (0, false) when no numeric ordering
+// applies, so compareForOrder can fall back to same-type comparison.
+func numericCmpCoerced(a, b ivm.Value) (int, bool) {
+	af, aNum := numericToFloat64(a)
+	bf, bNum := numericToFloat64(b)
+	if aNum && !bNum {
+		if bs, ok := b.(string); ok {
+			if bp, err := strconv.ParseFloat(bs, 64); err == nil {
+				bf, bNum = bp, true
+			}
+		}
+	} else if bNum && !aNum {
+		if as, ok := a.(string); ok {
+			if ap, err := strconv.ParseFloat(as, 64); err == nil {
+				af, aNum = ap, true
+			}
+		}
+	}
+	if aNum && bNum {
+		switch {
+		case af < bf:
+			return -1, true
+		case af > bf:
+			return 1, true
+		default:
+			return 0, true
+		}
+	}
+	return 0, false
+}
+
 // matchLike implements SQL LIKE pattern matching (% and _ wildcards).
 // likeRegexCache memoizes compiled LIKE patterns. The pattern (RHS) is
 // constant per condition but matchLike runs per row, so compile once and reuse.
@@ -297,24 +347,32 @@ func compileLikePattern(source string, caseInsensitive bool) *regexp.Regexp {
 }
 
 // valueIn checks if left is contained in right (which should be a slice).
+//
+// Types MED-8: `x IN (a, b)` is sugar for `x = a OR x = b`, so each element
+// test must use the SAME equality as the `=` operator — valuesIdentical, which
+// applies the cross-type numeric↔numeric-string coercion the TS path gets from
+// SQLite (HIGH-2). The old code used ivm.ValuesEqual (strict, no coercion) for
+// []interface{}/[]float64 and a fragile fmt.Sprintf string compare for
+// []string, so `count IN ('5')` with count=5 returned false while `count = '5'`
+// returned true — an asymmetric divergence from TS. Routing every element
+// through valuesIdentical makes IN/NOT IN agree with =/!=.
 func valueIn(left, right ivm.Value) bool {
 	switch arr := right.(type) {
 	case []interface{}:
 		for _, v := range arr {
-			if ivm.ValuesEqual(left, v) {
+			if valuesIdentical(left, v) {
 				return true
 			}
 		}
 	case []string:
-		ls := fmt.Sprintf("%v", left)
 		for _, v := range arr {
-			if ls == v {
+			if valuesIdentical(left, v) {
 				return true
 			}
 		}
 	case []float64:
 		for _, v := range arr {
-			if ivm.ValuesEqual(left, v) {
+			if valuesIdentical(left, v) {
 				return true
 			}
 		}

@@ -239,6 +239,88 @@ func TestFilterPredicate(t *testing.T) {
 	}
 }
 
+// TestCrossTypeOrderedComparison covers operators MED-8: a numeric column
+// compared against a numeric-string literal (or vice versa) must coerce and
+// order numerically — mirroring the TS path that runs the filter through
+// SQLite's implicit cast — instead of panicking in ivm.CompareValues. Pairs
+// with the =/!= coercion HIGH-2 already shipped via valuesIdentical.
+func TestCrossTypeOrderedComparison(t *testing.T) {
+	tests := []struct {
+		name   string
+		op     string
+		left   ivm.Value // column value
+		right  ivm.Value // literal value
+		expect bool
+	}{
+		// number column vs numeric-string literal.
+		{"num > numstr true", ">", float64(10), "5", true},
+		{"num > numstr false", ">", float64(3), "5", false},
+		{"num >= numstr equal", ">=", float64(5), "5", true},
+		{"num < numstr true", "<", float64(3), "5", true},
+		{"num <= numstr equal", "<=", float64(5), "5", true},
+		// numeric-string column vs number literal (inverse direction).
+		{"numstr < num true", "<", "3", float64(5), true},
+		{"numstr > num false", ">", "3", float64(5), false},
+		// int64 (PK-shaped) vs numeric-string still coerces.
+		{"int64 > numstr", ">", int64(10), "5", true},
+		// same-type strings still order lexically (no numeric coercion).
+		{"string < string lexical", "<", "apple", "banana", true},
+		{"string > string lexical", ">", "apple", "banana", false},
+		// same-type numbers unaffected.
+		{"num < num", "<", float64(1), float64(2), true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cond := &Condition{
+				Type:  "simple",
+				Op:    tt.op,
+				Left:  &ValuePos{Type: "column", Name: "v"},
+				Right: &ValuePos{Type: "literal", Value: tt.right},
+			}
+			got := BuildPredicate(cond)(ivm.Row{"v": tt.left})
+			if got != tt.expect {
+				t.Fatalf("%s %v %v = %v, want %v", tt.op, tt.left, tt.right, got, tt.expect)
+			}
+		})
+	}
+}
+
+// TestInCoercion covers types MED-8: IN/NOT IN must coerce numeric↔
+// numeric-string per element, exactly like =/!= (valuesIdentical), so
+// `count IN ('5')` agrees with `count = '5'`.
+func TestInCoercion(t *testing.T) {
+	tests := []struct {
+		name   string
+		op     string
+		left   ivm.Value
+		list   ivm.Value
+		expect bool
+	}{
+		{"num IN numeric-string list match", "IN", float64(5), []interface{}{"5", "6"}, true},
+		{"num IN numeric-string list no match", "IN", float64(7), []interface{}{"5", "6"}, false},
+		{"int64 IN numeric-string list", "IN", int64(5), []interface{}{"4", "5"}, true},
+		{"numeric-string IN number list", "IN", "5", []float64{5, 6}, true},
+		{"NOT IN numeric-string excludes", "NOT IN", float64(5), []interface{}{"5", "6"}, false},
+		{"NOT IN numeric-string includes", "NOT IN", float64(9), []interface{}{"5", "6"}, true},
+		{"string IN string list exact", "IN", "ab", []string{"ab", "cd"}, true},
+		{"string IN string list miss", "IN", "zz", []string{"ab", "cd"}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cond := &Condition{
+				Type:  "simple",
+				Op:    tt.op,
+				Left:  &ValuePos{Type: "column", Name: "v"},
+				Right: &ValuePos{Type: "literal", Value: tt.list},
+			}
+			got := BuildPredicate(cond)(ivm.Row{"v": tt.left})
+			if got != tt.expect {
+				t.Fatalf("%s %v in %v = %v, want %v", tt.op, tt.left, tt.list, got, tt.expect)
+			}
+		})
+	}
+}
+
 func TestStripCSQConditions(t *testing.T) {
 	cond := &Condition{
 		Type: "and",
