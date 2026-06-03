@@ -316,6 +316,21 @@ func (e *Engine) RefreshAllSources() {
 	}
 }
 
+// signalAdvanceEnd notifies every registered source that the current
+// advance batch is complete. Sources that don't implement OnAdvanceEnd
+// (MemorySource — state evolves naturally via writeChange) are silently
+// skipped. TableSource uses this to rotate its snapshot to the post-batch
+// frame and clear its batch-scoped delta — without this hook every Push
+// would pull in the replicator's already-committed future-batch mutations
+// and trip Take's stale-bound trap (see tablesource/source.go OnAdvanceEnd).
+func (e *Engine) signalAdvanceEnd() {
+	for _, src := range e.sourcesView() {
+		if h, ok := src.(interface{ OnAdvanceEnd() }); ok {
+			h.OnAdvanceEnd()
+		}
+	}
+}
+
 // RegisterMemorySource registers a MemorySource directly.
 // Enables parallel fan-out if the engine's parallelThreshold > 0.
 func (e *Engine) RegisterMemorySource(ms *ivm.MemorySource) {
@@ -735,6 +750,15 @@ func (e *Engine) Advance(changes []SnapshotChange) *AdvanceResult {
 		}
 	}()
 
+	// End-of-batch hook for every registered source — rotates TableSource
+	// snapshots + clears their batch-scoped delta so the next batch
+	// reads from a frame that reflects this batch's committed mutations.
+	// Runs on BOTH the success and drift paths: on drift the engine
+	// will be re-inited from SQLite truth anyway, but until that lands
+	// we want batchDelta cleared so a follow-up Advance call between
+	// drift and re-init starts clean.
+	e.signalAdvanceEnd()
+
 	if drift != nil {
 		// Partial-emit-then-drift: prior successful pushes' output goes to
 		// the caller so clients see it (TS behavior). The drift signal
@@ -904,6 +928,12 @@ func (e *Engine) AdvanceStream(
 			}
 		}
 	}()
+
+	// End-of-batch hook — rotate TableSource snapshots + clear their
+	// batch-scoped delta. See Engine.Advance for the full rationale; same
+	// invariant applies to the streaming path. Runs OUTSIDE the
+	// recover()-guarded func so it fires on the drift path too.
+	e.signalAdvanceEnd()
 
 	// Always emit a terminal Final frame. Carries cumulative timings on
 	// success; carries Drift + empty Changes on drift recovery (TS
