@@ -1,19 +1,31 @@
 package tablesource
 
-// Source: read-only TableSource implementing engine.Source against the TS
-// replica's SQLite file.
+// Source: TableSource leaf implementing engine.Source against the TS
+// replica's SQLite file. The architecture mirrors TS's Snapshotter +
+// TableSource pair (`mono/packages/zero-cache/.../snapshotter.ts`,
+// `mono/packages/zqlite/.../table-source.ts`):
 //
-// Phase 2a (this file): construct, expose schema, accept Connect()s,
-// implement Fetch() for the simple "ORDER BY + filter, no constraint, no
-// cursor, no overlay" case. Push() panics — callers must not wire this
-// leaf into the engine until Phase 2d lands the push fanout.
+//   - Per Source: one dedicated *sql.Conn from a writable pool.
+//   - On first use: `BEGIN CONCURRENT` on that conn — the "prev snapshot".
+//     Every read in this Source goes through this conn (so it sees the
+//     pinned WAL frame plus any in-flight writes from this batch).
+//   - On Push: `writeChange` applies INSERT/UPDATE/DELETE on the prev
+//     conn within the same tx. Subsequent Fetches in the same batch
+//     observe those writes (read-your-own-writes within the tx). This
+//     is what TS's TableSource.#writeChange does (table-source.ts:416).
+//   - On OnAdvanceEnd (called by engine.signalAdvanceEnd at end of
+//     batch): ROLLBACK + new BEGIN CONCURRENT, repinning at the
+//     post-batch WAL frame. That's TS's `Snapshot.resetToHead()`
+//     (snapshotter.ts:392).
 //
-// Schema: takes (columns, primaryKey) at construction time. We considered
-// inferring from PRAGMA table_info, but FromSQLiteType needs TS-level
-// types ("number" vs "boolean" vs "json") that SQLite affinity can't
-// reliably express. The sidecar already receives this info from TS via
-// the `tables` RPC payload, so reusing that data flow keeps Phase 2 a
-// pure source-substitution rather than dragging schema discovery in too.
+// Why this matters: the previous architecture used sqlite3_snapshot_get
+// + per-Fetch sqlite3_snapshot_open to pin reads at a WAL frame, with
+// an in-memory `batchDelta` overlaying not-yet-applied changes during a
+// batch. That overlay couldn't influence SQL ordering — so a tied
+// sort-key REMOVE-then-ADD inside a batch returned rows in a different
+// order than TS, which made Take pick a different bound row. The TS
+// approach writes the change into the SQL tx, so subsequent SELECTs
+// produce the correct ordering on their own.
 
 import (
 	"context"
@@ -26,67 +38,69 @@ import (
 	"github.com/kartikparsoya-eng/go-ivm/sqlite"
 )
 
-// queryRunner is the subset of *sql.DB and *sql.Tx that fetchForConn
-// uses. Lets fetchForConn pick the right read path (pool or
-// snapshot-pinned tx) without branching the actual query call.
-type queryRunner interface {
-	Query(query string, args ...any) (*sql.Rows, error)
-}
-
 // Source is the read-only TableSource leaf. One instance per (CG, table).
 type Source struct {
-	db         *sql.DB
+	// db is the original read-only pool from `tablesource.Open`. Kept
+	// only for the initial `SELECT 1 FROM <table> LIMIT 0` table-presence
+	// probe in New() — the prev-tx path below uses writableDB exclusively.
+	db *sql.DB
+
+	// writableDB is the writable pool from `tablesource.OpenWritable`.
+	// Each Source acquires ONE dedicated *sql.Conn from it on first use,
+	// holds it until Close. Writes never commit (we always rollback) so
+	// the underlying file is never mutated — matches TS Snapshotter's
+	// "Applied changes are ephemeral" contract (snapshotter.ts:283).
+	writableDB *sql.DB
+
 	tableName  string
 	primaryKey []string
 	columns    map[string]sqlite.ColumnSchema
 
-	// Connection list + per-source push state. Mirrors MemorySource's
-	// connection management — Push fans out to every connection and
-	// each tracks its own LastPushedEpoch for overlay visibility.
+	// Cached ordering of columns + cached SQL for writeChange. Computed
+	// once at New() so the Push hot path doesn't re-derive them per
+	// change. Mirrors TS's `#getStatementsFor` cache (table-source.ts:136).
+	columnOrder []string // stable iteration order for INSERT VALUES (...)
+	nonPKCols   []string // cols not in the primary key, for UPDATE SET ...
+	insertSQL   string
+	deleteSQL   string
+	updateSQL   string // "" if all columns are part of the primary key
+
+	// mu serializes all Source state: connection list, pushEpoch,
+	// overlay, AND the prev-tx (prevConn + prevTxStarted). Acquired
+	// across the full Push and Fetch hot paths because the prev-tx
+	// conn is single-flight (one writer at a time per SQLite tx). TS
+	// has implicit serialization via its single-threaded JS event loop;
+	// we recreate it explicitly. Hot-path contention is bounded because
+	// in practice all calls on a given Source come from one CG worker.
 	mu          sync.Mutex
 	connections []*connection
 	pushEpoch   int
 
 	// overlay is the pending Push that hasn't finished fanning out yet.
-	// Concurrent Fetches whose lastPushedEpoch < overlay.Epoch splice
-	// this in so they see the post-push state — same contract as
-	// MemorySource's overlay field. nil when no Push is in flight.
+	// A Fetch fired DURING the current Push's output.Push (e.g. a
+	// child-side fetch inside an EXISTS join) sees the change spliced
+	// in if its connection hasn't observed the push yet. After the
+	// current Push's writeChange lands in the prev tx, overlay clears
+	// and subsequent Fetches see the change via the SQL read directly.
+	// Mirrors TS MemorySource's `#overlay` field (memory-source.ts).
 	overlay *ivm.Overlay
 
-	// snapMu protects currentSnapshot. R-locked on the Fetch hot path
-	// (so concurrent reads don't serialize); W-locked on Push and
-	// RefreshSnapshot when we rotate the snapshot. The snapshot itself
-	// is goroutine-safe to pass to OpenAtSnapshot from many callers.
-	snapMu          sync.RWMutex
-	currentSnapshot *Snapshot
-
-	// snapshotDisabled latches true if CaptureSnapshot ever returns an
-	// error (e.g., stub build without libsqlite3, or SQLite version
-	// without SQLITE_ENABLE_SNAPSHOT). When true, fetchForConn skips
-	// the snapshot path entirely and reads via db.Query directly,
-	// recovering Fetch concurrency at the cost of cross-Fetch snapshot
-	// consistency outside of Push. Single-flight: set once, never
-	// reset within a Source's lifetime.
-	snapshotDisabled bool
-
-	// batchDelta accumulates SourceChange entries Pushed within the
-	// current advance batch. Applied during Fetch on top of the snapshot
-	// so the source view evolves like TS's TableSource — which writes
-	// each push to its prev snapshot's db via INSERT/UPDATE/DELETE so
-	// subsequent Fetches in the same batch see prior pushes' effects.
+	// Prev-tx state.
 	//
-	// Without this, Go's per-Push rotateSnapshot pulled in the live
-	// replica's state on every push — which in high-throughput soaks
-	// included mutations the IVM advance had not yet applied (the
-	// replicator commits the whole batch to SQLite before notifying the
-	// engine). That caused Take's pushEditChange to see a row at its
-	// new sort BEFORE the push that nominally lands it there — the
-	// stale-bound trap.
+	// prevConn is the *sql.Conn dedicated to this Source's prev snapshot.
+	// Acquired lazily on first ensurePrevTx call. Released on Close.
 	//
-	// Cleared in OnAdvanceEnd alongside the snapshot rotation, so the
-	// next batch starts with a freshly-captured snapshot + empty delta.
-	// Guarded by mu (same lock as overlay).
-	batchDelta []ivm.SourceChange
+	// prevTxStarted is true once a `BEGIN CONCURRENT` has succeeded on
+	// prevConn (or plain `BEGIN` if the build doesn't have rocicorp's
+	// wal2 patch). False after OnAdvanceEnd has rolled it back but
+	// before the next ensurePrevTx restarts it.
+	//
+	// beginStmt is the BEGIN variant that worked the first time
+	// (`BEGIN CONCURRENT` or `BEGIN`). Cached so OnAdvanceEnd doesn't
+	// retry CONCURRENT each cycle when the build doesn't support it.
+	prevConn      *sql.Conn
+	prevTxStarted bool
+	beginStmt     string
 }
 
 // connection is one downstream pipeline subscribed to this source.
@@ -102,21 +116,24 @@ type connection struct {
 
 	// LastPushedEpoch is the most recent pushEpoch this connection has
 	// already observed via its Output.Push. Read during Fetch to gate
-	// overlay application. (Push fanout will use this in Phase 2d.)
+	// overlay application.
 	lastPushedEpoch int
 }
 
-// New constructs a Source for tableName. Validates that the table exists
-// (a SELECT against an unknown table at first Fetch would surface the
-// error far from construction; failing-closed here is friendlier).
+// New constructs a Source for tableName.
+//
+// db is the read-only pool used for the table-presence probe; the live
+// read+write path uses writableDB instead.
 //
 // columns must include every column the source ever returns — anything
-// missing gets dropped silently from fetched rows (TS-MemorySource has
-// the same behavior). primaryKey must be non-empty and every entry must
-// be present in columns.
-func New(db *sql.DB, tableName string, columns map[string]sqlite.ColumnSchema, primaryKey []string) (*Source, error) {
+// missing gets dropped silently from fetched rows. primaryKey must be
+// non-empty and every entry must be present in columns.
+func New(db *sql.DB, writableDB *sql.DB, tableName string, columns map[string]sqlite.ColumnSchema, primaryKey []string) (*Source, error) {
 	if db == nil {
 		return nil, fmt.Errorf("tablesource.New: db is nil")
+	}
+	if writableDB == nil {
+		return nil, fmt.Errorf("tablesource.New: writableDB is nil")
 	}
 	if tableName == "" {
 		return nil, fmt.Errorf("tablesource.New: tableName is empty")
@@ -136,97 +153,197 @@ func New(db *sql.DB, tableName string, columns map[string]sqlite.ColumnSchema, p
 	if _, err := db.Exec(`SELECT 1 FROM ` + quoteIdent(tableName) + ` LIMIT 0`); err != nil {
 		return nil, fmt.Errorf("tablesource.New %s: table not found: %w", tableName, err)
 	}
+
+	// Pre-compute the column ordering used for INSERT VALUES (...) and
+	// derived SQL strings. Sorted for stable iteration; matches the
+	// behavior TS gets implicitly from Object.keys insertion order.
+	colOrder := make([]string, 0, len(columns))
+	for c := range columns {
+		colOrder = append(colOrder, c)
+	}
+	// Sort for determinism so the generated SQL is identical across runs.
+	for i := 1; i < len(colOrder); i++ {
+		for j := i; j > 0 && colOrder[j] < colOrder[j-1]; j-- {
+			colOrder[j], colOrder[j-1] = colOrder[j-1], colOrder[j]
+		}
+	}
+	pkSet := make(map[string]bool, len(primaryKey))
+	for _, k := range primaryKey {
+		pkSet[k] = true
+	}
+	nonPK := make([]string, 0, len(colOrder))
+	for _, c := range colOrder {
+		if !pkSet[c] {
+			nonPK = append(nonPK, c)
+		}
+	}
+
+	insertCols := make([]string, len(colOrder))
+	for i, c := range colOrder {
+		insertCols[i] = quoteIdent(c)
+	}
+	placeholders := make([]string, len(colOrder))
+	for i := range placeholders {
+		placeholders[i] = "?"
+	}
+	insertSQL := fmt.Sprintf(
+		"INSERT INTO %s (%s) VALUES (%s)",
+		quoteIdent(tableName),
+		strings.Join(insertCols, ","),
+		strings.Join(placeholders, ","),
+	)
+
+	pkConds := make([]string, len(primaryKey))
+	for i, k := range primaryKey {
+		pkConds[i] = quoteIdent(k) + "=?"
+	}
+	deleteSQL := fmt.Sprintf(
+		"DELETE FROM %s WHERE %s",
+		quoteIdent(tableName),
+		strings.Join(pkConds, " AND "),
+	)
+
+	updateSQL := ""
+	if len(nonPK) > 0 {
+		setClauses := make([]string, len(nonPK))
+		for i, c := range nonPK {
+			setClauses[i] = quoteIdent(c) + "=?"
+		}
+		updateSQL = fmt.Sprintf(
+			"UPDATE %s SET %s WHERE %s",
+			quoteIdent(tableName),
+			strings.Join(setClauses, ","),
+			strings.Join(pkConds, " AND "),
+		)
+	}
+
 	return &Source{
-		db:         db,
-		tableName:  tableName,
-		primaryKey: primaryKey,
-		columns:    columns,
+		db:          db,
+		writableDB:  writableDB,
+		tableName:   tableName,
+		primaryKey:  primaryKey,
+		columns:     columns,
+		columnOrder: colOrder,
+		nonPKCols:   nonPK,
+		insertSQL:   insertSQL,
+		deleteSQL:   deleteSQL,
+		updateSQL:   updateSQL,
 	}, nil
 }
 
-// Close releases the pinned snapshot (if any). The underlying *sql.DB
-// pool is NOT closed — that's owned by the sidecar's process-level
-// lifecycle, not by individual sources. Idempotent.
+// Close rolls back the prev tx (if started) and releases the dedicated
+// conn back to the writable pool. Idempotent.
 func (s *Source) Close() error {
-	s.snapMu.Lock()
-	old := s.currentSnapshot
-	s.currentSnapshot = nil
-	s.snapMu.Unlock()
-	if old != nil {
-		old.Free()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.prevConn != nil {
+		if s.prevTxStarted {
+			_, _ = s.prevConn.ExecContext(context.Background(), "ROLLBACK")
+			s.prevTxStarted = false
+		}
+		_ = s.prevConn.Close()
+		s.prevConn = nil
 	}
 	return nil
 }
 
-// rotateSnapshot frees the existing snapshot (if any) and captures a
-// fresh one. Called from Push (after fanout) and RefreshSnapshot. If
-// the capture errors — most commonly because the build lacks the
-// libsqlite3 tag and we got the stub — we latch snapshotDisabled and
-// return; subsequent fetchForConn calls take the snapshot-less path
-// and just read via db.Query.
+// ensurePrevTxLocked makes sure prevConn is acquired and a tx is open.
+// MUST be called with s.mu held.
 //
-// Caller must NOT hold snapMu — this method acquires it internally.
-func (s *Source) rotateSnapshot() {
-	s.snapMu.Lock()
-	if s.snapshotDisabled {
-		s.snapMu.Unlock()
-		return
+// First-time path:
+//  1. Acquire a *sql.Conn from writableDB.
+//  2. Try `BEGIN CONCURRENT` (rocicorp's wal2 patch). On error, fall
+//     back to plain `BEGIN`.
+//  3. Cache which BEGIN variant worked in s.beginStmt.
+//  4. Issue a `SELECT 1` to actually acquire the read lock — `BEGIN
+//     CONCURRENT` alone is deferred until first read (snapshotter.ts:308).
+//
+// Subsequent calls (after OnAdvanceEnd rolled the tx back) just re-issue
+// the cached BEGIN variant + the warm-up SELECT.
+func (s *Source) ensurePrevTxLocked() error {
+	ctx := context.Background()
+	if s.prevConn == nil {
+		conn, err := s.writableDB.Conn(ctx)
+		if err != nil {
+			return fmt.Errorf("ensurePrevTx %s: acquire conn: %w", s.tableName, err)
+		}
+		s.prevConn = conn
 	}
-	old := s.currentSnapshot
-	s.currentSnapshot = nil
-	s.snapMu.Unlock()
-	if old != nil {
-		old.Free()
+	if s.prevTxStarted {
+		return nil
 	}
-
-	fresh, err := CaptureSnapshot(context.Background(), s.db)
-	s.snapMu.Lock()
-	defer s.snapMu.Unlock()
-	if err != nil {
-		s.snapshotDisabled = true
-		return
+	if s.beginStmt == "" {
+		// First-ever tx: try CONCURRENT, fall back to plain BEGIN.
+		// CONCURRENT requires rocicorp's wal2 patch — present in the
+		// libsqlite3-tag build, absent in mattn-bundled test builds.
+		if _, err := s.prevConn.ExecContext(ctx, "BEGIN CONCURRENT"); err == nil {
+			s.beginStmt = "BEGIN CONCURRENT"
+		} else if _, err2 := s.prevConn.ExecContext(ctx, "BEGIN"); err2 == nil {
+			s.beginStmt = "BEGIN"
+		} else {
+			return fmt.Errorf("ensurePrevTx %s: BEGIN: %w", s.tableName, err2)
+		}
+	} else {
+		if _, err := s.prevConn.ExecContext(ctx, s.beginStmt); err != nil {
+			return fmt.Errorf("ensurePrevTx %s: %s: %w", s.tableName, s.beginStmt, err)
+		}
 	}
-	s.currentSnapshot = fresh
+	// Warm-up read to actually acquire the snapshot. BEGIN CONCURRENT
+	// is deferred-style: no lock is taken until first access. Without
+	// this, sqlite3_snapshot_get-equivalent semantics don't kick in
+	// until the first Fetch — which would race with a concurrent
+	// writer commit. Matches snapshotter.ts:308-311.
+	if _, err := s.prevConn.ExecContext(ctx, "SELECT 1"); err != nil {
+		return fmt.Errorf("ensurePrevTx %s: warm-up: %w", s.tableName, err)
+	}
+	s.prevTxStarted = true
+	return nil
 }
 
-// RefreshSnapshot bumps snapshotEpoch so the next Fetch rolls the pinned
-// read tx to the current WAL frame. Called externally (e.g., by the
-// drift audit) when the caller needs Go's reads to compare against the
-// replica's latest committed state rather than the snapshot held since
-// the last Push.
+// OnAdvanceEnd is called by the engine.signalAdvanceEnd at the end of
+// each advance batch (success OR drift). Rolls back the prev tx
+// (discarding all writeChange-applied mutations) and starts a fresh
+// `BEGIN CONCURRENT` pinned at the current WAL frame.
+//
+// Matches TS Snapshotter.advanceWithoutDiff (snapshotter.ts:183-196)
+// which does: prev.resetToHead() → rollback() + new BEGIN CONCURRENT.
+func (s *Source) OnAdvanceEnd() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.prevConn == nil || !s.prevTxStarted {
+		return
+	}
+	ctx := context.Background()
+	if _, err := s.prevConn.ExecContext(ctx, "ROLLBACK"); err != nil {
+		// If ROLLBACK fails the conn is in an unknown state; close it
+		// so the next ensurePrevTx will reacquire a fresh one.
+		_ = s.prevConn.Close()
+		s.prevConn = nil
+		s.prevTxStarted = false
+		return
+	}
+	s.prevTxStarted = false
+	// Don't eagerly re-BEGIN here — let the next Push/Fetch trigger
+	// ensurePrevTx. Defers the cost of the warm-up SELECT to a moment
+	// when we actually need the tx.
+}
+
+// RefreshSnapshot is the legacy API name kept for callers (e.g. the
+// drift audit) that want the prev tx repinned to the current WAL frame
+// outside the engine's normal batch lifecycle. Semantically equivalent
+// to OnAdvanceEnd: rollback + lazy re-BEGIN on next use.
 //
 // No-op while a Push is in progress (overlay != nil) — rolling the tx
 // mid-fanout would invalidate the snapshot-consistency guarantee that
-// downstream Fetches inside Output.Push depend on. Once the Push
-// completes, its own deferred snapshotEpoch++ takes care of the roll
-// and a subsequent RefreshSnapshot can move us forward further.
+// downstream Fetches inside Output.Push depend on.
 func (s *Source) RefreshSnapshot() {
 	s.mu.Lock()
-	pushInFlight := s.overlay != nil
-	s.mu.Unlock()
-	if pushInFlight {
+	if s.overlay != nil {
+		s.mu.Unlock()
 		return
 	}
-	s.rotateSnapshot()
-}
-
-// OnAdvanceEnd is called by the engine at the end of each advance batch
-// (success OR drift). Clears batchDelta and rotates the snapshot to the
-// current WAL frame so the NEXT batch reads from a frame that reflects
-// the just-completed batch's mutations.
-//
-// Within a batch, the snapshot stayed pinned at the prev-batch frame and
-// batchDelta accumulated pushes (matching TS's prev snapshot + writeChange
-// pattern). Now that the batch is over, the live replica's frame
-// represents the post-batch state — rotating here aligns Go's source
-// view with that state going forward, and clearing batchDelta avoids
-// double-applying batch-N's pushes against batch-(N+1)'s snapshot which
-// already has them.
-func (s *Source) OnAdvanceEnd() {
-	s.mu.Lock()
-	s.batchDelta = nil
 	s.mu.Unlock()
-	s.rotateSnapshot()
+	s.OnAdvanceEnd()
 }
 
 // TableName / PrimaryKey / NormalizeRow satisfy engine.Source.
@@ -252,10 +369,7 @@ func (s *Source) NormalizeRow(row ivm.Row) {
 	}
 }
 
-// Connect registers a new pipeline connection. sort may be nil (defaults
-// to primary-key ascending). filterPredicate is applied to every row
-// post-fetch; nil disables it. splitEditKeys is the TS partition-key
-// set for edit-split correctness during Push (used in Phase 2d).
+// Connect registers a new pipeline connection.
 func (s *Source) Connect(
 	sort ivm.Ordering,
 	filterPredicate func(ivm.Row) bool,
@@ -295,30 +409,30 @@ func (s *Source) Connect(
 	return in
 }
 
-// Push fans the change through every subscribed connection. Unlike the
-// legacy in-process sqlite.TableSource, we do NOT write to the database
-// here — the TS replicator owns the file and has already written by
-// the time advance() reaches us. This source is a pure read-side
-// adapter; Push is fanout + overlay only.
+// Push fans the change through every subscribed connection AND applies
+// the change to the prev-snapshot tx via writeChange so subsequent
+// Fetches in this batch observe it.
 //
 // Order matches TS MemorySource.genPushAndWriteWithSplitEdit
-// (mono/packages/zql/src/ivm/memory-source.ts:452-506):
-//   1. Decide shouldSplitEdit GLOBALLY by scanning every connection's
-//      splitEditKeys against the Edit's old/new. If ANY connection
-//      requests a split, the source-level change is rewritten as
-//      Remove(oldRow) followed by Add(newRow) before fan-out.
-//   2. For each source-level change (1 or 2), fan out to every
-//      connection through filterPush, which handles per-connection
-//      filter predicates including the EDIT-with-filter-transition
-//      case via maybeSplitAndPushEditChange.
-//
-// Pre-fix Go made both decisions per-connection inline — fan-out of a
-// connection without splitEditKeys missed the source-level split that
-// TS would have done because another connection asked for it.
-// That diverged downstream Take/Exists state from TS and tripped the
-// stale-bound trap on tied sort keys (audit fix A).
+// (memory-source.ts:452-506):
+//  1. Decide shouldSplitEdit GLOBALLY by scanning every connection's
+//     splitEditKeys against the Edit's old/new.
+//  2. For each source-level change (1 or 2), per change:
+//     a. Set overlay (epoch++).
+//     b. Fan out to every connection through filterPush.
+//     c. After fanout: writeChange applies the change to prev tx.
+//     d. Clear overlay.
 func (s *Source) Push(change ivm.SourceChange) []ivm.Change {
+	// Acquire mu just long enough to set up the in-flight work:
+	// ensure prev tx, snapshot connections, decide shouldSplitEdit.
+	// Release before fanout — downstream output.Push callbacks may
+	// recursively call back into this Source (Fetch / RefreshSnapshot)
+	// and would deadlock against a held mu.
 	s.mu.Lock()
+	if err := s.ensurePrevTxLocked(); err != nil {
+		s.mu.Unlock()
+		panic(fmt.Sprintf("tablesource.Source.Push %s: ensurePrevTx: %v", s.tableName, err))
+	}
 	shouldSplitEdit := false
 	if change.Type == ivm.ChangeTypeEdit {
 		for _, conn := range s.connections {
@@ -334,33 +448,30 @@ func (s *Source) Push(change ivm.SourceChange) []ivm.Change {
 
 	var out []ivm.Change
 	if change.Type == ivm.ChangeTypeEdit && shouldSplitEdit {
-		out = append(out, s.genPushAndAppendDelta(ivm.MakeSourceChangeRemove(change.OldRow), conns)...)
-		out = append(out, s.genPushAndAppendDelta(ivm.MakeSourceChangeAdd(change.Row), conns)...)
+		out = append(out, s.genPushAndWrite(ivm.MakeSourceChangeRemove(change.OldRow), conns)...)
+		out = append(out, s.genPushAndWrite(ivm.MakeSourceChangeAdd(change.Row), conns)...)
 	} else {
-		out = append(out, s.genPushAndAppendDelta(change, conns)...)
+		out = append(out, s.genPushAndWrite(change, conns)...)
 	}
 	return out
 }
 
-// genPushAndAppendDelta runs ONE source-level change through every
-// connection's filterPush, then appends the change to batchDelta so
-// subsequent Fetches in the same batch see it (the TS equivalent
-// is genPushAndWrite calling writeChange after genPush — Go can't
-// write to its read-only snapshot, so batchDelta in-memory layer
-// stands in for the snapshot mutation TS performs).
-func (s *Source) genPushAndAppendDelta(change ivm.SourceChange, conns []*connection) []ivm.Change {
+// genPushAndWrite runs ONE source-level change through every connection's
+// filterPush, then applies the change to the prev tx via writeChange.
+//
+// Locking discipline mirrors TS's MemorySource.genPushAndWriteWithSplitEdit:
+//   - Overlay is set under mu, then mu released. Fanout runs WITHOUT mu
+//     so downstream callbacks can Fetch / RefreshSnapshot recursively.
+//   - After fanout: re-acquire mu, run writeChange against prev tx, clear
+//     overlay, release.
+//
+// Direct port of TS's genPushAndWrite (memory-source.ts).
+func (s *Source) genPushAndWrite(change ivm.SourceChange, conns []*connection) []ivm.Change {
 	s.mu.Lock()
 	s.pushEpoch++
 	epoch := s.pushEpoch
 	s.overlay = &ivm.Overlay{Epoch: epoch, Change: change}
 	s.mu.Unlock()
-
-	defer func() {
-		s.mu.Lock()
-		s.overlay = nil
-		s.batchDelta = append(s.batchDelta, change)
-		s.mu.Unlock()
-	}()
 
 	var out []ivm.Change
 	for _, conn := range conns {
@@ -369,7 +480,9 @@ func (s *Source) genPushAndAppendDelta(change ivm.SourceChange, conns []*connect
 		}
 		// Bump lastPushedEpoch BEFORE filterPush so a downstream Fetch
 		// inside output.Push sees the gate match TS's genPush ordering
-		// (memory-source.ts:555).
+		// (memory-source.ts:555). lastPushedEpoch is a single int field
+		// touched only from Push fanout + Fetch overlay-gate read; the
+		// engine serializes both per-source so no data race.
 		conn.lastPushedEpoch = epoch
 		outputChange := sourceChangeToChange(change)
 		if outputChange == nil {
@@ -378,15 +491,120 @@ func (s *Source) genPushAndAppendDelta(change ivm.SourceChange, conns []*connect
 		out = append(out, filterPush(*outputChange, conn)...)
 	}
 
+	// Re-acquire mu for writeChange + overlay clear.
+	s.mu.Lock()
+	err := s.writeChangeLocked(change)
+	s.overlay = nil
+	s.mu.Unlock()
+	if err != nil {
+		// Stale prev tx is unrecoverable from inside Push; surface
+		// as panic and let the engine's drift-recovery handle it
+		// (engine.Advance catches and re-inits).
+		panic(fmt.Sprintf("tablesource.Source.Push %s: writeChange: %v", s.tableName, err))
+	}
+
 	return out
+}
+
+// writeChangeLocked applies the SourceChange to the prev-snapshot tx as
+// SQL writes. Direct port of TS TableSource.#writeChange
+// (table-source.ts:416-478).
+//
+// MUST be called with s.mu held (so prevConn is single-flight).
+func (s *Source) writeChangeLocked(change ivm.SourceChange) error {
+	ctx := context.Background()
+	switch change.Type {
+	case ivm.ChangeTypeAdd:
+		args := s.rowToInsertArgs(change.Row)
+		if _, err := s.prevConn.ExecContext(ctx, s.insertSQL, args...); err != nil {
+			return fmt.Errorf("INSERT: %w", err)
+		}
+		return nil
+
+	case ivm.ChangeTypeRemove:
+		args := s.rowToPKArgs(change.Row)
+		if _, err := s.prevConn.ExecContext(ctx, s.deleteSQL, args...); err != nil {
+			return fmt.Errorf("DELETE: %w", err)
+		}
+		return nil
+
+	case ivm.ChangeTypeEdit:
+		if s.canUseUpdate(change.OldRow, change.Row) {
+			merged := mergeRow(change.OldRow, change.Row)
+			args := append(s.rowToNonPKArgs(merged), s.rowToPKArgs(merged)...)
+			if _, err := s.prevConn.ExecContext(ctx, s.updateSQL, args...); err != nil {
+				return fmt.Errorf("UPDATE: %w", err)
+			}
+			return nil
+		}
+		// PK changed: DELETE + INSERT.
+		delArgs := s.rowToPKArgs(change.OldRow)
+		if _, err := s.prevConn.ExecContext(ctx, s.deleteSQL, delArgs...); err != nil {
+			return fmt.Errorf("EDIT.DELETE: %w", err)
+		}
+		insArgs := s.rowToInsertArgs(change.Row)
+		if _, err := s.prevConn.ExecContext(ctx, s.insertSQL, insArgs...); err != nil {
+			return fmt.Errorf("EDIT.INSERT: %w", err)
+		}
+		return nil
+	}
+	return fmt.Errorf("writeChange: unknown change type %v", change.Type)
+}
+
+// canUseUpdate returns true if the edit can use UPDATE (PK unchanged
+// AND there are non-PK columns to set). Matches TS's canUseUpdate
+// (table-source.ts:647-659).
+func (s *Source) canUseUpdate(oldRow, newRow ivm.Row) bool {
+	for _, pk := range s.primaryKey {
+		if ivm.CompareValues(oldRow[pk], newRow[pk]) != 0 {
+			return false
+		}
+	}
+	return s.updateSQL != ""
+}
+
+// mergeRow returns oldRow overlaid with newRow's fields. TS spreads
+// {...oldRow, ...newRow} — newRow wins for any overlapping key.
+func mergeRow(oldRow, newRow ivm.Row) ivm.Row {
+	out := make(ivm.Row, len(oldRow)+len(newRow))
+	for k, v := range oldRow {
+		out[k] = v
+	}
+	for k, v := range newRow {
+		out[k] = v
+	}
+	return out
+}
+
+// rowToInsertArgs returns SQLite-typed values in s.columnOrder order.
+func (s *Source) rowToInsertArgs(row ivm.Row) []any {
+	args := make([]any, len(s.columnOrder))
+	for i, c := range s.columnOrder {
+		args[i] = sqlite.ToSQLiteType(row[c], s.columns[c].Type)
+	}
+	return args
+}
+
+// rowToPKArgs returns SQLite-typed PK values in s.primaryKey order.
+func (s *Source) rowToPKArgs(row ivm.Row) []any {
+	args := make([]any, len(s.primaryKey))
+	for i, k := range s.primaryKey {
+		args[i] = sqlite.ToSQLiteType(row[k], s.columns[k].Type)
+	}
+	return args
+}
+
+// rowToNonPKArgs returns SQLite-typed non-PK values in s.nonPKCols order.
+func (s *Source) rowToNonPKArgs(row ivm.Row) []any {
+	args := make([]any, len(s.nonPKCols))
+	for i, c := range s.nonPKCols {
+		args[i] = sqlite.ToSQLiteType(row[c], s.columns[c].Type)
+	}
+	return args
 }
 
 // filterPush is the per-connection filter-aware push.
 // Direct port of mono/packages/zql/src/ivm/filter-push.ts:10-38.
-//
-// For ADD/REMOVE/CHILD: pushes only when predicate(row) passes.
-// For EDIT: delegates to maybeSplitAndPushEditChange which converts
-// to Add(new) or Remove(old) when the predicate flips across the edit.
 func filterPush(change ivm.Change, conn *connection) []ivm.Change {
 	if conn.filterPredicate == nil {
 		return conn.output.Push(change, conn.input)
@@ -405,10 +623,6 @@ func filterPush(change ivm.Change, conn *connection) []ivm.Change {
 
 // maybeSplitAndPushEditChange handles the EDIT-with-filter-transition
 // case. Direct port of mono/packages/zql/src/ivm/maybe-split-and-push-edit-change.ts.
-//   - both pass filter → forward EDIT
-//   - only old passes  → emit REMOVE(old)
-//   - only new passes  → emit ADD(new)
-//   - neither passes   → drop
 func maybeSplitAndPushEditChange(change ivm.Change, conn *connection) []ivm.Change {
 	oldWasPresent := conn.filterPredicate(change.OldNode.Row)
 	newIsPresent := conn.filterPredicate(change.Node.Row)
@@ -459,9 +673,7 @@ func (i *sourceInput) Fetch(req ivm.FetchRequest) []ivm.Node {
 	return i.src.fetchForConn(req, i.conn)
 }
 
-// disconnect removes conn from the source's connection list. O(n) over
-// the conns slice — fine because each CG typically has a handful of
-// connections per source, not thousands.
+// disconnect removes conn from the source's connection list.
 func (s *Source) disconnect(c *connection) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -475,23 +687,27 @@ func (s *Source) disconnect(c *connection) {
 
 // fetchForConn runs the SELECT for conn and returns the resulting nodes.
 //
-// SQL generation is delegated to sqlite.BuildSelectQuery — the same
-// builder the legacy in-process sqlite.TableSource uses, so cursor
-// lexicographic semantics, NULL-aware comparisons, and constraint
-// emission are byte-identical between the two source variants.
+// Reads go through s.prevConn — the dedicated conn for this Source's
+// prev-snapshot tx. The tx already contains any writeChanges from
+// previous Pushes in the current batch, so SQL ordering is correct
+// without any in-memory overlay/delta machinery.
 //
-// Coverage:
-//   - ORDER BY from conn.sort (or PK ascending if nil)
-//   - Reverse flips ASC↔DESC
-//   - Constraint → WHERE eq pushdown
-//   - Start cursor → WHERE lexicographic compare
-//   - Filter predicate applied post-scan (per-connection Go closure;
-//     can't be pushed to SQL because it's an opaque func)
-//
-// Phase 2d adds Push fanout + overlay handling on top of this.
+// The one exception is the IN-FLIGHT current push: s.overlay holds the
+// change being fanned out RIGHT NOW. writeChange hasn't run yet (it
+// runs after fanout). A Fetch fired during that fanout (e.g., from a
+// downstream Output.Push) splices the overlay in so the downstream
+// sees the post-push view. Connection lastPushedEpoch gates this:
+// connections that have already received the push via Output.Push
+// don't re-see it via overlay (their lastPushedEpoch matches/exceeds).
 func (s *Source) fetchForConn(req ivm.FetchRequest, conn *connection) []ivm.Node {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if err := s.ensurePrevTxLocked(); err != nil {
+		panic(fmt.Sprintf("tablesource.Source.Fetch %s: ensurePrevTx: %v", s.tableName, err))
+	}
+
 	// ORDER BY clause from connection sort (PK ascending if unset).
-	// Always non-nil so cursor / orderBy paths in BuildSelectQuery work.
 	order := conn.sort
 	if order == nil {
 		order = make(ivm.Ordering, len(s.primaryKey))
@@ -504,81 +720,14 @@ func (s *Source) fetchForConn(req ivm.FetchRequest, conn *connection) []ivm.Node
 		s.tableName,
 		s.columns,
 		req.Constraint,
-		nil, // filter pushdown via *Condition unused — we only have the Go predicate
+		nil, // filter pushdown unused — we have only the Go predicate
 		order,
 		req.Reverse,
 		req.Start,
 	)
 
-	// Read path selection: if a snapshot is held, every concurrent
-	// Fetch grabs its own conn from the pool and pins it via
-	// snapshot_open — independent *sql.Tx per goroutine, shared WAL
-	// frame, no mutex contention. If we don't have a snapshot (stub
-	// build without libsqlite3, or first Fetch before any Push has
-	// rotated us into a snapshot), fall back to a plain pool read —
-	// each Fetch sees whatever's currently in SQLite. The fallback
-	// loses cross-Fetch snapshot consistency outside of Push but the
-	// per-row hot path stays fast.
-	s.snapMu.RLock()
-	snap := s.currentSnapshot
-	s.snapMu.RUnlock()
-
-	var (
-		rows    *sql.Rows
-		queryDB queryRunner = s.db
-		txOwned *sql.Tx
-		cnOwned *sql.Conn
-		// readViaSnapshot: did this Fetch read from a pinned snapshot
-		// (pre-current-Push WAL frame) rather than via the live pool
-		// (post-replicator-commit state)? Matters for overlay handling
-		// below — the overlay represents the change being processed
-		// THIS Push, which is also already in SQLite by the time we
-		// fetch. The MemorySource-equivalence model (Push sets overlay
-		// before any state mutation) only holds if SQL returns
-		// pre-Push state, which is true ONLY when we read via a
-		// snapshot. Reading via the pool returns post-Push state, so
-		// applying overlay on top would double-count the change.
-		readViaSnapshot bool
-	)
-	if snap != nil {
-		tx, cn, err := OpenAtSnapshot(context.Background(), s.db, snap)
-		if err != nil {
-			// Snapshot may have been freed by a concurrent rotation —
-			// transparent retry against the current state via the pool.
-			// Operator semantics aren't affected; just lose the pin for
-			// this Fetch.
-			s.snapMu.RLock()
-			snap = s.currentSnapshot
-			s.snapMu.RUnlock()
-			if snap != nil {
-				tx, cn, err = OpenAtSnapshot(context.Background(), s.db, snap)
-			}
-			if err != nil {
-				queryDB = s.db
-			} else {
-				queryDB = tx
-				txOwned = tx
-				cnOwned = cn
-				readViaSnapshot = true
-			}
-		} else {
-			queryDB = tx
-			txOwned = tx
-			cnOwned = cn
-			readViaSnapshot = true
-		}
-	}
-	defer func() {
-		if txOwned != nil {
-			_ = txOwned.Rollback()
-		}
-		if cnOwned != nil {
-			_ = cnOwned.Close()
-		}
-	}()
-
-	var err error
-	rows, err = queryDB.Query(q.SQL, q.Params...)
+	ctx := context.Background()
+	rows, err := s.prevConn.QueryContext(ctx, q.SQL, q.Params...)
 	if err != nil {
 		panic(fmt.Sprintf("tablesource.Source.Fetch %s: query: %v\nSQL: %s",
 			s.tableName, err, q.SQL))
@@ -593,8 +742,8 @@ func (s *Source) fetchForConn(req ivm.FetchRequest, conn *connection) []ivm.Node
 
 	var out []ivm.Node
 	for rows.Next() {
-		raw := make([]interface{}, len(colNames))
-		ptrs := make([]interface{}, len(colNames))
+		raw := make([]any, len(colNames))
+		ptrs := make([]any, len(colNames))
 		for i := range raw {
 			ptrs[i] = &raw[i]
 		}
@@ -620,65 +769,24 @@ func (s *Source) fetchForConn(req ivm.FetchRequest, conn *connection) []ivm.Node
 			s.tableName, err))
 	}
 
-	// Apply pending Push overlay so a downstream Fetch fired mid-Push
-	// sees the change as if it had landed. Gate is the same as
-	// MemorySource: conn.lastPushedEpoch < overlay.Epoch means this
-	// connection hasn't yet observed the overlay's change via its own
-	// Output.Push, so we splice it in. Overlay rows are also subjected
-	// to the connection's filter predicate — they're indistinguishable
-	// from SQL-sourced rows downstream.
+	// Apply in-flight overlay (the push currently fanning out, whose
+	// writeChange hasn't run yet). Only relevant when:
+	//   - overlay != nil
+	//   - this connection hasn't observed the push (lastPushedEpoch < overlay.Epoch)
 	//
-	// IMPORTANT: only apply overlay when we read via a pinned snapshot
-	// (pre-Push WAL frame). When the fallback pool read returns
-	// post-replicator-commit state (snap was nil, e.g., first Push or
-	// snapshotDisabled latched), SQLite already has the row from the
-	// current Push and applying overlay would double-count it. Concretely:
-	// a child-side Fetch inside an EXISTS join would see fetchSize=2
-	// instead of 1 on an EXISTS-false→true transition, the Exists
-	// operator would miss the size==1 branch and never emit Add(parent).
-	// Discovered while writing the advance-side compound-key gap test on
-	// 2026-05-28; the production path uses snapshot_open so this branch
-	// is normally hit and the bug is invisible — but any deploy that
-	// falls back (snapshot capture failure, no libsqlite3 build) would
-	// silently lose IVM updates.
-	s.mu.Lock()
-	overlay := s.overlay
-	// Snapshot the batch delta under the same lock so we apply a
-	// consistent view of "pushes already landed in this batch" — even if
-	// another goroutine is mid-Push.
-	delta := make([]ivm.SourceChange, len(s.batchDelta))
-	copy(delta, s.batchDelta)
-	s.mu.Unlock()
-
-	// Apply previously-pushed changes in this batch BEFORE the current
-	// overlay so the source view reflects intra-batch evolution (TS
-	// equivalent: prev snapshot has been #writeChange'd by prior pushes
-	// in this batch, so subsequent Fetches see them). Only meaningful
-	// when we read via the pinned snapshot — the pool fallback already
-	// reflects every commit in the live db.
-	if readViaSnapshot {
-		for _, deltaChange := range delta {
-			out = applyOverlay(out, deltaChange, conn.compareRows, req.Constraint, s.primaryKey)
-		}
-	}
-
-	if overlay != nil && conn.lastPushedEpoch < overlay.Epoch && readViaSnapshot {
-		out = applyOverlay(out, overlay.Change, conn.compareRows, req.Constraint, s.primaryKey)
-	}
-
-	if conn.filterPredicate != nil && (len(delta) > 0 || overlay != nil) && readViaSnapshot {
-		// Overlays/delta-applied rows must still pass the connection's
-		// filter — they're indistinguishable from SQL-sourced rows
-		// downstream. Re-run filter only if we modified the node list
-		// (delta non-empty or overlay applied); SQL rows are already
-		// pre-filtered by the query.
-		filtered := out[:0]
-		for _, n := range out {
-			if conn.filterPredicate(n.Row) {
-				filtered = append(filtered, n)
+	// Once writeChange runs (after fanout) and overlay clears, the SQL
+	// query above naturally reflects the change — no overlay needed.
+	if s.overlay != nil && conn.lastPushedEpoch < s.overlay.Epoch {
+		out = applyOverlay(out, s.overlay.Change, conn.compareRows, req.Constraint, s.primaryKey)
+		if conn.filterPredicate != nil {
+			filtered := out[:0]
+			for _, n := range out {
+				if conn.filterPredicate(n.Row) {
+					filtered = append(filtered, n)
+				}
 			}
+			out = filtered
 		}
-		out = filtered
 	}
 	return out
 }

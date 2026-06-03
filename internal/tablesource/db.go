@@ -115,3 +115,60 @@ func assertWAL(db *sql.DB) error {
 	}
 	return nil
 }
+
+// OpenWritable returns a *sql.DB pool aimed at the SQLite file at path,
+// configured as the "prev snapshot" workspace for Sources. Each Source
+// acquires one dedicated *sql.Conn from this pool, opens a BEGIN
+// CONCURRENT (or plain BEGIN, if the build lacks rocicorp's wal2 patch)
+// transaction on it, and uses that conn as its read/write surface for
+// the lifetime of the source.
+//
+// Distinguishing features vs Open:
+//   - No `_query_only=true` — we WILL run INSERT/UPDATE/DELETE on this
+//     conn, against the prev-snapshot tx. The writes are never
+//     committed (we always ROLLBACK at end of batch), so the file is
+//     never mutated, but SQLite still requires the conn itself to be
+//     writable to accept the statements.
+//   - synchronous=OFF — the writes are ephemeral and discarded, so
+//     fsync cost is pure waste. Matches TS Snapshotter's
+//     `PRAGMA synchronous = OFF` (snapshotter.ts:283).
+//
+// The caller (sidecar startup) opens one of these pools per process and
+// passes it to every Source.New so all sources of a given CG share the
+// pool. Each Source then acquires a dedicated *sql.Conn from it.
+func OpenWritable(path string, opts OpenOptions) (*sql.DB, error) {
+	if path == "" {
+		return nil, fmt.Errorf("tablesource.OpenWritable: path is required")
+	}
+	busyMs := opts.BusyTimeoutMs
+	if busyMs <= 0 {
+		busyMs = defaultBusyTimeoutMs
+	}
+	maxOpen := opts.MaxOpenConns
+	if maxOpen <= 0 {
+		maxOpen = defaultMaxOpenConns
+	}
+	maxIdle := opts.MaxIdleConns
+	if maxIdle <= 0 {
+		maxIdle = defaultMaxIdleConns
+	}
+
+	// No `_query_only` — we run INSERT/UPDATE/DELETE on the prev tx.
+	// `_synchronous=OFF` matches TS Snapshotter (writes never commit).
+	dsn := "file:" + path +
+		"?_busy_timeout=" + strconv.Itoa(busyMs) +
+		"&_synchronous=OFF"
+
+	db, err := sql.Open("sqlite3", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("tablesource.OpenWritable: sql.Open: %w", err)
+	}
+	db.SetMaxOpenConns(maxOpen)
+	db.SetMaxIdleConns(maxIdle)
+
+	if err := assertWAL(db); err != nil {
+		db.Close()
+		return nil, err
+	}
+	return db, nil
+}

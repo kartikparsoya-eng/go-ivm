@@ -103,12 +103,14 @@ func newTableSourceStreamingEngine(t *testing.T, rowCount int) (*Engine, *sql.DB
 	t.Helper()
 	path := seedTicketReplica(t, rowCount)
 	db, err := tablesource.Open(path, tablesource.OpenOptions{})
+	wdb, _ := tablesource.OpenWritable(path, tablesource.OpenOptions{})
+	t.Cleanup(func() { wdb.Close() })
 	if err != nil {
 		t.Fatalf("tablesource.Open: %v", err)
 	}
 	t.Cleanup(func() { db.Close() })
 
-	src, err := tablesource.New(db, "tickets", ticketSchema(), []string{"id"})
+	src, err := tablesource.New(db, wdb, "tickets", ticketSchema(), []string{"id"})
 	if err != nil {
 		t.Fatalf("tablesource.New: %v", err)
 	}

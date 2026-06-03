@@ -63,16 +63,18 @@ func seedNotExistsReplica(t *testing.T) string {
 func TestTableSourceNotExistsCompoundKey_HydratesUnmatchedChannel(t *testing.T) {
 	path := seedNotExistsReplica(t)
 	db, err := tablesource.Open(path, tablesource.OpenOptions{})
+	wdb, _ := tablesource.OpenWritable(path, tablesource.OpenOptions{})
+	defer wdb.Close()
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
 	t.Cleanup(func() { db.Close() })
 
-	chanSrc, _ := tablesource.New(db, "channels",
+	chanSrc, _ := tablesource.New(db, wdb, "channels",
 		map[string]sqlite.ColumnSchema{
 			"id": {Type: "string"}, "name": {Type: "string"},
 		}, []string{"id"})
-	cpSrc, _ := tablesource.New(db, "channel_participants",
+	cpSrc, _ := tablesource.New(db, wdb, "channel_participants",
 		map[string]sqlite.ColumnSchema{
 			"id": {Type: "string"}, "channelId": {Type: "string"}, "userId": {Type: "string"},
 		}, []string{"id"})
@@ -151,12 +153,14 @@ func TestTableSourceJoin_NullInCompoundCorrelation(t *testing.T) {
 	w.Close()
 
 	db, _ := tablesource.Open(path, tablesource.OpenOptions{})
+	wdb, _ := tablesource.OpenWritable(path, tablesource.OpenOptions{})
+	defer wdb.Close()
 	t.Cleanup(func() { db.Close() })
 
-	parents, _ := tablesource.New(db, "parents",
+	parents, _ := tablesource.New(db, wdb, "parents",
 		map[string]sqlite.ColumnSchema{"id": {Type: "string"}, "joinCol": {Type: "string"}},
 		[]string{"id"})
-	kids, _ := tablesource.New(db, "kids",
+	kids, _ := tablesource.New(db, wdb, "kids",
 		map[string]sqlite.ColumnSchema{"id": {Type: "string"}, "parentCol": {Type: "string"}},
 		[]string{"id"})
 
@@ -226,15 +230,17 @@ func TestTableSourceNestedExists_TwoLevels(t *testing.T) {
 	w.Close()
 
 	db, _ := tablesource.Open(path, tablesource.OpenOptions{})
+	wdb, _ := tablesource.OpenWritable(path, tablesource.OpenOptions{})
+	defer wdb.Close()
 	t.Cleanup(func() { db.Close() })
 
-	chans, _ := tablesource.New(db, "channels",
+	chans, _ := tablesource.New(db, wdb, "channels",
 		map[string]sqlite.ColumnSchema{"id": {Type: "string"}, "name": {Type: "string"}},
 		[]string{"id"})
-	convs, _ := tablesource.New(db, "conversations",
+	convs, _ := tablesource.New(db, wdb, "conversations",
 		map[string]sqlite.ColumnSchema{"id": {Type: "string"}, "channelId": {Type: "string"}},
 		[]string{"id"})
-	msgs, _ := tablesource.New(db, "messages",
+	msgs, _ := tablesource.New(db, wdb, "messages",
 		map[string]sqlite.ColumnSchema{
 			"id": {Type: "string"}, "conversationId": {Type: "string"}, "content": {Type: "string"},
 		},
@@ -318,13 +324,15 @@ func TestTableSourceExistsPlusCursorPagination(t *testing.T) {
 	w.Close()
 
 	db, _ := tablesource.Open(path, tablesource.OpenOptions{})
+	wdb, _ := tablesource.OpenWritable(path, tablesource.OpenOptions{})
+	defer wdb.Close()
 	t.Cleanup(func() { db.Close() })
 
-	tickets, _ := tablesource.New(db, "tickets",
+	tickets, _ := tablesource.New(db, wdb, "tickets",
 		map[string]sqlite.ColumnSchema{
 			"id": {Type: "string"}, "channelId": {Type: "string"}, "title": {Type: "string"},
 		}, []string{"id"})
-	cps, _ := tablesource.New(db, "channel_participants",
+	cps, _ := tablesource.New(db, wdb, "channel_participants",
 		map[string]sqlite.ColumnSchema{
 			"id": {Type: "string"}, "channelId": {Type: "string"}, "userId": {Type: "string"},
 		}, []string{"id"})

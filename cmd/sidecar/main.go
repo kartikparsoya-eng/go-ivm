@@ -521,11 +521,12 @@ type Server struct {
 	// then read the result under the mutex. The mutex is only held
 	// for tiny critical sections (check cache, register probe, store
 	// result) — never across the slow retry loop.
-	replicaPath  string
-	replicaMu    sync.Mutex
-	replicaDB    *sql.DB       // populated on successful probe (under replicaMu)
-	replicaProbe chan struct{} // non-nil while a probe is in flight; closed when done
-	replicaErr   error         // last probe's terminal error (under replicaMu)
+	replicaPath        string
+	replicaMu          sync.Mutex
+	replicaDB          *sql.DB       // populated on successful probe (under replicaMu)
+	replicaWritableDB  *sql.DB       // writable companion pool — used for each Source's prev-snapshot tx conn
+	replicaProbe       chan struct{} // non-nil while a probe is in flight; closed when done
+	replicaErr         error         // last probe's terminal error (under replicaMu)
 }
 
 func NewServer(mode tablesource.Mode, replicaPath string) *Server {
@@ -587,33 +588,50 @@ func (s *Server) getReplicaDB() (*sql.DB, error) {
 	deadline := time.Now().Add(openTimeout)
 	backoff := 500 * time.Millisecond
 	var db *sql.DB
+	var writableDB *sql.DB
 	var lastErr error
 	for time.Now().Before(deadline) {
 		var err error
 		db, err = tablesource.Open(s.replicaPath, tablesource.OpenOptions{})
-		if err == nil {
+		if err != nil {
+			lastErr = err
 			fmt.Fprintf(os.Stderr,
-				"[GO-IVM] opened replica %s (WAL mode, query_only)\n",
-				s.replicaPath)
-			break
+				"[GO-IVM] replica not ready yet (%v) — retrying in %v\n",
+				err, backoff)
+			time.Sleep(backoff)
+			if backoff < 5*time.Second {
+				backoff *= 2
+			}
+			db = nil
+			continue
 		}
-		lastErr = err
+		writableDB, err = tablesource.OpenWritable(s.replicaPath, tablesource.OpenOptions{})
+		if err != nil {
+			db.Close()
+			db = nil
+			lastErr = err
+			fmt.Fprintf(os.Stderr,
+				"[GO-IVM] writable pool not ready yet (%v) — retrying in %v\n",
+				err, backoff)
+			time.Sleep(backoff)
+			if backoff < 5*time.Second {
+				backoff *= 2
+			}
+			continue
+		}
 		fmt.Fprintf(os.Stderr,
-			"[GO-IVM] replica not ready yet (%v) — retrying in %v\n",
-			err, backoff)
-		time.Sleep(backoff)
-		if backoff < 5*time.Second {
-			backoff *= 2
-		}
-		db = nil
+			"[GO-IVM] opened replica %s (WAL mode; query_only read pool + writable prev-tx pool)\n",
+			s.replicaPath)
+		break
 	}
 
 	// Phase 3: publish result under mu, signal waiters, and clear the
 	// probe registration so future callers can probe again (e.g., the
 	// next caller after a deadline-expiration retry).
 	s.replicaMu.Lock()
-	if db != nil {
+	if db != nil && writableDB != nil {
 		s.replicaDB = db
+		s.replicaWritableDB = writableDB
 		s.replicaErr = nil
 	} else if lastErr != nil {
 		s.replicaErr = fmt.Errorf("getReplicaDB: gave up after %v: %w", openTimeout, lastErr)
@@ -628,6 +646,16 @@ func (s *Server) getReplicaDB() (*sql.DB, error) {
 		return db, nil
 	}
 	return nil, s.replicaErr
+}
+
+// getReplicaWritableDB returns the writable companion pool created
+// alongside replicaDB during the singleflight probe. Must be called AFTER
+// getReplicaDB has succeeded (it sets both in the same critical section).
+// Returns nil if the probe never opened the writable pool.
+func (s *Server) getReplicaWritableDB() *sql.DB {
+	s.replicaMu.Lock()
+	defer s.replicaMu.Unlock()
+	return s.replicaWritableDB
 }
 
 // getOrCreateGroup returns the ClientGroup for the given ID, creating if needed.
@@ -1040,7 +1068,12 @@ func (s *Server) handleInit(req RPCRequest) RPCResponse {
 				return rpcError(req.ID, -32000,
 					"replica not ready: "+err.Error())
 			}
-			src, err := tablesource.New(db, tableName, schema.Columns, schema.PrimaryKey)
+			writableDB := s.getReplicaWritableDB()
+			if writableDB == nil {
+				return rpcError(req.ID, -32000,
+					"writable replica pool not ready")
+			}
+			src, err := tablesource.New(db, writableDB, tableName, schema.Columns, schema.PrimaryKey)
 			if err != nil {
 				return rpcError(req.ID, -32000,
 					"tablesource.New for "+tableName+": "+err.Error())

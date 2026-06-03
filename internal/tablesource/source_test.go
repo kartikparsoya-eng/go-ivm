@@ -53,13 +53,28 @@ func userSchema() map[string]sqlite.ColumnSchema {
 	}
 }
 
+// openWritableForTest opens the companion writable pool for a Source.
+// Most tests just need a working writableDB; the path is the same one
+// returned by seedTypedReplica.
+func openWritableForTest(t *testing.T, path string) *sql.DB {
+	t.Helper()
+	w, err := OpenWritable(path, OpenOptions{})
+	if err != nil {
+		t.Fatalf("OpenWritable: %v", err)
+	}
+	return w
+}
+
 func newUserSource(t *testing.T) (*Source, *sql.DB) {
 	t.Helper()
-	db, err := Open(seedTypedReplica(t), OpenOptions{})
+	path := seedTypedReplica(t)
+	db, err := Open(path, OpenOptions{})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	src, err := New(db, "users", userSchema(), []string{"id"})
+	wdb := openWritableForTest(t, path)
+	t.Cleanup(func() { wdb.Close() })
+	src, err := New(db, wdb, "users", userSchema(), []string{"id"})
 	if err != nil {
 		db.Close()
 		t.Fatalf("New: %v", err)
@@ -68,35 +83,44 @@ func newUserSource(t *testing.T) (*Source, *sql.DB) {
 }
 
 func TestNewRejectsUnknownTable(t *testing.T) {
-	db, err := Open(seedTypedReplica(t), OpenOptions{})
+	path := seedTypedReplica(t)
+	db, err := Open(path, OpenOptions{})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
 	defer db.Close()
-	if _, err := New(db, "nonexistent", userSchema(), []string{"id"}); err == nil {
+	wdb := openWritableForTest(t, path)
+	defer wdb.Close()
+	if _, err := New(db, wdb, "nonexistent", userSchema(), []string{"id"}); err == nil {
 		t.Fatalf("New on missing table succeeded; expected error")
 	}
 }
 
 func TestNewRejectsEmptyPK(t *testing.T) {
-	db, err := Open(seedTypedReplica(t), OpenOptions{})
+	path := seedTypedReplica(t)
+	db, err := Open(path, OpenOptions{})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
 	defer db.Close()
-	if _, err := New(db, "users", userSchema(), nil); err == nil {
+	wdb := openWritableForTest(t, path)
+	defer wdb.Close()
+	if _, err := New(db, wdb, "users", userSchema(), nil); err == nil {
 		t.Fatalf("New with empty PK succeeded; expected error")
 	}
 }
 
 func TestNewRejectsPKNotInColumns(t *testing.T) {
-	db, err := Open(seedTypedReplica(t), OpenOptions{})
+	path := seedTypedReplica(t)
+	db, err := Open(path, OpenOptions{})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
 	defer db.Close()
+	wdb := openWritableForTest(t, path)
+	defer wdb.Close()
 	cols := userSchema()
-	if _, err := New(db, "users", cols, []string{"missing_col"}); err == nil {
+	if _, err := New(db, wdb, "users", cols, []string{"missing_col"}); err == nil {
 		t.Fatalf("New with PK not in columns succeeded; expected error")
 	}
 }
@@ -347,85 +371,92 @@ func (o *overlayProbingOutput) Push(_ ivm.Change, _ ivm.InputBase) []ivm.Change 
 	return nil
 }
 
-// TestTxPinHidesExternalWriteUntilPushRolls is the Phase 4/7 snapshot
-// contract. Requires the libsqlite3 build tag (real snapshot impl);
-// the default-build stub reads live from the pool and would see the
-// external write immediately. The full contract is only meaningful
-// when the snapshot path is wired.
-func TestTxPinHidesExternalWriteUntilPushRolls(t *testing.T) {
-	if !snapshotAvailable(t) {
-		t.Skip("snapshot unavailable in this build (rebuild with -tags libsqlite3)")
-	}
+// TestPrevTxAppliesWritesAndRollback is the prev-snapshot tx contract
+// for the new architecture (matches TS Snapshotter):
+//   - The Source's prev tx is pinned at the WAL frame at first use.
+//   - Push within the batch DOES become visible (writeChange runs on
+//     the prev tx; subsequent reads see it via read-your-own-writes).
+//   - OnAdvanceEnd rolls back the prev tx (discarding writeChange writes)
+//     and lazily re-BEGINs on next use.
+//
+// This is the test that exercises the full writeChange + rollback cycle
+// without any external writer interleaving. The external-writer scenario
+// is covered separately when BEGIN CONCURRENT is available (rocicorp's
+// wal2 patch) — plain BEGIN can't isolate an in-tx write from a parallel
+// committed write on the same file in default mattn-bundled builds.
+func TestPrevTxAppliesWritesAndRollback(t *testing.T) {
 	path := seedTypedReplica(t)
 
-	// Our read-side pool (query_only, WAL).
 	db, err := Open(path, OpenOptions{})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
 	defer db.Close()
-	src, err := New(db, "users", userSchema(), []string{"id"})
+	wdb := openWritableForTest(t, path)
+	defer wdb.Close()
+	src, err := New(db, wdb, "users", userSchema(), []string{"id"})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
 	defer src.Close()
 
-	// Separate writer connection — models the TS replicator. NOT
-	// query_only, so it can actually INSERT.
-	writer, err := sql.Open("sqlite3", path)
-	if err != nil {
-		t.Fatalf("writer open: %v", err)
-	}
-	defer writer.Close()
-
 	in := src.Connect(nil, nil, nil)
-	in.SetOutput(&recordingOutput{}) // discard, just need a wired output
+	in.SetOutput(&recordingOutput{})
 
-	// Step 1: first Fetch pins the read tx at the current WAL frame (3 rows).
+	// Step 1: first Fetch starts the prev tx (3 seeded rows).
 	if got := len(in.Fetch(ivm.FetchRequest{})); got != 3 {
 		t.Fatalf("baseline fetch = %d rows, want 3", got)
 	}
 
-	// Step 2: external writer commits a new row.
-	if _, err := writer.Exec("INSERT INTO users VALUES (10, 'eve', 100, 1)"); err != nil {
-		t.Fatalf("external insert: %v", err)
-	}
-
-	// Step 3: re-fetch via Source — pinned tx should still see 3.
-	// If the tx weren't pinned, we'd see 4 here and overlay would
-	// double-apply during the next Push.
-	if got := len(in.Fetch(ivm.FetchRequest{})); got != 3 {
-		t.Fatalf("post-external-write fetch = %d rows, want 3 (tx must be pinned)", got)
-	}
-
-	// Step 4: trigger a Push so snapshotEpoch bumps in the deferred cleanup.
-	// The Push's change itself is irrelevant — what matters is that the
-	// deferred snapshotEpoch++ runs and the cache rolls the tx.
+	// Step 2: Push a row. writeChange applies it to the prev tx.
 	src.Push(ivm.MakeSourceChangeAdd(ivm.Row{
 		"id": float64(99), "name": "dave", "score": float64(50), "active": true,
 	}))
 
-	// Step 5: re-fetch — tx must have rolled, now sees external writer's row.
-	if got := len(in.Fetch(ivm.FetchRequest{})); got != 4 {
-		t.Fatalf("post-Push fetch = %d rows, want 4 (tx must have rolled)", got)
+	// Step 3: re-fetch within batch — Push's writeChange visible.
+	nodes := in.Fetch(ivm.FetchRequest{})
+	if len(nodes) != 4 {
+		t.Fatalf("post-Push fetch = %d rows, want 4", len(nodes))
+	}
+	hasDave := false
+	for _, n := range nodes {
+		if id, _ := n.Row["id"].(float64); id == 99 {
+			hasDave = true
+		}
+	}
+	if !hasDave {
+		t.Fatalf("post-Push fetch missing in-tx 'dave' — writeChange didn't run")
+	}
+
+	// Step 4: OnAdvanceEnd — rollback (discards in-tx 'dave').
+	src.OnAdvanceEnd()
+
+	// Step 5: re-fetch — back to 3 rows (rollback discarded the write).
+	nodes = in.Fetch(ivm.FetchRequest{})
+	if len(nodes) != 3 {
+		t.Fatalf("post-OnAdvanceEnd fetch = %d rows, want 3 (rollback should discard)", len(nodes))
+	}
+	for _, n := range nodes {
+		if id, _ := n.Row["id"].(float64); id == 99 {
+			t.Fatalf("post-OnAdvanceEnd fetch still has in-tx 'dave' — rollback didn't discard")
+		}
 	}
 }
 
-// TestRefreshSnapshotRollsTx is the Phase 6 contract for the drift
-// audit, gated on the real-snapshot impl. The stub build reads live
-// from the pool so RefreshSnapshot is a no-op for the user-visible
-// data — same skip pattern as TestTxPinHidesExternalWriteUntilPushRolls.
+// TestRefreshSnapshotRollsTx exercises the drift-audit contract: an
+// external caller (e.g. the audit) calls RefreshSnapshot when no Push
+// is in flight; the prev tx rolls back + repins at the current frame,
+// making external writes since the last pin visible.
 func TestRefreshSnapshotRollsTx(t *testing.T) {
-	if !snapshotAvailable(t) {
-		t.Skip("snapshot unavailable in this build (rebuild with -tags libsqlite3)")
-	}
 	path := seedTypedReplica(t)
 	db, err := Open(path, OpenOptions{})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
 	defer db.Close()
-	src, err := New(db, "users", userSchema(), []string{"id"})
+	wdb := openWritableForTest(t, path)
+	defer wdb.Close()
+	src, err := New(db, wdb, "users", userSchema(), []string{"id"})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
