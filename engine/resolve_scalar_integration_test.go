@@ -1,7 +1,6 @@
 package engine
 
 import (
-	"sort"
 	"testing"
 
 	"github.com/kartikparsoya-eng/go-ivm/builder"
@@ -101,10 +100,13 @@ func TestAddQuery_ResolvesScalarAndEmitsCompanion(t *testing.T) {
 	}
 }
 
-// Verifies the companion's source push fans out to the live companion
-// connection: editing the resolved user row produces an EDIT RowChange
-// under the parent queryID (companion live tracking is implicit because
-// the resolver built a real Pipeline connected to the subquery source).
+// Verifies the companion's live scalar-value-changed reset: the resolver
+// baked users.name="Alice" into the issues query as a literal. Editing the
+// resolved user row's child field (name: Alice -> Alicia) makes that
+// literal stale, so the advance must RESET (raise a scalar-subquery
+// DriftError that TS turns into a re-hydrate), NOT emit a companion EDIT.
+// Direct port of TS's CompanionPipeline ResetPipelinesSignal('scalar-
+// subquery') behavior (pipeline-driver.ts:2017-2047).
 func TestAddQuery_CompanionLiveTracking(t *testing.T) {
 	users := ivm.NewMemorySource("users",
 		map[string]string{"id": "string", "name": "string"},
@@ -151,9 +153,9 @@ func TestAddQuery_CompanionLiveTracking(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Edit the resolved companion row. The source's Push fans out to the
-	// companion's connection; its pipeline produces an EDIT change tagged
-	// with the parent queryID via the wired pipelineOutput.
+	// Edit the resolved companion row's child field (the baked scalar). The
+	// source's Push fans out to the companion's connection; its output runs
+	// the scalar-value-changed check and raises a reset.
 	res := eng.Advance([]SnapshotChange{
 		{
 			Table:      "users",
@@ -162,24 +164,101 @@ func TestAddQuery_CompanionLiveTracking(t *testing.T) {
 		},
 	})
 
-	// Sort changes by (table, type) so test isn't order-fragile.
-	sort.Slice(res.Changes, func(i, j int) bool {
-		if res.Changes[i].Table != res.Changes[j].Table {
-			return res.Changes[i].Table < res.Changes[j].Table
+	// The advance must signal a scalar-subquery reset (Op="ScalarSubquery")
+	// so the sidecar/TS re-hydrates the query with the new value baked in.
+	if res.Drift == nil {
+		t.Fatalf("expected scalar-subquery reset (Drift set), got Drift=nil changes=%+v", res.Changes)
+	}
+	if res.Drift.Op != "ScalarSubquery" {
+		t.Fatalf("expected Drift.Op=ScalarSubquery, got %q", res.Drift.Op)
+	}
+	if res.Drift.Table != "users" {
+		t.Fatalf("expected Drift.Table=users, got %q", res.Drift.Table)
+	}
+
+	// And it must NOT emit a companion EDIT row (the reset replaces the
+	// incremental emission; the stale literal can't be incrementally fixed).
+	for _, c := range res.Changes {
+		if c.Table == "users" && c.Type == RowChangeEdit && c.Row["name"] == "Alicia" {
+			t.Fatalf("expected no companion EDIT on scalar change (should reset), got %+v", res.Changes)
 		}
-		return res.Changes[i].Type < res.Changes[j].Type
+	}
+}
+
+// Verifies the companion does NOT over-reset: editing a NON-child column
+// of the resolved row leaves the scalar value unchanged, so the advance
+// must accumulate a normal companion EDIT (no reset). This is the
+// scalarValuesEqual==true branch of TS's companion push (the row still
+// streams via streamer.accumulate). Guards against J's reset firing on
+// every companion push.
+func TestAddQuery_CompanionEditNonScalarFieldNoReset(t *testing.T) {
+	users := ivm.NewMemorySource("users",
+		map[string]string{"id": "string", "name": "string", "email": "string"},
+		[]string{"id"})
+	users.BulkInsert([]ivm.Row{{"id": "u1", "name": "Alice", "email": "a@x.com"}})
+	issues := ivm.NewMemorySource("issues",
+		map[string]string{"id": "string", "ownerId": "string"},
+		[]string{"id"})
+	issues.BulkInsert([]ivm.Row{{"id": "i1", "ownerId": "Alice"}})
+
+	eng, err := NewEngine(EngineConfig{StoragePath: tempStoragePath(t)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+	eng.RegisterMemorySource(users)
+	eng.RegisterMemorySource(issues)
+	eng.SetTableUniqueKeys("users", [][]string{{"id"}})
+
+	ast := builder.AST{
+		Table: "issues",
+		Where: &builder.Condition{
+			Type:   "correlatedSubquery",
+			Op:     "EXISTS",
+			Scalar: true,
+			Related: &builder.CorrelatedSubquery{
+				Correlation: builder.Correlation{
+					ParentField: []string{"ownerId"},
+					ChildField:  []string{"name"},
+				},
+				Subquery: builder.AST{
+					Table: "users",
+					Where: &builder.Condition{
+						Type:  "simple",
+						Op:    "=",
+						Left:  &builder.ValuePos{Type: "column", Name: "id"},
+						Right: &builder.ValuePos{Type: "literal", Value: "u1"},
+					},
+				},
+			},
+		},
+	}
+	if _, _, err := eng.AddQuery("q", ast); err != nil {
+		t.Fatal(err)
+	}
+
+	// Edit only the email; the child field (name) is unchanged.
+	res := eng.Advance([]SnapshotChange{
+		{
+			Table:      "users",
+			PrevValues: []ivm.Row{{"id": "u1", "name": "Alice", "email": "a@x.com"}},
+			NextValue:  ivm.Row{"id": "u1", "name": "Alice", "email": "b@x.com"},
+		},
 	})
 
+	if res.Drift != nil {
+		t.Fatalf("expected no reset for non-scalar-field edit, got Drift=%+v", res.Drift)
+	}
 	found := false
 	for _, c := range res.Changes {
 		if c.Table == "users" && c.Type == RowChangeEdit && c.QueryID == "q" &&
-			c.Row["name"] == "Alicia" {
+			c.Row["email"] == "b@x.com" {
 			found = true
 			break
 		}
 	}
 	if !found {
-		t.Fatalf("expected EDIT companion row name=Alicia under q, got %+v", res.Changes)
+		t.Fatalf("expected companion EDIT row email=b@x.com under q, got %+v", res.Changes)
 	}
 }
 

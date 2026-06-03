@@ -111,16 +111,28 @@ type pipelineEntry struct {
 }
 
 // companionEntry is the Go-side companion record. The TS analogue is
-// CompanionPipeline in pipeline-driver.ts; this version omits the live
-// "scalar value changed" reset because almost all real workloads never
-// change a scalar's child field — they only ADD/REMOVE rows that flip
-// existence. If a value-change case becomes load-bearing, we can add a
-// reset signal here that piggybacks on the engine's existing reset path.
+// CompanionPipeline in pipeline-driver.ts. On advance, the companion's
+// output runs the live "scalar value changed" check (port of
+// pipeline-driver.ts:2017-2047): if a push moves the resolved scalar's
+// child field to a different value, the baked-in literal in the main
+// query's plan is stale, so we raise a reset (DriftError) that flows
+// through the engine's existing recover→re-hydrate path — TS re-registers
+// the query, which re-runs ResolveSimpleScalarSubqueries against current
+// truth and bakes the NEW value. Matches TS's ResetPipelinesSignal
+// ('scalar-subquery') end behavior. Unchanged-value pushes accumulate
+// normally.
 type companionEntry struct {
 	pipeline   *builder.Pipeline
 	schema     *ivm.SourceSchema
 	matchedRow ivm.Row // captured by the executor at resolve time; nil = no match
 	childField string
+
+	// resolvedValue is the scalar's child-field value captured at resolve
+	// time (nil == SQL/JS null, which is also what an unmatched subquery
+	// resolves to — TS stores the same single resolvedValue with no
+	// separate "matched" flag). The companion's advance-time output
+	// compares each push's child value against this.
+	resolvedValue ivm.Value
 }
 
 // Engine is the IVM engine that manages sources, pipelines, and the advance loop.
@@ -409,6 +421,11 @@ func (e *Engine) buildAndRegisterLocked(queryID string, ast builder.AST) *pipeli
 			value = nodes[0].Row[childField]
 			matched = true
 		}
+		// Capture the resolved scalar value so the companion's advance-time
+		// output can detect a later change (port of TS CompanionPipeline's
+		// resolvedValue). nil means the subquery matched no row (or matched
+		// a null) — both are SQL/JS null, exactly as TS treats them.
+		ce.resolvedValue = value
 		companions = append(companions, ce)
 		return value, matched
 	}
@@ -435,12 +452,18 @@ func (e *Engine) buildAndRegisterLocked(queryID string, ast builder.AST) *pipeli
 	// Wire each companion's output to the streamer tagged with the MAIN
 	// queryID — when source.Push fans out and the companion's pipeline
 	// produces a Change, it lands in the same accumulated batch the main
-	// query's changes do and ships to the client as a peer row.
+	// query's changes do and ships to the client as a peer row. The
+	// companionOutput wrapper additionally runs the scalar-value-changed
+	// reset check before accumulating (port of pipeline-driver.ts:2017-2047).
 	for _, ce := range companions {
-		ce.pipeline.Input.SetOutput(&pipelineOutput{
-			engine:  e,
-			queryID: queryID,
-			schema:  ce.schema,
+		ce.pipeline.Input.SetOutput(&companionOutput{
+			pipelineOutput: pipelineOutput{
+				engine:  e,
+				queryID: queryID,
+				schema:  ce.schema,
+			},
+			childField:    ce.childField,
+			resolvedValue: ce.resolvedValue,
 		})
 	}
 
@@ -1022,6 +1045,68 @@ func (po *pipelineOutput) Push(change ivm.Change, pusher ivm.InputBase) []ivm.Ch
 	materialized := materializeChange(change)
 	po.engine.streamer.Accumulate(po.queryID, po.schema, []ivm.Change{materialized})
 	return nil
+}
+
+// companionOutput wraps pipelineOutput for a resolved scalar-subquery
+// companion pipeline. Before accumulating the companion's change it runs
+// the scalar-value-changed reset check — direct port of TS's live
+// companion push (pipeline-driver.ts:2017-2047). A push that moves the
+// resolved scalar's child field to a different value makes the main
+// query's baked-in literal stale, so it raises a *ivm.DriftError to ride
+// the engine's existing recover→re-hydrate path: TS re-registers the
+// query, re-running ResolveSimpleScalarSubqueries against current truth
+// and baking the NEW value. Net behavior matches TS's
+// ResetPipelinesSignal('scalar-subquery'). Unchanged-value pushes
+// accumulate exactly as the plain pipelineOutput would.
+type companionOutput struct {
+	pipelineOutput
+	childField    string
+	resolvedValue ivm.Value
+}
+
+func (co *companionOutput) Push(change ivm.Change, pusher ivm.InputBase) []ivm.Change {
+	changed := false
+	switch change.Type {
+	case ivm.ChangeTypeAdd, ivm.ChangeTypeEdit:
+		// New scalar value is the child field of the pushed (new) node.
+		// TS: newValue = change.node.row[childField] ?? null.
+		newValue := change.Node.Row[co.childField]
+		changed = !scalarValuesEqual(newValue, co.resolvedValue)
+	case ivm.ChangeTypeRemove:
+		// TS: newValue = undefined for REMOVE, and scalarValuesEqual(
+		// undefined, resolvedValue) is always false (resolvedValue is never
+		// undefined) — so removing the scalar's source row always resets.
+		changed = true
+	case ivm.ChangeTypeChild:
+		// TS returns [] for CHILD: a relationship-only change does not move
+		// the scalar value — neither accumulate nor reset.
+		return nil
+	}
+	if changed {
+		panic(&ivm.DriftError{
+			Table:    co.schema.TableName,
+			Op:       "ScalarSubquery",
+			PK:       map[string]ivm.Value{},
+			HasCount: 0,
+		})
+	}
+	return co.pipelineOutput.Push(change, pusher)
+}
+
+// scalarValuesEqual ports TS's scalarValuesEqual (pipeline-driver.ts:3278,
+// strict `a === b`) for the resolved-scalar child-field comparison. Go's
+// interface `==` matches JS `===` for scalar literals (the only thing a
+// resolvable scalar subquery yields), with nil == SQL/JS null. The recover
+// guards the rare non-comparable dynamic type (JSON map/slice would panic
+// on ==); treating those as unequal mirrors TS's reference-inequality for
+// object-typed values (→ reset), which is the safe direction.
+func scalarValuesEqual(a, b ivm.Value) (eq bool) {
+	defer func() {
+		if recover() != nil {
+			eq = false
+		}
+	}()
+	return a == b
 }
 
 // materializeChange eagerly evaluates all lazy relationship closures in a change.
