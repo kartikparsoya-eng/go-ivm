@@ -302,26 +302,16 @@ func TestTableSourceExistsSingleKey_HydratesMatchingChannel(t *testing.T) {
 // participant at hydrate time. Without the take.go fix the advance would
 // drop the EXISTS-now-true delta.
 func TestTableSourceExistsCompoundKey_AdvanceEmitsNewlyMatchingChannel(t *testing.T) {
-	// This test exercised the old snapshotDisabled overlay double-count
-	// path (readViaSnapshot gate added 2026-05-28). It depended on an
-	// external SQLite INSERT to simulate the replicator commit, then
-	// counted on the source's per-Fetch snapshot-or-pool read to surface
-	// that row to Take.Fetch during the downstream EXISTS evaluation.
+	// Advance-path regression test for the EXISTS-now-true transition.
+	// A participant is inserted for a channel that had none at hydrate;
+	// the advance must (re-)emit the channel row.
 	//
-	// The prev-tx refactor (2026-06-03) moved writeChange onto a per-
-	// Source BEGIN CONCURRENT tx that's pinned at the pre-batch frame.
-	// During Push fanout the tx hasn't been writeChange'd yet, so a
-	// child-side Take.Fetch (which runs over the same source connection
-	// the push went to) doesn't see the in-flight row through the
-	// overlay gate (lastPushedEpoch == overlay.epoch). The external
-	// INSERT also fails — plain BEGIN can't write from a stale snapshot
-	// without rocicorp's wal2 + BEGIN CONCURRENT (which mattn-bundled
-	// SQLite lacks). Skipping until either the IVM tree gains an
-	// in-flight bypass (FlippedJoin already has one — see
-	// flipped_join.go:328), or the engine grows a snapshotter analog
-	// that supplies both prev (writes go here) and curr (reads from
-	// post-commit state) for the EXISTS re-fetch path.
-	t.Skip("prev-tx arch: downstream re-Fetch during Push fanout doesn't see in-flight writeChange; needs IVM-tree bypass or two-snapshot snapshotter")
+	// In the prev-tx arch the in-flight participant is made visible to the
+	// child-side Take.Fetch (which runs over the same source connection the
+	// push arrived on) via the source overlay, gated on
+	// lastPushedEpoch >= overlay.epoch — matching TS generateWithOverlay.
+	// No external INSERT is needed; Source.Push's overlay + writeChange
+	// supply the row.
 
 	// Seed only the channel — no participant yet. Hydrate should produce
 	// 0 changes (EXISTS is false because no participant).

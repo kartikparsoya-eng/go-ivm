@@ -29,7 +29,6 @@ import (
 // `bulk priority→MEDIUM on tickets in chan-N` pattern that triggered
 // the soak panic (ORM bumps updatedAt on every UPDATE).
 func TestTableSourceTake_BulkUpdateAcrossBound(t *testing.T) {
-	t.Skip("prev-tx arch: mid-batch external INSERT can't be simulated without BEGIN CONCURRENT (rocicorp wal2 patch). Production path uses BEGIN CONCURRENT and works; this test relied on the OLD snapshot-rotate-per-Push mechanism.")
 	path := filepath.Join(t.TempDir(), "replica.sqlite")
 	w, _ := sql.Open("sqlite3", path)
 	if _, err := w.Exec("PRAGMA journal_mode=WAL"); err != nil {
@@ -94,17 +93,10 @@ func TestTableSourceTake_BulkUpdateAcrossBound(t *testing.T) {
 		panic(r)
 	}()
 
-	// Apply the same updates to SQLite first (mimicking the replicator).
-	w2, _ := sql.Open("sqlite3", path)
-	tx, _ := w2.Begin()
-	for i := 0; i < 10; i++ {
-		_, err := tx.Exec(`UPDATE tickets SET updatedAt = 3000 WHERE id = ?`, fmt.Sprintf("t-%02d", i))
-		if err != nil {
-			t.Fatalf("update: %v", err)
-		}
-	}
-	tx.Commit()
-	w2.Close()
+	// The SnapshotChanges below ARE the replicator notification; Source.Push's
+	// writeChange applies each Edit to the prev tx. No external UPDATE — that
+	// would commit after the prev tx's read snapshot and deadlock the
+	// writeChange under plain BEGIN (mattn has no BEGIN CONCURRENT).
 
 	// Build the snapshot changes the replicator would emit and call
 	// engine.Advance with the whole batch.
@@ -131,7 +123,6 @@ func TestTableSourceTake_BulkUpdateAcrossBound(t *testing.T) {
 // likely to expose snapshot-rotation timing: the bound is being
 // updated while the Edits are still being processed.
 func TestTableSourceTake_BulkUpdateIncludingBound(t *testing.T) {
-	t.Skip("prev-tx arch: mid-batch external INSERT can't be simulated without BEGIN CONCURRENT (rocicorp wal2 patch). Production path uses BEGIN CONCURRENT and works; this test relied on the OLD snapshot-rotate-per-Push mechanism.")
 	path := filepath.Join(t.TempDir(), "replica.sqlite")
 	w, _ := sql.Open("sqlite3", path)
 	if _, err := w.Exec("PRAGMA journal_mode=WAL"); err != nil {
@@ -191,16 +182,8 @@ func TestTableSourceTake_BulkUpdateIncludingBound(t *testing.T) {
 		panic(r)
 	}()
 
-	w2, _ := sql.Open("sqlite3", path)
-	tx, _ := w2.Begin()
-	for _, i := range []int{8, 9, 10, 11, 12} {
-		_, err := tx.Exec(`UPDATE tickets SET updatedAt = 3500 WHERE id = ?`, fmt.Sprintf("t-%02d", i))
-		if err != nil {
-			t.Fatalf("update: %v", err)
-		}
-	}
-	tx.Commit()
-	w2.Close()
+	// SnapshotChanges drive the prev-tx writeChange; no external UPDATE
+	// (would deadlock the prev tx's read snapshot under plain BEGIN).
 
 	var changes []SnapshotChange
 	for _, i := range []int{8, 9, 10, 11, 12} {

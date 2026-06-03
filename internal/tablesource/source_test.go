@@ -271,6 +271,72 @@ func TestPushFanoutAddToConnection(t *testing.T) {
 	}
 }
 
+// TestPushDriftOnDuplicateAdd verifies that an ADD for a row already
+// present in the source raises a *ivm.DriftError BEFORE any fanout —
+// matching TS TableSource.genPush's `assert(!exists(row))`
+// (table-source.ts:399-413 + memory-source.ts:531). The prev-tx
+// writeChange would otherwise raw-panic "UNIQUE constraint failed",
+// which is NOT recoverable by engine.Advance and crashes the cg/sidecar.
+func TestPushDriftOnDuplicateAdd(t *testing.T) {
+	// Seed already has users id=1,2,3 (see seedTypedReplica).
+	src, db := newUserSource(t)
+	defer db.Close()
+
+	in := src.Connect(nil, nil, nil)
+	rec := &recordingOutput{}
+	in.SetOutput(rec)
+
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatalf("dup-Add should panic with *DriftError; no panic")
+		}
+		d, ok := r.(*ivm.DriftError)
+		if !ok {
+			t.Fatalf("dup-Add panic type = %T, want *ivm.DriftError (raw panic crashes the sidecar)", r)
+		}
+		if d.Op != "Add" {
+			t.Errorf("DriftError.Op = %q, want \"Add\"", d.Op)
+		}
+		if len(rec.pushed) != 0 {
+			t.Errorf("DriftError must be raised BEFORE fanout; got %d pushed changes", len(rec.pushed))
+		}
+	}()
+
+	// id=1 already exists in the seed → ADD must drift, not INSERT.
+	row := ivm.Row{"id": float64(1), "name": "alice", "score": float64(90), "active": true}
+	src.Push(ivm.MakeSourceChangeAdd(row))
+}
+
+// TestPushDriftOnRemoveMissing verifies a REMOVE of an absent row raises a
+// *ivm.DriftError before fanout (TS: assert(exists(row))).
+func TestPushDriftOnRemoveMissing(t *testing.T) {
+	src, db := newUserSource(t)
+	defer db.Close()
+
+	in := src.Connect(nil, nil, nil)
+	rec := &recordingOutput{}
+	in.SetOutput(rec)
+
+	defer func() {
+		r := recover()
+		d, ok := r.(*ivm.DriftError)
+		if !ok {
+			t.Fatalf("missing-Remove panic type = %T, want *ivm.DriftError", r)
+		}
+		if d.Op != "Remove" {
+			t.Errorf("DriftError.Op = %q, want \"Remove\"", d.Op)
+		}
+		if len(rec.pushed) != 0 {
+			t.Errorf("DriftError must be raised BEFORE fanout; got %d pushed", len(rec.pushed))
+		}
+	}()
+
+	// id=999 not in seed → REMOVE must drift.
+	row := ivm.Row{"id": float64(999), "name": "ghost", "score": float64(0), "active": false}
+	src.Push(ivm.MakeSourceChangeRemove(row))
+}
+
 func TestPushFilterDropsRow(t *testing.T) {
 	src, db := newUserSource(t)
 	defer db.Close()

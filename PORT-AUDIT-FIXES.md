@@ -13,6 +13,49 @@ Symptom this list is rooted in: Go's Take operator emits a different displaced r
 
 ---
 
+## Session log — 2026-06-03 (prev-tx refactor)
+
+- **Prev-tx architecture** ✅ — replaced `sqlite3_snapshot_get` + per-Fetch
+  `snapshot_open` + in-memory `batchDelta` with a per-Source dedicated
+  `*sql.Conn` holding a `BEGIN CONCURRENT` (plain `BEGIN` fallback in
+  mattn builds). `writeChange` (INSERT/UPDATE/DELETE) runs against the prev
+  tx after fanout; `OnAdvanceEnd` does ROLLBACK + lazy re-BEGIN. Direct port
+  of TS Snapshotter prev/curr + TableSource.#writeChange. Commit `9ad33ad`.
+- **Overlay gate inversion** ✅ — `fetchForConn` applied the in-flight
+  overlay on the WRONG connections (`lastPushedEpoch < epoch`). TS applies
+  it for the connection CURRENTLY being pushed (`>= epoch`,
+  `memory-source.ts:634`). The inversion hid the in-flight row from the
+  EXISTS/Join child re-fetch (which runs on the pushed connection) →
+  advance emitted far fewer changes than TS ("TS produced 21, Go produced
+  2"). Fixed to `>=`. Old batchDelta arch masked it by applying every batch
+  push to every fetch. Un-skipped + un-external-INSERT'd the 4 engine tests
+  that this fixed (EXISTS/NotExists advance, Take bulk).
+
+### Post-prev-tx soak (4u × ~130s active, gate fix in):
+- ✅ in-flight-visibility count divergence ("TS 21 / Go 2") — GONE.
+- 🔴 **X** (new): `writeChange` UNIQUE-constraint raw panic — see below.
+- 🟠 **B/C-residual**: Take tied-sort row-pick divergence STILL present
+  (the original symptom) — prev-tx did NOT fix it; it's in Take's bound
+  selection, not the source snapshot timing. See header symptom.
+
+---
+
+## NEW — prev-tx-introduced (P0, stability)
+
+- [ ] **X.** `writeChange` ADD of an already-present row → raw panic
+  - `internal/tablesource/source.go` `writeChangeLocked`: `INSERT` fails with
+    `UNIQUE constraint failed` when a batch ADD targets a row already in the
+    prev tx (dup messageId from insert+delete+insert / coalesced diff).
+  - Raw `panic`, NOT `*ivm.DriftError` → `engine.Advance` recover re-raises
+    → risks crashing the cg/sidecar. Drives the `Go produced 0` re-hydrates.
+  - TS: `genPush` runs `assert(!exists(row))` BEFORE fanout → throws →
+    view-syncer re-hydrates (`memory-source.ts:531`). Symmetric for
+    REMOVE/EDIT of a missing row.
+  - Fix: exists-check (or catch UNIQUE) and raise `DriftError` so the engine
+    recovers cleanly + re-hydrates, matching TS.
+
+---
+
 ## Direct causes of Take-bound mismatch (FIX FIRST)
 
 - [x] **A.** tablesource Push order: filter-transition runs BEFORE split-edit, per-conn instead of global ✅
@@ -80,11 +123,14 @@ Symptom this list is rooted in: Go's Take operator emits a different displaced r
 
 ## Fix order
 
-1. A + D (single PR, both in `tablesource/source.go` + `tablesource/overlay.go`)
-2. B + C (`ivm/take.go` — revert Go-specific safety nets)
-3. F (one-line `pipeline-driver.ts:985`)
-4. G (engine push-loop brackets)
-5. E (skip full-comparator)
-6. Remaining in priority order, working down severity
+Done: A, D, F, prev-tx, overlay-gate (✅).
 
-After each fix: rebuild + soak (20 users × 30 min shadow + mutate) and record observed delta.
+Remaining, by priority:
+1. **X** — `writeChange` → DriftError on dup-ADD / missing-REMOVE (P0 crash risk).
+2. **Take tied-sort row-pick** — the original symptom; line-by-line `pushEditChange`/`pushAddChange` bound logic vs `take.ts`.
+3. **G** — engine push-loop beginFilter/endFilter brackets.
+4. **E** — skip full-comparator.
+5. **H, I, J** — lifecycle/restart.
+6. **K–W** — observability (won't cause runtime mismatch).
+
+After each fix: rebuild amd64 → swap mounted binary → soak (4 users × 4 min shadow + mutate, per Mac limit) and record observed delta. See `memory/reference_soak_run_procedure.md` for the header-size gotchas.

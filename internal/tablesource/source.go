@@ -59,11 +59,12 @@ type Source struct {
 	// Cached ordering of columns + cached SQL for writeChange. Computed
 	// once at New() so the Push hot path doesn't re-derive them per
 	// change. Mirrors TS's `#getStatementsFor` cache (table-source.ts:136).
-	columnOrder []string // stable iteration order for INSERT VALUES (...)
-	nonPKCols   []string // cols not in the primary key, for UPDATE SET ...
-	insertSQL   string
-	deleteSQL   string
-	updateSQL   string // "" if all columns are part of the primary key
+	columnOrder    []string // stable iteration order for INSERT VALUES (...)
+	nonPKCols      []string // cols not in the primary key, for UPDATE SET ...
+	insertSQL      string
+	deleteSQL      string
+	updateSQL      string // "" if all columns are part of the primary key
+	checkExistsSQL string // SELECT 1 FROM t WHERE pk=? ... LIMIT 1
 
 	// mu serializes all Source state: connection list, pushEpoch,
 	// overlay, AND the prev-tx (prevConn + prevTxStarted). Acquired
@@ -217,17 +218,24 @@ func New(db *sql.DB, writableDB *sql.DB, tableName string, columns map[string]sq
 		)
 	}
 
+	checkExistsSQL := fmt.Sprintf(
+		"SELECT 1 FROM %s WHERE %s LIMIT 1",
+		quoteIdent(tableName),
+		strings.Join(pkConds, " AND "),
+	)
+
 	return &Source{
-		db:          db,
-		writableDB:  writableDB,
-		tableName:   tableName,
-		primaryKey:  primaryKey,
-		columns:     columns,
-		columnOrder: colOrder,
-		nonPKCols:   nonPK,
-		insertSQL:   insertSQL,
-		deleteSQL:   deleteSQL,
-		updateSQL:   updateSQL,
+		db:             db,
+		writableDB:     writableDB,
+		tableName:      tableName,
+		primaryKey:     primaryKey,
+		columns:        columns,
+		columnOrder:    colOrder,
+		nonPKCols:      nonPK,
+		insertSQL:      insertSQL,
+		deleteSQL:      deleteSQL,
+		updateSQL:      updateSQL,
+		checkExistsSQL: checkExistsSQL,
 	}, nil
 }
 
@@ -468,6 +476,19 @@ func (s *Source) Push(change ivm.SourceChange) []ivm.Change {
 // Direct port of TS's genPushAndWrite (memory-source.ts).
 func (s *Source) genPushAndWrite(change ivm.SourceChange, conns []*connection) []ivm.Change {
 	s.mu.Lock()
+	// Drift validation BEFORE any state mutation or fanout — matches TS
+	// MemorySource.genPush (memory-source.ts:529-550) and the in-memory
+	// MemorySource port (ivm/source.go genPush). Raising here, before
+	// pushEpoch++/overlay/writeChange and before any Output.Push, keeps the
+	// DriftError recoverability invariant: engine.Advance recovers the panic
+	// and drops the in-flight advance with no half-applied state. This also
+	// replaces the previous raw "UNIQUE constraint failed" panic from
+	// writeChange (a dup-Add) which was NOT a *DriftError and would crash the
+	// cg/sidecar instead of triggering a clean re-hydrate.
+	if d := s.driftCheckLocked(change); d != nil {
+		s.mu.Unlock()
+		panic(d)
+	}
 	s.pushEpoch++
 	epoch := s.pushEpoch
 	s.overlay = &ivm.Overlay{Epoch: epoch, Change: change}
@@ -504,6 +525,72 @@ func (s *Source) genPushAndWrite(change ivm.SourceChange, conns []*connection) [
 	}
 
 	return out
+}
+
+// driftCheckLocked validates the change against current source state,
+// returning a *ivm.DriftError if it diverged (so the caller raises it
+// BEFORE any fanout/mutation). Direct port of TS genPush's pre-fanout
+// asserts (memory-source.ts:529-550) using TS TableSource's `exists`
+// closure (table-source.ts:399-413, backed by the checkExists stmt).
+// Mirrors the in-memory MemorySource Go port (ivm/source.go genPush)
+// switch + DriftError construction exactly.
+//
+//   - ADD:    assert !exists(row)      → dup-Add drift
+//   - REMOVE: assert  exists(row)      → missing-row drift
+//   - EDIT:   assert  exists(oldRow)   → missing-row drift
+//
+// MUST be called with s.mu held (queries the prev tx via prevConn).
+func (s *Source) driftCheckLocked(change ivm.SourceChange) *ivm.DriftError {
+	switch change.Type {
+	case ivm.ChangeTypeAdd:
+		if s.existsLocked(change.Row) {
+			return &ivm.DriftError{Table: s.tableName, Op: "Add", PK: s.pkOf(change.Row), HasCount: s.countLocked()}
+		}
+	case ivm.ChangeTypeRemove:
+		if !s.existsLocked(change.Row) {
+			return &ivm.DriftError{Table: s.tableName, Op: "Remove", PK: s.pkOf(change.Row), HasCount: s.countLocked()}
+		}
+	case ivm.ChangeTypeEdit:
+		if !s.existsLocked(change.OldRow) {
+			return &ivm.DriftError{Table: s.tableName, Op: "Edit", PK: s.pkOf(change.OldRow), HasCount: s.countLocked()}
+		}
+	}
+	return nil
+}
+
+// existsLocked reports whether a row with row's primary key exists in the
+// prev tx. Faithful port of TS TableSource's `exists` closure
+// (table-source.ts:399-402): checkExists SELECT 1 ... LIMIT 1.
+//
+// MUST be called with s.mu held (queries prevConn). ensurePrevTxLocked has
+// already run by the time genPushAndWrite reaches the drift check.
+func (s *Source) existsLocked(row ivm.Row) bool {
+	args := s.rowToPKArgs(row)
+	var one int
+	err := s.prevConn.QueryRowContext(context.Background(), s.checkExistsSQL, args...).Scan(&one)
+	return err == nil && one == 1
+}
+
+// pkOf extracts the primary-key columns of row into a fresh map, matching
+// the MemorySource port's DriftError.PK construction (ivm/source.go).
+func (s *Source) pkOf(row ivm.Row) map[string]ivm.Value {
+	pk := make(map[string]ivm.Value, len(s.primaryKey))
+	for _, c := range s.primaryKey {
+		pk[c] = row[c]
+	}
+	return pk
+}
+
+// countLocked returns the current source row count for DriftError
+// diagnostics (analogous to len(ms.data) in the MemorySource port). Only
+// called on the rare drift path, so the COUNT(*) cost is irrelevant.
+func (s *Source) countLocked() int {
+	var n int
+	if err := s.prevConn.QueryRowContext(context.Background(),
+		"SELECT COUNT(*) FROM "+quoteIdent(s.tableName)).Scan(&n); err != nil {
+		return -1
+	}
+	return n
 }
 
 // writeChangeLocked applies the SourceChange to the prev-snapshot tx as
@@ -770,13 +857,26 @@ func (s *Source) fetchForConn(req ivm.FetchRequest, conn *connection) []ivm.Node
 	}
 
 	// Apply in-flight overlay (the push currently fanning out, whose
-	// writeChange hasn't run yet). Only relevant when:
-	//   - overlay != nil
-	//   - this connection hasn't observed the push (lastPushedEpoch < overlay.Epoch)
+	// writeChange hasn't run yet against the prev tx).
 	//
-	// Once writeChange runs (after fanout) and overlay clears, the SQL
-	// query above naturally reflects the change — no overlay needed.
-	if s.overlay != nil && conn.lastPushedEpoch < s.overlay.Epoch {
+	// Gate matches TS generateWithOverlay (memory-source.ts:634):
+	//   apply iff lastPushedEpoch >= overlay.epoch
+	//
+	// i.e. the overlay is visible to the connection CURRENTLY being pushed
+	// (its lastPushedEpoch was just set == overlay.epoch in genPushAndWrite),
+	// NOT to sibling connections that haven't observed the push yet. This is
+	// the path that makes an EXISTS/Join child re-fetch — which runs through
+	// the very connection the push came in on — see the in-flight row, so
+	// the existence condition flips and the parent is (re-)emitted. A prior
+	// inverted gate (`<`) hid the in-flight row from exactly that re-fetch,
+	// causing advance to emit far fewer changes than TS (shadow soak:
+	// "TS produced 21 changes, Go produced 2"). The old snapshot+batchDelta
+	// arch masked the inversion by applying every batch push to every fetch
+	// unconditionally; the prev-tx arch relies on this gate being correct.
+	//
+	// Once writeChange runs (after fanout) and overlay clears, the SQL query
+	// above naturally reflects the change — no overlay needed.
+	if s.overlay != nil && conn.lastPushedEpoch >= s.overlay.Epoch {
 		out = applyOverlay(out, s.overlay.Change, conn.compareRows, req.Constraint, s.primaryKey)
 		if conn.filterPredicate != nil {
 			filtered := out[:0]

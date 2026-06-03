@@ -48,7 +48,6 @@ import (
 // bound and the row that's actually moving — that's what causes Take to
 // pick the wrong newBoundNode in the reverse fetch.
 func TestTableSourceTake_StaleBoundOnTieAtLimit1(t *testing.T) {
-	t.Skip("prev-tx arch: mid-batch external INSERT can't be simulated without BEGIN CONCURRENT (rocicorp wal2 patch). Production path uses BEGIN CONCURRENT and works; this test relied on the OLD snapshot-rotate-per-Push mechanism.")
 	path := filepath.Join(t.TempDir(), "replica.sqlite")
 	w, err := sql.Open("sqlite3", path)
 	if err != nil {
@@ -116,20 +115,12 @@ func TestTableSourceTake_StaleBoundOnTieAtLimit1(t *testing.T) {
 		t.Fatalf("AddQuery: %v", err)
 	}
 
-	// Apply the same updates to SQLite first (mimicking the replicator).
 	// Both ticket-6 and ticket-14 land at the SAME new updatedAt = 623262.
 	// With id-ASC tiebreaker, ticket-14 < ticket-6 lex, so at the tied
-	// sort ticket-14 ends up at the smaller forward position.
+	// sort ticket-14 ends up at the smaller forward position. The
+	// SnapshotChanges below drive the prev-tx writeChange — no external
+	// UPDATE (would deadlock the prev tx's read snapshot under plain BEGIN).
 	const newTs = int64(623262)
-	w2, _ := sql.Open("sqlite3", path)
-	tx, _ := w2.Begin()
-	for _, id := range []string{"ticket-6", "ticket-14"} {
-		if _, err := tx.Exec(`UPDATE tickets SET updatedAt = ? WHERE id = ?`, newTs, id); err != nil {
-			t.Fatalf("update %s: %v", id, err)
-		}
-	}
-	tx.Commit()
-	w2.Close()
 
 	// Batch the two edits in a single Advance — order matters: ticket-6
 	// first (so it lands in source.data before ticket-14's push fires).

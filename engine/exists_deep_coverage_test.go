@@ -133,7 +133,6 @@ func TestTableSourceNestedExists_ThreeLevels(t *testing.T) {
 // Without the snapshotDisabled overlay fix (gap #1) this would fail the
 // same way the EXISTS-advance test did.
 func TestTableSourceNotExistsCompoundKey_AdvanceEmitsTransition(t *testing.T) {
-	t.Skip("prev-tx arch: mid-batch external INSERT can't be simulated without BEGIN CONCURRENT (rocicorp wal2 patch). Production path uses BEGIN CONCURRENT and works; this test relied on the OLD snapshot-rotate-per-Push mechanism.")
 	path := filepath.Join(t.TempDir(), "replica.sqlite")
 	w, _ := sql.Open("sqlite3", path)
 	for _, stmt := range []string{
@@ -210,12 +209,11 @@ func TestTableSourceNotExistsCompoundKey_AdvanceEmitsTransition(t *testing.T) {
 		t.Fatalf("initial NOT EXISTS hydrate should yield only chan-B; got %v", initial)
 	}
 
-	// Advance 1: INSERT participant for chan-B → NOT EXISTS chan-B flips
-	// true→false → Remove(chan-B) must be emitted.
-	w2, _ := sql.Open("sqlite3", path)
-	w2.Exec(`INSERT INTO channel_participants VALUES ('cp-b-X', 'chan-B', 'user-X')`)
-	w2.Close()
-
+	// Advance 1: a participant is added for chan-B → NOT EXISTS chan-B flips
+	// true→false → Remove(chan-B) must be emitted. The SnapshotChange below
+	// IS the replicator notification; Source.Push's writeChange applies it
+	// to the prev tx (no external INSERT — that would race the prev tx's
+	// read snapshot and deadlock under plain BEGIN).
 	result := eng.Advance([]SnapshotChange{{
 		Table: "channel_participants",
 		NextValue: ivm.Row{"id": "cp-b-X", "channelId": "chan-B", "userId": "user-X"},
