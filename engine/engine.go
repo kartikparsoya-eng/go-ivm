@@ -169,6 +169,63 @@ type Engine struct {
 
 	// parallelThreshold: if a source has more connections than this, fan-out in parallel
 	parallelThreshold int
+
+	// minRowVersions: per-table minRowVersion forwarded from TS-side
+	// tableSpec.minRowVersion (set after a RESET during incremental catchup).
+	// Used to bump an emitted row's _0_version up to minRowVersion when the
+	// row's stored version is below it — direct port of TS streamNodes
+	// (pipeline-driver.ts:3172-3178). Empty/missing for a table means no bump.
+	// The bump is a no-op in steady state (minRowVersion unset or rows already
+	// at/above it), so it only activates in the rare post-RESET window.
+	minRowVersions map[string]string
+}
+
+// zeroVersionColumn is the row-version bookkeeping column (TS
+// ZERO_VERSION_COLUMN_NAME, replication-state.ts). Present on rows read from
+// the replica; compared/bumped against minRowVersion. Not part of the zql
+// spec, so it is stripped before client comparison — see the drift-audit
+// projection in pipeline-driver.ts.
+const zeroVersionColumn = "_0_version"
+
+// SetMinRowVersions installs the per-table minRowVersion map (from
+// handleInit). Safe to call before any advance/hydrate; nil clears it.
+func (e *Engine) SetMinRowVersions(m map[string]string) {
+	e.mu.Lock()
+	e.minRowVersions = m
+	e.mu.Unlock()
+}
+
+// bumpRowVersions applies the TS streamNodes minRowVersion bump
+// (pipeline-driver.ts:3172-3178) to a finished RowChange slice: for each
+// non-REMOVE change whose table has a minRowVersion and whose row's stored
+// _0_version is below it, rewrite _0_version up to minRowVersion. Bumps on a
+// COPY of the row so the source's row map is never mutated. No-op (returns the
+// input untouched) when no minRowVersions are set — the common steady state.
+func bumpRowVersions(changes []RowChange, mrv map[string]string) []RowChange {
+	if len(mrv) == 0 {
+		return changes
+	}
+	for i := range changes {
+		c := &changes[i]
+		if c.Type == RowChangeRemove || c.Row == nil {
+			continue
+		}
+		want := mrv[c.Table]
+		if want == "" {
+			continue
+		}
+		cur, ok := c.Row[zeroVersionColumn].(string)
+		if !ok || cur >= want {
+			continue
+		}
+		nr := make(ivm.Row, len(c.Row))
+		for k, v := range c.Row {
+			nr[k] = v
+		}
+		nr[zeroVersionColumn] = want
+		c.Row = nr
+	}
+	return changes
 }
 
 // EngineConfig configures the engine.
@@ -383,7 +440,7 @@ func (e *Engine) AddQuery(queryID string, ast builder.AST) ([]RowChange, float64
 	// Hydrate: fetch current state and return as ADD changes (plus any
 	// resolver-recorded companion rows).
 	start := time.Now()
-	hydration := hydrateEntry(entry)
+	hydration := bumpRowVersions(hydrateEntry(entry), e.minRowVersions)
 	timingMs := float64(time.Since(start).Microseconds()) / 1000.0
 
 	return hydration, timingMs, nil
@@ -510,13 +567,16 @@ func (e *Engine) AddQueries(queries []QuerySpec) ([]QueryResult, error) {
 
 	// Phase 2: Hydrate all pipelines in parallel (read-only fetches).
 	results := make([]QueryResult, len(built))
+	// Snapshot minRowVersions under the held e.mu so the parallel hydrate
+	// goroutines read a stable map (K: minRowVersion bump).
+	mrv := e.minRowVersions
 	var wg sync.WaitGroup
 	wg.Add(len(built))
 	for i, entry := range built {
 		go func(idx int, entry *pipelineEntry) {
 			defer wg.Done()
 			start := time.Now()
-			hydration := hydrateEntry(entry)
+			hydration := bumpRowVersions(hydrateEntry(entry), mrv)
 			timingMs := float64(time.Since(start).Microseconds()) / 1000.0
 			// Non-streaming path: result is the single (final) chunk.
 			results[idx] = QueryResult{
@@ -579,6 +639,9 @@ func (e *Engine) AddQueriesStream(
 	// improves time-to-first-byte for large hydrations. Go-side memory is
 	// NOT bounded — pipeline.Input.Fetch still returns the full result
 	// slice up front; operator-level chunking would be a separate refactor.
+	// Snapshot minRowVersions under the held e.mu so the parallel hydrate
+	// goroutines read a stable map (K: minRowVersion bump).
+	mrv := e.minRowVersions
 	var wg sync.WaitGroup
 	wg.Add(len(built))
 	for _, b := range built {
@@ -599,7 +662,7 @@ func (e *Engine) AddQueriesStream(
 				}
 				onResult(QueryResult{
 					QueryID:    entry.queryID,
-					Changes:    chunk,
+					Changes:    bumpRowVersions(chunk, mrv),
 					ChunkIndex: chunkIndex,
 					Final:      final,
 					TimingMs:   timingMs,
@@ -786,9 +849,9 @@ func (e *Engine) Advance(changes []SnapshotChange) *AdvanceResult {
 		// Partial-emit-then-drift: prior successful pushes' output goes to
 		// the caller so clients see it (TS behavior). The drift signal
 		// triggers re-hydrate which catches up any missed deltas.
-		return &AdvanceResult{Changes: allRowChanges, Timings: timings, Drift: drift}
+		return &AdvanceResult{Changes: bumpRowVersions(allRowChanges, e.minRowVersions), Timings: timings, Drift: drift}
 	}
-	return &AdvanceResult{Changes: allRowChanges, Timings: timings}
+	return &AdvanceResult{Changes: bumpRowVersions(allRowChanges, e.minRowVersions), Timings: timings}
 }
 
 // AdvanceStreamPartial is one frame in the AdvanceStream output. Multiple
@@ -866,7 +929,7 @@ func (e *Engine) AdvanceStream(
 			t = timings
 		}
 		onResult(AdvanceStreamPartial{
-			Changes:    pending,
+			Changes:    bumpRowVersions(pending, e.minRowVersions),
 			ChunkIndex: chunkIndex,
 			Final:      final,
 			Timings:    t,

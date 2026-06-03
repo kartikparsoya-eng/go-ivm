@@ -996,6 +996,11 @@ type tableSchemaParams struct {
 	// by the scalar-subquery resolver to identify subqueries returning at
 	// most one row. Empty/nil disables the resolver for this table.
 	UniqueKeys [][]string `json:"uniqueKeys,omitempty"`
+	// MinRowVersion: the table's minRowVersion (TS liteTableSpec.minRowVersion),
+	// set after a RESET during incremental catchup. Forwarded so streamNodes can
+	// bump an emitted row's _0_version up to it when below (audit item K, port of
+	// pipeline-driver.ts:3172-3178). Empty/absent means no bump for this table.
+	MinRowVersion string `json:"minRowVersion,omitempty"`
 	// Rows are typed as ivm.Row (not []map[string]interface{}) so the custom
 	// Row.DecodeMsgpack runs at decode time — performing the in-place
 	// int->float64 coercion that the SnapshotChange path already gets via
@@ -1056,7 +1061,11 @@ func (s *Server) handleInit(req RPCRequest) RPCResponse {
 	// MemorySource and bulk-load the rows TS sent in the init payload.
 	// In ModeTable we build a tablesource.Source over the shared replica
 	// pool — schema.Rows is ignored (the SQLite file is authoritative).
+	minRowVersions := make(map[string]string)
 	for tableName, schema := range p.Tables {
+		if schema.MinRowVersion != "" {
+			minRowVersions[tableName] = schema.MinRowVersion
+		}
 		columns := make(map[string]string, len(schema.Columns))
 		for col, cs := range schema.Columns {
 			columns[col] = cs.Type
@@ -1116,6 +1125,10 @@ func (s *Server) handleInit(req RPCRequest) RPCResponse {
 			eng.SetTableUniqueKeys(tableName, schema.UniqueKeys)
 		}
 	}
+
+	// Install the per-table minRowVersion map for the streamNodes bump
+	// (audit item K). Empty map is fine — bumpRowVersions is a no-op then.
+	eng.SetMinRowVersions(minRowVersions)
 
 	return RPCResponse{
 		JSONRPC: "2.0",
