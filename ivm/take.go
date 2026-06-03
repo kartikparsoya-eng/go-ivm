@@ -307,22 +307,16 @@ func (t *Take) Push(change Change, pusher InputBase) []Change {
 			results = append(results, t.output.Push(MakeAddChange(*newBound.node), t)...)
 			return results
 		}
-		// If neither fetch found a replacement bound, the partition is empty
-		// from the source's perspective. The previous code wrote
-		// `{Size: takeState.Size-1, Bound: nil}` which violates the Take
-		// invariant `Size > 0 → Bound != nil` whenever Size was >= 2,
-		// causing the next EDIT against this partition to panic at
-		// pushEditChange's `if takeState.Bound == nil` check. Force Size=0
-		// when there's no bound: an unfindable bound means an empty window.
-		var newSize int
+		// Match TS take.ts:413-418 — unconditional Size-1, Bound = newBound?.node.row
+		// (may be nil). The Take invariant "Size > 0 → Bound != nil" is enforced
+		// in TS by the assertions inside pushEditChange ("Bound should be set");
+		// the Go-only Size=0 reset diverged the partition's state from TS so
+		// subsequent pushes were against a different baseline. (Audit fix B.)
 		var boundRow Row
 		if newBound != nil {
-			newSize = takeState.Size - 1
 			boundRow = newBound.node.Row
-		} else {
-			newSize = 0
 		}
-		t.setTakeState(takeStateKey, newSize, boundRow, maxBound)
+		t.setTakeState(takeStateKey, takeState.Size-1, boundRow, maxBound)
 		return t.output.Push(change, t)
 
 	case ChangeTypeChild:
@@ -448,14 +442,28 @@ func (t *Take) pushEditChange(change Change) []Change {
 				break
 			}
 		}
+		// Match TS take.ts:594-600 — both oldBoundNode and newBoundNode are
+		// asserted non-nil. The TS invariant: when old is outside the bound
+		// and new is inside, the fetch (reverse from bound 'at') MUST return
+		// at least 2 nodes (the bound itself + the row before it that becomes
+		// the new bound). If only 1 node is returned, the source state is
+		// inconsistent — TS asserts (throws), Go panics with DriftError so
+		// the engine recovers via re-init.
+		// Pre-fix audit C had a Go-only fallback that silently bumped Size+1
+		// while keeping the stale Bound. That diverged the partition's state
+		// from TS, causing subsequent pushes to operate on a wrong baseline.
+		// Match TS take.ts:594-600 assertions but signal as DriftError so
+		// engine.Advance's recover catches it and triggers re-init from
+		// SQLite truth (the same pattern as the other stale-bound sites in
+		// pushEditChange). A raw panic here would crash the sidecar and
+		// every cg on it; DriftError lets just THIS advance be dropped.
 		if oldBoundNode == nil {
-			panic("Take: oldBoundNode must be found during fetch")
+			t.dumpFlightRecorder("oldBoundNode missing in pushEditChange oldCmp>0,newCmp<0 fetch")
+			panic(t.staleBoundDriftError(change, "oldBoundNode nil (oldCmp>0, newCmp<0)"))
 		}
 		if newBoundNode == nil {
-			// Edge case: only 1 row at/before bound (size < limit). The new row
-			// enters the window without displacing anything. Bound stays as-is.
-			t.setTakeState(takeStateKey, takeState.Size+1, takeState.Bound, maxBound)
-			return t.output.Push(MakeAddChange(change.Node), t)
+			t.dumpFlightRecorder("newBoundNode missing in pushEditChange oldCmp>0,newCmp<0 fetch")
+			panic(t.staleBoundDriftError(change, "newBoundNode nil (oldCmp>0, newCmp<0)"))
 		}
 		t.setTakeState(takeStateKey, takeState.Size, newBoundNode.Row, maxBound)
 		var results []Change

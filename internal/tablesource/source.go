@@ -68,6 +68,25 @@ type Source struct {
 	// consistency outside of Push. Single-flight: set once, never
 	// reset within a Source's lifetime.
 	snapshotDisabled bool
+
+	// batchDelta accumulates SourceChange entries Pushed within the
+	// current advance batch. Applied during Fetch on top of the snapshot
+	// so the source view evolves like TS's TableSource — which writes
+	// each push to its prev snapshot's db via INSERT/UPDATE/DELETE so
+	// subsequent Fetches in the same batch see prior pushes' effects.
+	//
+	// Without this, Go's per-Push rotateSnapshot pulled in the live
+	// replica's state on every push — which in high-throughput soaks
+	// included mutations the IVM advance had not yet applied (the
+	// replicator commits the whole batch to SQLite before notifying the
+	// engine). That caused Take's pushEditChange to see a row at its
+	// new sort BEFORE the push that nominally lands it there — the
+	// stale-bound trap.
+	//
+	// Cleared in OnAdvanceEnd alongside the snapshot rotation, so the
+	// next batch starts with a freshly-captured snapshot + empty delta.
+	// Guarded by mu (same lock as overlay).
+	batchDelta []ivm.SourceChange
 }
 
 // connection is one downstream pipeline subscribed to this source.
@@ -191,6 +210,25 @@ func (s *Source) RefreshSnapshot() {
 	s.rotateSnapshot()
 }
 
+// OnAdvanceEnd is called by the engine at the end of each advance batch
+// (success OR drift). Clears batchDelta and rotates the snapshot to the
+// current WAL frame so the NEXT batch reads from a frame that reflects
+// the just-completed batch's mutations.
+//
+// Within a batch, the snapshot stayed pinned at the prev-batch frame and
+// batchDelta accumulated pushes (matching TS's prev snapshot + writeChange
+// pattern). Now that the batch is over, the live replica's frame
+// represents the post-batch state — rotating here aligns Go's source
+// view with that state going forward, and clearing batchDelta avoids
+// double-applying batch-N's pushes against batch-(N+1)'s snapshot which
+// already has them.
+func (s *Source) OnAdvanceEnd() {
+	s.mu.Lock()
+	s.batchDelta = nil
+	s.mu.Unlock()
+	s.rotateSnapshot()
+}
+
 // TableName / PrimaryKey / NormalizeRow satisfy engine.Source.
 
 func (s *Source) TableName() string { return s.tableName }
@@ -263,90 +301,127 @@ func (s *Source) Connect(
 // the time advance() reaches us. This source is a pure read-side
 // adapter; Push is fanout + overlay only.
 //
-// Edit / split-edit / filter-transition handling mirrors the existing
-// sqlite.TableSource.Push contract so downstream operators see
-// identical change sequences regardless of which leaf is in use.
+// Order matches TS MemorySource.genPushAndWriteWithSplitEdit
+// (mono/packages/zql/src/ivm/memory-source.ts:452-506):
+//   1. Decide shouldSplitEdit GLOBALLY by scanning every connection's
+//      splitEditKeys against the Edit's old/new. If ANY connection
+//      requests a split, the source-level change is rewritten as
+//      Remove(oldRow) followed by Add(newRow) before fan-out.
+//   2. For each source-level change (1 or 2), fan out to every
+//      connection through filterPush, which handles per-connection
+//      filter predicates including the EDIT-with-filter-transition
+//      case via maybeSplitAndPushEditChange.
+//
+// Pre-fix Go made both decisions per-connection inline — fan-out of a
+// connection without splitEditKeys missed the source-level split that
+// TS would have done because another connection asked for it.
+// That diverged downstream Take/Exists state from TS and tripped the
+// stale-bound trap on tied sort keys (audit fix A).
 func (s *Source) Push(change ivm.SourceChange) []ivm.Change {
 	s.mu.Lock()
-	s.pushEpoch++
-	epoch := s.pushEpoch
-	s.overlay = &ivm.Overlay{Epoch: epoch, Change: change}
+	shouldSplitEdit := false
+	if change.Type == ivm.ChangeTypeEdit {
+		for _, conn := range s.connections {
+			if conn.splitEditKeys != nil && editChangesSplitKeys(change, conn.splitEditKeys) {
+				shouldSplitEdit = true
+				break
+			}
+		}
+	}
 	conns := make([]*connection, len(s.connections))
 	copy(conns, s.connections)
 	s.mu.Unlock()
 
-	// Defer overlay clear AND snapshotEpoch bump to the end of fan-out.
-	// Bump order matters: snapshotEpoch++ is what tells the next
-	// Fetch's TxCache.Acquire to roll the pinned read tx to a fresh
-	// WAL frame. Doing this BEFORE fanout would roll the tx mid-Push,
-	// then Fetches inside the fanout would see post-replicator-commit
-	// state AND the overlay → double-application. Doing it AFTER means
-	// the tx stays pinned through the whole fanout, so Fetch sees pre-
-	// commit + overlay = correct post-commit view.
+	var out []ivm.Change
+	if change.Type == ivm.ChangeTypeEdit && shouldSplitEdit {
+		out = append(out, s.genPushAndAppendDelta(ivm.MakeSourceChangeRemove(change.OldRow), conns)...)
+		out = append(out, s.genPushAndAppendDelta(ivm.MakeSourceChangeAdd(change.Row), conns)...)
+	} else {
+		out = append(out, s.genPushAndAppendDelta(change, conns)...)
+	}
+	return out
+}
+
+// genPushAndAppendDelta runs ONE source-level change through every
+// connection's filterPush, then appends the change to batchDelta so
+// subsequent Fetches in the same batch see it (the TS equivalent
+// is genPushAndWrite calling writeChange after genPush — Go can't
+// write to its read-only snapshot, so batchDelta in-memory layer
+// stands in for the snapshot mutation TS performs).
+func (s *Source) genPushAndAppendDelta(change ivm.SourceChange, conns []*connection) []ivm.Change {
+	s.mu.Lock()
+	s.pushEpoch++
+	epoch := s.pushEpoch
+	s.overlay = &ivm.Overlay{Epoch: epoch, Change: change}
+	s.mu.Unlock()
+
 	defer func() {
 		s.mu.Lock()
 		s.overlay = nil
+		s.batchDelta = append(s.batchDelta, change)
 		s.mu.Unlock()
-		// Rotate the snapshot AFTER the fanout completes. Downstream
-		// Fetches inside Output.Push read the PRE-rotation snapshot
-		// (which sees pre-replicator-commit state) + overlay → correct
-		// post-commit view. Once fanout is done, the next Fetch picks
-		// up the NEW snapshot (which sees the now-current WAL frame).
-		s.rotateSnapshot()
 	}()
 
 	var out []ivm.Change
-
 	for _, conn := range conns {
 		if conn.output == nil {
 			continue
 		}
-
-		// Filter-transition handling:
-		//  - row fails filter → either remove (if Edit and old passed)
-		//    or skip
-		//  - Edit where only old passed filter → emit Remove
-		//  - Edit where only new passes filter → emit Add
-		if conn.filterPredicate != nil {
-			if !conn.filterPredicate(change.Row) {
-				if change.Type == ivm.ChangeTypeEdit && conn.filterPredicate(change.OldRow) {
-					rm := ivm.MakeRemoveChange(ivm.Node{Row: change.OldRow})
-					out = append(out, conn.output.Push(rm, conn.input)...)
-				}
-				conn.lastPushedEpoch = epoch
-				continue
-			}
-			if change.Type == ivm.ChangeTypeEdit && !conn.filterPredicate(change.OldRow) {
-				ad := ivm.MakeAddChange(ivm.Node{Row: change.Row})
-				out = append(out, conn.output.Push(ad, conn.input)...)
-				conn.lastPushedEpoch = epoch
-				continue
-			}
-		}
-
-		// Split-edit: when an Edit changes a partition key the connection
-		// cares about (per splitEditKeys), the downstream needs to see
-		// the edit as a Remove + Add so its IVM state stays consistent
-		// with the partitioning.
-		if change.Type == ivm.ChangeTypeEdit && conn.splitEditKeys != nil &&
-			editChangesSplitKeys(change, conn.splitEditKeys) {
-			rm := ivm.MakeRemoveChange(ivm.Node{Row: change.OldRow})
-			out = append(out, conn.output.Push(rm, conn.input)...)
-			ad := ivm.MakeAddChange(ivm.Node{Row: change.Row})
-			out = append(out, conn.output.Push(ad, conn.input)...)
-			conn.lastPushedEpoch = epoch
-			continue
-		}
-
-		ivmChange := sourceChangeToChange(change)
-		if ivmChange == nil {
-			continue
-		}
-		out = append(out, conn.output.Push(*ivmChange, conn.input)...)
+		// Bump lastPushedEpoch BEFORE filterPush so a downstream Fetch
+		// inside output.Push sees the gate match TS's genPush ordering
+		// (memory-source.ts:555).
 		conn.lastPushedEpoch = epoch
+		outputChange := sourceChangeToChange(change)
+		if outputChange == nil {
+			continue
+		}
+		out = append(out, filterPush(*outputChange, conn)...)
 	}
 
 	return out
+}
+
+// filterPush is the per-connection filter-aware push.
+// Direct port of mono/packages/zql/src/ivm/filter-push.ts:10-38.
+//
+// For ADD/REMOVE/CHILD: pushes only when predicate(row) passes.
+// For EDIT: delegates to maybeSplitAndPushEditChange which converts
+// to Add(new) or Remove(old) when the predicate flips across the edit.
+func filterPush(change ivm.Change, conn *connection) []ivm.Change {
+	if conn.filterPredicate == nil {
+		return conn.output.Push(change, conn.input)
+	}
+	switch change.Type {
+	case ivm.ChangeTypeAdd, ivm.ChangeTypeRemove, ivm.ChangeTypeChild:
+		if conn.filterPredicate(change.Node.Row) {
+			return conn.output.Push(change, conn.input)
+		}
+		return nil
+	case ivm.ChangeTypeEdit:
+		return maybeSplitAndPushEditChange(change, conn)
+	}
+	return nil
+}
+
+// maybeSplitAndPushEditChange handles the EDIT-with-filter-transition
+// case. Direct port of mono/packages/zql/src/ivm/maybe-split-and-push-edit-change.ts.
+//   - both pass filter → forward EDIT
+//   - only old passes  → emit REMOVE(old)
+//   - only new passes  → emit ADD(new)
+//   - neither passes   → drop
+func maybeSplitAndPushEditChange(change ivm.Change, conn *connection) []ivm.Change {
+	oldWasPresent := conn.filterPredicate(change.OldNode.Row)
+	newIsPresent := conn.filterPredicate(change.Node.Row)
+	if oldWasPresent && newIsPresent {
+		return conn.output.Push(change, conn.input)
+	}
+	if oldWasPresent && !newIsPresent {
+		return conn.output.Push(ivm.MakeRemoveChange(*change.OldNode), conn.input)
+	}
+	if !oldWasPresent && newIsPresent {
+		return conn.output.Push(ivm.MakeAddChange(change.Node), conn.input)
+	}
+	return nil
 }
 
 // columnsAsTypeMap returns the column → type-name map used by the
@@ -568,18 +643,42 @@ func (s *Source) fetchForConn(req ivm.FetchRequest, conn *connection) []ivm.Node
 	// silently lose IVM updates.
 	s.mu.Lock()
 	overlay := s.overlay
+	// Snapshot the batch delta under the same lock so we apply a
+	// consistent view of "pushes already landed in this batch" — even if
+	// another goroutine is mid-Push.
+	delta := make([]ivm.SourceChange, len(s.batchDelta))
+	copy(delta, s.batchDelta)
 	s.mu.Unlock()
+
+	// Apply previously-pushed changes in this batch BEFORE the current
+	// overlay so the source view reflects intra-batch evolution (TS
+	// equivalent: prev snapshot has been #writeChange'd by prior pushes
+	// in this batch, so subsequent Fetches see them). Only meaningful
+	// when we read via the pinned snapshot — the pool fallback already
+	// reflects every commit in the live db.
+	if readViaSnapshot {
+		for _, deltaChange := range delta {
+			out = applyOverlay(out, deltaChange, conn.compareRows, req.Constraint, s.primaryKey)
+		}
+	}
+
 	if overlay != nil && conn.lastPushedEpoch < overlay.Epoch && readViaSnapshot {
 		out = applyOverlay(out, overlay.Change, conn.compareRows, req.Constraint, s.primaryKey)
-		if conn.filterPredicate != nil {
-			filtered := out[:0]
-			for _, n := range out {
-				if conn.filterPredicate(n.Row) {
-					filtered = append(filtered, n)
-				}
+	}
+
+	if conn.filterPredicate != nil && (len(delta) > 0 || overlay != nil) && readViaSnapshot {
+		// Overlays/delta-applied rows must still pass the connection's
+		// filter — they're indistinguishable from SQL-sourced rows
+		// downstream. Re-run filter only if we modified the node list
+		// (delta non-empty or overlay applied); SQL rows are already
+		// pre-filtered by the query.
+		filtered := out[:0]
+		for _, n := range out {
+			if conn.filterPredicate(n.Row) {
+				filtered = append(filtered, n)
 			}
-			out = filtered
 		}
+		out = filtered
 	}
 	return out
 }
