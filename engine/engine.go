@@ -690,7 +690,12 @@ func (e *Engine) AddQueriesStream(
 					Final:      final,
 					TimingMs:   timingMs,
 				})
-				chunk = nil
+				// T1-5: reuse the backing array (see the matching note in
+				// AdvanceStream's flush). onResult encodes Changes
+				// synchronously via the sidecar's streamW before returning, so
+				// the array is free to reuse. Revert to `chunk = nil` if any
+				// caller retains Changes asynchronously.
+				chunk = chunk[:0]
 				chunkIndex++
 			}
 
@@ -976,7 +981,14 @@ func (e *Engine) AdvanceStream(
 			Timings:    t,
 			Drift:      drift, // nil unless this is the terminal drift signal
 		})
-		pending = nil
+		// T1-5: reuse the backing array instead of `pending = nil`. SAFE only
+		// because onResult consumes `Changes` SYNCHRONOUSLY — the sidecar's
+		// streamW → writeFrameLocked → mpMarshal encodes the slice into a
+		// separate byte buffer before this call returns (cmd/sidecar/main.go
+		// streamW). By here the array is no longer referenced downstream.
+		// INVARIANT: if a caller's onResult ever retains Changes past return
+		// (async encode/buffer), revert this to `pending = nil`.
+		pending = pending[:0]
 		chunkIndex++
 	}
 

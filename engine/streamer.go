@@ -113,9 +113,9 @@ func streamChanges(queryID string, schema *ivm.SourceSchema, changes []ivm.Chang
 
 		switch change.Type {
 		case ivm.ChangeTypeAdd:
-			result = append(result, streamNodes(queryID, schema, RowChangeAdd, change.Node)...)
+			streamNodesInto(&result, queryID, schema, RowChangeAdd, change.Node)
 		case ivm.ChangeTypeRemove:
-			result = append(result, streamNodes(queryID, schema, RowChangeRemove, change.Node)...)
+			streamNodesInto(&result, queryID, schema, RowChangeRemove, change.Node)
 		case ivm.ChangeTypeEdit:
 			// Edit: emit the new row only (no relationship recursion for edits)
 			rowKey := make(map[string]interface{}, len(schema.PrimaryKey))
@@ -143,16 +143,33 @@ func streamChanges(queryID string, schema *ivm.SourceSchema, changes []ivm.Chang
 }
 
 // streamNodes produces RowChanges for a node and its relationships.
+//
+// Thin wrapper over streamNodesInto (T1-3): pre-sizes a single accumulator and
+// lets the whole relationship subtree append into it. The previous version
+// allocated a fresh []RowChange at every recursion level and re-appended it
+// into the parent's slice — O(N log N) allocator work for an O(N) result.
 func streamNodes(queryID string, schema *ivm.SourceSchema, op int, node ivm.Node) []RowChange {
+	// Estimate: this node + its immediate relationships. Append amortises any
+	// deeper growth. We deliberately DON'T tree-walk to count exactly — the
+	// relationship values are closures that materialise child nodes, so a
+	// counting pre-walk would fetch every relationship twice.
+	out := make([]RowChange, 0, 1+len(node.Relationships))
+	streamNodesInto(&out, queryID, schema, op, node)
+	return out
+}
+
+// streamNodesInto appends the RowChanges for a node and its relationships into
+// *out, recursing in place so the entire subtree shares one backing slice.
+func streamNodesInto(out *[]RowChange, queryID string, schema *ivm.SourceSchema, op int, node ivm.Node) {
 	// Skip permission-system rows — mirrors TS pipeline-driver.ts:2101.
 	// streamChanges already guards permissions for top-level Add/Remove, but
-	// the recursive descent into child relationships re-enters streamNodes
-	// with the child schema. If that child is a permission CSQ (e.g. the
+	// the recursive descent into child relationships re-enters here with the
+	// child schema. If that child is a permission CSQ (e.g. the
 	// channel_participants EXISTS on conversation read policy), without
 	// this guard Go emits those rows to the client while TS correctly
 	// suppresses them.
 	if schema.System == "permissions" {
-		return nil
+		return
 	}
 	// IsScalar skip — when a CSQ was pre-resolved by the scalar resolver as
 	// a companion subquery, the join's relationship is still built (the
@@ -161,9 +178,8 @@ func streamNodes(queryID string, schema *ivm.SourceSchema, op int, node ivm.Node
 	// Mirrors TS's pattern where pre-resolved scalar CSQs don't add a
 	// relationship to the streamed node.
 	if schema.IsScalar {
-		return nil
+		return
 	}
-	var result []RowChange
 
 	rowKey := make(map[string]interface{}, len(schema.PrimaryKey))
 	for _, pk := range schema.PrimaryKey {
@@ -179,7 +195,7 @@ func streamNodes(queryID string, schema *ivm.SourceSchema, op int, node ivm.Node
 	if op != RowChangeRemove {
 		rc.Row = node.Row
 	}
-	result = append(result, rc)
+	*out = append(*out, rc)
 
 	if node.Relationships != nil && schema.Relationships != nil {
 		// Iterate relationships in a STABLE order. TS streams them in
@@ -203,10 +219,8 @@ func streamNodes(queryID string, schema *ivm.SourceSchema, op int, node ivm.Node
 				continue
 			}
 			for _, childNode := range node.Relationships[relName]() {
-				result = append(result, streamNodes(queryID, childSchema, op, childNode)...)
+				streamNodesInto(out, queryID, childSchema, op, childNode)
 			}
 		}
 	}
-
-	return result
 }
