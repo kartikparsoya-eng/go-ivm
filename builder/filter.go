@@ -5,8 +5,10 @@ package builder
 
 import (
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/kartikparsoya-eng/go-ivm/ivm"
 )
@@ -132,21 +134,13 @@ func evalOp(op string, left, right ivm.Value) bool {
 	case ">=":
 		return ivm.CompareValues(left, right) >= 0
 	case "LIKE":
-		return matchLike(fmt.Sprintf("%v", left), fmt.Sprintf("%v", right), true)
+		return matchLike(fmt.Sprintf("%v", left), fmt.Sprintf("%v", right), false)
 	case "NOT LIKE":
-		return !matchLike(fmt.Sprintf("%v", left), fmt.Sprintf("%v", right), true)
+		return !matchLike(fmt.Sprintf("%v", left), fmt.Sprintf("%v", right), false)
 	case "ILIKE":
-		return matchLike(
-			strings.ToLower(fmt.Sprintf("%v", left)),
-			strings.ToLower(fmt.Sprintf("%v", right)),
-			false,
-		)
+		return matchLike(fmt.Sprintf("%v", left), fmt.Sprintf("%v", right), true)
 	case "NOT ILIKE":
-		return !matchLike(
-			strings.ToLower(fmt.Sprintf("%v", left)),
-			strings.ToLower(fmt.Sprintf("%v", right)),
-			false,
-		)
+		return !matchLike(fmt.Sprintf("%v", left), fmt.Sprintf("%v", right), true)
 	case "IN":
 		return valueIn(left, right)
 	case "NOT IN":
@@ -229,41 +223,77 @@ func numericToFloat64(v ivm.Value) (float64, bool) {
 }
 
 // matchLike implements SQL LIKE pattern matching (% and _ wildcards).
-func matchLike(s, pattern string, caseSensitive bool) bool {
-	if !caseSensitive {
-		s = strings.ToLower(s)
-		pattern = strings.ToLower(pattern)
+// likeRegexCache memoizes compiled LIKE patterns. The pattern (RHS) is
+// constant per condition but matchLike runs per row, so compile once and reuse.
+var likeRegexCache sync.Map // key string -> *regexp.Regexp (typed nil = bad pattern)
+
+// matchLike reports whether s matches a SQL LIKE/ILIKE pattern. Direct port of
+// TS getLikeOp/patternToRegExp (mono/packages/zql/src/builder/like.ts):
+// translate the pattern to an anchored, multiline, Unicode-aware regexp
+// (% -> .*, _ -> ., backslash escapes the next char, regex metachars escaped)
+// and test. Replaces the previous byte-by-byte matcher that broke multi-byte
+// UTF-8 (_ matched one byte of a code point), ignored backslash escapes, and
+// let % cross newlines (HIGH-8). caseInsensitive maps to the regexp (?i) flag
+// (ILIKE).
+func matchLike(s, pattern string, caseInsensitive bool) bool {
+	re := likeRegexpFor(pattern, caseInsensitive)
+	if re == nil {
+		// Unparsable pattern (e.g. trailing escape — TS throws). Fail the match
+		// rather than crash the predicate.
+		return false
 	}
-	return likeMatch(s, pattern, 0, 0)
+	return re.MatchString(s)
 }
 
-func likeMatch(s, p string, si, pi int) bool {
-	for pi < len(p) {
-		switch p[pi] {
+func likeRegexpFor(pattern string, caseInsensitive bool) *regexp.Regexp {
+	key := "s\x00" + pattern
+	if caseInsensitive {
+		key = "i\x00" + pattern
+	}
+	if v, ok := likeRegexCache.Load(key); ok {
+		re, _ := v.(*regexp.Regexp)
+		return re
+	}
+	re := compileLikePattern(pattern, caseInsensitive)
+	likeRegexCache.Store(key, re) // store nil too, so bad patterns aren't recompiled
+	return re
+}
+
+// compileLikePattern translates a SQL LIKE pattern to a Go regexp, mirroring TS
+// patternToRegExp. Returns nil on an invalid pattern (TS throws).
+func compileLikePattern(source string, caseInsensitive bool) *regexp.Regexp {
+	var b strings.Builder
+	// (?m): multiline so ^/$ anchor at line boundaries, matching JS's 'm' flag.
+	// Go RE2 '.' already excludes \n (like JS without 's'), so % (-> .*) won't
+	// cross newlines.
+	b.WriteString("(?m)")
+	if caseInsensitive {
+		b.WriteString("(?i)")
+	}
+	b.WriteByte('^')
+	runes := []rune(source)
+	for i := 0; i < len(runes); i++ {
+		switch c := runes[i]; c {
 		case '%':
-			pi++
-			// % matches any sequence
-			for i := si; i <= len(s); i++ {
-				if likeMatch(s, p, i, pi) {
-					return true
-				}
-			}
-			return false
+			b.WriteString(".*")
 		case '_':
-			if si >= len(s) {
-				return false
+			b.WriteString(".")
+		case '\\':
+			if i == len(runes)-1 {
+				return nil // TS: "LIKE pattern must not end with escape character"
 			}
-			si++
-			pi++
+			i++
+			b.WriteString(regexp.QuoteMeta(string(runes[i])))
 		default:
-			if si >= len(s) || s[si] != p[pi] {
-				return false
-			}
-			si++
-			pi++
+			b.WriteString(regexp.QuoteMeta(string(c)))
 		}
 	}
-	return si == len(s)
+	b.WriteByte('$')
+	re, err := regexp.Compile(b.String())
+	if err != nil {
+		return nil
+	}
+	return re
 }
 
 // valueIn checks if left is contained in right (which should be a slice).

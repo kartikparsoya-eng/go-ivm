@@ -108,6 +108,14 @@ type pipelineEntry struct {
 	// Tracked here so removeQuery can destroy them alongside the main
 	// pipeline. Empty for queries with no resolved scalar subqueries.
 	companions []*companionEntry
+
+	// delegate is the per-query BuilderDelegate shared by the main pipeline
+	// and all companion sub-pipelines. Held so removeQueryLocked can call
+	// delegate.cgs.Destroy() to DELETE this query's operator-storage rows
+	// (keyed by cgID == queryID). Without this the rows leaked — Destroy was
+	// never invoked anywhere (HIGH-4). cgs is nil for queries with no
+	// storage-using operator (e.g. no Take).
+	delegate *engineDelegate
 }
 
 // companionEntry is the Go-side companion record. The TS analogue is
@@ -443,6 +451,9 @@ func (e *Engine) AddQuery(queryID string, ast builder.AST) ([]RowChange, float64
 	hydration := bumpRowVersions(hydrateEntry(entry), e.minRowVersions)
 	timingMs := float64(time.Since(start).Microseconds()) / 1000.0
 
+	// HIGH-11: wire companion outputs after hydrate.
+	e.wireCompanionOutputsLocked(entry)
+
 	return hydration, timingMs, nil
 }
 
@@ -497,6 +508,7 @@ func (e *Engine) buildAndRegisterLocked(queryID string, ast builder.AST) *pipeli
 		pipeline:   mainPipeline,
 		schema:     schema,
 		companions: companions,
+		delegate:   delegate,
 	}
 	e.pipelines[queryID] = entry
 
@@ -506,25 +518,31 @@ func (e *Engine) buildAndRegisterLocked(queryID string, ast builder.AST) *pipeli
 		schema:  schema,
 	})
 
-	// Wire each companion's output to the streamer tagged with the MAIN
-	// queryID — when source.Push fans out and the companion's pipeline
-	// produces a Change, it lands in the same accumulated batch the main
-	// query's changes do and ships to the client as a peer row. The
-	// companionOutput wrapper additionally runs the scalar-value-changed
-	// reset check before accumulating (port of pipeline-driver.ts:2017-2047).
-	for _, ce := range companions {
+	// HIGH-11: companion outputs are wired AFTER hydrate (see
+	// wireCompanionOutputsLocked), matching TS which wires the main pipeline
+	// before hydrate but companions after (pipeline-driver.ts:1936-2026). They
+	// only emit on advance (source.Push), never during the hydrate Fetch, so
+	// deferring the wiring keeps companion emissions out of the hydrate window
+	// even if the build+hydrate locking is ever loosened for throughput.
+	return entry
+}
+
+// wireCompanionOutputsLocked attaches each companion sub-pipeline's output to
+// the streamer (tagged with the MAIN queryID) and the scalar-value-changed
+// reset check. Called by the AddQuery* paths AFTER hydrateEntry, so a companion
+// can never emit during hydrate. Must be called with e.mu held.
+func (e *Engine) wireCompanionOutputsLocked(entry *pipelineEntry) {
+	for _, ce := range entry.companions {
 		ce.pipeline.Input.SetOutput(&companionOutput{
 			pipelineOutput: pipelineOutput{
 				engine:  e,
-				queryID: queryID,
+				queryID: entry.queryID,
 				schema:  ce.schema,
 			},
 			childField:    ce.childField,
 			resolvedValue: ce.resolvedValue,
 		})
 	}
-
-	return entry
 }
 
 // hydrateEntry fetches the main pipeline's current state and emits all
@@ -589,6 +607,11 @@ func (e *Engine) AddQueries(queries []QuerySpec) ([]QueryResult, error) {
 		}(i, entry)
 	}
 	wg.Wait()
+
+	// HIGH-11: wire companion outputs after all hydrates complete.
+	for _, entry := range built {
+		e.wireCompanionOutputsLocked(entry)
+	}
 
 	return results, nil
 }
@@ -705,6 +728,11 @@ func (e *Engine) AddQueriesStream(
 		}(b)
 	}
 	wg.Wait()
+
+	// HIGH-11: wire companion outputs after all hydrates complete.
+	for _, entry := range built {
+		e.wireCompanionOutputsLocked(entry)
+	}
 	return nil
 }
 
@@ -760,6 +788,13 @@ func (e *Engine) removeQueryLocked(queryID string) {
 	for _, ce := range entry.companions {
 		ce.pipeline.Input.Destroy()
 	}
+	// HIGH-4: DELETE this query's operator-storage rows (Take windows, etc.).
+	// CreateClientGroupStorage DELETEs on construction but Destroy was never
+	// called, so rows accumulated per distinct queryID over the engine's
+	// lifetime. cgs is nil when no storage-using operator was built.
+	if entry.delegate != nil && entry.delegate.cgs != nil {
+		entry.delegate.cgs.Destroy()
+	}
 	delete(e.pipelines, queryID)
 }
 
@@ -801,6 +836,12 @@ func (e *Engine) Advance(changes []SnapshotChange) *AdvanceResult {
 					}
 					return
 				}
+				// HIGH-10: drain the streamer before re-raising a non-drift
+				// panic, matching AdvanceStream's recover. Otherwise this
+				// aborted advance's accumulated entries survive and the NEXT
+				// successful Advance's first streamer.Stream() surfaces them as
+				// if produced by that advance — wrong RowChanges to clients.
+				_ = e.streamer.Stream()
 				panic(r) // re-raise non-drift panics
 			}
 		}()

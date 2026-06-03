@@ -4,11 +4,29 @@ package engine
 // for relationships) into one RowChange per affected row.
 
 import (
+	"fmt"
 	"sort"
 	"sync"
 
 	"github.com/kartikparsoya-eng/go-ivm/ivm"
 )
+
+// pkValue reads a primary-key column from a row, panicking if it is missing
+// or nil. Primary keys are NOT NULL by definition, so a nil PK means a
+// corrupted replica or a join mis-constructing the node — TS fails loud here
+// via must() (pipeline-driver.ts:3184). Go previously wrote nil silently,
+// shipping a {pk: nil} rowKey the CVR records but no future advance matches →
+// permanent client-view soft-leak (HIGH-6). Panicking matches TS's
+// fail-fast contract; engine.Advance's recover surfaces it for re-init.
+func pkValue(row ivm.Row, pk, table string) interface{} {
+	v, ok := row[pk]
+	if !ok || v == nil {
+		panic(fmt.Sprintf(
+			"streamer: row for table %q missing primary-key column %q (nil PK)",
+			table, pk))
+	}
+	return v
+}
 
 // RowChangeType mirrors the output change type enum.
 const (
@@ -102,7 +120,7 @@ func streamChanges(queryID string, schema *ivm.SourceSchema, changes []ivm.Chang
 			// Edit: emit the new row only (no relationship recursion for edits)
 			rowKey := make(map[string]interface{}, len(schema.PrimaryKey))
 			for _, pk := range schema.PrimaryKey {
-				rowKey[pk] = change.Node.Row[pk]
+				rowKey[pk] = pkValue(change.Node.Row, pk, schema.TableName)
 			}
 			result = append(result, RowChange{
 				Type:    RowChangeEdit,
@@ -149,7 +167,7 @@ func streamNodes(queryID string, schema *ivm.SourceSchema, op int, node ivm.Node
 
 	rowKey := make(map[string]interface{}, len(schema.PrimaryKey))
 	for _, pk := range schema.PrimaryKey {
-		rowKey[pk] = node.Row[pk]
+		rowKey[pk] = pkValue(node.Row, pk, schema.TableName)
 	}
 
 	rc := RowChange{

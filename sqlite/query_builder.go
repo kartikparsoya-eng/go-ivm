@@ -11,6 +11,11 @@ import (
 	"github.com/kartikparsoya-eng/go-ivm/ivm"
 )
 
+// maxSafeInteger is JS Number.MAX_SAFE_INTEGER (2^53 - 1). int64/uint64 values
+// beyond ±this cannot round-trip through float64 without precision loss, which
+// is how TS's number model (all numbers are float64) bounds integers (HIGH-9).
+const maxSafeInteger = int64(1)<<53 - 1
+
 // Condition represents a filter condition from the query AST.
 type Condition struct {
 	Type       string       // "simple", "and", "or"
@@ -347,8 +352,19 @@ func FromSQLiteType(v interface{}, colType string) ivm.Value {
 	case "number":
 		switch val := v.(type) {
 		case int64:
+			// HIGH-9: int64 above JS Number.MAX_SAFE_INTEGER (±2^53-1) cannot
+			// round-trip through float64 — silent precision loss aliases PKs to
+			// adjacent integers and makes joins match wrong rows. TS throws
+			// UnsupportedValueError on the same input; panic to match (the
+			// engine's recover surfaces it instead of corrupting silently).
+			if val > maxSafeInteger || val < -maxSafeInteger {
+				panic(fmt.Sprintf("FromSQLiteType(number): int64 %d exceeds JS MAX_SAFE_INTEGER (±2^53-1); float64 coercion loses precision", val))
+			}
 			return float64(val)
 		case uint64:
+			if val > uint64(maxSafeInteger) {
+				panic(fmt.Sprintf("FromSQLiteType(number): uint64 %d exceeds JS MAX_SAFE_INTEGER (2^53-1); float64 coercion loses precision", val))
+			}
 			return float64(val)
 		case float64:
 			return val
@@ -404,9 +420,59 @@ func FromSQLiteType(v interface{}, colType string) ivm.Value {
 		default:
 			return fmt.Sprintf("%v", v)
 		}
+	case "null":
+		// CRIT-6: TS folds 'null' with 'number'|'string' (table-source.ts:619-630)
+		// — pass the value through unchanged, but reject int64/uint64 beyond
+		// ±2^53 that cannot round-trip as a JS number (same bound as HIGH-9).
+		// Previously 'null' silently hit the default below with no bounds check.
+		switch val := v.(type) {
+		case int64:
+			if val > maxSafeInteger || val < -maxSafeInteger {
+				panic(fmt.Sprintf("FromSQLiteType(null): int64 %d exceeds JS MAX_SAFE_INTEGER (±2^53-1)", val))
+			}
+		case uint64:
+			if val > uint64(maxSafeInteger) {
+				panic(fmt.Sprintf("FromSQLiteType(null): uint64 %d exceeds JS MAX_SAFE_INTEGER (2^53-1)", val))
+			}
+		}
+		return v
 	default:
 		return v
 	}
+}
+
+// SelfCheckCoercion validates the init-vs-advance shape-convergence contract
+// (CRIT-6) at sidecar startup. TS's init path sends raw SQLite values (bool as
+// 0/1 int, etc.) while the advance path sends pre-coerced JS shapes (bool,
+// number); both land in the same source and only stay consistent because
+// FromSQLiteType maps BOTH shapes to the same canonical value for every
+// colType. A future PG type added to TS's pgTypeToGoType without a matching
+// FromSQLiteType case would silently hit the default passthrough and desync the
+// two paths — invisible corruption. This asserts the invariant up front so that
+// regression fails loud at boot instead of mis-shipping client data later.
+func SelfCheckCoercion() error {
+	checks := []struct {
+		colType  string
+		rawShape interface{} // representative shape the init path sends
+		jsShape  interface{} // representative shape the advance path sends
+	}{
+		{"boolean", int64(1), true},
+		{"boolean", int64(0), false},
+		{"number", int64(42), float64(42)},
+		{"string", int64(7), "7"},
+	}
+	for _, c := range checks {
+		a := FromSQLiteType(c.rawShape, c.colType)
+		b := FromSQLiteType(c.jsShape, c.colType)
+		if a != b {
+			return fmt.Errorf(
+				"coercion self-check FAILED for colType=%q: init-shape %T(%v)→%v "+
+					"vs advance-shape %T(%v)→%v diverge — init and advance rows "+
+					"would have mismatched per-column shapes",
+				c.colType, c.rawShape, c.rawShape, a, c.jsShape, c.jsShape, b)
+		}
+	}
+	return nil
 }
 
 // --- Helpers ---

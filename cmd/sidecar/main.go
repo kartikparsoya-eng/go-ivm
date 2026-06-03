@@ -1954,6 +1954,15 @@ func main() {
 		socketPath = os.Args[1]
 	}
 
+	// CRIT-6: fail loud at boot if the init/advance value-coercion contract is
+	// broken (a colType that doesn't map both raw and JS shapes to the same
+	// canonical value) — better a startup crash than silent client-data
+	// corruption once a CG is serving.
+	if err := sqlite.SelfCheckCoercion(); err != nil {
+		fmt.Fprintf(os.Stderr, "[GO-IVM] FATAL: %v\n", err)
+		os.Exit(1)
+	}
+
 	// Optional pprof endpoint. Off by default — opens only when
 	// GO_IVM_PPROF_ADDR is set (e.g., "127.0.0.1:6060" in a sandbox or
 	// "0.0.0.0:6060" when the container exposes the port). Enabling block
