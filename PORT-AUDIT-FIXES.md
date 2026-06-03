@@ -76,17 +76,15 @@ Symptom this list is rooted in: Go's Take operator emits a different displaced r
     !#isInternalTable filter the other dispatch sites already use. Shadow
     soak: resetFail + no-source panics **→ 0**; drift now self-heals.
 
-### Residual: frame-timing false drift (fundamental, self-healing)
+### Residual: frame-timing false drift (fundamental) — DEFERRED, see deep-dive below
 The Go TableSource reads the shared replica file; the replicator commits a
 batch BEFORE sending its advance RPC, and can race further ahead during
 advance processing. The single prev-tx can't pin at exactly TS's
 prev.version frame, so some ADDs see their own freshly-committed row →
 DriftError. This is PRE-EXISTING (the old snapshot_get arch had it too)
-and now SELF-HEALS via resetEngine (correct end state; in shadow mode the
-single drifted advance still logs as TS=N/Go=0). Eliminating it entirely
-needs TS to communicate prev.version to Go (protocol change) or a true
-two-snapshot leapfrog pinned at RPC-arrival. Deferred — not a correctness
-bug given self-heal.
+and now SELF-HEALS via resetEngine. Full analysis + the decision to defer
+the real fix is in the deep-dive section at the bottom of this file
+("Deep-dive: frame-timing drift — root cause, options, decision").
 
 ---
 
@@ -106,24 +104,39 @@ bug given self-heal.
   - Audit claim: TS strips Remove overlay if filter rejects row; Go calls removeByPK regardless.
   - Reality: Go's SQL fetch doesn't push filter to WHERE (closure-based predicate), so applyFilter runs post-scan. Rows that fail filter are NOT in `out` when applyOverlay runs. removeByPK is a no-op when the row isn't there. Final filter re-pass also re-runs filter on overlay-added rows. Functionally equivalent to TS even though the mechanism differs.
 
-- [ ] **E.** Skip uses CompareWithPartialBound vs TS's full comparator
-  - Go: `ivm/skip.go:113` (and `getStart`)
-  - TS: `mono/packages/zql/src/ivm/skip.ts:68-73` uses full comparator
-  - Fix: use full comparator; missing column comparison should treat nil as less-than-any-value.
+- [?] **E.** Skip uses CompareWithPartialBound vs TS's full comparator — **re-examined: NOT a divergence, audit recommendation would REINTRODUCE drift**
+  - Verified TS's `compareValues` (data.ts:32) does `a = a ?? null` and returns
+    **-1 when `a === null`** — IDENTICAL to Go's `CompareValues(nil,x) = -1`. So a
+    literal port of TS's `Skip.#shouldBePresent` (full comparator) would INCLUDE
+    the partial-bound row too. TS excludes it at the **SQL source** (three-valued
+    logic), not at the Skip operator. Go's `CompareWithPartialBound` (skip.go:57-90)
+    replicates that SQL boundary at the Skip operator to match TS end-to-end, and is
+    soak-validated (it fixed the `channelConversationsPaginatedV3` drift).
+  - Reverting to the full comparator (the audit's "fix") would reintroduce that
+    drift. The real divergence is *structural* (where the boundary is enforced:
+    SQL source in TS vs Skip operator in Go) — not a bug. KEEP current code.
 
 - [x] **F.** Per-query Go hydrate (`#goHydrate`) skips `#planAstForGo` ✅
   - Fixed: `pipeline-driver.ts:985` now calls `#planAstForGo(query)` before `#goBackend.hydrate`, matching the batch path. Stored `transformedAst` is the planned variant. TS check-types green.
 
 ## Engine-level (high impact)
 
-- [ ] **G.** Engine.Advance doesn't bracket pushes with beginFilter/endFilter
-  - Go: `engine/engine.go:738-749` no bracketing
-  - TS: view-syncer advance loop calls beginFilter/endFilter on each ArrayView; clears Exists cache
-  - Fix: wire begin/endFilter brackets matching TS dispatch.
+- [?] **G.** Engine.Advance doesn't bracket pushes with beginFilter/endFilter — **re-examined: NOT a divergence, already implemented (audit misframed)**
+  - The brackets are NOT an advance-loop concern. In TS, `FilterStart.fetch`
+    (filter-operators.ts:86-103) wraps EACH **fetch** with `beginFilter`/`endFilter`;
+    the only stateful use is `Exists.endFilter()` clearing its per-fetch memoization
+    cache (exists.ts:75-78).
+  - Go already does exactly this: `FilterStart.Fetch` (filter_operators.go:74-76)
+    has `BeginFilter()` + `defer EndFilter()`, and `Exists.EndFilter` clears its cache
+    (exists.go:82-86), with the `inPush` guard so the cache isn't used during push.
+    No change needed.
 
-- [ ] **H.** snapshotToSourceChanges PK-match is last-wins, not stable
-  - Go: `engine/engine.go:961-998` keeps LAST PK-matching prev as `editOldRow`
-  - Risk: low in prod; replicator rarely emits dup PKs
+- [?] **H.** snapshotToSourceChanges PK-match is last-wins, not stable — **re-examined: NOT a divergence, matches TS exactly**
+  - Go's `snapshotToSourceChanges` (engine.go:965-995) is line-for-line equivalent to
+    TS (pipeline-driver.ts:2851-2886): both overwrite `editOldRow` in the loop
+    (last-wins), and push removes-in-order then the edit/add. The "last-wins, not
+    stable" concern applies equally to TS, so it is not a port divergence. In practice
+    only one prevValue can match the full PK anyway. KEEP.
 
 ## Lifecycle / restart (CRITICAL but not the Take symptom)
 
@@ -132,10 +145,23 @@ bug given self-heal.
   - Other dispatch sites filter correctly (959, 1111, 1279, 1438-1442)
   - Fix: add `!#isInternalQueryID && !#isInternalTable` filter to re-register callback.
 
-- [ ] **J.** Scalar-subquery value change during advance: TS resets, Go doesn't
-  - TS: `pipeline-driver.ts:2009-2015` throws `ResetPipelinesSignal` via `scalarValuesEqual`
-  - Go: `engine/engine.go:580-596` companion path just emits, no value-comparison
-  - Fix: port `scalarValuesEqual` check + emit a drift/reset signal.
+- [x] **J.** Scalar-subquery value change during advance: TS resets, Go doesn't ✅ **FIXED (2026-06-03)**
+  - TS: `pipeline-driver.ts:2017-2047` throws `ResetPipelinesSignal('scalar-subquery')`
+    via `scalarValuesEqual` when a companion push moves the resolved scalar's child
+    field to a new value.
+  - Fix: added `companionOutput` (engine.go) wrapping `pipelineOutput`. On advance it
+    computes the new child value (ADD/EDIT → `node.row[childField]`; REMOVE → always
+    changed; CHILD → no-op) and, if `!scalarValuesEqual(new, resolvedValue)`, panics a
+    `*ivm.DriftError{Op:"ScalarSubquery"}` that rides the engine's existing
+    recover→re-hydrate path (TS re-registers the query → re-resolves the scalar with
+    the NEW value). `scalarValuesEqual` ports TS's strict `===` (Go `a == b`, nil==null,
+    recover-guarded for non-comparable). `companionEntry` now stores `resolvedValue`.
+  - Tests: rewrote `TestAddQuery_CompanionLiveTracking` (child-field edit now asserts
+    the reset, not an emitted EDIT) + added `TestAddQuery_CompanionEditNonScalarFieldNoReset`
+    (non-child edit still emits a companion EDIT, no over-reset). Full suite green.
+  - Note: piggybacks on the DriftError telemetry/breaker (vs TS's separate
+    ResetPipelinesSignal). Acceptable given scalar-value changes are rare; a dedicated
+    reset-signal type + protocol field would separate the metrics if it ever matters.
 
 ## Observability (won't cause runtime mismatch)
 
@@ -168,3 +194,79 @@ Remaining, by priority:
 6. **K–W** — observability (won't cause runtime mismatch).
 
 After each fix: rebuild amd64 → swap mounted binary → soak (4 users × 4 min shadow + mutate, per Mac limit) and record observed delta. See `memory/reference_soak_run_procedure.md` for the header-size gotchas.
+
+---
+
+## Deep-dive: frame-timing drift — root cause, options, decision (2026-06-03)
+
+### Root cause (confirmed in both codebases)
+TS's `Snapshotter` (snapshotter.ts:183-196 `advanceWithoutDiff` → `resetToHead`)
+opens its `prev` connection's `BEGIN CONCURRENT` at the instant head crossed
+version `P`, and holds it frozen by MVCC. So `prev.version` is *defined by when
+TS opened it*, and TS derives the shipped diff to match that exact frame. The
+diff is shipped to Go as `SnapshotChange[]` (pipeline-driver.ts:2216-2225,
+`advanceStream(snapshotChanges)`) — **carrying no version**.
+
+Go's `OnAdvanceEnd` (source.go:318) re-pins its single conn at *current head* —
+a different instant than when TS pinned. The replicator commits ahead
+independently (sole writer, doesn't wait on readers), so Go's snapshot lands at
+a version ≥ TS's `prev.version`. TS then ships a diff keyed to its `P`; Go
+applies `ADD(row)` where `row` was already committed in `(P, head_go]` →
+`driftCheckLocked` fires. **Two independent processes reading "head" at
+different instants cannot agree on a version unless one tells the other.** No
+Go-side re-pin *timing* closes this — it is structural.
+
+### Is it a correctness issue, or only a shadow-mode artifact?
+It IS a (minor, self-limiting) **Go-primary correctness issue**, not just a
+shadow artifact:
+- Shadow mode: TS serves clients, Go output only compared → client unaffected.
+- Go-primary: Go serves user queries. On drift, `#advanceWithRecovery`
+  (go-compute-backend.ts:276-308) re-inits Go's engine from current snapshot but
+  **discards the re-hydrate output** ("we only need Go's internal pipeline state
+  rebuilt; TS already owns the client view" — go-compute-backend.ts:130-131) and
+  returns only `partialChanges`. It does NOT throw `ResetPipelinesSignal`, so the
+  view-syncer's full CVR reconciliation (view-syncer.ts:2320) never runs. Net:
+  the client's CVR advances to curr.version but is **missing the drifted delta**,
+  not auto-corrected until those rows change again or the query re-hydrates
+  (reconnect/TTL). Repeated drift trips the breaker → Go disabled → TS fallback.
+  This is strictly weaker than TS's own drift path, which re-hydrates + reconciles
+  the client.
+
+### Options considered
+1. **Ship TS's snapshot handle to Go** — INFEASIBLE. The handle is a
+   process-local C pointer (`*C.sqlite3_snapshot` into TS's address space,
+   snapshot.go:68). Cannot be serialized/shipped over the Unix socket.
+2. **Private accumulating copy** (Go keeps its own SQLite copy, mutated ONLY by
+   TS's shipped diffs, committed not rolled back, never re-reads the racing
+   replica). Zero drift by construction. BUT = reverting to the MemorySource
+   memory profile: init loads `SELECT * FROM <table>` for every syncable table
+   per CG (pipeline-driver.ts:618, no per-CG filter) → memory =
+   (active CGs) × (full syncable dataset). Measured baseline: Go heap ~12MB,
+   dataset ~13MB, ~4 CGs in soak → fine here; but at high CG-fanout (Zero's
+   scaling story) → GBs. This is exactly the cost ModeTable was built to escape.
+   The row TRANSFER is already paid today (TS does `SELECT *` and ships rows;
+   ModeTable's `handleLoadRows` is a no-op that discards them — main.go:1172), so
+   the private copy adds ~zero new transfer, only memory.
+3. **Snapshotter-in-Go** (port TS's leapfrog Snapshotter into Go: two
+   `BEGIN CONCURRENT` conns + read `_zero.changeLog2` + derive own diff). Keeps
+   the shared-replica memory model (no per-CG copy) AND gets zero drift, because
+   Go becomes self-consistent like TS. BUT moves version authority for user
+   queries into Go → ripples into the wire protocol (advance becomes a trigger;
+   Go reports its own version), CVR version bookkeeping (view-syncer must stamp
+   user-query CVR at Go's version), and shadow-mode validation (per-advance
+   compare breaks under coalescing races → must rely on the full-state drift
+   audit). Biggest change, heaviest part lands in mono, but the only option that
+   is both zero-drift AND keeps the shared-memory profile.
+4. **Make Go-primary drift recovery client-correct** — route Go drift through the
+   same `ResetPipelinesSignal` full re-hydrate TS uses, instead of discarding the
+   re-hydrate. Smallest change (mono only). Drift still happens, but stops being a
+   correctness issue (client always reconciles). Cost: a full re-hydrate per
+   drift; shadow still logs the per-advance mismatch.
+
+### Decision (2026-06-03)
+**DEFERRED.** Snapshotter-in-Go (option 3) is the right long-term answer (zero
+drift + shared-memory), but it is a major cross-repo change (protocol + CVR
+version authority). Not doing it now. When revisited, the smaller stop-gap for
+Go-primary *correctness* (not shadow cleanliness) is option 4 — make the drift
+recovery trigger a real client re-hydrate. Proceeding with the remaining
+audit-fix items (G, E, H, J) in the meantime.
