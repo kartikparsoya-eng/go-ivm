@@ -49,16 +49,37 @@ func editChangesSplitKeys(change ivm.SourceChange, splitKeys map[string]bool) bo
 // applyOverlay splices the pending change into the already-fetched node
 // list so a Fetch during the same Push sees the change as if it had
 // already happened. Sort order is maintained via comparator.
+//
+// comparator MUST be the fetch's effective comparator — i.e.
+// MakeComparator(sort, req.Reverse) — so the overlay row lands at the same
+// index TS's generateWithOverlay would place it (table-source.ts:298-312).
+//
+// start gates overlay-ADD rows the same way TS's overlaysForStartAt +
+// generateWithStart do (memory-source.ts:696-707): an add whose row sorts
+// (in `comparator` order) before req.start — or equal to it when the basis
+// is "after" — is dropped, because the windowed fetch starts at that
+// cursor. Without this, Take's start:bound reverse fetch would splice an
+// in-flight row that belongs outside the requested window.
 func applyOverlay(
 	nodes []ivm.Node,
 	change ivm.SourceChange,
 	comparator ivm.Comparator,
 	constraint *ivm.Constraint,
+	start *ivm.Start,
 	primaryKey []string,
 ) []ivm.Node {
+	// addAllowed mirrors TS computeOverlays' constraint + start filtering
+	// for an add candidate row.
+	addAllowed := func(row ivm.Row) bool {
+		if constraint != nil && !constraintMatchesRow(*constraint, row) {
+			return false
+		}
+		return overlayRowAtOrAfterStart(row, start, comparator)
+	}
+
 	switch change.Type {
 	case ivm.ChangeTypeAdd:
-		if constraint != nil && !constraintMatchesRow(*constraint, change.Row) {
+		if !addAllowed(change.Row) {
 			return nodes
 		}
 		return insertSorted(nodes, ivm.Node{Row: change.Row}, comparator)
@@ -68,18 +89,37 @@ func applyOverlay(
 
 	case ivm.ChangeTypeEdit:
 		if constraint != nil && !constraintMatchesRow(*constraint, change.OldRow) {
-			if constraintMatchesRow(*constraint, change.Row) {
+			if addAllowed(change.Row) {
 				return insertSorted(nodes, ivm.Node{Row: change.Row}, comparator)
 			}
 			return nodes
 		}
 		nodes = removeByPK(nodes, change.OldRow, primaryKey)
-		if constraint == nil || constraintMatchesRow(*constraint, change.Row) {
+		if addAllowed(change.Row) {
 			nodes = insertSorted(nodes, ivm.Node{Row: change.Row}, comparator)
 		}
 		return nodes
 	}
 	return nodes
+}
+
+// overlayRowAtOrAfterStart reports whether an overlay-add row should be
+// kept given the fetch's start cursor — porting TS overlaysForStartAt
+// (row < startAt ⇒ drop) plus generateWithStart's basis handling
+// (basis "after" ⇒ also drop the row equal to the cursor). `comparator`
+// is the fetch's effective (reverse-aware) comparator.
+func overlayRowAtOrAfterStart(row ivm.Row, start *ivm.Start, comparator ivm.Comparator) bool {
+	if start == nil {
+		return true
+	}
+	c := comparator(row, start.Row)
+	if c < 0 {
+		return false
+	}
+	if c == 0 && start.Basis == "after" {
+		return false
+	}
+	return true
 }
 
 func constraintMatchesRow(constraint ivm.Constraint, row ivm.Row) bool {

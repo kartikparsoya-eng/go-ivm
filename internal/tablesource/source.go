@@ -331,9 +331,28 @@ func (s *Source) OnAdvanceEnd() {
 		return
 	}
 	s.prevTxStarted = false
-	// Don't eagerly re-BEGIN here — let the next Push/Fetch trigger
-	// ensurePrevTx. Defers the cost of the warm-up SELECT to a moment
-	// when we actually need the tx.
+
+	// EAGERLY re-pin the prev snapshot here — do NOT defer to the next
+	// Push/Fetch. This is the crux of TS Snapshotter.resetToHead's timing
+	// (snapshotter.ts:183-196): it pins the new snapshot at the END of the
+	// current advance, BEFORE the replicator commits the next batch. The
+	// IVM then reads the next batch from a frame that does NOT yet contain
+	// that batch's rows.
+	//
+	// Deferring the re-BEGIN to the next batch's first Push pins the prev tx
+	// AFTER the replicator has already committed that batch (the replicator
+	// writes the replica file and only then sends the advance RPC to the
+	// sidecar). checkExists would then see the batch's own freshly-committed
+	// rows and false-drift every ADD ("source drift table=messages op=Add
+	// ... has_count=N" while TS produces the changes normally) — observed in
+	// the shadow soak as TS-produced-8 / Go-produced-0 re-hydrates.
+	if err := s.ensurePrevTxLocked(); err != nil {
+		// Re-pin failed; leave prevTxStarted=false so the next ensurePrevTx
+		// retries. The next batch reads from a later frame (possibly
+		// including its own commits) — a missed re-pin degrades to the old
+		// lazy behavior for one batch rather than wedging.
+		_ = err
+	}
 }
 
 // RefreshSnapshot is the legacy API name kept for callers (e.g. the
@@ -812,7 +831,6 @@ func (s *Source) fetchForConn(req ivm.FetchRequest, conn *connection) []ivm.Node
 		req.Reverse,
 		req.Start,
 	)
-
 	ctx := context.Background()
 	rows, err := s.prevConn.QueryContext(ctx, q.SQL, q.Params...)
 	if err != nil {
@@ -876,8 +894,21 @@ func (s *Source) fetchForConn(req ivm.FetchRequest, conn *connection) []ivm.Node
 	//
 	// Once writeChange runs (after fanout) and overlay clears, the SQL query
 	// above naturally reflects the change — no overlay needed.
+	//
+	// The overlay must be spliced into `out` at the position the fetch's
+	// effective order would place it — which for a reverse fetch is the
+	// REVERSE comparator, NOT conn.compareRows (the forward one). TS's
+	// #fetch passes makeComparator(sort, req.reverse) to generateWithOverlay
+	// (table-source.ts:298-312); generateWithStart/overlaysForStartAt also
+	// drops overlay rows that fall before req.start in that order. Using the
+	// forward comparator here put the in-flight Add at the wrong index in a
+	// reverse fetch — exactly the fetch Take issues for its displaced-bound
+	// lookup (start:bound, basis:'at', reverse:true) — so Take picked a
+	// different boundNode/beforeBoundNode and emitted a different displaced
+	// row than TS (shadow soak: TS removes msg-X / Go removes msg-Y).
 	if s.overlay != nil && conn.lastPushedEpoch >= s.overlay.Epoch {
-		out = applyOverlay(out, s.overlay.Change, conn.compareRows, req.Constraint, s.primaryKey)
+		effCmp := ivm.MakeComparator(order, req.Reverse)
+		out = applyOverlay(out, s.overlay.Change, effCmp, req.Constraint, req.Start, s.primaryKey)
 		if conn.filterPredicate != nil {
 			filtered := out[:0]
 			for _, n := range out {
