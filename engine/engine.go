@@ -685,10 +685,19 @@ func (e *Engine) Advance(changes []SnapshotChange) *AdvanceResult {
 			if r := recover(); r != nil {
 				if d, ok := r.(*ivm.DriftError); ok {
 					drift = d
-					// Drain any accumulated output the streamer is holding from
-					// earlier successful Push calls in this loop — we won't
-					// surface them.
-					_ = e.streamer.Stream()
+					// Match TS view-syncer behavior: emit whatever output
+					// successful prior Push calls in this loop already
+					// produced, then signal drift so the caller re-hydrates.
+					// TS's assert-and-throw path emits its partial computation
+					// before snapshot revert; previously Go discarded prior
+					// output here, which produced observable output divergence
+					// between Go and TS for the corrupt advance (see 30-min
+					// shadow soak: TS=N changes, Go=0 changes for the failing
+					// batch). Drain anything still in the streamer in case the
+					// panicking Push emitted partial output before the panic.
+					if drained := e.streamer.Stream(); len(drained) > 0 {
+						allRowChanges = append(allRowChanges, drained...)
+					}
 					return
 				}
 				panic(r) // re-raise non-drift panics
@@ -727,7 +736,10 @@ func (e *Engine) Advance(changes []SnapshotChange) *AdvanceResult {
 	}()
 
 	if drift != nil {
-		return &AdvanceResult{Timings: timings, Drift: drift}
+		// Partial-emit-then-drift: prior successful pushes' output goes to
+		// the caller so clients see it (TS behavior). The drift signal
+		// triggers re-hydrate which catches up any missed deltas.
+		return &AdvanceResult{Changes: allRowChanges, Timings: timings, Drift: drift}
 	}
 	return &AdvanceResult{Changes: allRowChanges, Timings: timings}
 }
@@ -831,11 +843,18 @@ func (e *Engine) AdvanceStream(
 			if r := recover(); r != nil {
 				if d, ok := r.(*ivm.DriftError); ok {
 					drift = d
-					// Drop any accumulated output from earlier successful
-					// pushes in this advance — TS will discard the whole
-					// stream and re-init from fresh SQLite truth.
-					pending = nil
-					_ = e.streamer.Stream() // drain residual
+					// Match TS view-syncer: emit whatever partial output
+					// successful prior pushes produced in this advance, then
+					// signal drift so TS re-hydrates. Previously Go dropped
+					// the partial output (`pending = nil`), producing
+					// observable output divergence vs TS for the corrupt
+					// advance (30-min shadow soak: TS emitted partial changes
+					// for the batch, Go emitted none). Drain anything still
+					// in the streamer in case the panicking Push left
+					// residual output before the panic point.
+					if drained := e.streamer.Stream(); len(drained) > 0 {
+						pending = append(pending, drained...)
+					}
 					return
 				}
 				// Capture non-Drift panic for re-raise after flush.

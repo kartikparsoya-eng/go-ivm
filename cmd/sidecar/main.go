@@ -1453,10 +1453,26 @@ type advanceResult struct {
 
 // rpcCodeDrift is the JSON-RPC error code for source-drift detection.
 // TS-side go-ivm-client recognizes this code and triggers re-init via the
-// existing onRestart pipeline, then returns empty results to the caller
-// (matching the post-crash recovery semantics — clients miss exactly one
-// delta and resync against the freshly-loaded state).
+// existing onRestart pipeline, then emits the partial Changes the drift
+// data carries to clients before re-hydrating (matching TS's view-syncer
+// where assert-and-throw streams pre-throw RowChanges to pokers before
+// snapshot revert).
 const rpcCodeDrift = -32100
+
+// driftRPCData is the JSON shape Go ships in the rpcCodeDrift error's
+// Data field. Carries the standard *ivm.DriftError diagnostic fields
+// PLUS the partial Advance output produced by Pushes that completed
+// successfully BEFORE the panic. TS-side accumulates these into
+// DriftError.partialChanges so GoComputeBackend's drift recovery can
+// forward them to the view-syncer instead of dropping them.
+type driftRPCData struct {
+	Table          string               `json:"table"`
+	Op             string               `json:"op"`
+	PK             map[string]ivm.Value `json:"pk"`
+	HasCount       int                  `json:"hasCount"`
+	PartialChanges []engine.RowChange   `json:"partialChanges,omitempty"`
+	PartialTimings []engine.TableTiming `json:"partialTimings,omitempty"`
+}
 
 func (s *Server) handleAdvance(req RPCRequest) RPCResponse {
 	var p advanceParams
@@ -1487,13 +1503,24 @@ func (s *Server) handleAdvance(req RPCRequest) RPCResponse {
 	if result.Drift != nil {
 		// Self-heal signal: TS will re-init. Log clearly so prod ops can
 		// see frequency vs the panic line that used to crash the sidecar.
+		// Carry the partial Changes alongside the drift signal so the TS
+		// view-syncer can emit them to clients before re-hydrating —
+		// matches TS's assert-and-throw behavior where partial output
+		// already streamed to pokers before the snapshot revert.
 		fmt.Fprintf(os.Stderr, "[GO-IVM][drift] advance cg=%s %s\n", cgID, result.Drift.Error())
 		return RPCResponse{
 			JSONRPC: "2.0",
 			Error: &RPCError{
 				Code:    rpcCodeDrift,
 				Message: result.Drift.Error(),
-				Data:    result.Drift,
+				Data: driftRPCData{
+					Table:          result.Drift.Table,
+					Op:             result.Drift.Op,
+					PK:             result.Drift.PK,
+					HasCount:       result.Drift.HasCount,
+					PartialChanges: result.Changes,
+					PartialTimings: result.Timings,
+				},
 			},
 			ID: req.ID,
 		}
