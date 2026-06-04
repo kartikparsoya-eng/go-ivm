@@ -401,8 +401,12 @@ a clean shadow run is a real guarantee about primary.
   build): 530 `[shadow]` matches, 0 advance mismatches, 0 panics, 0
   `database is locked`, 0 resets.** The naive-spike crash is gone: writing into
   the past-pinned `prev` works under `BEGIN CONCURRENT`/wal2 (the drive unit test
-  skips under plain BEGIN). **Residual:** 2 rare hydrate misses (`TS=2,Go=0`,
-  0.4%) — a hydrate-path frame edge to chase, NOT in the advance path.
+  skips under plain BEGIN). **Hydrate misses FIXED:** the rare `TS=2,Go=0` was a
+  LIKE-escape divergence, NOT version skew — Go's `matchLike` treated `\` as an
+  escape, but TS pushes `LIKE ?` into SQLite with no `ESCAPE` (`\` literal), so
+  `content LIKE '%\%%'` matched backslash-content in TS / percent-content in Go.
+  `compileLikePattern` now treats `\` as literal (SQLite default). Re-soak:
+  **488 matches, 0 mismatches (advance AND hydrate), 0 panics, 0 resets.**
   **Remaining for P2:** CVR two-version reconciliation (P2c) — actually stamping
   the user-query CVR at Go's version for Go-primary serving (vs today's shadow
   compare).
