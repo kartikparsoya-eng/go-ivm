@@ -409,7 +409,9 @@ a clean shadow run is a real guarantee about primary.
   **488 matches, 0 mismatches (advance AND hydrate), 0 panics, 0 resets.**
   **Remaining for P2:** CVR two-version reconciliation (P2c) — actually stamping
   the user-query CVR at Go's version for Go-primary serving (vs today's shadow
-  compare).
+  compare). **Rule specced in §10:** flip `#goPrimaryAdvance` from push
+  (`advanceStream`) to trigger (`advanceToHead`) so Go is self-consistent, and
+  stamp `CVR.stateVersion = min(V_ts, V_go)` (the completeness-floor rule).
 - **P3 — lean Go-primary.** Drop TS's user-query compute; TS = cold fallback.
   Then the PERF-REVIEW Tier-1 parallelism items (`T1-3/4/5/7`,
   `GO_IVM_PARALLEL_THRESHOLD`) carry the actual prod win. Gated on P2.
@@ -455,3 +457,93 @@ a TS-shipped diff to a Go-side `advanceToHead()` trigger, and move user-query CV
 version authority into the view-syncer — making Go self-consistent (zero drift),
 unifying shadow & primary into one path, and unlocking the goroutine parallelism
 that is the entire point of the sidecar.
+
+---
+
+## 10. P2c — the two-version reconciliation rule (spec)
+
+This is the "genuinely novel logic" flagged in §8 risk #2. It is the rule for the
+CVR `stateVersion` when **user-query** data comes from Go's snapshotter (at
+`V_go`) and **internal/control-plane** data (lmids, mutationResults) comes from
+TS's snapshotter (at `V_ts`).
+
+### 10.1 What "Go-primary trigger" actually changes
+
+Today (push) `#goPrimaryAdvance` ships the **TS-derived** diff to Go via
+`advanceStream(snapshotChanges)`. Go merely applies TS's diff, so `V_go ≡ V_ts`
+by construction — Go is *not* self-consistent and the frame-timing drift the port
+set out to kill is still present on the primary path.
+
+P2c flips this to **trigger**: `#goPrimaryAdvance` calls `advanceToHead()` (no
+payload). Go independently leapfrogs its own Snapshotter, derives its own diff
+from `changeLog2`, drives its own engine frame-coordinated (the P2b path, now
+validated in shadow), and returns `{rowChanges, version: V_go}`. This is what
+makes Go self-consistent — and it is exactly what introduces `V_go ≠ V_ts`,
+because the two snapshotters read `_zero.replicationState.stateVersion` at
+slightly different instants (TS first in the cycle, then Go), so a replicator
+commit landing in between gives `V_go ≥ V_ts`.
+
+### 10.2 The invariant that fixes the rule
+
+From the CVR code (`cvr.ts`, `row-record-cache.ts`):
+
+- Client catchup/poke selects rows by **`patchVersion`**:
+  `patchVersion > client.version AND patchVersion <= CVR.version`
+  (`row-record-cache.ts catchupRowPatches`).
+- `patchVersion` is stamped at the **committed CVR `stateVersion`**
+  (`#assertNewVersion` returns `this._cvr.version`), **not** the row's own
+  `_0_version`/`rowVersion`.
+- Therefore the CVR `stateVersion` is a **completeness floor**: it asserts "the
+  client view is complete and correct as of database version V." There is *no*
+  assertion tying a row's `_0_version` to the CVR version.
+
+Consequences for the split:
+
+| CVR stamped at | internal (at `V_ts`) | user (at `V_go ≥ V_ts`) | verdict |
+|---|---|---|---|
+| `min = V_ts` | complete @ `V_ts` ✓ | complete @ `V_ts` (superset; extra rows up to `V_go` are an idempotent over-deliver) ✓ | **SAFE** |
+| `max = V_go` | **missing** internal changes in `(V_ts, V_go]`, but CVR claims `V_go` | complete @ `V_go` ✓ | **UNSAFE — over-claims; a client can miss an internal change in the gap** |
+
+So:
+
+> **Rule: `CVR.stateVersion = min(V_ts, V_go)`.** Commit the CVR only at a version
+> *both* authorities have crossed. Under-claiming is safe (the ahead side's extra
+> data is an idempotent superset, delivered with `patchVersion = committed
+> watermark`); over-claiming risks a client missing a change in the gap.
+
+With TS reading head before Go each cycle, `V_ts ≤ V_go`, so `min = V_ts` in the
+common path — i.e. **the CVR keeps stamping at TS's version**, exactly as today;
+only the user-query *data* now comes from Go's self-consistent engine. The
+explicit `min` is the guard for the inverted edge (`V_go < V_ts`, e.g. Go
+re-init/retry left it pinned at an older head): it prevents a backward or
+over-claiming stamp.
+
+### 10.3 Monotonicity
+
+`min(V_ts, V_go)` is monotone in each argument and each authority only moves
+forward, so the watermark is non-decreasing. Equality (no advance) is a no-op in
+`cvr.ts` (`_setVersion` only bumps on `>`). The pathological "watermark frozen
+but changes exist" requires `V_ts` frozen while changes exist, which under
+same-replica semantics requires the replica head frozen → no changes for anyone.
+We assert/log if that model is ever violated rather than silently mis-stamping.
+
+### 10.4 Reset handling
+
+If `advanceToHead()` returns `{reset}` (truncate/permissions/reset signal), Go's
+user pipelines must full-re-hydrate (existing `#scheduleGoReset` →
+`#reinitPerCGAndRegisterQueries`). For that cycle we drop the user delta
+(`goResults = []`) and stamp at `V_ts` — internal is complete at `V_ts`, and the
+re-hydrate re-establishes user rows at head `≥ V_ts` (still a superset of the
+`V_ts` floor). Mirrors the validated advanceStream-failure path.
+
+### 10.5 Gate + blast radius
+
+Off by default behind **`goSidecar.goPrimaryTrigger`** (requires
+`enabled && !shadowMode`, plus a sidecar built with `GO_IVM_ADVANCE_TO_HEAD=true`
++ `GO_IVM_ADVANCE_DRIVE=true` + `GO_IVM_SOURCE_MODE=table`). When off,
+`#goPrimaryAdvance` keeps the byte-identical push (`advanceStream`) path. The
+reconciliation lives entirely in `#goPrimaryAdvance` (returns the already-`min`'d
+`AdvanceResult.version`), so `view-syncer.ts` stamps it transparently;
+`AdvanceResult` additionally carries `tsVersion`/`goVersion` for observability and
+a view-syncer-side monotonicity assertion. **Go side needs nothing new — the P1/P2b
+`advanceToHead` drive already produces `{rowChanges, version}`.**
