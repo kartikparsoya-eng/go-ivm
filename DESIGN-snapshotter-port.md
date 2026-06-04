@@ -1,10 +1,13 @@
 # DESIGN: Snapshotter-in-Go — line-by-line port of TS's `Snapshotter`
 
-Status: **P0 + P1 IMPLEMENTED** — `internal/snapshotter` (13 fixture tests),
-`advanceToHead` RPC (Go + mono), Go-vs-TS `[go-diff-shadow]` compare. P1 awaits
-soak validation; P2 (frame-coordinated engine self-consistency + CVR version
-authority) and P3 (lean primary) pending — see §7 for the P2 spike finding.
-Authored 2026-06-04.
+Status: **P0 + P1 DONE & SOAK-VALIDATED.** `internal/snapshotter` (13 fixture
+tests), `advanceToHead` RPC (Go + mono), Go-vs-TS `[go-diff-shadow]` compare.
+**P1 soak gate PASSED (2026-06-04):** 8-user/183s mutate shadow soak on rust-test
+→ 24 `[go-diff-shadow]` "TS and Go derived identical diffs", **0 mismatches**, 0
+Go panics, 0 reset cascades. The ported Go Snapshotter derives byte-identical
+diffs to TS. **P2 is now unblocked** (frame-coordinated engine self-consistency +
+CVR version authority); P3 (lean primary) follows. See §7 for the P2 spike
+finding. Authored 2026-06-04.
 Companion to [`DESIGN-tablesource-port.md`](./DESIGN-tablesource-port.md) and the
 frame-timing deep-dive in [`PORT-AUDIT-FIXES.md`](./PORT-AUDIT-FIXES.md).
 
@@ -363,8 +366,14 @@ a clean shadow run is a real guarantee about primary.
   table+prevValues+nextValue signature compare logged under `[go-diff-shadow]`).
   Off by default; runs inside shadow mode only. **P1 is now end-to-end: enable
   `shadowMode` + `advanceToHead` and the logs prove Go derives the same diff TS
-  does.** Next: run a soak and confirm `[go-diff-shadow]` shows zero mismatches —
-  that is the gate for P2.
+  does.** **✅ SOAK-VALIDATED 2026-06-04:** rust-test shadow soak (8 users / 183s
+  / `--mutate`, rev-7 sidecar + mounted P1 mono) → **24 "TS and Go derived
+  identical diffs", 0 mismatches, 0 panics, 0 resets.** Unblocked by a
+  pre-existing tablesource fix found mid-soak: the nullable `">"` start-cursor
+  bound emitted 2 placeholders but bound 1 value (`want 2 got 1` panic) —
+  `gatherStartConstraints` now binds the start value twice for that form
+  (`sqlite/query_builder.go`, regression test added). The gate for P2 is now
+  green.
 - **P2 — view-syncer version authority + engine self-consistency** (the heavy
   part). CVR stamping from Go's version; two-snapshotter reconciliation;
   shadow→full-state compare.
