@@ -277,14 +277,18 @@ func numericCmpCoerced(a, b ivm.Value) (int, bool) {
 // constant per condition but matchLike runs per row, so compile once and reuse.
 var likeRegexCache sync.Map // key string -> *regexp.Regexp (typed nil = bad pattern)
 
-// matchLike reports whether s matches a SQL LIKE/ILIKE pattern. Direct port of
-// TS getLikeOp/patternToRegExp (mono/packages/zql/src/builder/like.ts):
-// translate the pattern to an anchored, multiline, Unicode-aware regexp
-// (% -> .*, _ -> ., backslash escapes the next char, regex metachars escaped)
-// and test. Replaces the previous byte-by-byte matcher that broke multi-byte
-// UTF-8 (_ matched one byte of a code point), ignored backslash escapes, and
-// let % cross newlines (HIGH-8). caseInsensitive maps to the regexp (?i) flag
-// (ILIKE).
+// matchLike reports whether s matches a SQL LIKE/ILIKE pattern, using SQLite's
+// default LIKE semantics (the engine both TS and Go ultimately read through):
+// `%` -> .*, `_` -> ., and EVERY other character — including `\` — is a literal
+// (no escape character; SQLite requires an explicit `ESCAPE` clause for that,
+// which Zero never emits). The pattern is compiled to an anchored, multiline,
+// Unicode-aware regexp. caseInsensitive maps to (?i) (ILIKE).
+//
+// Earlier this treated `\` as an escape (mirroring TS's in-memory patternToRegExp).
+// But TS's TableSource hydrates by pushing `col LIKE ?` into SQLite with no
+// ESCAPE clause, so `\` is literal there — and a `%\%%` pattern matched
+// backslash-content in TS but percent-content in Go, a deterministic hydrate
+// divergence. Matching SQLite is the faithful behavior.
 func matchLike(s, pattern string, caseInsensitive bool) bool {
 	re := likeRegexpFor(pattern, caseInsensitive)
 	if re == nil {
@@ -328,13 +332,16 @@ func compileLikePattern(source string, caseInsensitive bool) *regexp.Regexp {
 			b.WriteString(".*")
 		case '_':
 			b.WriteString(".")
-		case '\\':
-			if i == len(runes)-1 {
-				return nil // TS: "LIKE pattern must not end with escape character"
-			}
-			i++
-			b.WriteString(regexp.QuoteMeta(string(runes[i])))
 		default:
+			// NOTE: backslash is NOT an escape character here. TS's TableSource
+			// pushes the LIKE filter into SQLite SQL (`col LIKE ?`) with NO
+			// `ESCAPE` clause (zqlite/query-builder.ts), so SQLite — the engine
+			// both sides share — treats `\` (and every non-`%`/`_` char) as a
+			// LITERAL. We MUST match that, or a pattern like `%\%%` diverges:
+			// SQLite/TS reads it as "contains a backslash" while a backslash-as-
+			// escape reading is "contains a percent". (Observed as a deterministic
+			// "TS=2, Go=0" hydrate mismatch in the drive-mode soak.) Treating `\`
+			// as a metachar to quote keeps it literal — exactly SQLite's default.
 			b.WriteString(regexp.QuoteMeta(string(c)))
 		}
 	}

@@ -3,8 +3,9 @@ package builder
 import "testing"
 
 // TestMatchLike covers the HIGH-8 cases the old byte-by-byte matcher got
-// wrong: multi-byte UTF-8 under `_`, backslash escapes, and `%`/`_` vs
-// embedded newlines — plus ILIKE case folding. Ports TS like.ts semantics.
+// wrong: multi-byte UTF-8 under `_` and `%`/`_` vs embedded newlines — plus
+// ILIKE case folding. Backslash is a LITERAL (SQLite default LIKE, which TS's
+// SQL pushdown uses — no ESCAPE clause).
 func TestMatchLike(t *testing.T) {
 	cases := []struct {
 		name            string
@@ -17,11 +18,18 @@ func TestMatchLike(t *testing.T) {
 		{"underscore matches multibyte rune", "café", "caf_", false, true},
 		{"underscore one rune not two", "café", "ca_", false, false},
 
-		// Backslash escape: `\_` and `\%` match literal _ / %.
-		{"escaped underscore literal", "caf_", `caf\_`, false, true},
-		{"escaped underscore not wildcard", "café", `caf\_`, false, false},
-		{"escaped percent literal", "10%", `10\%`, false, true},
-		{"escaped percent not wildcard", "100", `10\%`, false, false},
+		// Backslash is LITERAL (no escape — SQLite default; TS pushes LIKE to
+		// SQLite without ESCAPE). So `\_` = literal backslash + any char, and
+		// `\%` = literal backslash + zero-or-more chars.
+		{"backslash is literal not escape", `a\b`, `a\%`, false, true},
+		{"backslash underscore one char after slash", `a\b`, `a\_`, false, true},
+		{"no backslash no match", "ab", `a\_`, false, false},
+		// The exact regression: %\%% matches content containing a backslash,
+		// NOT content containing a percent (matches TS's SQLite fetch).
+		{"escaped-percent pattern matches backslash", `path\to`, `%\%%`, false, true},
+		{"escaped-percent pattern not percent", "50% off", `%\%%`, false, false},
+		// `_` after the literal backslash is still a single-char wildcard.
+		{"underscore still wildcard after literal", "10%", `10_`, false, true},
 
 		// Newlines: `.` (from _/%) does not cross \n (Go RE2 default, like JS).
 		{"underscore does not cross newline", "foo\nbar", "foo_bar", false, false},
@@ -31,8 +39,8 @@ func TestMatchLike(t *testing.T) {
 		{"ilike folds unicode", "CAFÉ", "café", true, true},
 		{"like is case sensitive", "CAFE", "cafe", false, false},
 
-		// Trailing escape is an invalid pattern (TS throws) → no match.
-		{"trailing escape no match", "x", `x\`, false, false},
+		// Trailing backslash is now just a literal backslash (no longer invalid).
+		{"trailing backslash literal", `x\`, `x\`, false, true},
 
 		// Plain wildcards still work.
 		{"percent prefix", "hello world", "%world", false, true},
