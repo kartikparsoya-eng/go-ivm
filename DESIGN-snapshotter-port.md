@@ -412,9 +412,33 @@ a clean shadow run is a real guarantee about primary.
   compare). **Rule specced in §10:** flip `#goPrimaryAdvance` from push
   (`advanceStream`) to trigger (`advanceToHead`) so Go is self-consistent, and
   stamp `CVR.stateVersion = min(V_ts, V_go)` (the completeness-floor rule).
-- **P3 — lean Go-primary.** Drop TS's user-query compute; TS = cold fallback.
-  Then the PERF-REVIEW Tier-1 parallelism items (`T1-3/4/5/7`,
-  `GO_IVM_PARALLEL_THRESHOLD`) carry the actual prod win. Gated on P2.
+- **P3 — lean Go-primary. ✅ "drop TS compute" half DONE (mono).** Behind
+  `goSidecar.leanPrimary`: in Go-primary mode TS no longer walks USER-table
+  changes in `#advance`. TS already held only no-op STUB user pipelines (Go owns
+  them) and keeps its user TableSources current via the snapshot `setDB` on every
+  advance — NOT via per-change pushes (`#advance` line ~3348 setDB loop vs the
+  redundant per-change `#push`) — so the walk was pure waste (getRowKey +
+  makeSourceChange + no-op push per change, plus materializing every user entry
+  into the replay buffer). Lean drops user entries from TS's replay buffer
+  (`#goPrimaryAdvance`); trigger mode never materializes them at all (Go derives
+  its own diff), push mode still ships them to Go via `snapshotChanges`. Drift
+  audit + cold fallback re-hydrate user queries on demand from the
+  snapshot-backed TableSources, so correctness holds. **Remaining:** the
+  PERF-REVIEW Tier-1 sidecar parallelism items (`T1-3/4/5/7`,
+  `GO_IVM_PARALLEL_THRESHOLD`) — the separate Go-side perf workstream that carries
+  the actual prod win.
+  **✅ SOAK-VALIDATED 2026-06-04:** 10-min Go-primary soak, **20 users**, full P3
+  stack (trigger + lean + reset-hardening + count-tuning): 20 users sustained the
+  whole 600s (frames 414→16627), **0 client mismatches / 0 errors / 0 reconnects**,
+  **195 drift-audit data compares all `ts=N go=N ok`** (incl. ts=497), **0
+  db-closed, 0 failed resets, 0 FREEZE, 0 watermark-assert, 0 container restarts**
+  (held within the 1.465 GiB limit). At sustained load the count-check produced
+  **zero** shortfalls — the tuning + lean fully eliminated the churn.
+- **Drift-audit count pre-check tuned (`9e7f3d5`):** the `goCount < tsExpected`
+  freeze check now requires the shortfall to persist `DRIFT_COUNT_MISMATCH_GRACE`
+  (2) consecutive audits before firing a resetEngine, so transient async-
+  registration lag in Go-primary mode no longer churns needless re-registrations
+  (the P2c soak's ~4-6/run). A genuine freeze persists and still self-heals.
 
 Interim stop-gap (if Go-primary correctness is needed before P2 lands): the
 deep-dive's **option 4** — route Go-primary drift through the same
