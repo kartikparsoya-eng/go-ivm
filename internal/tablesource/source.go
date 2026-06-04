@@ -102,6 +102,15 @@ type Source struct {
 	prevConn      *sql.Conn
 	prevTxStarted bool
 	beginStmt     string
+
+	// externalConn, when non-nil, redirects ALL prev-tx reads/writes to a
+	// connection owned by something else (the Snapshotter's `prev` Snapshot —
+	// P2 frame-coordination). While bound, ensurePrevTx/OnAdvanceEnd are
+	// no-ops: the Snapshotter owns the pinned BEGIN CONCURRENT frame the diff
+	// was derived against, so applying that diff's changes here lands them in
+	// the SAME frame (no independent re-pin = no frame-timing drift). Set/
+	// cleared via BindConn/UnbindConn around a driven advance or hydrate.
+	externalConn *sql.Conn
 }
 
 // connection is one downstream pipeline subscribed to this source.
@@ -255,6 +264,36 @@ func (s *Source) Close() error {
 	return nil
 }
 
+// BindConn binds this Source's prev-tx reads/writes to an externally-owned,
+// already-pinned connection (the Snapshotter's `prev` Snapshot conn). While
+// bound, the Source does NOT manage its own prev tx — the snapshotter owns the
+// frame. P2 frame-coordination: the engine applies a Snapshotter-derived diff
+// into the very frame it was derived against, eliminating the residual drift
+// that an independently-re-pinned per-Source tx caused.
+func (s *Source) BindConn(conn *sql.Conn) {
+	s.mu.Lock()
+	s.externalConn = conn
+	s.mu.Unlock()
+}
+
+// UnbindConn detaches the external connection; the Source reverts to its own
+// prev tx (re-acquired lazily on the next ensurePrevTx).
+func (s *Source) UnbindConn() {
+	s.mu.Lock()
+	s.externalConn = nil
+	s.mu.Unlock()
+}
+
+// activeConn returns the connection reads/writes should use: the externally
+// bound (Snapshotter-owned) conn when frame-coordinated, else this Source's own
+// prev-tx conn. MUST be called with s.mu held.
+func (s *Source) activeConn() *sql.Conn {
+	if s.externalConn != nil {
+		return s.externalConn
+	}
+	return s.prevConn
+}
+
 // ensurePrevTxLocked makes sure prevConn is acquired and a tx is open.
 // MUST be called with s.mu held.
 //
@@ -269,6 +308,11 @@ func (s *Source) Close() error {
 // Subsequent calls (after OnAdvanceEnd rolled the tx back) just re-issue
 // the cached BEGIN variant + the warm-up SELECT.
 func (s *Source) ensurePrevTxLocked() error {
+	// Frame-coordinated: the Snapshotter owns the pinned frame on externalConn,
+	// already BEGIN-and-read. Nothing for this Source to acquire.
+	if s.externalConn != nil {
+		return nil
+	}
 	ctx := context.Background()
 	if s.prevConn == nil {
 		conn, err := s.writableDB.Conn(ctx)
@@ -318,6 +362,11 @@ func (s *Source) ensurePrevTxLocked() error {
 func (s *Source) OnAdvanceEnd() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// Frame-coordinated: the Snapshotter drives the leapfrog (resetToHead on its
+	// own prev conn). This Source must NOT roll back or re-pin externalConn.
+	if s.externalConn != nil {
+		return
+	}
 	if s.prevConn == nil || !s.prevTxStarted {
 		return
 	}
@@ -586,7 +635,7 @@ func (s *Source) driftCheckLocked(change ivm.SourceChange) *ivm.DriftError {
 func (s *Source) existsLocked(row ivm.Row) bool {
 	args := s.rowToPKArgs(row)
 	var one int
-	err := s.prevConn.QueryRowContext(context.Background(), s.checkExistsSQL, args...).Scan(&one)
+	err := s.activeConn().QueryRowContext(context.Background(), s.checkExistsSQL, args...).Scan(&one)
 	return err == nil && one == 1
 }
 
@@ -605,7 +654,7 @@ func (s *Source) pkOf(row ivm.Row) map[string]ivm.Value {
 // called on the rare drift path, so the COUNT(*) cost is irrelevant.
 func (s *Source) countLocked() int {
 	var n int
-	if err := s.prevConn.QueryRowContext(context.Background(),
+	if err := s.activeConn().QueryRowContext(context.Background(),
 		"SELECT COUNT(*) FROM "+quoteIdent(s.tableName)).Scan(&n); err != nil {
 		return -1
 	}
@@ -619,17 +668,18 @@ func (s *Source) countLocked() int {
 // MUST be called with s.mu held (so prevConn is single-flight).
 func (s *Source) writeChangeLocked(change ivm.SourceChange) error {
 	ctx := context.Background()
+	conn := s.activeConn()
 	switch change.Type {
 	case ivm.ChangeTypeAdd:
 		args := s.rowToInsertArgs(change.Row)
-		if _, err := s.prevConn.ExecContext(ctx, s.insertSQL, args...); err != nil {
+		if _, err := conn.ExecContext(ctx, s.insertSQL, args...); err != nil {
 			return fmt.Errorf("INSERT: %w", err)
 		}
 		return nil
 
 	case ivm.ChangeTypeRemove:
 		args := s.rowToPKArgs(change.Row)
-		if _, err := s.prevConn.ExecContext(ctx, s.deleteSQL, args...); err != nil {
+		if _, err := conn.ExecContext(ctx, s.deleteSQL, args...); err != nil {
 			return fmt.Errorf("DELETE: %w", err)
 		}
 		return nil
@@ -638,18 +688,18 @@ func (s *Source) writeChangeLocked(change ivm.SourceChange) error {
 		if s.canUseUpdate(change.OldRow, change.Row) {
 			merged := mergeRow(change.OldRow, change.Row)
 			args := append(s.rowToNonPKArgs(merged), s.rowToPKArgs(merged)...)
-			if _, err := s.prevConn.ExecContext(ctx, s.updateSQL, args...); err != nil {
+			if _, err := conn.ExecContext(ctx, s.updateSQL, args...); err != nil {
 				return fmt.Errorf("UPDATE: %w", err)
 			}
 			return nil
 		}
 		// PK changed: DELETE + INSERT.
 		delArgs := s.rowToPKArgs(change.OldRow)
-		if _, err := s.prevConn.ExecContext(ctx, s.deleteSQL, delArgs...); err != nil {
+		if _, err := conn.ExecContext(ctx, s.deleteSQL, delArgs...); err != nil {
 			return fmt.Errorf("EDIT.DELETE: %w", err)
 		}
 		insArgs := s.rowToInsertArgs(change.Row)
-		if _, err := s.prevConn.ExecContext(ctx, s.insertSQL, insArgs...); err != nil {
+		if _, err := conn.ExecContext(ctx, s.insertSQL, insArgs...); err != nil {
 			return fmt.Errorf("EDIT.INSERT: %w", err)
 		}
 		return nil
@@ -832,7 +882,7 @@ func (s *Source) fetchForConn(req ivm.FetchRequest, conn *connection) []ivm.Node
 		req.Start,
 	)
 	ctx := context.Background()
-	rows, err := s.prevConn.QueryContext(ctx, q.SQL, q.Params...)
+	rows, err := s.activeConn().QueryContext(ctx, q.SQL, q.Params...)
 	if err != nil {
 		panic(fmt.Sprintf("tablesource.Source.Fetch %s: query: %v\nSQL: %s",
 			s.tableName, err, q.SQL))

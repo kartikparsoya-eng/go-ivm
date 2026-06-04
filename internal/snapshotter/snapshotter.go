@@ -226,6 +226,12 @@ type Snapshot struct {
 // Version returns the stateVersion this frame is pinned at.
 func (s *Snapshot) Version() string { return s.version }
 
+// Conn returns the connection holding this snapshot's pinned BEGIN CONCURRENT
+// frame. P2 frame-coordination binds the engine's tablesource leaves to this
+// conn so a Snapshotter-derived diff is applied into the exact frame it was
+// derived against. The caller must not close it (the Snapshotter owns it).
+func (s *Snapshot) Conn() *sql.Conn { return s.conn }
+
 // resetToHead ends this snapshot's tx and re-pins the same connection at the
 // new head. Mirrors resetToHead() (392-395). The Snapshot object is mutated in
 // place (same conn, new version) and returned to the caller as the next curr.

@@ -6,6 +6,7 @@ package engine
 // pushes don't race with concurrent fetches.
 
 import (
+	"database/sql"
 	"errors"
 	"fmt"
 	"os"
@@ -415,6 +416,35 @@ func (e *Engine) RegisterMemorySource(ms *ivm.MemorySource) {
 		ms.SetParallel(true, e.parallelThreshold)
 	}
 	e.RegisterSource(&memorySourceAdapter{ms: ms})
+}
+
+// connBinder is implemented by sources that can redirect their prev-tx
+// reads/writes to an externally-pinned connection — tablesource.Source, for
+// P2 frame-coordination. MemorySource adapters don't implement it.
+type connBinder interface {
+	BindConn(*sql.Conn)
+	UnbindConn()
+}
+
+// BindTableSourcesToConn binds every connBinder leaf to conn — the Snapshotter's
+// pinned BEGIN CONCURRENT frame — so a Snapshotter-derived diff is applied into
+// the exact frame it was derived against (no independent per-Source re-pin, no
+// frame-timing drift). Must be paired with UnbindTableSources after the advance.
+func (e *Engine) BindTableSourcesToConn(conn *sql.Conn) {
+	for _, src := range e.sourcesView() {
+		if b, ok := src.(connBinder); ok {
+			b.BindConn(conn)
+		}
+	}
+}
+
+// UnbindTableSources detaches every connBinder leaf from its external conn.
+func (e *Engine) UnbindTableSources() {
+	for _, src := range e.sourcesView() {
+		if b, ok := src.(connBinder); ok {
+			b.UnbindConn()
+		}
+	}
 }
 
 // GetMemorySource returns the registered MemorySource for tableName, or nil

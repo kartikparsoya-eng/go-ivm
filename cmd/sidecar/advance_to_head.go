@@ -15,7 +15,9 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"os"
 
+	"github.com/kartikparsoya-eng/go-ivm/engine"
 	"github.com/kartikparsoya-eng/go-ivm/internal/snapshotter"
 	"github.com/kartikparsoya-eng/go-ivm/ivm"
 )
@@ -43,9 +45,17 @@ type resetWire struct {
 }
 
 type advanceToHeadResult struct {
-	Changes    []snapshotChangeWire `json:"changes"`
+	// Changes is the Go-derived diff (P1 pure-derivation / shadow compare).
+	// Populated when NOT in drive mode; omitted in drive mode.
+	Changes    []snapshotChangeWire `json:"changes,omitempty"`
 	Version    string               `json:"version"`
 	NumChanges int                  `json:"numChanges"`
+	// RowChanges + Timings are the engine output, populated only in drive mode
+	// (P2): the deltas the view-syncer emits to clients, stamped at Version,
+	// produced by applying Go's OWN derived diff to Go's engine — frame-
+	// coordinated against the Snapshotter's prev frame (no drift).
+	RowChanges []engine.RowChange   `json:"rowChanges,omitempty"`
+	Timings    []engine.TableTiming `json:"timings,omitempty"`
 	// Reset is non-nil when the diff hit a reset/truncate/permissions-change;
 	// Changes is then empty and the caller re-hydrates at Version.
 	Reset *resetWire `json:"reset,omitempty"`
@@ -91,6 +101,17 @@ func (s *Server) buildSnapshotterLocked(group *ClientGroup, p *initParams) error
 	group.snap = snap
 	group.snapSpecs = buildSnapshotterSpecs(p.Tables)
 	group.snapAllNames = allNames
+
+	// Drive mode (P2): the engine's tablesource leaves read from the
+	// Snapshotter's frame, not their own per-Source tx. Sticky-bind them to
+	// curr now so the initial hydrate (addQuery) reads the same frame the
+	// Snapshotter is pinned at. Each advanceToHead flips the binding to prev for
+	// the apply, then back to curr. (Non-drive P1 leaves binding untouched.)
+	if s.advanceDriveEnabled {
+		if cur, cerr := snap.Current(); cerr == nil {
+			group.eng.BindTableSourcesToConn(cur.Conn())
+		}
+	}
 	return nil
 }
 
@@ -168,9 +189,24 @@ func (s *Server) handleAdvanceToHead(req RPCRequest) RPCResponse {
 		return rpcError(req.ID, -32000, "advanceToHead advance: "+err.Error())
 	}
 	version := diff.Curr().Version()
+	drive := s.advanceDriveEnabled
+
+	// After the leapfrog, the sources (sticky-bound to the old curr) ARE bound
+	// to diff.Prev() — the exact frame the diff was derived against. Make it
+	// explicit, and arrange to rebind to the new curr on every exit so the next
+	// hydrate/fetch reads head.
+	if drive {
+		group.eng.BindTableSourcesToConn(diff.Prev().Conn())
+	}
+	rebindCurr := func() {
+		if drive {
+			group.eng.BindTableSourcesToConn(diff.Curr().Conn())
+		}
+	}
 
 	changes, err := diff.Collect()
 	if err != nil {
+		rebindCurr()
 		// A reset/truncate/permissions-change is a normal outcome: report it so
 		// the caller re-hydrates at `version`.
 		if rs, ok := snapshotter.IsReset(err); ok {
@@ -184,6 +220,45 @@ func (s *Server) handleAdvanceToHead(req RPCRequest) RPCResponse {
 		return rpcError(req.ID, -32000, "advanceToHead diff: "+err.Error())
 	}
 
+	// P2 drive mode: apply Go's own derived diff to Go's engine (frame-
+	// coordinated against diff.Prev()) and return the resulting RowChanges +
+	// version — a fully self-consistent advance with no TS-shipped diff.
+	if drive {
+		snapChanges := make([]engine.SnapshotChange, len(changes))
+		for i, c := range changes {
+			snapChanges[i] = engine.SnapshotChange{
+				Table:      c.Table,
+				PrevValues: c.PrevValues,
+				NextValue:  c.NextValue,
+			}
+		}
+		result := group.eng.Advance(snapChanges)
+		rebindCurr()
+		if result.Drift != nil {
+			fmt.Fprintf(os.Stderr, "[GO-IVM][drift] advanceToHead(drive) cg=%s %s\n",
+				cgID, result.Drift.Error())
+			return RPCResponse{JSONRPC: "2.0", ID: req.ID, Error: &RPCError{
+				Code:    rpcCodeDrift,
+				Message: result.Drift.Error(),
+				Data: driftRPCData{
+					Table:          result.Drift.Table,
+					Op:             result.Drift.Op,
+					PK:             result.Drift.PK,
+					HasCount:       result.Drift.HasCount,
+					PartialChanges: result.Changes,
+					PartialTimings: result.Timings,
+				},
+			}}
+		}
+		return RPCResponse{JSONRPC: "2.0", ID: req.ID, Result: advanceToHeadResult{
+			Version:    version,
+			NumChanges: diff.Changes,
+			RowChanges: result.Changes,
+			Timings:    result.Timings,
+		}}
+	}
+
+	// P1 pure derivation: return the derived diff (no engine mutation).
 	wire := make([]snapshotChangeWire, len(changes))
 	for i, c := range changes {
 		wire[i] = snapshotChangeWire{

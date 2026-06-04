@@ -551,6 +551,13 @@ type Server struct {
 	// advanceToHead RPC becomes available. Off by default — the legacy
 	// TS-ships-the-diff advance path is unaffected (design §7 P1: behind a flag).
 	advanceToHeadEnabled bool
+
+	// advanceDriveEnabled (P2) turns advanceToHead from a pure derivation into a
+	// self-consistent driven advance: the engine's tablesource leaves are
+	// frame-bound to the Snapshotter's pinned conn (curr for hydrate, prev for
+	// the apply), so Go's own derived diff drives Go's engine with no TS-shipped
+	// changes and no frame-timing drift. Implies advanceToHeadEnabled.
+	advanceDriveEnabled bool
 }
 
 func NewServer(mode tablesource.Mode, replicaPath string) *Server {
@@ -2098,15 +2105,24 @@ func main() {
 	server := NewServer(sourceMode, replicaPath)
 	server.appID = os.Getenv("GO_IVM_APP_ID")
 	server.advanceToHeadEnabled = os.Getenv("GO_IVM_ADVANCE_TO_HEAD") == "true"
+	// GO_IVM_ADVANCE_DRIVE implies advanceToHead (P2 self-consistent advance).
+	server.advanceDriveEnabled = os.Getenv("GO_IVM_ADVANCE_DRIVE") == "true"
+	if server.advanceDriveEnabled {
+		server.advanceToHeadEnabled = true
+	}
 	if server.advanceToHeadEnabled {
 		if sourceMode != tablesource.ModeTable {
 			fmt.Fprintln(os.Stderr,
 				"[GO-IVM] GO_IVM_ADVANCE_TO_HEAD=true ignored: requires GO_IVM_SOURCE_MODE=table")
 			server.advanceToHeadEnabled = false
+			server.advanceDriveEnabled = false
 		} else {
+			mode := "derive-only (P1 shadow)"
+			if server.advanceDriveEnabled {
+				mode = "DRIVE (P2 frame-coordinated self-consistent advance)"
+			}
 			fmt.Fprintf(os.Stderr,
-				"[GO-IVM] advanceToHead ARMED (Go derives its own snapshot diff; appID=%q)\n",
-				server.appID)
+				"[GO-IVM] advanceToHead ARMED [%s] (appID=%q)\n", mode, server.appID)
 		}
 	}
 
