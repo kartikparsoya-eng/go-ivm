@@ -1,13 +1,15 @@
 # DESIGN: Snapshotter-in-Go — line-by-line port of TS's `Snapshotter`
 
-Status: **P0 + P1 DONE & SOAK-VALIDATED.** `internal/snapshotter` (13 fixture
-tests), `advanceToHead` RPC (Go + mono), Go-vs-TS `[go-diff-shadow]` compare.
-**P1 soak gate PASSED (2026-06-04):** 8-user/183s mutate shadow soak on rust-test
-→ 24 `[go-diff-shadow]` "TS and Go derived identical diffs", **0 mismatches**, 0
-Go panics, 0 reset cascades. The ported Go Snapshotter derives byte-identical
-diffs to TS. **P2 is now unblocked** (frame-coordinated engine self-consistency +
-CVR version authority); P3 (lean primary) follows. See §7 for the P2 spike
-finding. Authored 2026-06-04.
+Status: **P0 + P1 + P2a/P2b DONE & SOAK-VALIDATED.** `internal/snapshotter` (13
+fixture tests), `advanceToHead` RPC (Go + mono), Go-vs-TS `[go-diff-shadow]`
+compare, AND frame-coordinated DRIVE mode (Go derives its own diff and drives its
+own engine). **Soaks PASSED (2026-06-04, rust-test, 8u/183s/mutate):** P1 → 24
+identical diffs / 0 mismatches; P2 drive → 530 `[shadow]` matches / **0 advance
+mismatches** / 0 panics / 0 `database is locked` / 0 resets (2 rare hydrate
+misses to chase). The hard frame-coordination problem the spike crashed on is
+solved. **Remaining: P2c** (CVR version authority — stamp the user-query CVR at
+Go's version for real Go-primary serving) then **P3** (lean primary). See §7.
+Authored 2026-06-04.
 Companion to [`DESIGN-tablesource-port.md`](./DESIGN-tablesource-port.md) and the
 frame-timing deep-dive in [`PORT-AUDIT-FIXES.md`](./PORT-AUDIT-FIXES.md).
 
@@ -386,10 +388,24 @@ a clean shadow run is a real guarantee about primary.
   fix is frame-coordination:** during a Go-primary advance the engine's leaf
   reads/writes must be bound to the Snapshotter's `prev` connection (apply the
   diff into the SAME `BEGIN CONCURRENT` frame the diff was derived against),
-  rather than each `Source` owning + re-pinning its own tx. That refactor
-  (Source accepts an externally-pinned conn from the Snapshotter) plus the CVR
-  two-version reconciliation is P2 proper — and must be soak-validated AFTER P1's
-  `[go-diff-shadow]` is clean, per this plan's own sequencing.
+  rather than each `Source` owning + re-pinning its own tx.
+  **✅ P2a/P2b DONE & SOAK-VALIDATED (2026-06-04):** implemented the
+  frame-coordination — `tablesource.Source.BindConn/UnbindConn` + `activeConn()`
+  (when bound, all prev-tx reads/writes use the Snapshotter-owned conn;
+  ensurePrevTx/OnAdvanceEnd no-op), `Snapshot.Conn()`,
+  `engine.BindTableSourcesToConn`, and `advanceToHead` DRIVE mode
+  (`GO_IVM_ADVANCE_DRIVE`): sticky-bind leaves to curr for hydrate, flip to
+  `diff.Prev()` for the apply (== the old curr post-leapfrog), rebind curr. mono:
+  `goSidecar.advanceDrive` sources the shadow Go advance via `advanceToHead`
+  (drive) and compares its RowChanges to TS. **Soak (8u/183s/mutate, wal2
+  build): 530 `[shadow]` matches, 0 advance mismatches, 0 panics, 0
+  `database is locked`, 0 resets.** The naive-spike crash is gone: writing into
+  the past-pinned `prev` works under `BEGIN CONCURRENT`/wal2 (the drive unit test
+  skips under plain BEGIN). **Residual:** 2 rare hydrate misses (`TS=2,Go=0`,
+  0.4%) — a hydrate-path frame edge to chase, NOT in the advance path.
+  **Remaining for P2:** CVR two-version reconciliation (P2c) — actually stamping
+  the user-query CVR at Go's version for Go-primary serving (vs today's shadow
+  compare).
 - **P3 — lean Go-primary.** Drop TS's user-query compute; TS = cold fallback.
   Then the PERF-REVIEW Tier-1 parallelism items (`T1-3/4/5/7`,
   `GO_IVM_PARALLEL_THRESHOLD`) carry the actual prod win. Gated on P2.
