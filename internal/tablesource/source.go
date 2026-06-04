@@ -896,12 +896,21 @@ func (s *Source) fetchForConn(req ivm.FetchRequest, conn *connection) []ivm.Node
 	}
 
 	var out []ivm.Node
+	// Reuse the scan buffers across rows. `raw` holds one row's column values and
+	// `ptrs` the &raw[i] pointers Scan writes through; both are fixed-shape for
+	// the query, so allocating them per-row (this was ~588MB / 13% of all sidecar
+	// allocations in the 20-user profile — the #2/#3 alloc lines after the row
+	// map) is pure waste. Safe to reuse: each rows.Scan OVERWRITES raw[i] with a
+	// freshly-materialised value, and FromSQLiteType copies that value into the
+	// per-row `row` map (line below) — it never retains a reference to `raw` or
+	// its slots — so the previous row's data, already handed to its own map, is
+	// untouched by the next iteration.
+	raw := make([]any, len(colNames))
+	ptrs := make([]any, len(colNames))
+	for i := range raw {
+		ptrs[i] = &raw[i]
+	}
 	for rows.Next() {
-		raw := make([]any, len(colNames))
-		ptrs := make([]any, len(colNames))
-		for i := range raw {
-			ptrs[i] = &raw[i]
-		}
 		if err := rows.Scan(ptrs...); err != nil {
 			panic(fmt.Sprintf("tablesource.Source.Fetch %s: scan: %v",
 				s.tableName, err))
