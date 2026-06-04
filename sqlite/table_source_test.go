@@ -2,6 +2,7 @@ package sqlite
 
 import (
 	"database/sql"
+	"strings"
 	"testing"
 
 	"github.com/kartikparsoya-eng/go-ivm/ivm"
@@ -194,6 +195,33 @@ func TestQueryBuilder_Basic(t *testing.T) {
 	expected := `SELECT "id", "name" FROM "users" ORDER BY "name" asc`
 	if result.SQL != expected {
 		t.Fatalf("expected:\n%s\ngot:\n%s", expected, result.SQL)
+	}
+}
+
+// Regression: a Take/Skip start cursor over a NULLABLE order column with op
+// ">" emits "(? IS NULL OR col > ?)" — two placeholders both bound to the
+// start value. The param list must match, or SQLite panics at execute time
+// with "not enough args to execute query: want 2 got 1" (observed crashing
+// the sidecar mid-soak on a nullable-ordered hydrate).
+func TestQueryBuilder_StartCursorOptionalColumn_ParamCount(t *testing.T) {
+	columns := map[string]ColumnSchema{
+		"id":   {Type: "string", Optional: true},
+		"name": {Type: "string"},
+	}
+	start := ivm.Start{Row: ivm.Row{"id": "abc"}, Basis: "after"}
+	result := BuildSelectQuery("tickets", columns, nil, nil,
+		ivm.Ordering{{"id", "asc"}}, false, &start)
+
+	placeholders := strings.Count(result.SQL, "?")
+	if placeholders != len(result.Params) {
+		t.Fatalf("placeholder/param mismatch: SQL has %d '?' but %d params\nSQL: %s\nParams: %v",
+			placeholders, len(result.Params), result.SQL, result.Params)
+	}
+	// Both placeholders bind the same start value.
+	for _, p := range result.Params {
+		if p != "abc" {
+			t.Errorf("expected all start params to be \"abc\", got %v", result.Params)
+		}
 	}
 }
 

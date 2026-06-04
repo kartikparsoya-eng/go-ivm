@@ -243,6 +243,17 @@ func gatherStartConstraints(
 				rangeSQL := nullableAwareRangeComparison(iField, op, colSchema)
 				andParts = append(andParts, rangeSQL)
 				params = append(params, constraintValue)
+				// The optional-column ">" form is "(? IS NULL OR col > ?)" —
+				// TWO placeholders, both bound to the same start value (the
+				// leading "? IS NULL" tests whether the cursor value itself is
+				// NULL). Every other form ("col > ?", "(col IS NULL OR col < ?)")
+				// has a single placeholder. Without this second bind the
+				// statement has 2 params-wanted / 1 given and SQLite panics
+				// "not enough args to execute query: want 2 got 1" the first
+				// time a Take/Skip cursor hydrates over a nullable order column.
+				if op == ">" && colSchema.Optional {
+					params = append(params, constraintValue)
+				}
 			} else {
 				jField := order[j][0]
 				colSchema := columns[jField]
