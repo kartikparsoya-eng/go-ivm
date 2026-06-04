@@ -42,7 +42,7 @@ Symptom this list is rooted in: Go's Take operator emits a different displaced r
 
 ## NEW — prev-tx-introduced (P0, stability)
 
-- [ ] **X.** `writeChange` ADD of an already-present row → raw panic
+- [x] **X.** `writeChange` ADD of an already-present row → raw panic ✅ **DONE**
   - `internal/tablesource/source.go` `writeChangeLocked`: `INSERT` fails with
     `UNIQUE constraint failed` when a batch ADD targets a row already in the
     prev tx (dup messageId from insert+delete+insert / coalesced diff).
@@ -140,10 +140,14 @@ the real fix is in the deep-dive section at the bottom of this file
 
 ## Lifecycle / restart (CRITICAL but not the Take symptom)
 
-- [ ] **I.** getCurrentQueries doesn't filter internal queries on restart-recovery
+- [x] **I.** getCurrentQueries doesn't filter internal queries on restart-recovery ✅ **DONE**
   - TS: `pipeline-driver.ts:521-525` post-restart callback iterates ALL `#pipelines` without filter
   - Other dispatch sites filter correctly (959, 1111, 1279, 1438-1442)
   - Fix: add `!#isInternalQueryID && !#isInternalTable` filter to re-register callback.
+  - VERIFIED IN CODE (2026-06-04): the reset re-register callback at
+    `pipeline-driver.ts:531-537` applies exactly
+    `!this.#isInternalQueryID(queryID) && !this.#isInternalTable(p.transformedAst.table)`.
+    Checkbox was stale. (= master-audit CRIT-2.)
 
 - [x] **J.** Scalar-subquery value change during advance: TS resets, Go doesn't ✅ **FIXED (2026-06-03)**
   - TS: `pipeline-driver.ts:2017-2047` throws `ResetPipelinesSignal('scalar-subquery')`
