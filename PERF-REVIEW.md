@@ -13,6 +13,42 @@ Status as of 2026-05-21:
 
 Open Tier-1 items remaining: T1-3 (streamNodes pre-sizing), T1-4 (FetchRequest.Limit), T1-5 / T1-6 / T1-7 cleanups. None show in the profile top-15; all are safe, low-LoC cleanups worth doing as small PRs but with no measurable urgency.
 
+## REPROFILE (2026-06-04, 20-user Go-primary lean) — new #1 allocator surfaced
+
+Re-profiled under the post-snapshotter-port Go-primary lean path at **20 users**
+(the doc's recommended "heavier workload" step). T1-3 + T1-5 were already shipped
+(`63cdd8d`); the old T1-* items still don't appear in the top-15. The hot path has
+**moved** to the snapshotter-era tablesource read, which didn't exist at the
+2026-05-21 baseline:
+
+- **CPU only ~17% busy at 20 users** — not CPU-bound. The CPU that exists is
+  SQLite cgo (~26%) + GC (~20% gcDrain/scan/malloc), and the GC is driven by
+  allocation volume → allocations are the lever.
+- **`tablesource.(*Source).fetchForConn` = 59% of all allocations** (1.82GB flat
+  / 2.55GB cum of 4.38GB over 60s). Line-level: the per-row `row := make(ivm.Row)`
+  map is 1.22GB (intrinsic to the `map[string]Value` Row — the *rejected* P1-NEW),
+  but the next two lines were the per-row `raw`/`ptrs` `[]any` scan buffers at
+  **309MB + 280MB = 589MB**, allocated fresh every single row.
+
+✅ **SHIPPED + RE-PROFILE-VALIDATED (`d1bb2ea`): reuse fetchForConn scan buffers.**
+Hoisted `raw`/`ptrs` (+ the `&raw[i]` setup) out of the `rows.Next()` loop — they're
+fixed-shape per query, and `FromSQLiteType` copies values out so reuse is safe.
+Built the amd64 sidecar (Dockerfile, `-tags libsqlite3`), deployed over the baked
+binary, and re-profiled under identical 20-user load:
+
+| metric | before | after |
+|---|---|---|
+| scan-buffer lines (`raw`+`ptrs`) | 589 MB | **21.5 MB** (−96%) |
+| `fetchForConn` flat | 1.82 GB (42.6%) | **1.15 GB (32.8%)** |
+| **total sidecar allocations / 60s** | 4.38 GB | **3.60 GB (−17.9%)** |
+| sidecar CPU busy | 17.4% | 14.1% |
+
+The −17.9% total exceeds the −13% pre-estimate (the 589MB scan-buffer cut plus
+reduced downstream GC re-churn; some run variance). 0 mismatches / 0 errors in both
+runs. The only remaining large allocation lever is the 1.22GB per-row Row map =
+revisiting the Row representation (P1-NEW, rejected on TS-parity grounds).
+Artifacts: `/tmp/profile-20u/` (before), `/tmp/profile-20u-after/` (after).
+
 **Shadow-mode log demotion (small latency cleanup, post-T1-1).** Two per-event info logs in `pipeline-driver.ts` (`#shadowAddQuery` hydrate timing at L1526 and `#shadowAdvance` PERF line at L1609) were demoted info → debug. They fire once per hydrate query and once per advance respectively, contributing ~100-300µs of synchronous template-string + sink work per advance in shadow mode. Mismatch logs are all at `error` level inside `#shadowCompare` and unaffected. The batch summary (`[shadow][batch-stream]` at L918) is kept at info because it's 1 line per batch — useful in healthy logs without dominating volume. Net effect: shadow-mode log volume in production drops ~95%, tail-latency shaved by the synchronous-log cost.
 
 **The takeaway from the v2→v4 cycle:** read-only review predicted "engine lock granularity and streamer contention" as HIGH. Profile said neither was real, and the actual #1 allocation hotspot (msgpack walk overhead) needed a targeted fix that turned out small and correctness-clean. Sustained-load soak confirmed the fix and ruled out leaks. Always profile before you refactor; always soak before you call a fix done.
