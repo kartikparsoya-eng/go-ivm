@@ -1,6 +1,7 @@
 # DESIGN: Snapshotter-in-Go — line-by-line port of TS's `Snapshotter`
 
-Status: **PLAN (not yet implemented).** Authored 2026-06-04.
+Status: **P0 IMPLEMENTED** (`internal/snapshotter`, 13 fixture tests green);
+P1–P3 pending. Authored 2026-06-04.
 Companion to [`DESIGN-tablesource-port.md`](./DESIGN-tablesource-port.md) and the
 frame-timing deep-dive in [`PORT-AUDIT-FIXES.md`](./PORT-AUDIT-FIXES.md).
 
@@ -326,11 +327,21 @@ a clean shadow run is a real guarantee about primary.
 
 ## 7. Phased plan
 
-- **P0 — `internal/snapshotter` package.** Port snapshotter.ts §1.1–1.4
-  verbatim against a wal2 replica. Unit-test the `Diff` against hand-built
-  `changeLog2` fixtures (set/delete/truncate/reset/permissions/unique-conflict/
-  no-op/version-invalid). No wire/mono changes yet — pure Go, diff-equivalence
-  vs the TS Snapshotter on the same fixtures.
+- **P0 — `internal/snapshotter` package. ✅ DONE.** Ported snapshotter.ts
+  §1.1–1.4 verbatim: `Snapshotter` (curr/prev leapfrog, conn reuse,
+  BEGIN CONCURRENT→BEGIN fallback), `Snapshot` (version read pins the frame,
+  `resetToHead`, `NumChangesSince`, `ChangesSince`, `GetRow`, `GetRows` with
+  NULL-key filtering), and `Diff` (the §1.4 iterator: reset/truncate/
+  permissions signals, syncable/allTableNames handling, minRowVersion assert,
+  unique-conflict prevValues, no-op filter, `checkThatDiffIsValid`). Files:
+  `snapshotter.go`, `snapshot_read.go`, `spec.go`, `diff.go`. 13 fixture tests
+  (`snapshotter_test.go`) cover set/edit/delete/no-op/unique-conflict/truncate/
+  reset/unknown-table/non-syncable-skip/version-invalid/permissions-change/
+  permissions-unchanged/leapfrog/lifecycle — all green. Pure Go, no wire/mono
+  changes. **Deviation (forced):** `ChangesSince` buffers the (identifier-only)
+  change-log entries before per-entry `getRow`, because Go's `database/sql`
+  allows only one active query per `*sql.Conn`; row CONTENTS stay lazily
+  fetched, so memory is still bounded by catch-up size, not row data.
 - **P1 — advance-trigger RPC.** Add `advanceToHead()` alongside the existing
   `advanceStream`; behind a sidecar flag. Go derives its own diff; compare its
   derived `SnapshotChange[]` to TS's shipped ones on the SAME replica
