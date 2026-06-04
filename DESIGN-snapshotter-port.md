@@ -342,10 +342,19 @@ a clean shadow run is a real guarantee about primary.
   change-log entries before per-entry `getRow`, because Go's `database/sql`
   allows only one active query per `*sql.Conn`; row CONTENTS stay lazily
   fetched, so memory is still bounded by catch-up size, not row data.
-- **P1 — advance-trigger RPC.** Add `advanceToHead()` alongside the existing
-  `advanceStream`; behind a sidecar flag. Go derives its own diff; compare its
-  derived `SnapshotChange[]` to TS's shipped ones on the SAME replica
-  (a Go-vs-TS *diff* shadow — proves §3.1 fidelity before touching the CVR).
+- **P1 — advance-trigger RPC. ✅ Go side DONE; mono client pending.** Sidecar:
+  `advanceToHead` RPC (`cmd/sidecar/advance_to_head.go`) gated by
+  `GO_IVM_ADVANCE_TO_HEAD=true` + table mode + `GO_IVM_APP_ID` (or per-init
+  `appID`). Per-CG `Snapshotter` built in `handleInit` (pinned at the hydrate
+  head), torn down on re-init/destroy. The handler leapfrogs the Snapshotter and
+  returns the derived `{changes, version, numChanges, reset?}` WITHOUT driving
+  the engine — a pure Go-derived diff for the TS-vs-Go shadow compare. `allNames`
+  comes from `sqlite_master` so replicated-but-non-syncable tables are skipped,
+  not errored. protocolRev 6→7. Tests: `advance_to_head_test.go` (derive-diff +
+  non-syncable-skip) green; full sidecar suite green (the two `getReplicaDB`
+  probe-timing tests fail identically on the P0 baseline — pre-existing, env
+  timing). **Remaining:** mono `go-ivm-client.ts` `advanceToHead()` method +
+  config flag + the Go-vs-TS diff comparison in the pipeline-driver.
 - **P2 — view-syncer version authority** (mono). CVR stamping from Go's version;
   two-snapshotter reconciliation; shadow→full-state compare.
 - **P3 — lean Go-primary.** Drop TS's user-query compute; TS = cold fallback.

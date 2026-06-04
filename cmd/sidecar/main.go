@@ -27,6 +27,7 @@ import (
 
 	"github.com/kartikparsoya-eng/go-ivm/builder"
 	"github.com/kartikparsoya-eng/go-ivm/engine"
+	"github.com/kartikparsoya-eng/go-ivm/internal/snapshotter"
 	"github.com/kartikparsoya-eng/go-ivm/internal/tablesource"
 	"github.com/kartikparsoya-eng/go-ivm/ivm"
 	"github.com/kartikparsoya-eng/go-ivm/sqlite"
@@ -376,8 +377,8 @@ const defaultSocket = "/tmp/go-ivm.sock"
 // the TS client can refuse to talk to an incompatible sidecar
 // (REVIEW-final MED-CROSS-5).
 const (
-	sidecarVersion     = "0.6.0"
-	sidecarProtocolRev = 6 // bumped: refreshSnapshot RPC added (rolls TableSource pinned tx — drift audit calls it to align comparison reads with Go's view; safe to call against MemorySource too as it's a no-op there).
+	sidecarVersion     = "0.7.0"
+	sidecarProtocolRev = 7 // bumped: advanceToHead RPC added (Go derives its own snapshot diff via internal/snapshotter instead of consuming TS-shipped SnapshotChange[]; gated by GO_IVM_ADVANCE_TO_HEAD + table mode). Rev 6 added refreshSnapshot.
 )
 
 // rpcCodeStaleInitEpoch signals that a mutating RPC arrived with an
@@ -471,6 +472,18 @@ type ClientGroup struct {
 	// (REVIEW-final HIGH-CROSS-2 / HIGH-CROSS-3). Accessed via atomic so the
 	// reaper doesn't need mu.
 	lastUsedNs atomic.Int64
+
+	// snap is this group's Snapshotter — the Go-side leapfrog that derives
+	// its own snapshot diff from the replica's changeLog2 (internal/snapshotter).
+	// Non-nil only when GO_IVM_ADVANCE_TO_HEAD=true AND sourceMode==table; the
+	// advanceToHead RPC uses it instead of TS-shipped SnapshotChange[]. Built
+	// in handleInit (pinned at the then-current head, matching the hydrate
+	// version), torn down in shutdownGroup / re-init. snapSpecs/snapAllNames
+	// are the syncable TableSpecs and the full replicated table-name set,
+	// captured at init for the Diff's syncable/non-syncable classification.
+	snap         *snapshotter.Snapshotter
+	snapSpecs    map[string]*snapshotter.TableSpec
+	snapAllNames map[string]bool
 }
 
 type clientGroupReq struct {
@@ -527,6 +540,17 @@ type Server struct {
 	replicaWritableDB  *sql.DB       // writable companion pool — used for each Source's prev-snapshot tx conn
 	replicaProbe       chan struct{} // non-nil while a probe is in flight; closed when done
 	replicaErr         error         // last probe's terminal error (under replicaMu)
+
+	// appID names the app whose `${appID}.permissions` table the Snapshotter's
+	// Diff watches for permissions-change resets. From GO_IVM_APP_ID (or the
+	// per-init AppID field). Only consulted when advanceToHead is enabled.
+	appID string
+
+	// advanceToHeadEnabled gates the Go-derived-diff path. When true (and
+	// sourceMode==table) handleInit builds a per-CG Snapshotter and the
+	// advanceToHead RPC becomes available. Off by default — the legacy
+	// TS-ships-the-diff advance path is unaffected (design §7 P1: behind a flag).
+	advanceToHeadEnabled bool
 }
 
 func NewServer(mode tablesource.Mode, replicaPath string) *Server {
@@ -913,6 +937,10 @@ func (s *Server) shutdownGroup(g *ClientGroup) {
 		g.eng.Close()
 		g.eng = nil
 	}
+	if g.snap != nil {
+		g.snap.Destroy()
+		g.snap = nil
+	}
 	g.mu.Unlock()
 }
 
@@ -964,6 +992,8 @@ func (s *Server) handleRequest(req RPCRequest) (resp RPCResponse) {
 		return s.handleRemoveQuery(req)
 	case "advance":
 		return s.handleAdvance(req)
+	case "advanceToHead":
+		return s.handleAdvanceToHead(req)
 	case "destroy":
 		return s.handleDestroy(req)
 	case "refreshSnapshot":
@@ -986,6 +1016,10 @@ type initParams struct {
 	DBPath        string                       `json:"dbPath"` // deprecated, kept for compat
 	Storage       string                       `json:"storagePath"`
 	Tables        map[string]tableSchemaParams `json:"tables"`
+	// AppID names the app whose `${appID}.permissions` table the Snapshotter
+	// watches for permissions-change resets. Optional; falls back to the
+	// process-level GO_IVM_APP_ID. Only used when advanceToHead is enabled.
+	AppID string `json:"appID,omitempty"`
 }
 
 type tableSchemaParams struct {
@@ -1035,6 +1069,13 @@ func (s *Server) handleInit(req RPCRequest) RPCResponse {
 	// Close previous engine if re-initializing this group
 	if group.eng != nil {
 		group.eng.Close()
+	}
+	// Tear down a previous Snapshotter (re-init re-pins from scratch).
+	if group.snap != nil {
+		group.snap.Destroy()
+		group.snap = nil
+		group.snapSpecs = nil
+		group.snapAllNames = nil
 	}
 
 	// Bump epoch BEFORE we create the new engine so any in-flight loadRows
@@ -1129,6 +1170,19 @@ func (s *Server) handleInit(req RPCRequest) RPCResponse {
 	// Install the per-table minRowVersion map for the streamNodes bump
 	// (audit item K). Empty map is fine — bumpRowVersions is a no-op then.
 	eng.SetMinRowVersions(minRowVersions)
+
+	// Build the per-CG Snapshotter when the Go-derived-diff path is armed.
+	// Pinned at the current replica head, which is the same frame the
+	// hydrate (tablesource fetch) reads from, so the first advanceToHead diff
+	// is computed against the version the engine was hydrated at. Failures
+	// here are non-fatal: advanceToHead simply stays unavailable for this CG
+	// and the legacy TS-shipped advance path keeps working.
+	if s.advanceToHeadEnabled && s.sourceMode == tablesource.ModeTable {
+		if err := s.buildSnapshotterLocked(group, &p); err != nil {
+			fmt.Fprintf(os.Stderr,
+				"[GO-IVM] advanceToHead disabled for cg=%s: %v\n", cgID, err)
+		}
+	}
 
 	return RPCResponse{
 		JSONRPC: "2.0",
@@ -2042,6 +2096,19 @@ func main() {
 		socketPath, sourceMode)
 
 	server := NewServer(sourceMode, replicaPath)
+	server.appID = os.Getenv("GO_IVM_APP_ID")
+	server.advanceToHeadEnabled = os.Getenv("GO_IVM_ADVANCE_TO_HEAD") == "true"
+	if server.advanceToHeadEnabled {
+		if sourceMode != tablesource.ModeTable {
+			fmt.Fprintln(os.Stderr,
+				"[GO-IVM] GO_IVM_ADVANCE_TO_HEAD=true ignored: requires GO_IVM_SOURCE_MODE=table")
+			server.advanceToHeadEnabled = false
+		} else {
+			fmt.Fprintf(os.Stderr,
+				"[GO-IVM] advanceToHead ARMED (Go derives its own snapshot diff; appID=%q)\n",
+				server.appID)
+		}
+	}
 
 	// Start periodic metrics reporter
 	go func() {
