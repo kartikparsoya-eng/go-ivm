@@ -1,7 +1,10 @@
 # DESIGN: Snapshotter-in-Go — line-by-line port of TS's `Snapshotter`
 
-Status: **P0 IMPLEMENTED** (`internal/snapshotter`, 13 fixture tests green);
-P1–P3 pending. Authored 2026-06-04.
+Status: **P0 + P1 IMPLEMENTED** — `internal/snapshotter` (13 fixture tests),
+`advanceToHead` RPC (Go + mono), Go-vs-TS `[go-diff-shadow]` compare. P1 awaits
+soak validation; P2 (frame-coordinated engine self-consistency + CVR version
+authority) and P3 (lean primary) pending — see §7 for the P2 spike finding.
+Authored 2026-06-04.
 Companion to [`DESIGN-tablesource-port.md`](./DESIGN-tablesource-port.md) and the
 frame-timing deep-dive in [`PORT-AUDIT-FIXES.md`](./PORT-AUDIT-FIXES.md).
 
@@ -353,13 +356,34 @@ a clean shadow run is a real guarantee about primary.
   not errored. protocolRev 6→7. Tests: `advance_to_head_test.go` (derive-diff +
   non-syncable-skip) green; full sidecar suite green (the two `getReplicaDB`
   probe-timing tests fail identically on the P0 baseline — pre-existing, env
-  timing). **Remaining:** mono `go-ivm-client.ts` `advanceToHead()` method +
-  config flag + the Go-vs-TS diff comparison in the pipeline-driver.
-- **P2 — view-syncer version authority** (mono). CVR stamping from Go's version;
-  two-snapshotter reconciliation; shadow→full-state compare.
+  timing). **✅ mono side DONE:** `go-ivm-client.ts` `advanceToHead()` +
+  `AdvanceToHeadResult`, `GoComputeBackend.advanceToHead()`, `isGoDerivedDiff`,
+  protocolRev 6→7 in `sidecar-manager.ts`, `goSidecar.advanceToHead` config,
+  and `#compareGoDerivedDiff` in `pipeline-driver.ts` (an order-independent
+  table+prevValues+nextValue signature compare logged under `[go-diff-shadow]`).
+  Off by default; runs inside shadow mode only. **P1 is now end-to-end: enable
+  `shadowMode` + `advanceToHead` and the logs prove Go derives the same diff TS
+  does.** Next: run a soak and confirm `[go-diff-shadow]` shows zero mismatches —
+  that is the gate for P2.
+- **P2 — view-syncer version authority + engine self-consistency** (the heavy
+  part). CVR stamping from Go's version; two-snapshotter reconciliation;
+  shadow→full-state compare.
+  **⚠️ Spike finding (2026-06-04):** a naive "drive" mode — `advanceToHead`
+  applying its own derived diff via `engine.Advance` — was prototyped and
+  **proven incorrect**: the engine's `tablesource.Source` leaves re-pin their
+  OWN read tx at head independently of the Snapshotter's frame, so applying a
+  derived `add(row)` hits a `tablesource` prev-tx frame that *already contains
+  that row* → `UNIQUE` failure / drift panic (reproduced; reverted). **The real
+  fix is frame-coordination:** during a Go-primary advance the engine's leaf
+  reads/writes must be bound to the Snapshotter's `prev` connection (apply the
+  diff into the SAME `BEGIN CONCURRENT` frame the diff was derived against),
+  rather than each `Source` owning + re-pinning its own tx. That refactor
+  (Source accepts an externally-pinned conn from the Snapshotter) plus the CVR
+  two-version reconciliation is P2 proper — and must be soak-validated AFTER P1's
+  `[go-diff-shadow]` is clean, per this plan's own sequencing.
 - **P3 — lean Go-primary.** Drop TS's user-query compute; TS = cold fallback.
   Then the PERF-REVIEW Tier-1 parallelism items (`T1-3/4/5/7`,
-  `GO_IVM_PARALLEL_THRESHOLD`) carry the actual prod win.
+  `GO_IVM_PARALLEL_THRESHOLD`) carry the actual prod win. Gated on P2.
 
 Interim stop-gap (if Go-primary correctness is needed before P2 lands): the
 deep-dive's **option 4** — route Go-primary drift through the same
