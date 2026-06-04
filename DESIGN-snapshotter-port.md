@@ -547,3 +547,34 @@ reconciliation lives entirely in `#goPrimaryAdvance` (returns the already-`min`'
 `AdvanceResult` additionally carries `tsVersion`/`goVersion` for observability and
 a view-syncer-side monotonicity assertion. **Go side needs nothing new — the P1/P2b
 `advanceToHead` drive already produces `{rowChanges, version}`.**
+
+### 10.6 P2c soak result (2026-06-04, rust-test, first-ever Go-primary soak)
+
+**✅ Go-primary TRIGGER soak CLEAN** (4u/90s + 6u/180s, `--mutate`): client
+mismatches 0, frames flowing (1360 over 180s), **drift-audit DATA compares all
+matched** (`ts=N go=N ok` for every sampled query incl. a 2959-row one →
+**0 row-data drift**), **0 watermark-assert violations** (the `min` floor held),
+0 protocol violations. The version-authority logic produced zero incorrect data.
+
+**Two non-correctness findings (both addressed/triaged):**
+1. **Reset-vs-teardown race (P2c-amplified, FIXED `1bd43ee65`).** First trigger
+   soak logged 35× `database connection is not open` for ONE cg in a 12 ms burst:
+   a fire-and-forget Go reset (the drift-audit self-heal) ran `#currentTablesForGo`
+   against a `destroy()`'d snapshotter (destroy closes the conn but leaves `#curr`
+   set, so `current()` returns a closed Snapshot). The longer `advanceToHead`
+   window widens the overlap (push mode: 0). Fixed with `Snapshotter.destroyed`
+   + three guards (skip-reset / typed-throw / no-retry-on-teardown). Re-soak: 0
+   failed resets; the lone db-closed left was the audit's *optional* SQL
+   third-opinion skipping while the TS-vs-Go compare still matched.
+2. **`drift-audit-pipeline-count-mismatch` over-fires (PRE-EXISTING, not P2c).**
+   The audit's count pre-check (`goCount < tsExpected`) fired ~4–6 precautionary
+   resets per soak — all COMPLETED cleanly, **0 data impact** (the data audits in
+   the same run all matched). Fires identically in push mode → it's the existing
+   drift-audit calibration, transient registration-lag under load, not the version
+   change. **Follow-up (separate from P2c):** give the count pre-check a grace /
+   recheck before resetting so primary mode doesn't churn re-registrations.
+
+**Conclusion:** P2c (Go-primary CVR version authority via min-floor) is
+implemented, unit-tested, and **soak-validated correct** in real Go-primary
+serving. Gate for **P3 (lean primary)** is green; the count-pre-check tuning is a
+recommended pre-P3 hardening but not a correctness blocker.
