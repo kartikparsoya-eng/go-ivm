@@ -155,6 +155,26 @@ func readAllTableNames(db *sql.DB) (map[string]bool, error) {
 	return out, rows.Err()
 }
 
+// refreshSnapForInitialHydrateLocked re-pins the Snapshotter's curr at head
+// before the FIRST hydrate in drive mode, so Go reads the same version TS does.
+// Init() pins curr at handleInit time, but the replicator may advance before the
+// initial addQueries arrives — leaving Go's hydrate frame slightly behind TS's
+// (rare "Go produced 0" shadow misses for rows that landed in that window).
+// No-op once any pipeline exists: re-pinning curr would desync hydrated
+// pipelines. MUST hold group.mu.
+func (s *Server) refreshSnapForInitialHydrateLocked(group *ClientGroup) {
+	if !s.advanceDriveEnabled || group.snap == nil || group.eng == nil {
+		return
+	}
+	if group.eng.PipelineCount() > 0 {
+		return
+	}
+	if err := group.snap.RefreshCurrentToHead(); err != nil {
+		fmt.Fprintf(os.Stderr,
+			"[GO-IVM] refresh curr before initial hydrate failed: %v\n", err)
+	}
+}
+
 func (s *Server) handleAdvanceToHead(req RPCRequest) RPCResponse {
 	var p advanceToHeadParams
 	if err := mpUnmarshal(req.Params, &p); err != nil {

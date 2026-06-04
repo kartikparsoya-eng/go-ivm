@@ -1338,6 +1338,7 @@ func (s *Server) handleAddQuery(req RPCRequest) RPCResponse {
 		return resp
 	}
 
+	s.refreshSnapForInitialHydrateLocked(group)
 	changes, timingMs, err := group.eng.AddQuery(p.QueryID, p.AST)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[GO-IVM] addQuery ERROR cg=%s query=%s: %v\n", cgID, p.QueryID, err)
@@ -1416,6 +1417,7 @@ func (s *Server) handleAddQueries(req RPCRequest) RPCResponse {
 		specs[i] = engine.QuerySpec{QueryID: q.QueryID, AST: q.AST}
 	}
 
+	s.refreshSnapForInitialHydrateLocked(group)
 	results, err := group.eng.AddQueries(specs)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[GO-IVM] addQueries ERROR cg=%s: %v\n", cgID, err)
@@ -1487,6 +1489,7 @@ func (s *Server) handleAddQueriesStream(req RPCRequest, streamW streamWriter) RP
 	// On the Final frame, ChunkIndex+1 is the total chunk count for that
 	// query — engine_streaming_test.go locks in the invariant that Final
 	// is always on the last (highest-ChunkIndex) frame.
+	s.refreshSnapForInitialHydrateLocked(group)
 	err := group.eng.AddQueriesStream(specs, func(r engine.QueryResult) {
 		streamW(req.ID, addQueriesStreamPartial{
 			QueryID:    r.QueryID,

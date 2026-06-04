@@ -153,6 +153,27 @@ func (s *Snapshotter) advanceWithoutDiffLocked() (prev, curr *Snapshot, err erro
 	return s.prev, s.curr, nil
 }
 
+// RefreshCurrentToHead re-pins the current snapshot at the latest replica head
+// on its existing connection. P2 drive mode calls this immediately before the
+// FIRST hydrate: Init() pins curr at handleInit time, but the replicator may
+// have advanced by the time the initial addQueries arrives, so without this the
+// hydrate reads a frame slightly behind the one TS hydrates at (observed as rare
+// "Go produced 0" shadow misses for a query whose matching rows landed in that
+// window). Because curr carries no IVM writes (only prev does), the rollback is
+// a clean re-pin. The connection object is unchanged, so any sources already
+// bound to curr.Conn() automatically observe the new frame.
+//
+// ONLY safe when no pipeline depends on curr yet (initial hydrate): re-pinning
+// shifts curr's version, which would desync already-hydrated pipelines.
+func (s *Snapshotter) RefreshCurrentToHead() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.curr == nil {
+		return fmt.Errorf("snapshotter: not initialized")
+	}
+	return s.curr.resetToHead(s.beginStmt)
+}
+
 // Destroy closes both snapshot connections. Mirrors destroy() (202).
 func (s *Snapshotter) Destroy() {
 	s.mu.Lock()
