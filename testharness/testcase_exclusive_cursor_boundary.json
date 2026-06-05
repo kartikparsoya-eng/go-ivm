@@ -1,0 +1,73 @@
+{
+  "_comment": "Repro for the 2026-06-05 deep-interaction shadow-soak exclusive-cursor over-include. conversations list filtered by channelId + scalar EXISTS(channels: PUBLIC), start={createdAt:300} EXCLUSIVE, orderBy [createdAt asc] (PK conversationId appended by completeOrdering, as production does), limit 50. The cursor createdAt=300 is the NEWEST row, so the correct page is EMPTY (nothing strictly after the cursor). Replica ground-truth = 0. Soak observed TS=1 / Go=2 (transient WAL-frame snapshot skew, NOT a logic bug — this test pins the correct clean-snapshot result). Hydration MUST be empty.",
+
+  "schema": {
+    "channels": {
+      "columns": {
+        "id": {"type": "string"},
+        "visibility": {"type": "string"}
+      },
+      "primaryKey": ["id"]
+    },
+    "conversations": {
+      "columns": {
+        "conversationId": {"type": "string"},
+        "channelId": {"type": "string"},
+        "createdAt": {"type": "number"}
+      },
+      "primaryKey": ["conversationId"]
+    }
+  },
+
+  "initialData": {
+    "channels": [
+      {"id": "ch1", "visibility": "PUBLIC"}
+    ],
+    "conversations": [
+      {"conversationId": "c-100", "channelId": "ch1", "createdAt": 100},
+      {"conversationId": "c-200", "channelId": "ch1", "createdAt": 200},
+      {"conversationId": "c-300", "channelId": "ch1", "createdAt": 300}
+    ]
+  },
+
+  "ast": {
+    "table": "conversations",
+    "where": {
+      "type": "and",
+      "conditions": [
+        {
+          "type": "simple",
+          "op": "=",
+          "left": {"type": "column", "name": "channelId"},
+          "right": {"type": "literal", "value": "ch1"}
+        },
+        {
+          "type": "correlatedSubquery",
+          "op": "EXISTS",
+          "scalar": true,
+          "related": {
+            "correlation": {
+              "parentField": ["channelId"],
+              "childField": ["id"]
+            },
+            "subquery": {
+              "table": "channels",
+              "alias": "channels",
+              "where": {
+                "type": "simple",
+                "op": "=",
+                "left": {"type": "column", "name": "visibility"},
+                "right": {"type": "literal", "value": "PUBLIC"}
+              }
+            }
+          }
+        }
+      ]
+    },
+    "start": {"row": {"createdAt": 300}, "exclusive": true},
+    "orderBy": [["createdAt", "asc"]],
+    "limit": 50
+  },
+
+  "mutations": []
+}
