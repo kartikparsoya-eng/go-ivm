@@ -19,6 +19,7 @@ import (
 	"os/signal"
 	"reflect"
 	"runtime"
+	"runtime/debug"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -2043,11 +2044,52 @@ func handleConnection(conn net.Conn, server *Server) {
 
 // --- main ---
 
+// tuneRuntime relaxes the garbage collector for this allocation-heavy server.
+// Each hydrate of a ~1k-row query allocates ~8.6k objects (the per-row Row map
+// dominates — see PERF-REVIEW.md). At the Go default GOGC=100 the GC saturates
+// under concurrent multi-CG load and becomes the ceiling on multi-core scaling:
+// the cross-CG parallel speedup measured 2.6x at 16 CGs on a 14-core box at
+// GOGC=100, but 4.9x at GOGC=800 (TableSourceMulti benchmarks) — the cores and
+// the parallelization code were never the bottleneck, the GC was.
+//
+// Defaults to a moderate 2x (GOGC=200), which is overridable:
+//   - GO_IVM_GOGC=<n|off>   — GC target percent (this namespace, logged).
+//   - GO_IVM_GOMEMLIMIT=<bytes> — soft memory cap (debug.SetMemoryLimit). The
+//     principled high-throughput config: set this to the container budget and
+//     run a high/off GOGC so GC only fires near the cap.
+// The standard GOGC env (already applied by the runtime) takes precedence when
+// GO_IVM_GOGC is unset, so existing deployments that tuned GOGC are unaffected.
+func tuneRuntime() {
+	if v := os.Getenv("GO_IVM_GOGC"); v != "" {
+		if v == "off" {
+			debug.SetGCPercent(-1)
+			fmt.Fprintf(os.Stderr, "[GO-IVM] GC disabled (GO_IVM_GOGC=off)\n")
+		} else if n, err := strconv.Atoi(v); err == nil {
+			debug.SetGCPercent(n)
+			fmt.Fprintf(os.Stderr, "[GO-IVM] GC percent set to %d (GO_IVM_GOGC)\n", n)
+		}
+	} else if os.Getenv("GOGC") == "" {
+		// No operator GC tuning at all → apply the moderate default.
+		debug.SetGCPercent(200)
+		fmt.Fprintf(os.Stderr, "[GO-IVM] GC percent defaulted to 200 (override GO_IVM_GOGC / GOGC)\n")
+	}
+	if v := os.Getenv("GO_IVM_GOMEMLIMIT"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+			debug.SetMemoryLimit(n)
+			fmt.Fprintf(os.Stderr, "[GO-IVM] soft memory limit set to %d bytes (GO_IVM_GOMEMLIMIT)\n", n)
+		}
+	}
+}
+
 func main() {
 	socketPath := defaultSocket
 	if len(os.Args) > 1 {
 		socketPath = os.Args[1]
 	}
+
+	// Relax GC before serving — the allocation rate, not the cores, caps
+	// multi-CG parallel scaling (see tuneRuntime).
+	tuneRuntime()
 
 	// CRIT-6: fail loud at boot if the init/advance value-coercion contract is
 	// broken (a colType that doesn't map both raw and JS shapes to the same
