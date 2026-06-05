@@ -618,11 +618,22 @@ func (e *Engine) AddQueries(queries []QuerySpec) ([]QueryResult, error) {
 	// Snapshot minRowVersions under the held e.mu so the parallel hydrate
 	// goroutines read a stable map (K: minRowVersion bump).
 	mrv := e.minRowVersions
+	// C1: a panic inside a hydrate goroutine (e.g. pkValue on a nil-PK row)
+	// cannot be caught by the RPC handler's recover — panics don't cross
+	// goroutine boundaries, so an uncaught one aborts the WHOLE multi-CG
+	// process. Capture per-goroutine and surface as an error (mirrors the
+	// per-goroutine recover in ivm/parallel.go's push fan-out).
+	hydratePanics := make([]any, len(built))
 	var wg sync.WaitGroup
 	wg.Add(len(built))
 	for i, entry := range built {
 		go func(idx int, entry *pipelineEntry) {
 			defer wg.Done()
+			defer func() {
+				if r := recover(); r != nil {
+					hydratePanics[idx] = r
+				}
+			}()
 			start := time.Now()
 			hydration := bumpRowVersions(hydrateEntry(entry), mrv)
 			timingMs := float64(time.Since(start).Microseconds()) / 1000.0
@@ -637,6 +648,9 @@ func (e *Engine) AddQueries(queries []QuerySpec) ([]QueryResult, error) {
 		}(i, entry)
 	}
 	wg.Wait()
+	if err := firstHydratePanic(built, hydratePanics); err != nil {
+		return nil, err
+	}
 
 	// HIGH-11: wire companion outputs after all hydrates complete.
 	for _, entry := range built {
@@ -695,11 +709,22 @@ func (e *Engine) AddQueriesStream(
 	// Snapshot minRowVersions under the held e.mu so the parallel hydrate
 	// goroutines read a stable map (K: minRowVersion bump).
 	mrv := e.minRowVersions
+	// C1: capture per-goroutine panics (see AddQueries) so a nil-PK panic in
+	// one query's hydrate becomes a returned error instead of a process abort.
+	// The query may have already emitted partial (Final=false) frames; the
+	// handler turns the returned error into an rpcError, which rejects the
+	// whole addQueriesStream call on the TS side — a clean failure, not a crash.
+	hydratePanics := make([]any, len(built))
 	var wg sync.WaitGroup
 	wg.Add(len(built))
-	for _, b := range built {
-		go func(entry *pipelineEntry) {
+	for bi, b := range built {
+		go func(idx int, entry *pipelineEntry) {
 			defer wg.Done()
+			defer func() {
+				if r := recover(); r != nil {
+					hydratePanics[idx] = r
+				}
+			}()
 			start := time.Now()
 			nodes := entry.pipeline.Input.Fetch(ivm.FetchRequest{})
 
@@ -760,13 +785,38 @@ func (e *Engine) AddQueriesStream(
 			// extra small frame per such query is the tradeoff for a simple
 			// invariant ("every query ends with Final=true").
 			flush(true)
-		}(b)
+		}(bi, b)
 	}
 	wg.Wait()
+	if err := firstHydratePanic(built, hydratePanics); err != nil {
+		return err
+	}
 
 	// HIGH-11: wire companion outputs after all hydrates complete.
 	for _, entry := range built {
 		e.wireCompanionOutputsLocked(entry)
+	}
+	return nil
+}
+
+// firstHydratePanic converts the first non-nil per-goroutine hydrate panic into
+// an error so the RPC handler can return an error frame instead of letting the
+// panic abort the whole sidecar process (C1). A *DriftError is preserved as-is
+// (the caller's drift handling expects that type); any other value is wrapped
+// with its query ID for diagnosis.
+func firstHydratePanic(built []*pipelineEntry, panics []any) error {
+	for i, p := range panics {
+		if p == nil {
+			continue
+		}
+		if d, ok := p.(*ivm.DriftError); ok {
+			return d
+		}
+		qid := ""
+		if i < len(built) && built[i] != nil {
+			qid = built[i].queryID
+		}
+		return fmt.Errorf("hydrate panic (query %s): %v", qid, p)
 	}
 	return nil
 }

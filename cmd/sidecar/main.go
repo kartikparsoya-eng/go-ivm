@@ -833,11 +833,16 @@ func (g *ClientGroup) worker(s *Server) {
 		if req.streamW != nil && method == "addQueriesStream" {
 			// Streaming variant: per-query partial frames go through streamW;
 			// the terminal "done" RPCResponse still flows through respCh.
-			resp = s.handleAddQueriesStream(req.req, req.streamW)
+			// C1: the stream handlers run OUTSIDE handleRequest's recover, and
+			// AdvanceStream deliberately re-raises non-drift panics on this
+			// (worker) goroutine — so without this recover such a panic aborts
+			// the whole multi-CG process. Convert it to an error response (the
+			// TS client rejects the call) instead.
+			resp = s.handleStreamWithRecover(req.req, req.streamW, s.handleAddQueriesStream)
 		} else if req.streamW != nil && method == "advanceStream" {
 			// Streaming variant of advance: partial frames go through streamW;
 			// terminal "done" RPCResponse still flows through respCh.
-			resp = s.handleAdvanceStream(req.req, req.streamW)
+			resp = s.handleStreamWithRecover(req.req, req.streamW, s.handleAdvanceStream)
 		} else {
 			resp = s.handleRequest(req.req)
 		}
@@ -960,6 +965,32 @@ func (s *Server) closeAll() {
 	for _, g := range groups {
 		s.shutdownGroup(g)
 	}
+}
+
+// handleStreamWithRecover runs a streaming handler with a panic recover (C1).
+// The streaming handlers dispatch directly from the worker goroutine, bypassing
+// handleRequest's recover; AdvanceStream also re-raises non-drift panics onto
+// this goroutine. Without this, such a panic would abort the whole process.
+// Any partial frames already written are harmless — the error RPCResponse makes
+// the TS client reject the call rather than awaiting a "done" that never comes.
+func (s *Server) handleStreamWithRecover(
+	req RPCRequest,
+	streamW streamWriter,
+	handler func(RPCRequest, streamWriter) RPCResponse,
+) (resp RPCResponse) {
+	defer func() {
+		if r := recover(); r != nil {
+			stack := make([]byte, 4096)
+			n := runtime.Stack(stack, false)
+			fmt.Fprintf(os.Stderr, "[GO-IVM] PANIC in %s (stream): %v\n%s\n", req.Method, r, stack[:n])
+			resp = RPCResponse{
+				JSONRPC: "2.0",
+				Error:   &RPCError{Code: -32000, Message: fmt.Sprintf("panic: %v", r)},
+				ID:      req.ID,
+			}
+		}
+	}()
+	return handler(req, streamW)
 }
 
 func (s *Server) handleRequest(req RPCRequest) (resp RPCResponse) {
