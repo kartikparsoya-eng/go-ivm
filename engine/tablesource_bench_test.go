@@ -205,3 +205,43 @@ func BenchmarkTableSourceMulti_1_Parallel(b *testing.B)    { benchTableSourceMul
 func BenchmarkTableSourceMulti_4_Parallel(b *testing.B)    { benchTableSourceMultiEngine(b, 4, true) }
 func BenchmarkTableSourceMulti_8_Parallel(b *testing.B)    { benchTableSourceMultiEngine(b, 8, true) }
 func BenchmarkTableSourceMulti_16_Parallel(b *testing.B)   { benchTableSourceMultiEngine(b, 16, true) }
+
+// --- Within-CG parallel hydration (a SEPARATE axis from cross-CG): one engine,
+//     M queries. Parallel = AddQueries([M]) fans out M goroutines (engine.go).
+//     Serial = M single-query AddQueries calls. Shows whether the per-query
+//     fan-out helps when a single CG hydrates many queries. ---
+
+func benchASTn(i int) builder.AST {
+	limit := 50
+	return builder.AST{
+		Table: "t",
+		Where: &builder.Condition{
+			Type: "simple", Op: ">",
+			Left:  &builder.ValuePos{Type: "column", Name: "val"},
+			Right: &builder.ValuePos{Type: "literal", Value: float64(50 + i)},
+		},
+		OrderBy: ivm.Ordering{{"id", "asc"}},
+		Limit:   &limit,
+	}
+}
+
+func benchWithinCG(b *testing.B, m int, parallel bool) {
+	eng := newTableSourceEngine(b, 1000)
+	b.ResetTimer()
+	for it := 0; it < b.N; it++ {
+		if parallel {
+			qs := make([]QuerySpec, m)
+			for i := 0; i < m; i++ {
+				qs[i] = QuerySpec{QueryID: fmt.Sprintf("q%d", i), AST: benchASTn(i)}
+			}
+			_, _ = eng.AddQueries(qs)
+		} else {
+			for i := 0; i < m; i++ {
+				_, _ = eng.AddQueries([]QuerySpec{{QueryID: fmt.Sprintf("q%d", i), AST: benchASTn(i)}})
+			}
+		}
+	}
+}
+
+func BenchmarkWithinCGHydrate_8_Serial(b *testing.B)   { benchWithinCG(b, 8, false) }
+func BenchmarkWithinCGHydrate_8_Parallel(b *testing.B) { benchWithinCG(b, 8, true) }
