@@ -13,6 +13,41 @@ import (
 // We normalize undefined → nil (same as TS normalizeUndefined).
 type Value interface{}
 
+// smallFloatCacheMax bounds boxedSmallFloat below. 1024 covers the values that
+// dominate real numeric columns — booleans-as-int (0/1), enums, status codes,
+// small counts, and low primary keys.
+const smallFloatCacheMax = 1024
+
+// boxedSmallFloat holds pre-boxed Value (interface{}) wrappers for the small
+// non-negative integers above. Boxing a float64 into an interface heap-allocates
+// 8 bytes PER value; numeric column coercion (FromSQLiteType on the hydrate path,
+// normalizeDecodedValue on the advance/wire path) was ~30% of all allocations in
+// the 1k-row hydrate profile, almost entirely these boxes. The boxed value is
+// immutable — every downstream reader (comparators, the view, msgpack encode)
+// only READS it and interface equality is by value — so handing the SAME box to
+// every row with an equal value is indistinguishable from a fresh box, at zero
+// per-row allocation. Built once at init.
+var boxedSmallFloat = func() [smallFloatCacheMax]Value {
+	var a [smallFloatCacheMax]Value
+	for i := range a {
+		a[i] = float64(i)
+	}
+	return a
+}()
+
+// BoxFloat64 wraps f as a Value, reusing a shared immutable box for small
+// non-negative integer values to avoid a per-row heap allocation. Out-of-range
+// or non-integral values fall through to a fresh box (the normal interface
+// conversion). Hot path: kept small enough to inline.
+func BoxFloat64(f float64) Value {
+	if f >= 0 && f < smallFloatCacheMax {
+		if i := int(f); float64(i) == f {
+			return boxedSmallFloat[i]
+		}
+	}
+	return f
+}
+
 // Row is a map of column name to value.
 type Row map[string]Value
 
@@ -67,27 +102,27 @@ func (r *Row) DecodeMsgpack(dec *msgpack.Decoder) error {
 func normalizeDecodedValue(v interface{}) interface{} {
 	switch x := v.(type) {
 	case int8:
-		return float64(x)
+		return BoxFloat64(float64(x))
 	case int16:
-		return float64(x)
+		return BoxFloat64(float64(x))
 	case int32:
-		return float64(x)
+		return BoxFloat64(float64(x))
 	case int64:
-		return float64(x)
+		return BoxFloat64(float64(x))
 	case int:
-		return float64(x)
+		return BoxFloat64(float64(x))
 	case uint8:
-		return float64(x)
+		return BoxFloat64(float64(x))
 	case uint16:
-		return float64(x)
+		return BoxFloat64(float64(x))
 	case uint32:
-		return float64(x)
+		return BoxFloat64(float64(x))
 	case uint64:
-		return float64(x)
+		return BoxFloat64(float64(x))
 	case uint:
-		return float64(x)
+		return BoxFloat64(float64(x))
 	case float32:
-		return float64(x)
+		return BoxFloat64(float64(x))
 	case map[string]interface{}:
 		for k, vv := range x {
 			x[k] = normalizeDecodedValue(vv)

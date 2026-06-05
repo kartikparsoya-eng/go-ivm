@@ -16,6 +16,11 @@ import (
 // is how TS's number model (all numbers are float64) bounds integers (HIGH-9).
 const maxSafeInteger = int64(1)<<53 - 1
 
+// boxFloat64 shares a single immutable box for common numeric column values to
+// avoid a per-row heap allocation. See ivm.BoxFloat64 — the cache lives in the
+// lower ivm package so the advance/wire path (normalizeDecodedValue) shares it.
+func boxFloat64(f float64) ivm.Value { return ivm.BoxFloat64(f) }
+
 // Condition represents a filter condition from the query AST.
 type Condition struct {
 	Type       string       // "simple", "and", "or"
@@ -375,32 +380,32 @@ func FromSQLiteType(v interface{}, colType string) ivm.Value {
 			if val > maxSafeInteger || val < -maxSafeInteger {
 				panic(fmt.Sprintf("FromSQLiteType(number): int64 %d exceeds JS MAX_SAFE_INTEGER (±2^53-1); float64 coercion loses precision", val))
 			}
-			return float64(val)
+			return boxFloat64(float64(val))
 		case uint64:
 			if val > uint64(maxSafeInteger) {
 				panic(fmt.Sprintf("FromSQLiteType(number): uint64 %d exceeds JS MAX_SAFE_INTEGER (2^53-1); float64 coercion loses precision", val))
 			}
-			return float64(val)
+			return boxFloat64(float64(val))
 		case float64:
-			return val
+			return boxFloat64(val)
 		case string:
 			// modernc.org/sqlite may return REAL values as strings
 			f, err := strconv.ParseFloat(val, 64)
 			if err != nil {
 				return v
 			}
-			return f
+			return boxFloat64(f)
 		case []byte:
 			f, err := strconv.ParseFloat(string(val), 64)
 			if err != nil {
 				return v
 			}
-			return f
+			return boxFloat64(f)
 		case bool:
 			if val {
-				return float64(1)
+				return boxFloat64(1)
 			}
-			return float64(0)
+			return boxFloat64(0)
 		default:
 			return v
 		}
