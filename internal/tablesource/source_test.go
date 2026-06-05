@@ -237,6 +237,48 @@ func TestFetchFilterPredicate(t *testing.T) {
 	}
 }
 
+// TestFetchLimitPushdown locks the FetchRequest.Limit contract that powers the
+// Take O(table)→O(limit) hydrate optimization: the source stops after Limit
+// rows in the request's effective order, counted AFTER its own filter predicate
+// — never under-fetching (a filtered row must not consume the limit budget) and
+// never over-fetching (Limit larger than the result set returns the full set).
+func TestFetchLimitPushdown(t *testing.T) {
+	src, db := newUserSource(t)
+	defer db.Close()
+
+	ids := func(nodes []ivm.Node) []float64 {
+		out := make([]float64, len(nodes))
+		for i, n := range nodes {
+			out[i], _ = n.Row["id"].(float64)
+		}
+		return out
+	}
+
+	// score<=80 passes id=2(80) and id=3(70); id=1(90) is filtered. So the
+	// filtered id=1 sits FIRST in id order — a correct limit must skip it
+	// without spending budget, returning id=2 as the first row.
+	pred := func(r ivm.Row) bool { s, _ := r["score"].(float64); return s <= 80 }
+	in := src.Connect(nil, pred, nil)
+
+	cases := []struct {
+		name string
+		req  ivm.FetchRequest
+		want []float64
+	}{
+		{"limit1_skips_filtered_first_row", ivm.FetchRequest{Limit: 1}, []float64{2}},
+		{"limit2_full_post_predicate_set", ivm.FetchRequest{Limit: 2}, []float64{2, 3}},
+		{"limit_over_set_no_overfetch", ivm.FetchRequest{Limit: 99}, []float64{2, 3}},
+		{"limit0_unlimited", ivm.FetchRequest{Limit: 0}, []float64{2, 3}},
+		{"reverse_limit1_first_in_desc_order", ivm.FetchRequest{Reverse: true, Limit: 1}, []float64{3}},
+	}
+	for _, c := range cases {
+		got := ids(in.Fetch(c.req))
+		if !reflect.DeepEqual(got, c.want) {
+			t.Errorf("%s: Fetch(%+v) ids = %v, want %v", c.name, c.req, got, c.want)
+		}
+	}
+}
+
 // recordingOutput is a test sink that records every Change it gets
 // pushed and returns no downstream changes. Used to verify Push fanout
 // hits the right connections with the right Change shape.

@@ -522,8 +522,18 @@ func (si *SourceInput) Fetch(req FetchRequest) []Node {
 		reverseNodes(nodes)
 	}
 
+	// Limit hint (Take pushdown): truncate to the first req.Limit rows in the
+	// effective (post-reverse) order. The overlay is already spliced above, so
+	// the retained prefix is the correct top-N. See FetchRequest.Limit.
+	if req.Limit > 0 && len(nodes) > req.Limit {
+		nodes = nodes[:req.Limit]
+	}
+
 	return nodes
 }
+
+// LeafSourceMarker marks SourceInput as a base source for Take's limit pushdown.
+func (si *SourceInput) LeafSourceMarker() {}
 
 // getSortedRows returns data sorted by the given ordering.
 func (ms *MemorySource) getSortedRows(ordering Ordering) []Row {

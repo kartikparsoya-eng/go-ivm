@@ -817,6 +817,9 @@ type sourceInput struct {
 
 func (i *sourceInput) GetSchema() *ivm.SourceSchema { return i.schema }
 
+// LeafSourceMarker marks sourceInput as a base source for Take's limit pushdown.
+func (i *sourceInput) LeafSourceMarker() {}
+
 func (i *sourceInput) SetOutput(o ivm.Output) {
 	i.conn.output = o
 }
@@ -927,6 +930,16 @@ func (s *Source) fetchForConn(req ivm.FetchRequest, conn *connection) []ivm.Node
 			continue
 		}
 		out = append(out, ivm.Node{Row: row})
+		// Limit pushdown (Take.initialFetch): once we have req.Limit
+		// post-predicate rows we can stop scanning. The SQLite cursor yields
+		// lazily via rows.Next(), so breaking here avoids materialising a Row
+		// map for every remaining replica row (a Limit:50 dashboard query over
+		// 1k rows built ~950 throwaway maps). Disabled when an in-flight overlay
+		// is present: applyOverlay below may splice a row into the top-N, so
+		// correctness needs the full candidate set in that (rare) case.
+		if req.Limit > 0 && s.overlay == nil && len(out) >= req.Limit {
+			break
+		}
 	}
 	if err := rows.Err(); err != nil {
 		panic(fmt.Sprintf("tablesource.Source.Fetch %s: rows: %v",
