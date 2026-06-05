@@ -245,3 +245,68 @@ func benchWithinCG(b *testing.B, m int, parallel bool) {
 
 func BenchmarkWithinCGHydrate_8_Serial(b *testing.B)   { benchWithinCG(b, 8, false) }
 func BenchmarkWithinCGHydrate_8_Parallel(b *testing.B) { benchWithinCG(b, 8, true) }
+
+// --- Within-CG hydration across DISTINCT tables: 8 queries, each on its own
+//     tablesource (own s.mu, own pinned conn from the SHARED pool). If s.mu is
+//     the same-table serializer, THIS should parallelize. ---
+
+func seedMultiTableReplica(tb testing.TB, nTables, rows int) string {
+	tb.Helper()
+	path := filepath.Join(tb.TempDir(), "replica.sqlite")
+	w, _ := sql.Open("sqlite3", path)
+	defer w.Close()
+	w.Exec("PRAGMA journal_mode=WAL")
+	w.Exec("PRAGMA synchronous=NORMAL")
+	for t := 0; t < nTables; t++ {
+		w.Exec(fmt.Sprintf("CREATE TABLE t%d (id INTEGER PRIMARY KEY, name TEXT, val INTEGER)", t))
+		tx, _ := w.Begin()
+		st, _ := tx.Prepare(fmt.Sprintf("INSERT INTO t%d (id,name,val) VALUES (?,?,?)", t))
+		for i := 1; i <= rows; i++ {
+			st.Exec(i, fmt.Sprintf("r%d", i), i%500)
+		}
+		st.Close()
+		tx.Commit()
+	}
+	return path
+}
+
+func benchMultiTable(b *testing.B, nTables int, parallel bool) {
+	path := seedMultiTableReplica(b, nTables, 1000)
+	db, _ := tablesource.Open(path, tablesource.OpenOptions{})
+	wdb, _ := tablesource.OpenWritable(path, tablesource.OpenOptions{})
+	eng, _ := NewEngine(EngineConfig{StoragePath: filepath.Join(b.TempDir(), "s.db")})
+	b.Cleanup(func() { eng.Close(); db.Close(); wdb.Close() })
+	for t := 0; t < nTables; t++ {
+		src, err := tablesource.New(db, wdb, fmt.Sprintf("t%d", t), benchColumns(), []string{"id"})
+		if err != nil {
+			b.Fatalf("New t%d: %v", t, err)
+		}
+		eng.RegisterSource(src)
+	}
+	mkAST := func(t int) builder.AST {
+		limit := 50
+		return builder.AST{
+			Table: fmt.Sprintf("t%d", t),
+			Where: &builder.Condition{Type: "simple", Op: ">",
+				Left: &builder.ValuePos{Type: "column", Name: "val"}, Right: &builder.ValuePos{Type: "literal", Value: float64(100)}},
+			OrderBy: ivm.Ordering{{"id", "asc"}}, Limit: &limit,
+		}
+	}
+	b.ResetTimer()
+	for it := 0; it < b.N; it++ {
+		if parallel {
+			qs := make([]QuerySpec, nTables)
+			for t := 0; t < nTables; t++ {
+				qs[t] = QuerySpec{QueryID: fmt.Sprintf("q%d", t), AST: mkAST(t)}
+			}
+			_, _ = eng.AddQueries(qs)
+		} else {
+			for t := 0; t < nTables; t++ {
+				_, _ = eng.AddQueries([]QuerySpec{{QueryID: fmt.Sprintf("q%d", t), AST: mkAST(t)}})
+			}
+		}
+	}
+}
+
+func BenchmarkMultiTableHydrate_8_Serial(b *testing.B)   { benchMultiTable(b, 8, false) }
+func BenchmarkMultiTableHydrate_8_Parallel(b *testing.B) { benchMultiTable(b, 8, true) }
