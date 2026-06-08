@@ -391,3 +391,158 @@ func TestTableSourceExistsPlusCursorPagination(t *testing.T) {
 		t.Fatalf("expected only t-4 (after cursor, in user-X's channel); got tickets=%v", ticketIDs)
 	}
 }
+
+// TestPartialCursorExclusionWithMultiColumnSort: the Bug(B) regression.
+// Sort: [createdAt ASC, id ASC], cursor: {createdAt: 100} exclusive (partial —
+// only specifies the first sort column). Rows at createdAt=100 must be excluded
+// from BOTH the initial hydrate AND the push path.
+//
+// Before the CompareWithPartialBound fix (ed7a302), Skip's shouldBePresent used
+// the full comparator which treated nil < non-nil for the second sort column.
+// A partial bound {createdAt:100} vs full row {createdAt:100, id:"X"}:
+//   full comparator: createdAt equal, id: nil < "X" → cmp = -1 → row passes
+// With CompareWithPartialBound: stops at first field not in bound → cmp = 0
+// + Exclusive=true → row blocked. This test catches regressions in that path.
+func TestPartialCursorExclusionWithMultiColumnSort(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "replica.sqlite")
+	w, _ := sql.Open("sqlite3", path)
+	for _, stmt := range []string{
+		"PRAGMA journal_mode=WAL",
+		`CREATE TABLE conversations (id TEXT PRIMARY KEY, channelId TEXT, createdAt INTEGER)`,
+		`CREATE TABLE members (id TEXT PRIMARY KEY, channelId TEXT, userId TEXT)`,
+		// conv-1, conv-4: at cursor (createdAt=100), channel has member → should be EXCLUDED
+		// conv-2: after cursor (createdAt=200), channel has member → INCLUDED
+		// conv-3: after cursor (createdAt=300), channel has NO member → excluded by EXISTS
+		`INSERT INTO conversations VALUES
+			('conv-1','ch-1',100),
+			('conv-2','ch-1',200),
+			('conv-3','ch-2',300),
+			('conv-4','ch-1',100)`,
+		`INSERT INTO members VALUES ('m-1','ch-1','user-X')`,
+	} {
+		if _, err := w.Exec(stmt); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+	}
+	w.Close()
+
+	db, _ := tablesource.Open(path, tablesource.OpenOptions{})
+	wdb, _ := tablesource.OpenWritable(path, tablesource.OpenOptions{})
+	defer wdb.Close()
+	t.Cleanup(func() { db.Close() })
+
+	convs, _ := tablesource.New(db, wdb, "conversations",
+		map[string]sqlite.ColumnSchema{
+			"id": {Type: "string"}, "channelId": {Type: "string"}, "createdAt": {Type: "number"},
+		}, []string{"id"})
+	members, _ := tablesource.New(db, wdb, "members",
+		map[string]sqlite.ColumnSchema{
+			"id": {Type: "string"}, "channelId": {Type: "string"}, "userId": {Type: "string"},
+		}, []string{"id"})
+
+	eng, _ := NewEngine(EngineConfig{StoragePath: tempStoragePath(t)})
+	t.Cleanup(func() { eng.Close() })
+	eng.RegisterSource(convs)
+	eng.RegisterSource(members)
+
+	limit := 10
+	ast := builder.AST{
+		Table: "conversations",
+		// PARTIAL cursor: only specifies createdAt, not id.
+		Start: &builder.Bound{Row: ivm.Row{"createdAt": int64(100)}, Exclusive: true},
+		Limit: &limit,
+		Where: &builder.Condition{
+			Type: "correlatedSubquery", Op: "EXISTS",
+			Related: &builder.CorrelatedSubquery{
+				System: "client",
+				Correlation: builder.Correlation{
+					ParentField: []string{"channelId"}, ChildField: []string{"channelId"},
+				},
+				Subquery: builder.AST{
+					Table: "members", Alias: "mbrs",
+					Where: &builder.Condition{
+						Type: "and",
+						Conditions: []builder.Condition{{
+							Type:  "simple",
+							Left:  &builder.ValuePos{Type: "column", Name: "userId"},
+							Op:    "=",
+							Right: &builder.ValuePos{Type: "literal", Value: "user-X"},
+						}},
+					},
+				},
+			},
+		},
+		OrderBy: ivm.Ordering{{"createdAt", "asc"}, {"id", "asc"}},
+	}
+
+	// --- Phase 1: Initial hydrate ---
+	changes, _, err := eng.AddQuery("q-partial-cursor", ast)
+	if err != nil {
+		t.Fatalf("AddQuery: %v", err)
+	}
+
+	var convIDs []string
+	for _, c := range changes {
+		if c.Table == "conversations" {
+			if id, _ := c.RowKey["id"].(string); id != "" {
+				convIDs = append(convIDs, id)
+			}
+		}
+	}
+	// Only conv-2 (createdAt=200, in ch-1 which has member).
+	// conv-1/conv-4 (createdAt=100) excluded by partial cursor.
+	// conv-3 (createdAt=300) excluded by EXISTS (ch-2 has no member).
+	if len(convIDs) != 1 || convIDs[0] != "conv-2" {
+		t.Fatalf("initial hydrate: expected [conv-2]; got %v", convIDs)
+	}
+
+	// --- Phase 2: Push — add a parent row AT the cursor boundary ---
+	// conv-5 has createdAt=100 and is in ch-1 (has member). Should NOT appear.
+	result := eng.Advance([]SnapshotChange{{
+		Table:     "conversations",
+		NextValue: ivm.Row{"id": "conv-5", "channelId": "ch-1", "createdAt": int64(100)},
+	}})
+	for _, c := range result.Changes {
+		if c.Table == "conversations" {
+			if id, _ := c.RowKey["id"].(string); id == "conv-5" {
+				t.Fatalf("push path: conv-5 (createdAt=100) should be excluded by partial cursor, but it was emitted as %v", c.Type)
+			}
+		}
+	}
+
+	// --- Phase 3: Push — add a parent row AFTER the cursor ---
+	// conv-6 has createdAt=150 and is in ch-1. Should appear.
+	result = eng.Advance([]SnapshotChange{{
+		Table:     "conversations",
+		NextValue: ivm.Row{"id": "conv-6", "channelId": "ch-1", "createdAt": int64(150)},
+	}})
+	var addedAfterCursor []string
+	for _, c := range result.Changes {
+		if c.Table == "conversations" && c.Type == RowChangeAdd {
+			if id, _ := c.RowKey["id"].(string); id != "" {
+				addedAfterCursor = append(addedAfterCursor, id)
+			}
+		}
+	}
+	if len(addedAfterCursor) != 1 || addedAfterCursor[0] != "conv-6" {
+		t.Fatalf("push path: expected conv-6 (createdAt=150) to be added; got %v", addedAfterCursor)
+	}
+
+	// --- Phase 4: Push — add child that flips EXISTS for a post-cursor parent ---
+	// Adding a member to ch-2 should cause conv-3 (createdAt=300) to appear.
+	result = eng.Advance([]SnapshotChange{{
+		Table:     "members",
+		NextValue: ivm.Row{"id": "m-2", "channelId": "ch-2", "userId": "user-X"},
+	}})
+	var existsFlipped []string
+	for _, c := range result.Changes {
+		if c.Table == "conversations" && c.Type == RowChangeAdd {
+			if id, _ := c.RowKey["id"].(string); id != "" {
+				existsFlipped = append(existsFlipped, id)
+			}
+		}
+	}
+	if len(existsFlipped) != 1 || existsFlipped[0] != "conv-3" {
+		t.Fatalf("child push: expected conv-3 to appear (EXISTS flipped); got %v", existsFlipped)
+	}
+}
