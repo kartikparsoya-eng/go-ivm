@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/kartikparsoya-eng/go-ivm/ivm"
 )
@@ -340,6 +341,25 @@ func ToSQLiteType(v ivm.Value, colType string) interface{} {
 func FromSQLiteType(v interface{}, colType string) ivm.Value {
 	if v == nil {
 		return nil
+	}
+	// mattn/go-sqlite3 auto-converts columns whose declared SQLite type is
+	// EXACTLY "timestamp"/"datetime"/"date" (case-insensitive) into time.Time
+	// in Rows.Next. Zero's replica declares NULLABLE temporal columns as bare
+	// "timestamp"/"date" but NON-null ones as "timestamp|NOT_NULL" — the
+	// "|NOT_NULL" suffix dodges mattn's exact-string decltype match, so ONLY
+	// nullable temporal columns reach us as time.Time (non-null ones arrive as
+	// the raw int64 epoch and flow through the numeric path below). TS models
+	// every timestamp as an epoch-MILLISECOND number, so an unconverted
+	// time.Time would (a) skip the numeric coercion below and (b) msgpack-encode
+	// as `{}` (a struct with only unexported fields), shipping the client an
+	// empty object instead of the timestamp — a real go-vs-TS content drift
+	// caught by the shadow SQL oracle on channel_user_status.conversationSeenCutoffAt
+	// + updatedAt. Normalize back to epoch ms here so the value rejoins the
+	// normal numeric path identically to a NOT_NULL temporal column. mattn builds
+	// the time.Time with a >1e12 ⇒ milliseconds heuristic, so UnixMilli()
+	// round-trips every real (post-2001) timestamp exactly.
+	if t, ok := v.(time.Time); ok {
+		v = t.UnixMilli()
 	}
 	switch colType {
 	case "boolean":
