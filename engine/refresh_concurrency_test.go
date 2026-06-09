@@ -27,6 +27,7 @@ func (b *blockingSource) Push(c ivm.SourceChange) []ivm.Change {
 	<-b.gate
 	return b.inner.Push(c)
 }
+func (b *blockingSource) Close() error { return b.inner.Close() }
 
 // RefreshSnapshot is the optional interface RefreshAllSources looks for. We
 // don't actually have a snapshot to roll — we just count invocations so the

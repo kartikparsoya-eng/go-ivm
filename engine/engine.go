@@ -44,12 +44,19 @@ func envChunkSize(name string, def int) int {
 var ErrEngineClosed = errors.New("engine is closed")
 
 // Source is the interface that engine sources must implement.
+//
+// Close releases any external resource the leaf holds (the tablesource leaf's
+// dedicated writable *sql.Conn + open prev tx). It is invoked by Engine.Close
+// on every registered source so group teardown / re-init returns those conns to
+// the writable pool instead of leaking them. MemorySource leaves implement it as
+// a no-op. Close must be idempotent.
 type Source interface {
 	TableName() string
 	PrimaryKey() []string
 	NormalizeRow(ivm.Row)
 	Push(ivm.SourceChange) []ivm.Change
 	Connect(sort ivm.Ordering, filterPredicate func(ivm.Row) bool, splitEditKeys map[string]bool) ivm.Input
+	Close() error
 }
 
 // memorySourceAdapter wraps *ivm.MemorySource to implement Source.
@@ -64,6 +71,12 @@ func (a *memorySourceAdapter) Push(sc ivm.SourceChange) []ivm.Change { return a.
 func (a *memorySourceAdapter) Connect(sort ivm.Ordering, filterPredicate func(ivm.Row) bool, splitEditKeys map[string]bool) ivm.Input {
 	return a.ms.Connect(sort, filterPredicate, splitEditKeys)
 }
+
+// Close is a no-op: MemorySource holds no external resource (no SQLite conn or
+// open tx). Present only to satisfy engine.Source so the tablesource leaf's
+// Close — which DOES roll back the prev tx and return its writable conn to the
+// pool — is callable polymorphically from Engine.Close.
+func (a *memorySourceAdapter) Close() error { return nil }
 
 // SnapshotChange represents a single row change from the snapshot diff.
 type SnapshotChange struct {
@@ -346,14 +359,34 @@ func (e *Engine) Close() error {
 		}
 	}
 	e.pipelines = nil
+
+	// Close each registered leaf source AFTER its pipeline inputs are
+	// destroyed. Input.Destroy → disconnect only drops the connection from
+	// the source's connection slice; it never releases the source's own
+	// writable *sql.Conn + open prev tx. Without this loop, every group
+	// teardown / re-init leaks one writable conn + one open tx per
+	// queried table (tablesource acquires them lazily on the first hydrate
+	// Fetch via ensurePrevTxLocked). Under sustained client-group churn that
+	// exhausts the writable pool — the reconnect-flood root cause that the
+	// pool-256 + 30s acquire-timeout (be2f2a1) only deferred. tablesource
+	// leaves roll back + return the conn here; MemorySource leaves no-op.
+	// Done under e.mu and before Store(nil) so no concurrent sourcesView()
+	// reader observes a half-closed source.
+	var firstErr error
+	for _, src := range e.sourcesView() {
+		if err := src.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
 	e.sources.Store(nil)
 	e.tableUniqueKeys = nil
-	if e.storage == nil {
-		return nil
+	if e.storage != nil {
+		if err := e.storage.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+		e.storage = nil
 	}
-	err := e.storage.Close()
-	e.storage = nil
-	return err
+	return firstErr
 }
 
 // RegisterSource registers a Source for a given table. Copy-on-write: builds a
