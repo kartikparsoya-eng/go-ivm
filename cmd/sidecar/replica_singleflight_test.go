@@ -87,7 +87,7 @@ func TestGetReplicaDB_ConcurrentCallersShareProbe(t *testing.T) {
 			defer wg.Done()
 			_, _ = s.getReplicaDB()
 			finished[idx] = time.Now()
-		}(0)
+		}(i)
 		// Stagger the callers slightly so the first one wins the probe.
 		time.Sleep(10 * time.Millisecond)
 	}
