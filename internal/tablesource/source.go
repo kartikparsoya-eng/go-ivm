@@ -884,11 +884,6 @@ func (s *Source) fetchForConn(req ivm.FetchRequest, conn *connection) []ivm.Node
 		req.Reverse,
 		req.Start,
 	)
-	// DEBUG: log conversations queries with exclusive cursor
-	if s.tableName == "conversations" && req.Start != nil && req.Start.Basis == "after" {
-		fmt.Printf("[GO-IVM][DEBUG] conversations fetch: SQL=%s params=%v startRow=%v\n", q.SQL, q.Params, req.Start.Row)
-	}
-
 	ctx := context.Background()
 	rows, err := s.activeConn().QueryContext(ctx, q.SQL, q.Params...)
 	if err != nil {
