@@ -33,11 +33,13 @@ const (
 	// stall by the writer, short enough to surface a wedge promptly.
 	defaultBusyTimeoutMs = 5000
 
-	// Pool ceiling. Sized so a multi-CG burst doesn't queue: 16 CGs ×
-	// ~4 concurrent queries each = 64 conns headroom. Bench-tunable;
-	// see PERF-REVIEW once Phase 1c lands microbenchmarks.
-	defaultMaxOpenConns = 64
-	defaultMaxIdleConns = 16
+	// Pool ceiling. Sized so a reconnect-flood burst doesn't starve:
+	// each CG holds ~7 Sources × 1 dedicated prevConn for the lifetime
+	// of the CG. With 20+ concurrent CGs during churn, 64 is too low
+	// (causes indefinite Conn() blocking → 120s RPC timeout on the TS
+	// side). 256 supports ~36 concurrent CGs comfortably.
+	defaultMaxOpenConns = 256
+	defaultMaxIdleConns = 32
 )
 
 // OpenOptions configures the read-side pool. Zero-valued fields fall back

@@ -33,6 +33,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/kartikparsoya-eng/go-ivm/ivm"
 	"github.com/kartikparsoya-eng/go-ivm/sqlite"
@@ -315,9 +316,16 @@ func (s *Source) ensurePrevTxLocked() error {
 	}
 	ctx := context.Background()
 	if s.prevConn == nil {
-		conn, err := s.writableDB.Conn(ctx)
+		// Use a bounded timeout so pool exhaustion surfaces as a fast error
+		// instead of blocking indefinitely (which previously caused the TS-side
+		// 120s RPC timeout to fire with no diagnostic). 30s is long enough to
+		// ride out a transient checkpoint stall but short enough to fail before
+		// the TS timeout.
+		acquireCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		conn, err := s.writableDB.Conn(acquireCtx)
+		cancel()
 		if err != nil {
-			return fmt.Errorf("ensurePrevTx %s: acquire conn: %w", s.tableName, err)
+			return fmt.Errorf("ensurePrevTx %s: acquire conn (30s timeout): %w", s.tableName, err)
 		}
 		s.prevConn = conn
 	}
@@ -978,18 +986,6 @@ func (s *Source) fetchForConn(req ivm.FetchRequest, conn *connection) []ivm.Node
 	// lookup (start:bound, basis:'at', reverse:true) — so Take picked a
 	// different boundNode/beforeBoundNode and emitted a different displaced
 	// row than TS (shadow soak: TS removes msg-X / Go removes msg-Y).
-	// DEBUG: log whether overlay is active for conversations exclusive cursor
-	if s.tableName == "conversations" && req.Start != nil && req.Start.Basis == "after" {
-		fmt.Printf("[GO-IVM][DEBUG] conversations after-SQL: overlay=%v, rows=%d\n", s.overlay != nil, len(out))
-		if startCreatedAt, ok := req.Start.Row["createdAt"]; ok {
-			for i, n := range out {
-				if n.Row["createdAt"] == startCreatedAt {
-					fmt.Printf("[GO-IVM][DEBUG] BOUNDARY ROW IN SQL RESULT at idx=%d! row=%v\n", i, n.Row["conversationId"])
-				}
-			}
-		}
-	}
-
 	if s.overlay != nil && conn.lastPushedEpoch >= s.overlay.Epoch {
 		// PARTIAL-bound comparator: req.Start may be a partial pagination cursor
 		// (e.g. {createdAt} while the sort is [createdAt, conversationId]). The
