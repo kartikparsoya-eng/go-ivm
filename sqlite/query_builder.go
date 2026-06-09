@@ -224,8 +224,23 @@ func gatherStartConstraints(
 	var params []interface{}
 
 	for i := range order {
-		var andParts []string
 		iField := order[i][0]
+
+		// Partial cursor: stop at the first sort column not present in start.Row.
+		// A partial cursor (e.g. start={createdAt: X} over sort [createdAt, pk])
+		// means "everything strictly after createdAt=X for ANY value of pk". TS's
+		// SQL gets this for free: toSQLiteType(undefined) binds NULL, and
+		// "col > NULL" evaluates to NULL in SQLite — disabling the clause. But
+		// when the column is Optional the nullable-aware form "(? IS NULL OR col > ?)"
+		// short-circuits to TRUE (because NULL IS NULL → TRUE), admitting the
+		// boundary row. The correct semantic — matching CompareWithPartialBound on
+		// the push path — is to not generate OR clauses beyond what the cursor
+		// specifies. This is the SQL-path counterpart of the ed7a302 push fix.
+		if _, ok := start.Row[iField]; !ok {
+			break
+		}
+
+		var andParts []string
 		iDirection := order[i][1]
 
 		for j := 0; j <= i; j++ {
@@ -272,11 +287,15 @@ func gatherStartConstraints(
 		orClauses = append(orClauses, "("+strings.Join(andParts, " AND ")+")")
 	}
 
-	// Inclusive (basis == "at"): add equality for all order fields
+	// Inclusive (basis == "at"): add equality for order fields present in start.Row.
+	// Same partial-cursor rule: skip columns not specified in the cursor.
 	if start.Basis == "at" {
 		var andParts []string
 		for _, o := range order {
 			field := o[0]
+			if _, ok := start.Row[field]; !ok {
+				break
+			}
 			colSchema := columns[field]
 			value := ToSQLiteType(start.Row[field], colSchema.Type)
 			eqSQL := nullableAwareEquality(field, colSchema)

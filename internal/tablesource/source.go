@@ -884,6 +884,11 @@ func (s *Source) fetchForConn(req ivm.FetchRequest, conn *connection) []ivm.Node
 		req.Reverse,
 		req.Start,
 	)
+	// DEBUG: log conversations queries with exclusive cursor
+	if s.tableName == "conversations" && req.Start != nil && req.Start.Basis == "after" {
+		fmt.Printf("[GO-IVM][DEBUG] conversations fetch: SQL=%s params=%v startRow=%v\n", q.SQL, q.Params, req.Start.Row)
+	}
+
 	ctx := context.Background()
 	rows, err := s.activeConn().QueryContext(ctx, q.SQL, q.Params...)
 	if err != nil {
@@ -978,8 +983,31 @@ func (s *Source) fetchForConn(req ivm.FetchRequest, conn *connection) []ivm.Node
 	// lookup (start:bound, basis:'at', reverse:true) — so Take picked a
 	// different boundNode/beforeBoundNode and emitted a different displaced
 	// row than TS (shadow soak: TS removes msg-X / Go removes msg-Y).
+	// DEBUG: log whether overlay is active for conversations exclusive cursor
+	if s.tableName == "conversations" && req.Start != nil && req.Start.Basis == "after" {
+		fmt.Printf("[GO-IVM][DEBUG] conversations after-SQL: overlay=%v, rows=%d\n", s.overlay != nil, len(out))
+		if startCreatedAt, ok := req.Start.Row["createdAt"]; ok {
+			for i, n := range out {
+				if n.Row["createdAt"] == startCreatedAt {
+					fmt.Printf("[GO-IVM][DEBUG] BOUNDARY ROW IN SQL RESULT at idx=%d! row=%v\n", i, n.Row["conversationId"])
+				}
+			}
+		}
+	}
+
 	if s.overlay != nil && conn.lastPushedEpoch >= s.overlay.Epoch {
-		effCmp := ivm.MakeComparator(order, req.Reverse)
+		// PARTIAL-bound comparator: req.Start may be a partial pagination cursor
+		// (e.g. {createdAt} while the sort is [createdAt, conversationId]). The
+		// overlay start-gate (overlayRowAtOrAfterStart) compares the in-flight
+		// row against req.Start.Row; with the plain MakeComparator the missing
+		// cursor column hits CompareValues(rowVal, nil) → +1 and the gate keeps a
+		// Basis:"after" boundary row it should drop (Go-vs-TS over-include at the
+		// exclusive cursor boundary). MakePartialBoundComparator stops at the
+		// first sort column absent from the cursor, matching SQL `col > NULL` and
+		// the Skip operator's CompareWithPartialBound. It is identical to
+		// MakeComparator for insertSorted (which compares two COMPLETE rows), so
+		// overlay placement order is unchanged.
+		effCmp := ivm.MakePartialBoundComparator(order, req.Reverse)
 		out = applyOverlay(out, s.overlay.Change, effCmp, req.Constraint, req.Start, s.primaryKey)
 		if conn.filterPredicate != nil {
 			filtered := out[:0]

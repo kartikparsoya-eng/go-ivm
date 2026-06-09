@@ -276,3 +276,43 @@ func MakeComparator(order Ordering, reverse bool) Comparator {
 		return 0
 	}
 }
+
+// MakePartialBoundComparator is MakeComparator except the SECOND argument is
+// treated as a PARTIAL bound (a pagination cursor): comparison stops at the
+// first sort column ABSENT from `b`, treating the remaining columns as equal.
+//
+// This mirrors SQL's three-valued logic where `col > NULL` is NULL — a cursor
+// `{createdAt}` against sort `[createdAt, conversationId]` produces a dead
+// `conversationId > NULL` clause, so a row equal on createdAt compares EQUAL to
+// the cursor (not strictly after). The plain MakeComparator instead hits
+// `CompareValues(row.conversationId, nil)` → +1 (nil < non-nil) and wrongly
+// ranks the boundary row strictly AFTER the cursor — which made the overlay
+// start-gate (overlayRowAtOrAfterStart) keep a Basis:"after" boundary row that
+// should be dropped. Same nil<non-nil asymmetry the Skip operator fixed via
+// CompareWithPartialBound.
+//
+// When `b` is a COMPLETE row (every sort column present — e.g. comparing two
+// real fetched rows for insertion order) this is byte-identical to
+// MakeComparator, so it is a safe drop-in wherever the second operand is
+// sometimes a partial cursor and sometimes a full row.
+func MakePartialBoundComparator(order Ordering, reverse bool) Comparator {
+	return func(a, b Row) int {
+		for _, ord := range order {
+			field := ord[0]
+			if _, ok := b[field]; !ok {
+				return 0
+			}
+			comp := CompareValues(a[field], b[field])
+			if comp != 0 {
+				if ord[1] == "desc" {
+					comp = -comp
+				}
+				if reverse {
+					comp = -comp
+				}
+				return comp
+			}
+		}
+		return 0
+	}
+}
