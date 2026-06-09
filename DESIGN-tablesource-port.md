@@ -170,6 +170,26 @@ phase shippable.
 
 ## Risks / open questions
 
+- **✅ FIXED (2026-06-09) — conn/tx leak on Source teardown.** The
+  leaf-lifecycle story was incomplete. `tablesource.(*Source).Close()`
+  (`internal/tablesource/source.go:254`) correctly rolls back the prev tx and
+  releases `prevConn`, but **no engine teardown path called it**: the engine
+  `Source` interface (`engine/engine.go:47-53`) had no `Close()`, so
+  `engine.Close()` could not reach it, and `Input.Destroy()`→`sourceInput.Destroy()`→
+  `disconnect()` (`source.go:835-853`) only unlinks the `*connection` from the
+  slice. `shutdownGroup` (`main.go:940-957`) / re-init (`main.go:1108-1111`) closed
+  only `eng`+`snap`. Net: every group teardown/re-init leaked ≈1 writable conn + open
+  tx per queried table (`ensurePrevTxLocked` fires on the first hydrate Fetch when not
+  frame-bound, `source.go:873`). This was the actual root cause of the reconnect-flood
+  pool exhaustion; the shipped pool-256 + 30s timeout (`be2f2a1`) only deferred it.
+  **Fix shipped this session:** added `Close() error` to the engine `Source`
+  interface (MemorySource = no-op; `tablesource.(*Source).Close()` already does the
+  rollback+release), and `Engine.Close()` now closes every registered leaf after
+  destroying pipeline inputs. No `ClientGroup` source-tracking was needed — every
+  teardown path (worker-exit, `shutdownGroup`, `closeAll`, re-init, idle reaper)
+  funnels through `engine.Close()`. Pinned by `engine/close_releases_source_test.go`
+  (asserts the writable conn returns to the pool; negative-verified to fail without
+  the fix).
 - **Per-row leaf cost regression.** Today's MemorySource is a map lookup
   (~50ns). SQLite index walk with hot page cache is ~500ns–2µs. For
   query-heavy workloads with small selectivity, this could net regress.

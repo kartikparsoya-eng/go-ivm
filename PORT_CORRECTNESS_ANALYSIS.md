@@ -4,6 +4,37 @@
 
 The Go port is structurally faithful and **production-verified** via shadow mode (0 mismatches, 72 matches per run across all query types including advance mutations). All originally identified bugs have been triaged and resolved. All defensive assertions from TS have been ported as `panic()` calls. Every operator is now confirmed correct.
 
+> **Operator correctness is settled; the one lifecycle defect found this review is
+> now fixed.** The 2026-06-09 review below found a writable-conn/tx leak on group
+> teardown (a resource-lifecycle bug in the engine/tablesource teardown path, not
+> an operator semantics bug — it never affected result correctness, only conn-pool
+> longevity under churn). It has since been fixed (`Close()` added to the engine
+> `Source` interface; `Engine.Close()` closes every leaf).
+
+---
+
+## 2026-06-09 re-verification (in-depth review)
+
+Re-read against source at HEAD `be2f2a1`; `go test ./... -short` all pass.
+
+- **UnionFanIn comparator — confirmed NOT A BUG.** A review agent flagged
+  `ivm/union_fan_in.go:88` as using a forward comparator where TS is reverse-aware.
+  False positive: Go `Fetch` merges on `ufi.schema.CompareRows`
+  (`union_fan_in.go:88`); TS `union-fan-in.ts` merges on
+  `this.#schema.compareRows(l.row, r.row)`. Both use the schema comparator
+  directly — identical. Go matches its porting target; no drift.
+- **Singleflight test — already fixed (uncommitted).** The previously-flagged
+  `cmd/sidecar/replica_singleflight_test.go` fixture bug (`}(0)` vs `}(i)`) is
+  already corrected in the working tree; the test passes (slow-by-design 60s
+  open-timeout). Product code was never wrong. Needs commit.
+- **Conn/tx leak on teardown — FIXED (lifecycle, not operator correctness).** Engine
+  `Source` interface lacked `Close()`; `engine.Close()`→`Input.Destroy()`→
+  `disconnect()` only unlinked the connection and never closed `prevConn`/tx;
+  `tablesource.(*Source).Close()` existed but was uncalled on the engine path.
+  Fixed by adding `Close()` to the interface and closing every leaf in
+  `Engine.Close()` (regression test + negative-verification). Full trace in
+  PORT-AUDIT-FIXES.md (2026-06-09).
+
 ---
 
 ## Bug Status Summary (Original)
@@ -193,7 +224,7 @@ All items from the original audit have been addressed. None were real correctnes
 | Indexing | BTree per column | Linear scan + sort | O(n log n) per fetch vs O(log n) — perf only |
 | Parallelism | None | Goroutine fan-out | New correctness surface area (mitigated by Streamer mutex fix) |
 | Error handling | try/finally + assertions | panic + defer | Now equivalent — defer cleanup added (#33) |
-| Iterator cleanup | iter.throw()/iter.return() | N/A (slices) | No resource leaks possible in Go approach |
+| Iterator cleanup | iter.throw()/iter.return() | N/A (slices) | No iterator leaks. The tablesource leaf's writable `prevConn`+tx are now released on group teardown via the engine `Source.Close()` added 2026-06-09 (was leaking; see PORT-AUDIT-FIXES.md) |
 
 ---
 

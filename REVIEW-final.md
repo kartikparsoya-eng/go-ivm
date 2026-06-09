@@ -16,6 +16,23 @@ soak-verified.
 
 ## Bottom line
 
+> **2026-06-09 in-depth review update.** Build/vet/`go test ./... -short` all clean
+> at HEAD `be2f2a1`. One stability defect was found, verified, and **fixed** this
+> session: a writable-conn/tx **leak on group teardown / re-init** (the engine
+> `Source` interface had no `Close()`, so `engine.Close()` couldn't release
+> tablesource `prevConn`/txns; `tablesource.(*Source).Close()` existed but was never
+> called on the engine path). Fix: added `Close()` to the engine `Source` interface
+> and `Engine.Close()` now closes every registered leaf — covering all teardown
+> paths, which all funnel through `engine.Close()`. Pinned by
+> `engine/close_releases_source_test.go` (asserts the writable conn returns to the
+> pool; negative-verified to fail without the fix). This removes the residual pool
+> exhaustion under sustained CG churn that the pool-256 + 30s-acquire-timeout
+> (`be2f2a1`) only deferred. Two prior agent findings were re-verified and
+> **rejected/closed**: the "UnionFanIn reverse-comparator drift" is a false positive
+> (Go == TS), and the "failing singleflight test" was a test-fixture bug already
+> fixed in the working tree (product code correct). Detail: PORT-AUDIT-FIXES.md /
+> PERF-REVIEW.md (2026-06-09).
+
 **READY** for both operating modes:
 
 - `ZERO_GO_SIDECAR_ENABLED=true` + `ZERO_GO_SIDECAR_SHADOW_MODE=true` (shadow, TS source of truth) — production-validated. Safe to roll out today.

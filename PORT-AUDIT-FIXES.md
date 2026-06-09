@@ -310,3 +310,100 @@ version authority). Not doing it now. When revisited, the smaller stop-gap for
 Go-primary *correctness* (not shadow cleanliness) is option 4 — make the drift
 recovery trigger a real client re-hydrate. Proceeding with the remaining
 audit-fix items (G, E, H, J) in the meantime.
+
+---
+
+## Session log — 2026-06-09 (in-depth correctness/perf/wiring review)
+
+Full re-read of the engine teardown + tablesource lifecycle paths. Every claim
+below was verified against current source (not comments/agent reports). Baseline
+this session: `go build ./...` clean, `go vet ./...` clean, `go test ./... -short`
+**all pass** (go1.26.3 darwin/arm64). HEAD = `be2f2a1`.
+
+### [x] HIGH — writable conn + open prev-tx leak on group teardown / re-init (FIXED)
+
+The real root cause behind the reconnect-flood pool exhaustion that Fix A (pool
+256) and Fix C (30s acquire timeout) only deferred. Verified end-to-end:
+
+- `engine.Source` interface (`engine/engine.go:47-53`) has **no `Close()`** — only
+  `TableName/PrimaryKey/NormalizeRow/Push/Connect`.
+- `engine.Close()` (`engine/engine.go:335-357`) destroys pipeline inputs and nils
+  the sources map; it cannot close tablesource conns because the interface has no
+  Close.
+- `engine.Close()` → `pipeline.Input.Destroy()` → … → `sourceInput.Destroy()`
+  (`internal/tablesource/source.go:835-837`) → `disconnect()` (`:844-853`) only
+  removes the `*connection` from the slice. It **never** touches `prevConn` or the
+  tx. Proven by `TestDestroyRemovesConnection` whose sole post-condition is
+  `len(connections)==0`.
+- `tablesource.(*Source).Close()` (`internal/tablesource/source.go:254-266`) DOES
+  roll back the prev tx + close `prevConn`, but **nothing calls it** on the engine
+  path. Repo-wide check: the only `.Close()` callers on the teardown path are
+  `g.eng.Close()` at `cmd/sidecar/main.go:950` (`shutdownGroup`) and `:1110`
+  (re-init). `ClientGroup` (`main.go:456-488`) has no source-tracking field.
+- **Leak rate = per-table-queried-per-CG** (≈7/CG). `fetchForConn` calls
+  `ensurePrevTxLocked()` unconditionally (`source.go:873`); when not frame-bound
+  (`externalConn==nil`, i.e. the hydrate Fetch in both shadow AND drive modes) it
+  acquires a writable `*sql.Conn` + `BEGIN [CONCURRENT]` (`source.go:318-344`).
+- **FIX SHIPPED (this session).** Added `Close() error` to the engine `Source`
+  interface (`engine/engine.go`); `memorySourceAdapter.Close()` is a no-op,
+  `tablesource.(*Source).Close()` already does the rollback+release, and the
+  `blockingSource` test mock delegates to its inner. `Engine.Close()` now iterates
+  `sourcesView()` and calls `src.Close()` on every leaf — AFTER destroying the
+  pipeline inputs, BEFORE `sources.Store(nil)`, under `e.mu`. No `ClientGroup`
+  source-tracking was needed: **every** teardown path already funnels through
+  `engine.Close()` — `shutdownGroup` (`main.go:950`, reached by worker-exit:775 /
+  `removeGroup`:927 ← remove RPC:1765 / `closeAll`:967 / idle reaper
+  `reapIdleGroups`:739→775) and re-init (`main.go:1110`). So the engine is the
+  single ownership point and closing there covers all of them.
+- **Regression test:** `engine/close_releases_source_test.go`
+  (`TestEngineClose_ReleasesTableSourceConn`) hydrates a tablesource-backed query
+  (checks a writable conn out of the pool), calls `eng.Close()`, and asserts
+  `wdb.Stats().InUse == 0`. **Negative-verified:** with the close loop removed the
+  test fails `InUse=1, want 0` (the exact leak); with the fix it passes. Full
+  `go build`/`go vet`/`go test ./...` clean.
+
+### [?] UnionFanIn forward-comparator "drift" — NOT A BUG (false positive, rejected)
+
+An agent claimed `ivm/union_fan_in.go:88` uses a forward comparator while TS is
+reverse-aware. Verified both sides: Go `Fetch` calls
+`MergeFetches(fetches, ufi.schema.CompareRows)` (`union_fan_in.go:88`); TS
+`union-fan-in.ts` calls `mergeFetches(iterables, (l,r) => this.#schema.compareRows(...))`.
+**Identical** — both merge on the schema comparator directly. Go faithfully matches
+its porting target. The existing PORT-AUDIT "CHECKED-OK" note stands.
+
+### [x] Failing singleflight test — already fixed in working tree (not an outstanding bug)
+
+`cmd/sidecar/replica_singleflight_test.go` had a fixture bug: the hydrate goroutine
+was launched with `}(0)` instead of `}(i)`, so `finished[1..3]` stayed zero-time →
+`MaxInt64` gap tripped the assertion at line 110. The working tree already carries
+the `}(0)`→`}(i)` fix (uncommitted, confirmed via `git diff`). With it the test
+**passes** (64.6s — slow by design: the 60s open-timeout against a nonexistent
+replica path, not a failure). Product `getReplicaDB` singleflight is correct.
+Action: commit the one-line test fix.
+
+### [x] LOW — Dockerfile build-flag divergence vs manual/CI cross-compile (RECONCILED)
+
+`Dockerfile:52-54` built `-tags "libsqlite3 sqlite_omit_load_extension"` (system
+static sqlite, built earlier in the image) with `-ldflags "-s -w -extldflags '-static'"`,
+but omitted the `osusergo netgo` tags the manual amd64 cross-compile uses. Image
+binary and locally-tested binary therefore differed in sqlite provenance (system
+`libsqlite3` vs mattn-vendored) and netgo/osusergo resolution.
+
+**Reconciled this session (Dockerfile):** added `osusergo netgo` to the build tags
+so the CI/published image and the manually cross-compiled binary share net/user
+resolution semantics (pure-Go resolvers — the correct choice for a fully static
+`-extldflags '-static'` musl build). The `libsqlite3` (rocicorp amalgamation) tag is
+**deliberately kept** on the production image: it is what gives the binary
+wal2-journal awareness (`DESIGN-snapshotter-port.md:455`). The manual cross-compile's
+mattn-vendored sqlite is an accepted local-convenience deviation, not the production
+path — so the two builds now agree on netgo/osusergo, and the remaining sqlite-provenance
+gap is intentional (production keeps rocicorp's wal2 sqlite).
+
+### By-design (perf note, NOT a bug) — drive-mode parallel hydrate over one shared conn
+
+`AddQueriesStream` (`engine/engine.go:720-789`) fans hydrate across one goroutine
+per query, each calling `Input.Fetch`. In drive mode `BindTableSourcesToConn`
+(`engine.go:433-438`) binds every leaf to ONE shared `*sql.Conn`, and `fetchForConn`
+holds `s.mu` across the whole SELECT+Scan+row-map (`source.go:870→1025`), so those
+goroutines serialize on the single conn. This is intentional for frame consistency
+(the Snapshotter owns the pinned frame); see PERF-REVIEW. Not a correctness issue.

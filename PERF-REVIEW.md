@@ -4,6 +4,46 @@ Date: 2026-05-21 (v2 — profile-driven revision)
 Reviewer: post-streaming-PR audit
 Scope: `engine/`, `ivm/`, `builder/`, `sqlite/`, `cmd/sidecar/` — production-readiness perf pass.
 
+## Current state (2026-06-09 in-depth review)
+
+Re-verified against source at HEAD `be2f2a1`. CPU is not the constraint (≈17% busy
+at 20 users); allocation volume drives GC which drives cost. Standing posture:
+
+- **Pool + fail-fast shipped (`be2f2a1`):** writable conn pool raised to 256 and
+  `prevConn` acquire bounded to 30s (`internal/tablesource/source.go:324`,
+  `internal/tablesource/db.go:33-41`). This raised headroom and turned exhaustion
+  into a fast, diagnosable error instead of a silent 120s TS-side RPC timeout. It
+  is **not** a leak fix — see the next bullet.
+- **⚠ Pool-exhaustion root cause was a conn/tx LEAK — now FIXED.** Group
+  teardown/re-init never closed tablesource `prevConn`/tx (the engine `Source`
+  interface had no `Close()`; `Input.Destroy()`→`disconnect()` only unlinked the
+  connection from the slice). ≈7 writable conns + open txns leaked per CG
+  teardown — under sustained churn the 256 pool would still exhaust, just later.
+  **Fixed this session:** `Close()` added to the engine `Source` interface and
+  `Engine.Close()` now closes every leaf (tablesource rolls back + returns the
+  conn; MemorySource no-ops). All teardown paths funnel through `engine.Close()`,
+  so this plugs it everywhere. Regression test
+  `engine/close_releases_source_test.go` asserts `wdb.Stats().InUse==0` after
+  Close and is negative-verified (fails without the fix). Detail in
+  PORT-AUDIT-FIXES.md (2026-06-09) and DESIGN-tablesource-port.md.
+- **❌ Fix B (separate read-only pool for hydrate) REJECTED — profiling evidence.**
+  60s mutex profile under 20-user load = 7.99ms total contention (0.013%); ZERO
+  samples in `tablesource`/`fetchForConn`/`s.mu`. Block profile = 100% idle channel
+  waits (request-bound, not lock-bound). A read-only pool would add complexity for
+  no measurable win. If perf ever matters the targets are msgpack response encode
+  (≈66% of the tiny lock budget) and per-row allocs (the `row := make(ivm.Row)` map
+  at `source.go:929` is the #1 allocator), profiled under drive mode.
+- **By design, not a regression — drive-mode parallel hydrate serializes on one
+  conn.** `AddQueriesStream` (`engine/engine.go:720-789`) spawns one hydrate
+  goroutine per query; in drive mode `BindTableSourcesToConn` (`engine.go:433-438`)
+  binds every leaf to ONE shared `*sql.Conn` and `fetchForConn` holds `s.mu` across
+  the whole SELECT+Scan+row-map (`source.go:870→1025`), so they serialize. This is
+  intentional for frame consistency (the Snapshotter owns the pinned BEGIN
+  CONCURRENT frame). Shadow-mode hydrate is unaffected (each source re-pins its own
+  prev tx). Relevant to perf expectations, not a bug.
+
+---
+
 ## Bottom line (v4 — post-soak validation)
 
 Status as of 2026-05-21:
