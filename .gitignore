@@ -1,5 +1,6 @@
 # Compiled Go binaries (top-level only — must not shadow cmd/sidecar/)
 /sidecar
+/go-ivm-sidecar-amd64
 *.exe
 *.dll
 *.so

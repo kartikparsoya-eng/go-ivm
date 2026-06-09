@@ -32,6 +32,19 @@ COPY . .
 #                                make that "system" SQLite be rocicorp's
 #                                amalgamation by compiling c/sqlite3/
 #                                into a static library installed below.
+#                                KEEP THIS: it is what gives the binary
+#                                wal2-journal awareness. The manual amd64
+#                                cross-compile (sandbox) links mattn's
+#                                vendored sqlite instead — a deliberate
+#                                local convenience, NOT the production path.
+#   osusergo netgo             — force the pure-Go os/user + net resolvers
+#                                instead of cgo getpwnam/getaddrinfo. On a
+#                                fully static (-extldflags '-static') musl
+#                                build the cgo resolvers can fail at runtime;
+#                                the pure-Go ones don't. Matches the manual
+#                                amd64 cross-compile so the CI image and the
+#                                locally-tested binary share net/user
+#                                resolution semantics.
 #
 # Static linking: -extldflags '-static' produces a self-contained binary
 # that runs in alpine or scratch without dragging libsqlite3.so along.
@@ -50,7 +63,7 @@ RUN gcc -O2 -fPIC -c c/sqlite3/sqlite3.c -o /tmp/sqlite3.o \
     && cp c/sqlite3/sqlite3ext.h /usr/include/sqlite3ext.h
 
 RUN CGO_ENABLED=1 GOOS=linux go build \
-    -tags "libsqlite3 sqlite_omit_load_extension" \
+    -tags "libsqlite3 sqlite_omit_load_extension osusergo netgo" \
     -ldflags="-s -w -extldflags '-static'" \
     -trimpath \
     -o /go-ivm-sidecar \
