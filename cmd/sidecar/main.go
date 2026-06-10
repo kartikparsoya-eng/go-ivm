@@ -379,7 +379,7 @@ const defaultSocket = "/tmp/go-ivm.sock"
 // (REVIEW-final MED-CROSS-5).
 const (
 	sidecarVersion     = "0.7.0"
-	sidecarProtocolRev = 7 // bumped: advanceToHead RPC added (Go derives its own snapshot diff via internal/snapshotter instead of consuming TS-shipped SnapshotChange[]; gated by GO_IVM_ADVANCE_TO_HEAD + table mode). Rev 6 added refreshSnapshot.
+	sidecarProtocolRev = 8 // bumped: advanceToHeadStream RPC added (streaming variant of advanceToHead; chunks drive-mode RowChanges over advanceChunkSize-sized frames so a bulk backfill / mass UPDATE doesn't blow the 64MB single-frame cap — finding F5). Rev 7 added advanceToHead. Rev 6 added refreshSnapshot.
 )
 
 // rpcCodeStaleInitEpoch signals that a mutating RPC arrived with an
@@ -844,6 +844,10 @@ func (g *ClientGroup) worker(s *Server) {
 			// Streaming variant of advance: partial frames go through streamW;
 			// terminal "done" RPCResponse still flows through respCh.
 			resp = s.handleStreamWithRecover(req.req, req.streamW, s.handleAdvanceStream)
+		} else if req.streamW != nil && method == "advanceToHeadStream" {
+			// Streaming variant of advanceToHead (drive mode): chunked RowChanges
+			// go through streamW; terminal "done" RPCResponse flows through respCh.
+			resp = s.handleStreamWithRecover(req.req, req.streamW, s.handleAdvanceToHeadStream)
 		} else {
 			resp = s.handleRequest(req.req)
 		}
@@ -2022,7 +2026,8 @@ func handleConnection(conn net.Conn, server *Server) {
 			// Streaming methods get a streamWriter; non-streaming methods
 			// don't (streamW field stays nil).
 			var sw streamWriter
-			if req.Method == "addQueriesStream" || req.Method == "advanceStream" {
+			if req.Method == "addQueriesStream" || req.Method == "advanceStream" ||
+				req.Method == "advanceToHeadStream" {
 				sw = streamW
 			}
 			if !group.trySendReq(clientGroupReq{req: req, respCh: respCh, streamW: sw, group: group}) {
