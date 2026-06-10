@@ -10,6 +10,7 @@ package sqlite
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -18,6 +19,22 @@ import (
 
 	_ "modernc.org/sqlite"
 )
+
+// storageDrift wraps an operator-storage infrastructure failure (failed
+// INSERT/DELETE/COMMIT/BEGIN/prepare) as a *ivm.DriftError so the panic rides
+// the engine's existing drift-recovery path: engine.Advance / the hydrate
+// goroutines recover *DriftError, drop the in-flight work, and TS re-inits
+// from SQLite truth. Before this, Exec errors were silently discarded — a
+// failed Take-bound write corrupted the window state and only surfaced much
+// later as a stale-bound panic in take.go, far from the cause.
+func storageDrift(op string, err error) *ivm.DriftError {
+	return &ivm.DriftError{
+		Table:    "_operator_storage",
+		Op:       op + ": " + err.Error(),
+		PK:       map[string]ivm.Value{},
+		HasCount: -1,
+	}
+}
 
 const createStorageTable = `
   CREATE TABLE IF NOT EXISTS storage (
@@ -90,11 +107,28 @@ func (ds *DatabaseStorage) beginTx() error {
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
 	}
+	// Prepare errors must not be discarded: a nil stmt would NPE on first use,
+	// and (pre-fix) the `, _` pattern turned a prepare failure into a crash at
+	// an unrelated call site.
+	stmts := []struct {
+		dst **sql.Stmt
+		sql string
+	}{
+		{&ds.stmtGet, `SELECT val FROM storage WHERE clientGroupID = ? AND op = ? AND key = ?`},
+		{&ds.stmtSet, `INSERT INTO storage (clientGroupID, op, key, val) VALUES(?, ?, ?, ?) ON CONFLICT(clientGroupID, op, key) DO UPDATE SET val = excluded.val`},
+		{&ds.stmtDel, `DELETE FROM storage WHERE clientGroupID = ? AND op = ? AND key = ?`},
+		{&ds.stmtScan, `SELECT key, val FROM storage WHERE clientGroupID = ? AND op = ? AND key >= ?`},
+	}
+	for _, s := range stmts {
+		st, err := tx.Prepare(s.sql)
+		if err != nil {
+			_ = tx.Rollback()
+			ds.tx = nil
+			return fmt.Errorf("prepare %q: %w", s.sql, err)
+		}
+		*s.dst = st
+	}
 	ds.tx = tx
-	ds.stmtGet, _ = tx.Prepare(`SELECT val FROM storage WHERE clientGroupID = ? AND op = ? AND key = ?`)
-	ds.stmtSet, _ = tx.Prepare(`INSERT INTO storage (clientGroupID, op, key, val) VALUES(?, ?, ?, ?) ON CONFLICT(clientGroupID, op, key) DO UPDATE SET val = excluded.val`)
-	ds.stmtDel, _ = tx.Prepare(`DELETE FROM storage WHERE clientGroupID = ? AND op = ? AND key = ?`)
-	ds.stmtScan, _ = tx.Prepare(`SELECT key, val FROM storage WHERE clientGroupID = ? AND op = ? AND key >= ?`)
 	return nil
 }
 
@@ -105,11 +139,20 @@ func (ds *DatabaseStorage) maybeCheckpoint() {
 	}
 }
 
+// checkpoint commits the rolling tx and opens a fresh one. Commit/begin
+// failures panic with a *DriftError: losing the committed window state is a
+// state corruption the engine must not paper over — the drift-recovery path
+// drops the in-flight advance and re-inits from SQLite truth.
 func (ds *DatabaseStorage) checkpoint() {
 	if ds.tx != nil {
-		ds.tx.Commit()
+		if err := ds.tx.Commit(); err != nil {
+			ds.tx = nil
+			panic(storageDrift("storage-checkpoint-commit", err))
+		}
 	}
-	ds.beginTx()
+	if err := ds.beginTx(); err != nil {
+		panic(storageDrift("storage-checkpoint-begin", err))
+	}
 	ds.numWrites = 0
 }
 
@@ -129,26 +172,36 @@ func (ds *DatabaseStorage) get(cgID string, opID int, key string) (json.RawMessa
 	var val string
 	err := ds.stmtGet.QueryRow(cgID, opID, key).Scan(&val)
 	if err != nil {
-		return nil, false
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, false
+		}
+		// Infra failure (busy, I/O, closed conn) is NOT "key absent" — treating
+		// it as absent makes Take re-run initialFetch against live state with a
+		// stale window, silently corrupting the bound.
+		panic(storageDrift("storage-get", err))
 	}
 	return json.RawMessage(val), true
 }
 
 func (ds *DatabaseStorage) set(cgID string, opID int, key string, val json.RawMessage) {
 	ds.maybeCheckpoint()
-	ds.stmtSet.Exec(cgID, opID, key, string(val))
+	if _, err := ds.stmtSet.Exec(cgID, opID, key, string(val)); err != nil {
+		panic(storageDrift("storage-set", err))
+	}
 }
 
 func (ds *DatabaseStorage) del(cgID string, opID int, key string) {
 	ds.maybeCheckpoint()
-	ds.stmtDel.Exec(cgID, opID, key)
+	if _, err := ds.stmtDel.Exec(cgID, opID, key); err != nil {
+		panic(storageDrift("storage-del", err))
+	}
 }
 
 func (ds *DatabaseStorage) scan(cgID string, opID int, prefix string) [][2]string {
 	ds.maybeCheckpoint()
 	rows, err := ds.stmtScan.Query(cgID, opID, prefix)
 	if err != nil {
-		return nil
+		panic(storageDrift("storage-scan", err))
 	}
 	defer rows.Close()
 
@@ -156,12 +209,15 @@ func (ds *DatabaseStorage) scan(cgID string, opID int, prefix string) [][2]strin
 	for rows.Next() {
 		var key, val string
 		if err := rows.Scan(&key, &val); err != nil {
-			break
+			panic(storageDrift("storage-scan-row", err))
 		}
 		if !strings.HasPrefix(key, prefix) {
 			break
 		}
 		results = append(results, [2]string{key, val})
+	}
+	if err := rows.Err(); err != nil {
+		panic(storageDrift("storage-scan-rows", err))
 	}
 	return results
 }
@@ -171,7 +227,9 @@ func (ds *DatabaseStorage) CreateClientGroupStorage(cgID string) *ClientGroupSto
 	ds.mu.Lock()
 	defer ds.mu.Unlock()
 	// Clear existing storage for this client group
-	ds.tx.Exec("DELETE FROM storage WHERE clientGroupID = ?", cgID)
+	if _, err := ds.tx.Exec("DELETE FROM storage WHERE clientGroupID = ?", cgID); err != nil {
+		panic(storageDrift("storage-cg-clear", err))
+	}
 	ds.checkpoint()
 
 	return &ClientGroupStorage{
@@ -207,7 +265,9 @@ func (cgs *ClientGroupStorage) CreateTakeStorage() ivm.TakeStorage {
 func (cgs *ClientGroupStorage) Destroy() {
 	cgs.ds.mu.Lock()
 	defer cgs.ds.mu.Unlock()
-	cgs.ds.tx.Exec("DELETE FROM storage WHERE clientGroupID = ?", cgs.cgID)
+	if _, err := cgs.ds.tx.Exec("DELETE FROM storage WHERE clientGroupID = ?", cgs.cgID); err != nil {
+		panic(storageDrift("storage-cg-destroy", err))
+	}
 	cgs.ds.checkpoint()
 }
 
@@ -243,51 +303,160 @@ func (s *OperatorStorage) Scan(prefix string) [][2]string {
 	return s.ds.scan(s.cgID, s.opID, prefix)
 }
 
-// SQLiteTakeStorage implements ivm.TakeStorage using OperatorStorage.
+// SQLiteTakeStorage implements ivm.TakeStorage using OperatorStorage, with an
+// in-memory write-through cache in front of the SQLite rows.
+//
+// Why the cache: every Take state touch used to be a JSON marshal + SQL
+// round-trip through the engine-wide DatabaseStorage mutex + its single
+// connection — the per-CG serializer right behind GOGC on the parallel-path
+// profile for Take-heavy dashboards. With write-through, reads are map hits
+// (including negative hits for the very common "no state yet → drop push"
+// probe) and SQLite is only touched on writes. SQLite stays authoritative:
+// writes land there FIRST (and panic via storageDrift on failure, leaving the
+// cache unchanged), then update the cache — so cache and DB can't diverge.
+//
+// Lifecycle safety: each SQLiteTakeStorage belongs to exactly one Take in one
+// pipeline. Re-registering a queryID tears down the old pipeline (and this
+// cache with it) and CreateClientGroupStorage DELETEs the cgID's rows before
+// fresh instances are built, so a stale cache can never outlive its rows. The
+// mutex is belt-and-braces for the parallel hydrate/push fan-out (a single
+// instance is only ever touched from one goroutine at a time today).
 type SQLiteTakeStorage struct {
 	storage *OperatorStorage
+
+	mu sync.Mutex
+	// states caches TakeState by key. A present key with nil value is a
+	// NEGATIVE entry ("known absent") so repeated misses skip SQLite too.
+	states map[string]*ivm.TakeState
+	// maxBound caches the "maxBound" row once loaded; maxBoundLoaded
+	// distinguishes "not yet read" from "read and absent (nil)".
+	maxBound       ivm.Row
+	maxBoundLoaded bool
 }
 
 func (s *SQLiteTakeStorage) GetTakeState(key string) *ivm.TakeState {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if cached, ok := s.states[key]; ok {
+		if cached == nil {
+			return nil
+		}
+		c := *cached
+		return &c
+	}
 	raw, ok := s.storage.Get(key)
 	if !ok {
+		s.cacheState(key, nil)
 		return nil
 	}
 	var state ivm.TakeState
 	if err := json.Unmarshal(raw, &state); err != nil {
-		return nil
+		// A row we wrote that no longer parses is corrupted state, not "absent".
+		panic(storageDrift("take-state-unmarshal "+key, err))
 	}
-	return &state
+	s.cacheState(key, &state)
+	c := state
+	return &c
 }
 
 func (s *SQLiteTakeStorage) SetTakeState(key string, state ivm.TakeState) {
+	validateBoundRow("TakeState.Bound", state.Bound)
 	data, err := json.Marshal(state)
 	if err != nil {
 		panic(fmt.Sprintf("marshal TakeState: %v", err))
 	}
-	s.storage.Set(key, data)
+	// Cache the DECODED form of what was written, not the caller's value, so
+	// a cached read is shape-identical to a fresh SQLite read (e.g. an int
+	// bound value normalizes to float64 either way). Production rows are
+	// pre-normalized so this is usually a no-op, but it keeps the cache
+	// observationally transparent.
+	var roundTripped ivm.TakeState
+	if err := json.Unmarshal(data, &roundTripped); err != nil {
+		panic(fmt.Sprintf("re-decode TakeState: %v", err))
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.storage.Set(key, data) // panics on failure → cache left unchanged
+	s.cacheState(key, &roundTripped)
 }
 
 func (s *SQLiteTakeStorage) GetMaxBound() ivm.Row {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.maxBoundLoaded {
+		return s.maxBound
+	}
 	raw, ok := s.storage.Get("maxBound")
 	if !ok {
+		s.maxBound = nil
+		s.maxBoundLoaded = true
 		return nil
 	}
 	var row ivm.Row
 	if err := json.Unmarshal(raw, &row); err != nil {
-		return nil
+		panic(storageDrift("take-maxBound-unmarshal", err))
 	}
+	s.maxBound = row
+	s.maxBoundLoaded = true
 	return row
 }
 
 func (s *SQLiteTakeStorage) SetMaxBound(bound ivm.Row) {
+	validateBoundRow("maxBound", bound)
 	data, err := json.Marshal(bound)
 	if err != nil {
 		panic(fmt.Sprintf("marshal maxBound: %v", err))
 	}
-	s.storage.Set("maxBound", data)
+	// Round-trip-faithful cache — see SetTakeState.
+	var roundTripped ivm.Row
+	if err := json.Unmarshal(data, &roundTripped); err != nil {
+		panic(fmt.Sprintf("re-decode maxBound: %v", err))
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.storage.Set("maxBound", data) // panics on failure → cache left unchanged
+	s.maxBound = roundTripped
+	s.maxBoundLoaded = true
 }
 
 func (s *SQLiteTakeStorage) Del(key string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.storage.Del(key)
+	s.cacheState(key, nil)
+}
+
+// cacheState records key→state (nil = known absent). MUST be called with
+// s.mu held.
+func (s *SQLiteTakeStorage) cacheState(key string, state *ivm.TakeState) {
+	if s.states == nil {
+		s.states = make(map[string]*ivm.TakeState)
+	}
+	s.states[key] = state
+}
+
+// validateBoundRow panics if a bound row holds a value that does NOT survive
+// the JSON round-trip with its comparison semantics intact. The allowed set
+// is exactly the canonical post-FromSQLiteType shapes: nil, string, bool,
+// numerics (JSON re-reads them as float64 — consistent with the single-Number
+// model), and JSON-column maps/slices. Everything else — []byte (re-read as a
+// base64 STRING, silently mis-ranking against fresh blob rows), time.Time
+// (marshals to an RFC3339 string), or any other struct — is the same "silent
+// shape change" family as the mattn time.Time bug, so fail loud at write time
+// instead of corrupting the window.
+func validateBoundRow(what string, row ivm.Row) {
+	for col, v := range row {
+		switch v.(type) {
+		case nil, string, bool,
+			float64, float32, int, int8, int16, int32, int64,
+			uint, uint8, uint16, uint32, uint64,
+			map[string]interface{}, []interface{}:
+			// JSON round-trip safe.
+		default:
+			panic(fmt.Sprintf(
+				"%s: column %q holds %T which does not survive the JSON round-trip "+
+					"through operator storage — sort/bound columns must be "+
+					"nil/string/bool/number/json", what, col, v))
+		}
+	}
 }
