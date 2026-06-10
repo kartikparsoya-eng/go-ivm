@@ -817,7 +817,7 @@ func (g *ClientGroup) worker(s *Server) {
 		method := req.req.Method
 
 		switch method {
-		case "advance", "advanceStream":
+		case "advanceStream":
 			start = time.Now()
 			n := metrics.advancesInFlight.Add(1)
 			updatePeak(&metrics.peakAdvConc, n)
@@ -855,7 +855,7 @@ func (g *ClientGroup) worker(s *Server) {
 		endSpan(resp.Error)
 
 		switch method {
-		case "advance", "advanceStream":
+		case "advanceStream":
 			metrics.advancesInFlight.Add(-1)
 			metrics.recordAdvance(time.Since(start))
 		case "addQuery", "addQueries", "addQueriesStream":
@@ -1033,8 +1033,6 @@ func (s *Server) handleRequest(req RPCRequest) (resp RPCResponse) {
 		return s.handleAddQueries(req)
 	case "removeQuery":
 		return s.handleRemoveQuery(req)
-	case "advance":
-		return s.handleAdvance(req)
 	case "advanceToHead":
 		return s.handleAdvanceToHead(req)
 	case "destroy":
@@ -1592,11 +1590,6 @@ type advanceParams struct {
 	InitEpoch     uint64                  `json:"initEpoch"`
 }
 
-type advanceResult struct {
-	Changes []engine.RowChange   `json:"changes"`
-	Timings []engine.TableTiming `json:"timings,omitempty"`
-}
-
 // rpcCodeDrift is the JSON-RPC error code for source-drift detection.
 // TS-side go-ivm-client recognizes this code and triggers re-init via the
 // existing onRestart pipeline, then emits the partial Changes the drift
@@ -1620,61 +1613,7 @@ type driftRPCData struct {
 	PartialTimings []engine.TableTiming `json:"partialTimings,omitempty"`
 }
 
-func (s *Server) handleAdvance(req RPCRequest) RPCResponse {
-	var p advanceParams
-	if err := mpUnmarshal(req.Params, &p); err != nil {
-		return rpcError(req.ID, -32602, err.Error())
-	}
-
-	cgID := p.ClientGroupID
-	if cgID == "" {
-		cgID = "default"
-	}
-
-	group := s.getGroup(cgID, false)
-	if group == nil {
-		return rpcError(req.ID, -32000, "engine not initialized (call init first)")
-	}
-	group.mu.Lock()
-	defer group.mu.Unlock()
-
-	if group.eng == nil {
-		return rpcError(req.ID, -32000, "engine not initialized")
-	}
-	if resp, stale := checkInitEpoch(group, req.ID, p.InitEpoch); stale {
-		return resp
-	}
-
-	result := group.eng.Advance(p.Changes)
-	if result.Drift != nil {
-		// Self-heal signal: TS will re-init. Log clearly so prod ops can
-		// see frequency vs the panic line that used to crash the sidecar.
-		// Carry the partial Changes alongside the drift signal so the TS
-		// view-syncer can emit them to clients before re-hydrating —
-		// matches TS's assert-and-throw behavior where partial output
-		// already streamed to pokers before the snapshot revert.
-		fmt.Fprintf(os.Stderr, "[GO-IVM][drift] advance cg=%s %s\n", cgID, result.Drift.Error())
-		return RPCResponse{
-			JSONRPC: "2.0",
-			Error: &RPCError{
-				Code:    rpcCodeDrift,
-				Message: result.Drift.Error(),
-				Data: driftRPCData{
-					Table:          result.Drift.Table,
-					Op:             result.Drift.Op,
-					PK:             result.Drift.PK,
-					HasCount:       result.Drift.HasCount,
-					PartialChanges: result.Changes,
-					PartialTimings: result.Timings,
-				},
-			},
-			ID: req.ID,
-		}
-	}
-	return RPCResponse{JSONRPC: "2.0", Result: advanceResult{Changes: result.Changes, Timings: result.Timings}, ID: req.ID}
-}
-
-// --- advanceStream: streaming variant of advance ---
+// --- advanceStream: streaming variant of the push-mode advance ---
 //
 // Wire shape: one OR MORE "partial" frames with the same id, each carrying
 // `{changes, chunkIndex, final, timings?}`. Frames arrive in monotonic
@@ -1684,8 +1623,8 @@ func (s *Server) handleAdvance(req RPCRequest) RPCResponse {
 // terminal frame whose Result is the literal string "done" — TS client
 // uses "done" to resolve the call promise.
 //
-// Reuses `advanceParams` since the request shape matches the non-streaming
-// `advance` method exactly.
+// Reuses `advanceParams` (the {clientGroupID, changes, initEpoch} request
+// shape).
 
 type advanceStreamPartial struct {
 	Changes    []engine.RowChange   `json:"changes"`
