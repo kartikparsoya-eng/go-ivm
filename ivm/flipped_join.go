@@ -218,11 +218,19 @@ func (fj *FlippedJoin) Fetch(req FetchRequest) []Node {
 
 			if fj.inprogressChildChange.Type == ChangeTypeRemove {
 				if hasBeenPushed {
-					// Filter out the removed node
+					// Filter out the removed node. TS filters by reference
+					// identity (flipped-join.ts:271-272: `n !== change.node`)
+					// because the removed node was spliced into childNodes by
+					// reference. Go copies nodes through slices, so identity
+					// is unavailable — we match by the child schema's full
+					// comparator instead. Equivalent ONLY because the child
+					// sort is total (Zero always appends the PK to the
+					// ordering), so CompareRows==0 ⟺ same row. If a non-total
+					// child sort is ever introduced, this could filter a
+					// DIFFERENT child that ties with the removed one.
 					filtered := make([]Node, 0, len(relatedChildNodes))
 					for _, n := range relatedChildNodes {
-						if &n != &fj.inprogressChildChange.Node &&
-							fj.child.GetSchema().CompareRows(n.Row, fj.inprogressChildChange.Node.Row) != 0 {
+						if fj.child.GetSchema().CompareRows(n.Row, fj.inprogressChildChange.Node.Row) != 0 {
 							filtered = append(filtered, n)
 						}
 					}
