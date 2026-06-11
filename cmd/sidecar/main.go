@@ -1020,6 +1020,11 @@ func (s *Server) handleRequest(req RPCRequest) (resp RPCResponse) {
 			Result: map[string]interface{}{
 				"version":     sidecarVersion,
 				"protocolRev": sidecarProtocolRev,
+				// sourceMode lets TS skip shipping row contents at init when
+				// the sidecar reads SQLite directly (loadRows is a no-op in
+				// table mode). Additive field — clients that don't read it
+				// keep the old ship-everything behavior.
+				"sourceMode": s.sourceMode.String(),
 			},
 			ID: req.ID,
 		}
