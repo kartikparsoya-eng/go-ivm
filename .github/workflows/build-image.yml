@@ -82,9 +82,15 @@ jobs:
   # so the workflow stays green during initial setup.
   notify-downstream:
     needs: build
-    # Only fire when we actually published an image (default branch
-    # pushes + version tags). PRs and forks never carry the secret.
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    # Fire on EVERY publishing push (any configured branch + version
+    # tags), not just main: the mono image bundles this repo's binary, so
+    # a feature-branch publish that doesn't dispatch leaves the
+    # downstream rebuild racing the binary publish — mono builds
+    # triggered by the same logical change pulled the PREVIOUS sidecar
+    # (observed 2026-06-11: mono 87e6fa259 bundled b1c1a58 instead of
+    # b6c5c39 because this gate skipped on feat/snapshotter-in-go).
+    # PRs and forks never carry the secret, so the push gate suffices.
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
       - name: Dispatch repository_dispatch event to mono-better
