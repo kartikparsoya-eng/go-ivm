@@ -653,9 +653,14 @@ func (s *Server) getReplicaDB() (*sql.DB, error) {
 	// RPC timeouts on the TS side → CG reset storms. Size via env:
 	// GO_IVM_MAX_OPEN_CONNS ≥ 3× expected concurrent CGs is a safe rule of
 	// thumb in drive mode (each SQLite conn costs ~2MB page cache).
+	// CacheSizeKB caps each conn's SQLite page cache (C-side malloc —
+	// invisible to GOMEMLIMIT). Worst-case C-side memory ≈ 2 pools ×
+	// MaxOpenConns × cache, so at 1024 conns the SQLite default (~2MB)
+	// costs up to ~4GB that no Go-side limiter can see.
 	poolOpts := tablesource.OpenOptions{
 		MaxOpenConns: envPositiveInt("GO_IVM_MAX_OPEN_CONNS", 0),
 		MaxIdleConns: envPositiveInt("GO_IVM_MAX_IDLE_CONNS", 0),
+		CacheSizeKB:  envPositiveInt("GO_IVM_CONN_CACHE_KB", 0),
 	}
 	if poolOpts.MaxOpenConns > 0 {
 		fmt.Fprintf(os.Stderr, "[GO-IVM] replica pool: max open conns %d (GO_IVM_MAX_OPEN_CONNS)\n",
@@ -2088,7 +2093,19 @@ func tuneRuntime() {
 			"[GO-IVM] soft memory limit defaulted to %d bytes (%d%% of cgroup limit %d; "+
 				"override GO_IVM_GOMEMLIMIT / GO_IVM_GOMEMLIMIT_PERCENT)\n",
 			soft, pct, limit)
+		return
 	}
+	// Cgroup limit unreadable or unlimited (bare metal, dev machine,
+	// non-standard cgroup layout) — without ANY ceiling, GOGC=200 lets the
+	// heap balloon to 3× live data with nothing pushing back. Apply a
+	// generous absolute fallback; it's a SOFT limit (GC works harder near
+	// it, nothing dies), and every soak to date ran the sidecar well under
+	// 2GB. Override with GO_IVM_GOMEMLIMIT for bigger deployments.
+	const fallbackSoftLimit = int64(8) << 30 // 8GiB
+	debug.SetMemoryLimit(fallbackSoftLimit)
+	fmt.Fprintf(os.Stderr,
+		"[GO-IVM] soft memory limit defaulted to %d bytes (no cgroup limit found; "+
+			"override GO_IVM_GOMEMLIMIT)\n", fallbackSoftLimit)
 }
 
 // readCgroupMemoryLimit returns the container memory limit in bytes, or 0

@@ -51,6 +51,15 @@ type OpenOptions struct {
 	MaxIdleConns int
 	// BusyTimeoutMs is the per-conn SQLite busy timeout. 0 → defaultBusyTimeoutMs.
 	BusyTimeoutMs int
+	// CacheSizeKB sets each connection's SQLite page-cache budget
+	// (PRAGMA cache_size, negative-KB form). 0 → SQLite default (~2MB).
+	// Matters at scale: the per-conn cache is C-side malloc — OUTSIDE
+	// GOMEMLIMIT's view — and total C-side memory is conns × cache, so at
+	// MaxOpenConns=1024 the default costs up to ~2GB per pool. Hot pages
+	// are also in the (shared, evictable, file-backed) OS page cache, so
+	// shrinking the per-conn cache trades a little repeat-read locality
+	// for a hard cap on invisible memory.
+	CacheSizeKB int
 }
 
 // Open returns a *sql.DB pool aimed at the SQLite file at path, configured
@@ -83,6 +92,10 @@ func Open(path string, opts OpenOptions) (*sql.DB, error) {
 	dsn := "file:" + path +
 		"?_busy_timeout=" + strconv.Itoa(busyMs) +
 		"&_query_only=true"
+	if opts.CacheSizeKB > 0 {
+		// Negative value = KB units (https://sqlite.org/pragma.html#pragma_cache_size).
+		dsn += "&_cache_size=-" + strconv.Itoa(opts.CacheSizeKB)
+	}
 
 	db, err := sql.Open("sqlite3", dsn)
 	if err != nil {
@@ -160,6 +173,10 @@ func OpenWritable(path string, opts OpenOptions) (*sql.DB, error) {
 	dsn := "file:" + path +
 		"?_busy_timeout=" + strconv.Itoa(busyMs) +
 		"&_synchronous=OFF"
+	if opts.CacheSizeKB > 0 {
+		// Negative value = KB units (see Open).
+		dsn += "&_cache_size=-" + strconv.Itoa(opts.CacheSizeKB)
+	}
 
 	db, err := sql.Open("sqlite3", dsn)
 	if err != nil {

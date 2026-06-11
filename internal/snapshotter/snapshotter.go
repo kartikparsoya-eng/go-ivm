@@ -30,6 +30,7 @@ import (
 	"database/sql"
 	"fmt"
 	"sync"
+	"time"
 )
 
 const (
@@ -191,10 +192,16 @@ func (s *Snapshotter) Destroy() {
 // newSnapshot opens a fresh connection and pins it. Mirrors
 // Snapshot.create (276) + the Snapshot constructor (306).
 func (s *Snapshotter) newSnapshot() (*Snapshot, error) {
-	ctx := context.Background()
-	conn, err := s.db.Conn(ctx)
+	// Bounded acquire, mirroring tablesource's ensurePrevTxLocked: at pool
+	// exhaustion (hundreds of CGs × 2 pinned conns each) an unbounded
+	// db.Conn() blocks forever, the TS-side 120s RPC timeout fires with no
+	// diagnostic, and the resulting reset needs MORE conns — a storm. 30s
+	// rides out a transient checkpoint stall but fails before the TS timeout.
+	acquireCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	conn, err := s.db.Conn(acquireCtx)
+	cancel()
 	if err != nil {
-		return nil, fmt.Errorf("snapshotter: acquire conn: %w", err)
+		return nil, fmt.Errorf("snapshotter: acquire conn (30s timeout): %w", err)
 	}
 	snap := &Snapshot{conn: conn}
 	if err := s.beginAndPin(snap); err != nil {
