@@ -224,6 +224,22 @@ func (s *Server) handleAdvanceToHead(req RPCRequest) RPCResponse {
 		}
 	}
 
+	// Memory guard: diff.Collect materializes the FULL catch-up diff —
+	// every change-log entry WITH row values — before the engine applies
+	// it. TS iterates its diff lazily, so Go is strictly more exposed: a
+	// bulk backfill against a behind CG can be 100k+ fat rows = GBs,
+	// multiplied by CGs advancing concurrently. Refuse oversized diffs and
+	// surface an error instead — the TS side's documented handling for an
+	// advanceToHead error is its own fallback/reset path, which re-hydrates
+	// with bounded memory.
+	if diff.Changes > maxDiffChanges {
+		rebindCurr()
+		return rpcError(req.ID, -32000, fmt.Sprintf(
+			"advanceToHead diff: %d changes exceeds GO_IVM_MAX_DIFF_CHANGES=%d — "+
+				"caller should reset/re-hydrate instead of replaying this diff",
+			diff.Changes, maxDiffChanges))
+	}
+
 	changes, err := diff.Collect()
 	if err != nil {
 		rebindCurr()
@@ -387,6 +403,17 @@ func (s *Server) handleAdvanceToHeadStream(req RPCRequest, streamW streamWriter)
 	group.eng.BindTableSourcesToConn(diff.Prev().Conn())
 	rebindCurr := func() {
 		group.eng.BindTableSourcesToConn(diff.Curr().Conn())
+	}
+
+	// Memory guard — same rationale as handleAdvanceToHead: Collect
+	// materializes the full diff with row values; refuse oversized diffs so
+	// the caller resets/re-hydrates with bounded memory instead.
+	if diff.Changes > maxDiffChanges {
+		rebindCurr()
+		return rpcError(req.ID, -32000, fmt.Sprintf(
+			"advanceToHeadStream diff: %d changes exceeds GO_IVM_MAX_DIFF_CHANGES=%d — "+
+				"caller should reset/re-hydrate instead of replaying this diff",
+			diff.Changes, maxDiffChanges))
 	}
 
 	changes, err := diff.Collect()

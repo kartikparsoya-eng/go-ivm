@@ -21,6 +21,7 @@ import (
 	"runtime"
 	"runtime/debug"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -408,6 +409,29 @@ var parallelThreshold = func() int {
 	return n
 }()
 
+// envPositiveInt reads a positive integer from env, returning def when
+// unset/invalid (with a stderr note on invalid).
+func envPositiveInt(name string, def int) int {
+	v := os.Getenv(name)
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 1 {
+		fmt.Fprintf(os.Stderr, "[GO-IVM] invalid %s=%q, using default %d\n", name, v, def)
+		return def
+	}
+	return n
+}
+
+// maxDiffChanges caps how many change-log entries advanceToHead[Stream] will
+// materialize via diff.Collect (full row values per entry — see the guards at
+// the Collect call sites). Above the cap the RPC returns an error and the TS
+// caller resets/re-hydrates with bounded memory. 50k fat rows ≈ low hundreds
+// of MB transient per CG — past that, replaying the diff is slower than a
+// re-hydrate anyway.
+var maxDiffChanges = envPositiveInt("GO_IVM_MAX_DIFF_CHANGES", 50_000)
+
 // --- RPC types ---
 
 type RPCRequest struct {
@@ -622,9 +646,24 @@ func (s *Server) getReplicaDB() (*sql.DB, error) {
 	var db *sql.DB
 	var writableDB *sql.DB
 	var lastErr error
+	// Pool sizing must scale with concurrent CG count: the package default
+	// (256) is sized for ~36 CGs in push mode / ~128 in drive mode (2 pinned
+	// snapshotter conns per CG), and production runs hundreds of CGs per
+	// shared sidecar. Exhaustion shows up as indefinite Conn() blocking →
+	// RPC timeouts on the TS side → CG reset storms. Size via env:
+	// GO_IVM_MAX_OPEN_CONNS ≥ 3× expected concurrent CGs is a safe rule of
+	// thumb in drive mode (each SQLite conn costs ~2MB page cache).
+	poolOpts := tablesource.OpenOptions{
+		MaxOpenConns: envPositiveInt("GO_IVM_MAX_OPEN_CONNS", 0),
+		MaxIdleConns: envPositiveInt("GO_IVM_MAX_IDLE_CONNS", 0),
+	}
+	if poolOpts.MaxOpenConns > 0 {
+		fmt.Fprintf(os.Stderr, "[GO-IVM] replica pool: max open conns %d (GO_IVM_MAX_OPEN_CONNS)\n",
+			poolOpts.MaxOpenConns)
+	}
 	for time.Now().Before(deadline) {
 		var err error
-		db, err = tablesource.Open(s.replicaPath, tablesource.OpenOptions{})
+		db, err = tablesource.Open(s.replicaPath, poolOpts)
 		if err != nil {
 			lastErr = err
 			fmt.Fprintf(os.Stderr,
@@ -637,7 +676,7 @@ func (s *Server) getReplicaDB() (*sql.DB, error) {
 			db = nil
 			continue
 		}
-		writableDB, err = tablesource.OpenWritable(s.replicaPath, tablesource.OpenOptions{})
+		writableDB, err = tablesource.OpenWritable(s.replicaPath, poolOpts)
 		if err != nil {
 			db.Close()
 			db = nil
@@ -2027,7 +2066,56 @@ func tuneRuntime() {
 			debug.SetMemoryLimit(n)
 			fmt.Fprintf(os.Stderr, "[GO-IVM] soft memory limit set to %d bytes (GO_IVM_GOMEMLIMIT)\n", n)
 		}
+		return
 	}
+	if os.Getenv("GOMEMLIMIT") != "" {
+		return // runtime already applied it
+	}
+	// No operator memory limit at all → default to a fraction of the cgroup
+	// limit. Without ANY limit, GOGC=200 lets the heap balloon to 3× live
+	// data and the kernel OOM-kills the whole container — which takes down
+	// every CG in the shared sidecar AND the zero-cache workers next to it.
+	// The sidecar shares its container with ~20 node syncer workers, so it
+	// must not claim the whole budget: default to 40% (override with
+	// GO_IVM_GOMEMLIMIT, GOMEMLIMIT, or GO_IVM_GOMEMLIMIT_PERCENT).
+	// GOMEMLIMIT is soft — GC works harder near the cap instead of the
+	// process dying — and it does not cover C-side SQLite page cache.
+	if limit := readCgroupMemoryLimit(); limit > 0 {
+		pct := int64(envPositiveInt("GO_IVM_GOMEMLIMIT_PERCENT", 40))
+		soft := limit * pct / 100
+		debug.SetMemoryLimit(soft)
+		fmt.Fprintf(os.Stderr,
+			"[GO-IVM] soft memory limit defaulted to %d bytes (%d%% of cgroup limit %d; "+
+				"override GO_IVM_GOMEMLIMIT / GO_IVM_GOMEMLIMIT_PERCENT)\n",
+			soft, pct, limit)
+	}
+}
+
+// readCgroupMemoryLimit returns the container memory limit in bytes, or 0
+// when unlimited / not in a container / unreadable. Supports cgroup v2
+// (memory.max) and v1 (memory.limit_in_bytes).
+func readCgroupMemoryLimit() int64 {
+	for _, p := range []string{
+		"/sys/fs/cgroup/memory.max",
+		"/sys/fs/cgroup/memory/memory.limit_in_bytes",
+	} {
+		b, err := os.ReadFile(p)
+		if err != nil {
+			continue
+		}
+		s := strings.TrimSpace(string(b))
+		if s == "max" {
+			return 0
+		}
+		n, err := strconv.ParseInt(s, 10, 64)
+		// cgroup v1 reports "unlimited" as a huge sentinel (~2^63); treat
+		// anything implausibly large (>4TB) as no limit.
+		if err != nil || n <= 0 || n > int64(4)<<40 {
+			return 0
+		}
+		return n
+	}
+	return 0
 }
 
 func main() {
@@ -2155,8 +2243,30 @@ func main() {
 	go func() {
 		ticker := time.NewTicker(10 * time.Second)
 		defer ticker.Stop()
+		var lastWait int64
 		for range ticker.C {
 			metrics.reportAndReset()
+			// Replica-pool pressure: WaitCount growth means goroutines are
+			// blocking on conn acquisition — the precursor to TS-side RPC
+			// timeouts. Surface it BEFORE it becomes reset storms so ops can
+			// raise GO_IVM_MAX_OPEN_CONNS (rule of thumb: ≥3× concurrent CGs).
+			server.replicaMu.Lock()
+			rdb, wdb := server.replicaDB, server.replicaWritableDB
+			server.replicaMu.Unlock()
+			if rdb != nil && wdb != nil {
+				rs, ws := rdb.Stats(), wdb.Stats()
+				wait := rs.WaitCount + ws.WaitCount
+				if wait > lastWait {
+					fmt.Fprintf(os.Stderr,
+						"[GO-IVM] replica pool pressure: +%d conn waits in last 10s "+
+							"(read in-use %d/%d, writable in-use %d/%d, total wait %s) — "+
+							"consider raising GO_IVM_MAX_OPEN_CONNS\n",
+						wait-lastWait, rs.InUse, rs.MaxOpenConnections,
+						ws.InUse, ws.MaxOpenConnections,
+						(rs.WaitDuration + ws.WaitDuration).Round(time.Millisecond))
+				}
+				lastWait = wait
+			}
 		}
 	}()
 

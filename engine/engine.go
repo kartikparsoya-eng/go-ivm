@@ -762,6 +762,7 @@ func (e *Engine) AddQueriesStream(
 			nodes := entry.pipeline.Input.Fetch(ivm.FetchRequest{})
 
 			var chunk []RowChange
+			chunkBytes := 0
 			chunkIndex := 0
 			flush := func(final bool) {
 				// TimingMs only on the final chunk (TS accumulator uses it
@@ -784,13 +785,15 @@ func (e *Engine) AddQueriesStream(
 				// the array is free to reuse. Revert to `chunk = nil` if any
 				// caller retains Changes asynchronously.
 				chunk = chunk[:0]
+				chunkBytes = 0
 				chunkIndex++
 			}
 
 			for _, node := range nodes {
 				nodeChanges := streamNodes(entry.queryID, entry.schema, RowChangeAdd, node)
 				chunk = append(chunk, nodeChanges...)
-				if len(chunk) >= hydrateChunkSize {
+				chunkBytes += estimateRowChangesBytes(nodeChanges)
+				if len(chunk) >= hydrateChunkSize || chunkBytes >= softChunkBytes {
 					flush(false)
 				}
 			}
@@ -807,7 +810,8 @@ func (e *Engine) AddQueriesStream(
 				node := ivm.Node{Row: ce.matchedRow}
 				nodeChanges := streamNodes(entry.queryID, ce.schema, RowChangeAdd, node)
 				chunk = append(chunk, nodeChanges...)
-				if len(chunk) >= hydrateChunkSize {
+				chunkBytes += estimateRowChangesBytes(nodeChanges)
+				if len(chunk) >= hydrateChunkSize || chunkBytes >= softChunkBytes {
 					flush(false)
 				}
 			}
@@ -886,6 +890,52 @@ type QueryResult struct {
 // Declared as var (not const) so tests can shrink it to exercise chunk
 // boundaries without allocating 10k-row payloads per case.
 var hydrateChunkSize = envChunkSize("GO_IVM_HYDRATE_CHUNK_SIZE", 10000)
+
+// softChunkBytes is the estimated-payload budget per streamed partial frame.
+// The row-count caps (hydrateChunkSize / advanceChunkSize) bound COUNT but
+// not BYTES: 10k rows averaging >6.4KB each (large message bodies, canvas
+// JSON, ...) msgpack-encode past the 64MB wire frame cap and the receiver
+// rejects the frame. For hydrate that is a DETERMINISTIC failure loop — the
+// same query re-fetches the same fat rows on every retry. Chunks flush early
+// when the running size estimate crosses this budget. The estimate ignores
+// msgpack framing overhead (undercounts slightly); the 8MB-vs-64MB margin
+// absorbs that. A SINGLE source-change or node whose changes alone exceed
+// the budget still ships in one frame (same caveat as the count cap —
+// splitting those needs operator-level chunking).
+var softChunkBytes = envChunkSize("GO_IVM_CHUNK_SOFT_BYTES", 8*1024*1024)
+
+// estimateRowChangeBytes is a cheap one-pass size estimate of a RowChange's
+// wire footprint, for softChunkBytes accounting. Strings/blobs dominate fat
+// rows, so they're measured exactly; every other value counts a fixed 16.
+func estimateRowChangeBytes(rc RowChange) int {
+	n := 64 + len(rc.QueryID) + len(rc.Table)
+	for k, v := range rc.RowKey {
+		n += len(k) + estimateValueBytes(v)
+	}
+	for k, v := range rc.Row {
+		n += len(k) + estimateValueBytes(v)
+	}
+	return n
+}
+
+func estimateValueBytes(v interface{}) int {
+	switch t := v.(type) {
+	case string:
+		return len(t) + 8
+	case []byte:
+		return len(t) + 8
+	default:
+		return 16
+	}
+}
+
+func estimateRowChangesBytes(rcs []RowChange) int {
+	n := 0
+	for _, rc := range rcs {
+		n += estimateRowChangeBytes(rc)
+	}
+	return n
+}
 
 // RemoveQuery destroys a pipeline.
 func (e *Engine) RemoveQuery(queryID string) {
@@ -1078,6 +1128,7 @@ func (e *Engine) AdvanceStream(
 	}
 
 	var pending []RowChange
+	pendingBytes := 0
 	var timings []TableTiming
 	chunkIndex := 0
 	var drift *ivm.DriftError
@@ -1102,6 +1153,7 @@ func (e *Engine) AdvanceStream(
 		// INVARIANT: if a caller's onResult ever retains Changes past return
 		// (async encode/buffer), revert this to `pending = nil`.
 		pending = pending[:0]
+		pendingBytes = 0
 		chunkIndex++
 	}
 
@@ -1163,18 +1215,21 @@ func (e *Engine) AdvanceStream(
 				rowChanges := e.streamer.Stream()
 				ms := float64(time.Since(start).Microseconds()) / 1000.0
 				pending = append(pending, rowChanges...)
+				pendingBytes += estimateRowChangesBytes(rowChanges)
 				timings = append(timings, TableTiming{
 					Table:   change.Table,
 					ChangeT: int(sc.Type),
 					Ms:      ms,
 				})
 
-				// Flush mid-batch if we've crossed the chunk threshold. We
-				// only check AFTER appending so a single source-change that
+				// Flush mid-batch if we've crossed the chunk threshold —
+				// row count OR estimated bytes (fat rows blow the 64MB wire
+				// frame long before 10k rows; see softChunkBytes). We only
+				// check AFTER appending so a single source-change that
 				// produces >chunkSize rows still ships in one frame (we
 				// don't split an individual source-change's RowChange list
 				// — that would require operator-level chunking).
-				if len(pending) >= advanceChunkSize {
+				if len(pending) >= advanceChunkSize || pendingBytes >= softChunkBytes {
 					flush(false)
 				}
 			}
