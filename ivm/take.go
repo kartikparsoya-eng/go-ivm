@@ -671,10 +671,9 @@ func GetTakeStateKey(partitionKey PartitionKey, rowOrConstraint Row) string {
 // compare (len(partitionKey)=2 vs len(constraint)=1) used to return false
 // here, causing Take.Fetch to skip its takeState path and fall through to
 // the maxBound branch which returns nil on first hydrate — producing 0
-// child rows in the Join, EXISTS false on every parent, and the channels
-// MISMATCH observed in the 2026-05-27 shadow-tablesrc soak. The fix is to
-// compare against the DISTINCT column set, matching what BuildJoinConstraint
-// produces.
+// child rows in the Join and a false EXISTS on every parent. Comparing
+// against the DISTINCT column set instead avoids that, matching what
+// BuildJoinConstraint produces.
 func ConstraintMatchesPartitionKey(constraint *Constraint, partitionKey PartitionKey) bool {
 	if constraint == nil && len(partitionKey) == 0 {
 		return true

@@ -104,7 +104,7 @@ func (s *Snapshot) GetRow(spec *TableSpec, rowKey map[string]any) (map[string]an
 //
 // Unique keys with any NULL/absent column are filtered out: NULL can't violate
 // uniqueness (NULL != NULL in SQL) AND SQLite's MULTI-INDEX-OR optimization
-// collapses to a full table scan when any OR branch binds NULL (PR #5542).
+// collapses to a full table scan when any OR branch binds NULL.
 func (s *Snapshot) GetRows(spec *TableSpec, uniqueKeys [][]string, row map[string]any) ([]map[string]any, error) {
 	var validKeys [][]string
 	for _, key := range uniqueKeys {

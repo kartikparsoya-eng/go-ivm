@@ -348,10 +348,10 @@ func (s *OperatorStorage) Scan(prefix string) [][2]string {
 //
 // Why bounded: the cache key varies over the Take's distinct partition values,
 // and the operator never Del's a partition whose window has emptied — so for a
-// high-cardinality partition under a huge scan the cache used to grow without
-// limit for the whole life of the pipeline (heap-profiling a prod-scale soak
-// found this to be the dominant retained allocation, pressing GOMEMLIMIT). The
-// LRU caps it at maxStates entries (0 = unbounded). Eviction is observationally
+// high-cardinality partition under a huge scan the cache would otherwise grow
+// without limit for the whole life of the pipeline, becoming the dominant
+// retained allocation and pressing GOMEMLIMIT. The LRU caps it at maxStates
+// entries (0 = unbounded). Eviction is observationally
 // transparent: SQLite is authoritative, so an evicted key just re-reads (and
 // re-caches) on next access — the exact pre-cache code path, never a drift.
 //

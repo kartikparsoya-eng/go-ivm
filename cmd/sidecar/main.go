@@ -2099,8 +2099,8 @@ func tuneRuntime() {
 	// non-standard cgroup layout) — without ANY ceiling, GOGC=200 lets the
 	// heap balloon to 3× live data with nothing pushing back. Apply a
 	// generous absolute fallback; it's a SOFT limit (GC works harder near
-	// it, nothing dies), and every soak to date ran the sidecar well under
-	// 2GB. Override with GO_IVM_GOMEMLIMIT for bigger deployments.
+	// it, nothing dies) sized well above typical sidecar working sets.
+	// Override with GO_IVM_GOMEMLIMIT for bigger deployments.
 	const fallbackSoftLimit = int64(8) << 30 // 8GiB
 	debug.SetMemoryLimit(fallbackSoftLimit)
 	fmt.Fprintf(os.Stderr,

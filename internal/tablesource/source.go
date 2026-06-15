@@ -400,9 +400,9 @@ func (s *Source) OnAdvanceEnd() {
 	// AFTER the replicator has already committed that batch (the replicator
 	// writes the replica file and only then sends the advance RPC to the
 	// sidecar). checkExists would then see the batch's own freshly-committed
-	// rows and false-drift every ADD ("source drift table=messages op=Add
-	// ... has_count=N" while TS produces the changes normally) — observed in
-	// the shadow soak as TS-produced-8 / Go-produced-0 re-hydrates.
+	// rows and false-drift every ADD: the batch's own freshly-committed
+	// rows look like unexpected additions, forcing needless re-hydrates
+	// while TS produces the changes normally.
 	if err := s.ensurePrevTxLocked(); err != nil {
 		// Re-pin failed; leave prevTxStarted=false so the next ensurePrevTx
 		// retries. The next batch reads from a later frame (possibly
@@ -965,10 +965,10 @@ func (s *Source) fetchForConn(req ivm.FetchRequest, conn *connection) []ivm.Node
 	// NOT to sibling connections that haven't observed the push yet. This is
 	// the path that makes an EXISTS/Join child re-fetch — which runs through
 	// the very connection the push came in on — see the in-flight row, so
-	// the existence condition flips and the parent is (re-)emitted. A prior
-	// inverted gate (`<`) hid the in-flight row from exactly that re-fetch,
-	// causing advance to emit far fewer changes than TS (shadow soak:
-	// "TS produced 21 changes, Go produced 2"). The old snapshot+batchDelta
+	// the existence condition flips and the parent is (re-)emitted. An
+	// inverted gate (`<`) would hide the in-flight row from exactly that
+	// re-fetch, causing advance to emit far fewer changes than TS. The
+	// old snapshot+batchDelta
 	// arch masked the inversion by applying every batch push to every fetch
 	// unconditionally; the prev-tx arch relies on this gate being correct.
 	//
@@ -981,11 +981,11 @@ func (s *Source) fetchForConn(req ivm.FetchRequest, conn *connection) []ivm.Node
 	// #fetch passes makeComparator(sort, req.reverse) to generateWithOverlay
 	// (table-source.ts:298-312); generateWithStart/overlaysForStartAt also
 	// drops overlay rows that fall before req.start in that order. Using the
-	// forward comparator here put the in-flight Add at the wrong index in a
-	// reverse fetch — exactly the fetch Take issues for its displaced-bound
-	// lookup (start:bound, basis:'at', reverse:true) — so Take picked a
-	// different boundNode/beforeBoundNode and emitted a different displaced
-	// row than TS (shadow soak: TS removes msg-X / Go removes msg-Y).
+	// forward comparator here would put the in-flight Add at the wrong index
+	// in a reverse fetch — exactly the fetch Take issues for its displaced-
+	// bound lookup (start:bound, basis:'at', reverse:true) — so Take would
+	// pick a different boundNode/beforeBoundNode and emit a different
+	// displaced row than TS.
 	if s.overlay != nil && conn.lastPushedEpoch >= s.overlay.Epoch {
 		// PARTIAL-bound comparator: req.Start may be a partial pagination cursor
 		// (e.g. {createdAt} while the sort is [createdAt, conversationId]). The

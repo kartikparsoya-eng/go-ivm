@@ -134,9 +134,9 @@ type pipelineEntry struct {
 
 // companionEntry is the Go-side companion record. The TS analogue is
 // CompanionPipeline in pipeline-driver.ts. On advance, the companion's
-// output runs the live "scalar value changed" check (port of
-// pipeline-driver.ts:2017-2047): if a push moves the resolved scalar's
-// child field to a different value, the baked-in literal in the main
+// output runs the live "scalar value changed" check: if a push moves the
+// resolved scalar's child field to a different value, the baked-in literal
+// in the main
 // query's plan is stale, so we raise a reset (DriftError) that flows
 // through the engine's existing recover→re-hydrate path — TS re-registers
 // the query, which re-runs ResolveSimpleScalarSubqueries against current
@@ -993,10 +993,9 @@ func (e *Engine) Advance(changes []SnapshotChange) *AdvanceResult {
 					// successful prior Push calls in this loop already
 					// produced, then signal drift so the caller re-hydrates.
 					// TS's assert-and-throw path emits its partial computation
-					// before snapshot revert; previously Go discarded prior
-					// output here, which produced observable output divergence
-					// between Go and TS for the corrupt advance (see 30-min
-					// shadow soak: TS=N changes, Go=0 changes for the failing
+					// before snapshot revert; discarding prior output here would
+					// diverge from TS for the corrupt advance (TS emits its
+					// partial change set, Go would emit none for the failing
 					// batch). Drain anything still in the streamer in case the
 					// panicking Push emitted partial output before the panic.
 					if drained := e.streamer.Stream(); len(drained) > 0 {
@@ -1173,11 +1172,10 @@ func (e *Engine) AdvanceStream(
 					drift = d
 					// Match TS view-syncer: emit whatever partial output
 					// successful prior pushes produced in this advance, then
-					// signal drift so TS re-hydrates. Previously Go dropped
-					// the partial output (`pending = nil`), producing
-					// observable output divergence vs TS for the corrupt
-					// advance (30-min shadow soak: TS emitted partial changes
-					// for the batch, Go emitted none). Drain anything still
+					// signal drift so TS re-hydrates. Dropping the partial
+					// output (`pending = nil`) would diverge from TS for the
+					// corrupt advance — TS emits its partial change set for the
+					// batch while Go would emit none. Drain anything still
 					// in the streamer in case the panicking Push left
 					// residual output before the panic point.
 					if drained := e.streamer.Stream(); len(drained) > 0 {
@@ -1333,8 +1331,8 @@ func (po *pipelineOutput) Push(change ivm.Change, pusher ivm.InputBase) []ivm.Ch
 
 // companionOutput wraps pipelineOutput for a resolved scalar-subquery
 // companion pipeline. Before accumulating the companion's change it runs
-// the scalar-value-changed reset check — direct port of TS's live
-// companion push (pipeline-driver.ts:2017-2047). A push that moves the
+// the scalar-value-changed reset check — a direct port of TS's live
+// companion push. A push that moves the
 // resolved scalar's child field to a different value makes the main
 // query's baked-in literal stale, so it raises a *ivm.DriftError to ride
 // the engine's existing recover→re-hydrate path: TS re-registers the

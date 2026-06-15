@@ -166,9 +166,9 @@ func evalOp(op string, left, right ivm.Value) bool {
 //     for `numeric_col = '5'` and inverse.
 //  5. Otherwise FALSE.
 //
-// Discovered via gap-cross-type-num-eq-str in the soak (2026-05-25):
-// `participantCount = '5'` produced TS=1/Go=0 mismatches because Go
-// stopped at rule 3 and rejected the string literal.
+// Rule 4 is the easy one to miss: without it a cross-type predicate like
+// `participantCount = '5'` stops at rule 3 and rejects the string literal,
+// diverging from SQLite (and therefore the TS path) which casts and matches.
 func valuesIdentical(a, b ivm.Value) bool {
 	if a == nil && b == nil {
 		return true
@@ -339,9 +339,8 @@ func compileLikePattern(source string, caseInsensitive bool) *regexp.Regexp {
 			// both sides share — treats `\` (and every non-`%`/`_` char) as a
 			// LITERAL. We MUST match that, or a pattern like `%\%%` diverges:
 			// SQLite/TS reads it as "contains a backslash" while a backslash-as-
-			// escape reading is "contains a percent". (Observed as a deterministic
-			// "TS=2, Go=0" hydrate mismatch in the drive-mode soak.) Treating `\`
-			// as a metachar to quote keeps it literal — exactly SQLite's default.
+			// escape reading is "contains a percent". Treating `\` as a metachar
+			// to quote keeps it literal — exactly SQLite's default.
 			b.WriteString(regexp.QuoteMeta(string(c)))
 		}
 	}

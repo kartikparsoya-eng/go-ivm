@@ -56,10 +56,10 @@ type Row map[string]Value
 // `toFloat64`) don't need a separate post-walk to coerce types.
 //
 // This replaces the legacy `walkForNumericNormalize` reflection walk for the
-// Row portion of decoded payloads. The walk was ~8% of allocations in the
-// 2026-05-21 profile (107MB of `reflect.unsafe_New`) and 50%+ of all msgpack
-// decoding cost happens through Row-bearing payloads (loadRows / advance).
-// Decoding straight into float64 instead of int* → walk-and-rebox saves both.
+// Row portion of decoded payloads. That walk was a significant share of total
+// allocations (reflection-driven boxing), and most msgpack decoding cost flows
+// through Row-bearing payloads (loadRows / advance). Decoding straight into
+// float64 instead of int* → walk-and-rebox eliminates both.
 //
 // Wire-format compatibility:
 //   - Numbers on the wire decode to msgpack-native int* / uint* / float types;

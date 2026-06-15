@@ -81,11 +81,10 @@ func buildPipelineInternal(ast AST, delegate Delegate, p *Pipeline, partitionKey
 	// To honor that invariant, the source must split such edits into
 	// Remove(old) + Add(new) before they ever reach Take.
 	//
-	// Discovered via the sandbox soak (2026-05-25): the new H.1/H.2/H.3
-	// mutations (move conv/msg/ticket between parents) edited FK columns
-	// that act as partition keys for nested-related templates, panicking
-	// the sidecar. Sidecar restart recovered each time, but the dropped
-	// changes are correctness-adjacent.
+	// This matters whenever a mutation edits an FK column that acts as a
+	// partition key for a nested-related template (e.g. moving a row to a
+	// different parent): without the split, Take's partition-key-stability
+	// assertion fires and the change is dropped.
 	splitEditKeys := collectSplitEditKeys(ast)
 	for _, k := range partitionKey {
 		if splitEditKeys == nil {
@@ -179,9 +178,8 @@ func buildPipelineInternal(ast AST, delegate Delegate, p *Pipeline, partitionKey
 		// columns). TS leaves these in place and emits the subquery rows as
 		// a normal relationship; do the same here. Propagating Scalar:true
 		// to the Join would mark the child schema IsScalar so the streamer
-		// drops emission entirely — that suppressed conversation rows that
-		// TS produces (H18-cont follow-up: scalar-EXISTS over-emit from
-		// 20-user soak template #5).
+		// drops emission entirely — which suppresses subquery rows (e.g. a
+		// scalar EXISTS over a related table) that TS still emits.
 		join := ivm.NewJoin(ivm.JoinArgs{
 			Parent:           end,
 			Child:            childInput,
