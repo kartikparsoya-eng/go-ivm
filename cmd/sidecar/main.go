@@ -2145,6 +2145,17 @@ func main() {
 	// multi-CG parallel scaling (see tuneRuntime).
 	tuneRuntime()
 
+	// Log the per-Take state-cache bound: it caps retained Go heap from
+	// high-cardinality Take partitions (the dominant pre-OOM allocation found
+	// by heap-profiling). 0 = unbounded (the old, OOM-prone behavior).
+	if m := sqlite.TakeStateCacheMax(); m > 0 {
+		fmt.Fprintf(os.Stderr,
+			"[GO-IVM] take-state cache: max %d entries per operator (GO_IVM_TAKE_STATE_CACHE_MAX)\n", m)
+	} else {
+		fmt.Fprintf(os.Stderr,
+			"[GO-IVM] take-state cache: UNBOUNDED (GO_IVM_TAKE_STATE_CACHE_MAX=0)\n")
+	}
+
 	// CRIT-6: fail loud at boot if the init/advance value-coercion contract is
 	// broken (a colType that doesn't map both raw and JS shapes to the same
 	// canonical value) — better a startup crash than silent client-data

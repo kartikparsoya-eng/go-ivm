@@ -8,10 +8,13 @@ package sqlite
 // for ephemeral (RAM-like) storage with durability OFF.
 
 import (
+	"container/list"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -47,6 +50,34 @@ const createStorageTable = `
 `
 
 const defaultCommitInterval = 5000
+
+// defaultTakeStateCacheMax bounds the per-Take in-memory take-state LRU when
+// no operator override is set. The cache key varies over a Take's distinct
+// partition values (GetTakeStateKey), so a high-cardinality partition under a
+// huge scan would otherwise grow the cache without limit for the life of the
+// pipeline (the Take operator never Del's stale partitions, and the idle
+// reaper is days away). 10k hot partitions per operator is generous for real
+// dashboards while capping the pathological case. Tunable / disable-able via
+// GO_IVM_TAKE_STATE_CACHE_MAX (0 = unbounded, restoring the old behavior).
+const defaultTakeStateCacheMax = 10000
+
+// takeStateCacheMax is the effective per-Take cache cap, resolved once at
+// process start. An explicit GO_IVM_TAKE_STATE_CACHE_MAX=0 is honored as
+// "unbounded"; unset or malformed falls back to the default.
+var takeStateCacheMax = readTakeStateCacheMax()
+
+func readTakeStateCacheMax() int {
+	if v := os.Getenv("GO_IVM_TAKE_STATE_CACHE_MAX"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			return n
+		}
+	}
+	return defaultTakeStateCacheMax
+}
+
+// TakeStateCacheMax returns the effective per-Take take-state cache cap so the
+// sidecar can log it at startup. 0 means unbounded.
+func TakeStateCacheMax() int { return takeStateCacheMax }
 
 // DatabaseStorage manages operator state in SQLite.
 type DatabaseStorage struct {
@@ -258,7 +289,7 @@ func (cgs *ClientGroupStorage) CreateStorage() *OperatorStorage {
 
 // CreateTakeStorage returns a TakeStorage backed by SQLite.
 func (cgs *ClientGroupStorage) CreateTakeStorage() ivm.TakeStorage {
-	return &SQLiteTakeStorage{storage: cgs.CreateStorage()}
+	return &SQLiteTakeStorage{storage: cgs.CreateStorage(), maxStates: takeStateCacheMax}
 }
 
 // Destroy deletes all storage for this client group.
@@ -303,8 +334,8 @@ func (s *OperatorStorage) Scan(prefix string) [][2]string {
 	return s.ds.scan(s.cgID, s.opID, prefix)
 }
 
-// SQLiteTakeStorage implements ivm.TakeStorage using OperatorStorage, with an
-// in-memory write-through cache in front of the SQLite rows.
+// SQLiteTakeStorage implements ivm.TakeStorage using OperatorStorage, with a
+// bounded in-memory write-through LRU cache in front of the SQLite rows.
 //
 // Why the cache: every Take state touch used to be a JSON marshal + SQL
 // round-trip through the engine-wide DatabaseStorage mutex + its single
@@ -314,6 +345,15 @@ func (s *OperatorStorage) Scan(prefix string) [][2]string {
 // probe) and SQLite is only touched on writes. SQLite stays authoritative:
 // writes land there FIRST (and panic via storageDrift on failure, leaving the
 // cache unchanged), then update the cache — so cache and DB can't diverge.
+//
+// Why bounded: the cache key varies over the Take's distinct partition values,
+// and the operator never Del's a partition whose window has emptied — so for a
+// high-cardinality partition under a huge scan the cache used to grow without
+// limit for the whole life of the pipeline (heap-profiling a prod-scale soak
+// found this to be the dominant retained allocation, pressing GOMEMLIMIT). The
+// LRU caps it at maxStates entries (0 = unbounded). Eviction is observationally
+// transparent: SQLite is authoritative, so an evicted key just re-reads (and
+// re-caches) on next access — the exact pre-cache code path, never a drift.
 //
 // Lifecycle safety: each SQLiteTakeStorage belongs to exactly one Take in one
 // pipeline. Re-registering a queryID tears down the old pipeline (and this
@@ -325,19 +365,35 @@ type SQLiteTakeStorage struct {
 	storage *OperatorStorage
 
 	mu sync.Mutex
-	// states caches TakeState by key. A present key with nil value is a
-	// NEGATIVE entry ("known absent") so repeated misses skip SQLite too.
-	states map[string]*ivm.TakeState
+	// states maps key→LRU element; lru orders elements most-recently-used at
+	// the front. An element whose takeStateEntry.state is nil is a NEGATIVE
+	// entry ("known absent") so repeated misses skip SQLite too. Bounded by
+	// maxStates (see cacheState).
+	states map[string]*list.Element
+	lru    *list.List
+	// maxStates caps the cache (0 = unbounded). Set from takeStateCacheMax at
+	// construction; overridable per-instance in tests.
+	maxStates int
 	// maxBound caches the "maxBound" row once loaded; maxBoundLoaded
 	// distinguishes "not yet read" from "read and absent (nil)".
 	maxBound       ivm.Row
 	maxBoundLoaded bool
 }
 
+// takeStateEntry is one LRU node: the cache key plus its state (nil = negative
+// "known absent"). The key is duplicated here so eviction of the back element
+// can delete the corresponding map entry in O(1).
+type takeStateEntry struct {
+	key   string
+	state *ivm.TakeState
+}
+
 func (s *SQLiteTakeStorage) GetTakeState(key string) *ivm.TakeState {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if cached, ok := s.states[key]; ok {
+	if el, ok := s.states[key]; ok {
+		s.lru.MoveToFront(el)
+		cached := el.Value.(*takeStateEntry).state
 		if cached == nil {
 			return nil
 		}
@@ -426,13 +482,30 @@ func (s *SQLiteTakeStorage) Del(key string) {
 	s.cacheState(key, nil)
 }
 
-// cacheState records key→state (nil = known absent). MUST be called with
-// s.mu held.
+// cacheState records key→state (nil = known absent) in the LRU, refreshing
+// recency, and evicts least-recently-used entries when maxStates>0 and the
+// cache would exceed it. MUST be called with s.mu held.
 func (s *SQLiteTakeStorage) cacheState(key string, state *ivm.TakeState) {
 	if s.states == nil {
-		s.states = make(map[string]*ivm.TakeState)
+		s.states = make(map[string]*list.Element)
+		s.lru = list.New()
 	}
-	s.states[key] = state
+	if el, ok := s.states[key]; ok {
+		el.Value.(*takeStateEntry).state = state
+		s.lru.MoveToFront(el)
+		return
+	}
+	s.states[key] = s.lru.PushFront(&takeStateEntry{key: key, state: state})
+	if s.maxStates > 0 {
+		for s.lru.Len() > s.maxStates {
+			oldest := s.lru.Back()
+			if oldest == nil {
+				break
+			}
+			delete(s.states, oldest.Value.(*takeStateEntry).key)
+			s.lru.Remove(oldest)
+		}
+	}
 }
 
 // validateBoundRow panics if a bound row holds a value that does NOT survive
