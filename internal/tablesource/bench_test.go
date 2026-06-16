@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/kartikparsoya-eng/go-ivm/ivm"
+	"github.com/kartikparsoya-eng/go-ivm/sqlite"
 	_ "github.com/mattn/go-sqlite3"
 )
 
@@ -169,3 +171,63 @@ func BenchmarkConcurrentReaders(b *testing.B) {
 // Source mutex contention was the bottleneck identified by the Phase 6
 // profile; the new model replaces it with per-call conn from the pool
 // pinned via sqlite3_snapshot_open, eliminating the mutex entirely.
+
+// BenchmarkSourceFetchRepeated drives the REAL Source.fetchForConn read path
+// (prev-tx conn + BuildSelectQuery + Scan loop + FromSQLiteType) rather than a
+// raw *sql.DB. The live read-path profile put fetchForConn at 63% of sidecar
+// CPU, with sqlite3_prepare_v2 = 14.6% of cgo time because database/sql's
+// one-shot QueryContext re-compiles the statement on every call. Repeated
+// identical-shape fetches model the steady-state advance/hydrate cadence (the
+// SQL text is constant — BuildSelectQuery parameterizes all values), so this
+// is the benchmark that exposes whether that prepare is amortized by a
+// per-(conn,SQL) prepared-statement cache. The prev conn is stable across all
+// iterations (no OnAdvanceEnd between fetches), exactly like the Snapshotter's
+// leapfrogged frame conn in production.
+func BenchmarkSourceFetchRepeated(b *testing.B) {
+	const rows = 1000
+	path := seedReplicaLarge(b, rows)
+	db, err := Open(path, OpenOptions{})
+	if err != nil {
+		b.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+	wdb, err := OpenWritable(path, OpenOptions{})
+	if err != nil {
+		b.Fatalf("OpenWritable: %v", err)
+	}
+	defer wdb.Close()
+
+	cols := map[string]sqlite.ColumnSchema{
+		"id":   {Type: "number"},
+		"name": {Type: "string"},
+		"val":  {Type: "number"},
+	}
+	src, err := New(db, wdb, "t", cols, []string{"id"})
+	if err != nil {
+		b.Fatalf("New: %v", err)
+	}
+	defer src.Close()
+	in := src.Connect(nil, nil, nil)
+
+	// Sweep fetch sizes: the prepared-statement cache eliminates a CONSTANT
+	// per-fetch sqlite3_prepare_v2, so its relative win grows as the per-row
+	// work shrinks. limit=1 models the high-frequency small-advance path;
+	// limit=100 the hydrate/dashboard path. req.Limit early-breaks the Scan
+	// loop Go-side (source.go), so a small limit genuinely scans fewer rows.
+	for _, limit := range []int{1, 10, 100} {
+		req := ivm.FetchRequest{Limit: limit}
+		// Establish the prev tx + warm pages + (for the cached variant) prime
+		// the statement cache so we measure steady state, not first-touch.
+		if got := len(in.Fetch(req)); got != limit {
+			b.Fatalf("warm fetch got %d rows, want %d", got, limit)
+		}
+		b.Run(fmt.Sprintf("limit=%d", limit), func(b *testing.B) {
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				if got := len(in.Fetch(req)); got != limit {
+					b.Fatalf("fetch got %d rows, want %d", got, limit)
+				}
+			}
+		})
+	}
+}

@@ -112,6 +112,21 @@ type Source struct {
 	// the SAME frame (no independent re-pin = no frame-timing drift). Set/
 	// cleared via BindConn/UnbindConn around a driven advance or hydrate.
 	externalConn *sql.Conn
+
+	// stmtCache memoizes prepared SELECT statements for fetchForConn, keyed by
+	// (active conn, SQL text). database/sql's one-shot QueryContext re-runs
+	// sqlite3_prepare_v2 on every call (14.6% of cgo time in the live read-path
+	// profile); a Conn-bound *sql.Stmt amortizes that to a cheap sqlite3_reset.
+	//
+	// Keyed by conn pointer because a Conn-bound Stmt is valid ONLY on the conn
+	// it was prepared on. The conn set is tiny and stable — this Source's own
+	// prevConn plus the Snapshotter's two leapfrog frame conns (bound via
+	// BindConn), all re-pinned in place via ROLLBACK+BEGIN and never reopened
+	// mid-life — so cardinality stays at a few entries and a cached stmt stays
+	// valid across advances (a prepare_v2 stmt is frame-independent and SQLite
+	// auto-recompiles it on the rare replica-schema change). Invalidated
+	// whenever a conn is torn down. Guarded by s.mu (held across the fetch).
+	stmtCache map[*sql.Conn]map[string]*sql.Stmt
 }
 
 // connection is one downstream pipeline subscribed to this source.
@@ -254,6 +269,7 @@ func New(db *sql.DB, writableDB *sql.DB, tableName string, columns map[string]sq
 func (s *Source) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.closeAllCachedStmtsLocked()
 	if s.prevConn != nil {
 		if s.prevTxStarted {
 			_, _ = s.prevConn.ExecContext(context.Background(), "ROLLBACK")
@@ -293,6 +309,59 @@ func (s *Source) activeConn() *sql.Conn {
 		return s.externalConn
 	}
 	return s.prevConn
+}
+
+// preparedSelectLocked returns a prepared statement for query bound to conn,
+// preparing and caching it on first use. MUST be called with s.mu held. The
+// returned *sql.Stmt executes on conn's current transaction (the pinned frame
+// plus any in-flight writeChange writes), so it observes read-your-own-writes
+// exactly like the previous one-shot QueryContext did. The caller resolved
+// conn from activeConn() under the same lock, and the cache is invalidated
+// whenever a conn is torn down, so a stale entry can never be executed.
+func (s *Source) preparedSelectLocked(conn *sql.Conn, query string) (*sql.Stmt, error) {
+	bySQL := s.stmtCache[conn]
+	if bySQL == nil {
+		if s.stmtCache == nil {
+			s.stmtCache = make(map[*sql.Conn]map[string]*sql.Stmt, 3)
+		}
+		bySQL = make(map[string]*sql.Stmt, 4)
+		s.stmtCache[conn] = bySQL
+	}
+	if st, ok := bySQL[query]; ok {
+		return st, nil
+	}
+	st, err := conn.PrepareContext(context.Background(), query)
+	if err != nil {
+		return nil, err
+	}
+	bySQL[query] = st
+	return st, nil
+}
+
+// closeCachedStmtsForConnLocked finalizes and drops every prepared statement
+// cached against conn. Called immediately before conn is closed so the
+// compiled sqlite3_stmts are released and a later conn that happens to reuse
+// the same pointer can't hit a stale entry. MUST be called with s.mu held.
+func (s *Source) closeCachedStmtsForConnLocked(conn *sql.Conn) {
+	bySQL := s.stmtCache[conn]
+	if bySQL == nil {
+		return
+	}
+	for _, st := range bySQL {
+		_ = st.Close()
+	}
+	delete(s.stmtCache, conn)
+}
+
+// closeAllCachedStmtsLocked finalizes every cached statement across all conns.
+// Used at Source teardown. MUST be called with s.mu held.
+func (s *Source) closeAllCachedStmtsLocked() {
+	for _, bySQL := range s.stmtCache {
+		for _, st := range bySQL {
+			_ = st.Close()
+		}
+	}
+	s.stmtCache = nil
 }
 
 // ensurePrevTxLocked makes sure prevConn is acquired and a tx is open.
@@ -381,7 +450,9 @@ func (s *Source) OnAdvanceEnd() {
 	ctx := context.Background()
 	if _, err := s.prevConn.ExecContext(ctx, "ROLLBACK"); err != nil {
 		// If ROLLBACK fails the conn is in an unknown state; close it
-		// so the next ensurePrevTx will reacquire a fresh one.
+		// so the next ensurePrevTx will reacquire a fresh one. Drop the
+		// statements cached against it first — they die with the conn.
+		s.closeCachedStmtsForConnLocked(s.prevConn)
 		_ = s.prevConn.Close()
 		s.prevConn = nil
 		s.prevTxStarted = false
@@ -893,7 +964,19 @@ func (s *Source) fetchForConn(req ivm.FetchRequest, conn *connection) []ivm.Node
 		req.Start,
 	)
 	ctx := context.Background()
-	rows, err := s.activeConn().QueryContext(ctx, q.SQL, q.Params...)
+	// Reuse a prepared statement for this (conn, SQL) instead of letting
+	// database/sql re-compile via sqlite3_prepare_v2 on every QueryContext
+	// (14.6% of cgo time in the live read-path profile). activeConn is a
+	// stable, single-flight conn (this Source's prevConn, or a Snapshotter
+	// frame conn bound via BindConn), so the cached Conn-bound stmt stays valid
+	// across advances and re-reads the new frame after each leapfrog.
+	dbConn := s.activeConn()
+	stmt, err := s.preparedSelectLocked(dbConn, q.SQL)
+	if err != nil {
+		panic(fmt.Sprintf("tablesource.Source.Fetch %s: prepare: %v\nSQL: %s",
+			s.tableName, err, q.SQL))
+	}
+	rows, err := stmt.QueryContext(ctx, q.Params...)
 	if err != nil {
 		panic(fmt.Sprintf("tablesource.Source.Fetch %s: query: %v\nSQL: %s",
 			s.tableName, err, q.SQL))
