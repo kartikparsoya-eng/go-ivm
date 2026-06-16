@@ -231,13 +231,13 @@ type perfMetrics struct {
 	hydratesInFlight atomic.Int64
 
 	// Latency tracking (last 10s window)
-	mu              sync.Mutex
+	mu               sync.Mutex
 	advanceLatencies []time.Duration
 	hydrateLatencies []time.Duration
-	advanceCount    atomic.Int64
-	hydrateCount    atomic.Int64
-	peakAdvConc     atomic.Int64 // peak concurrent advances seen
-	peakHydConc     atomic.Int64 // peak concurrent hydrates seen
+	advanceCount     atomic.Int64
+	hydrateCount     atomic.Int64
+	peakAdvConc      atomic.Int64 // peak concurrent advances seen
+	peakHydConc      atomic.Int64 // peak concurrent hydrates seen
 
 	// Chunk-count tracking (last 10s window) — answers "is the streaming
 	// path actually chunking, or are payloads always single-frame?" One
@@ -380,7 +380,7 @@ const defaultSocket = "/tmp/go-ivm.sock"
 // (REVIEW-final MED-CROSS-5).
 const (
 	sidecarVersion     = "0.7.0"
-	sidecarProtocolRev = 8 // bumped: advanceToHeadStream RPC added (streaming variant of advanceToHead; chunks drive-mode RowChanges over advanceChunkSize-sized frames so a bulk backfill / mass UPDATE doesn't blow the 64MB single-frame cap — finding F5). Rev 7 added advanceToHead. Rev 6 added refreshSnapshot.
+	sidecarProtocolRev = 9 // bumped: streamed RowChange chunks (addQueriesStream, advanceStream, advanceToHeadStream) now use the positional wire encoding (see positional.go) — keys sent once per (queryID,table) group instead of per row. Rev 8 added advanceToHeadStream. Rev 7 added advanceToHead. Rev 6 added refreshSnapshot.
 )
 
 // rpcCodeStaleInitEpoch signals that a mutating RPC arrived with an
@@ -435,14 +435,14 @@ var maxDiffChanges = envPositiveInt("GO_IVM_MAX_DIFF_CHANGES", 50_000)
 // --- RPC types ---
 
 type RPCRequest struct {
-	JSONRPC     string             `json:"jsonrpc"`
-	Method      string             `json:"method"`
-	Params      msgpack.RawMessage `json:"params"`
-	ID          interface{}        `json:"id"`
+	JSONRPC string             `json:"jsonrpc"`
+	Method  string             `json:"method"`
+	Params  msgpack.RawMessage `json:"params"`
+	ID      interface{}        `json:"id"`
 	// W3C traceparent forwarded by the TS client (REVIEW-final MED-CROSS-4).
 	// Logged for slow handlers; full Go-side OTel SDK integration is a
 	// separate feature.
-	Traceparent string             `json:"traceparent,omitempty"`
+	Traceparent string `json:"traceparent,omitempty"`
 }
 
 type RPCResponse struct {
@@ -453,8 +453,8 @@ type RPCResponse struct {
 }
 
 type RPCError struct {
-	Code    int         `json:"code"`
-	Message string      `json:"message"`
+	Code    int    `json:"code"`
+	Message string `json:"message"`
 	// Data carries an optional structured payload. Used by the drift
 	// signal (code -32100) to ship *ivm.DriftError details — table, op,
 	// PK, has_count — so TS can log specifics before re-init.
@@ -559,12 +559,12 @@ type Server struct {
 	// then read the result under the mutex. The mutex is only held
 	// for tiny critical sections (check cache, register probe, store
 	// result) — never across the slow retry loop.
-	replicaPath        string
-	replicaMu          sync.Mutex
-	replicaDB          *sql.DB       // populated on successful probe (under replicaMu)
-	replicaWritableDB  *sql.DB       // writable companion pool — used for each Source's prev-snapshot tx conn
-	replicaProbe       chan struct{} // non-nil while a probe is in flight; closed when done
-	replicaErr         error         // last probe's terminal error (under replicaMu)
+	replicaPath       string
+	replicaMu         sync.Mutex
+	replicaDB         *sql.DB       // populated on successful probe (under replicaMu)
+	replicaWritableDB *sql.DB       // writable companion pool — used for each Source's prev-snapshot tx conn
+	replicaProbe      chan struct{} // non-nil while a probe is in flight; closed when done
+	replicaErr        error         // last probe's terminal error (under replicaMu)
 
 	// appID names the app whose `${appID}.permissions` table the Snapshotter's
 	// Diff watches for permissions-change resets. From GO_IVM_APP_ID (or the
@@ -1532,11 +1532,14 @@ func (s *Server) handleAddQueries(req RPCRequest) RPCResponse {
 // the same query (recorded once when the query's fetch finishes).
 
 type addQueriesStreamPartial struct {
-	QueryID    string             `json:"queryID"`
-	Changes    []engine.RowChange `json:"changes"`
-	ChunkIndex int                `json:"chunkIndex"`
-	Final      bool               `json:"final"`
-	TimingMs   float64            `json:"timingMs"`
+	QueryID string `json:"queryID"`
+	// Positional (rev 9) RowChange encoding — see positional.go. Replaces the
+	// legacy `changes` array; keys are sent once per group in Dict.
+	Dict       []dictEntry     `json:"d,omitempty"`
+	Rows       [][]interface{} `json:"r,omitempty"`
+	ChunkIndex int             `json:"chunkIndex"`
+	Final      bool            `json:"final"`
+	TimingMs   float64         `json:"timingMs"`
 }
 
 func (s *Server) handleAddQueriesStream(req RPCRequest, streamW streamWriter) RPCResponse {
@@ -1574,9 +1577,11 @@ func (s *Server) handleAddQueriesStream(req RPCRequest, streamW streamWriter) RP
 	// is always on the last (highest-ChunkIndex) frame.
 	s.refreshSnapForInitialHydrateLocked(group)
 	err := group.eng.AddQueriesStream(specs, func(r engine.QueryResult) {
+		pc := toPositional(r.Changes)
 		streamW(req.ID, addQueriesStreamPartial{
 			QueryID:    r.QueryID,
-			Changes:    r.Changes,
+			Dict:       pc.Dict,
+			Rows:       pc.Rows,
 			ChunkIndex: r.ChunkIndex,
 			Final:      r.Final,
 			TimingMs:   r.TimingMs,
@@ -1676,7 +1681,9 @@ type driftRPCData struct {
 // shape).
 
 type advanceStreamPartial struct {
-	Changes    []engine.RowChange   `json:"changes"`
+	// Positional (rev 9) RowChange encoding — see positional.go.
+	Dict       []dictEntry          `json:"d,omitempty"`
+	Rows       [][]interface{}      `json:"r,omitempty"`
 	ChunkIndex int                  `json:"chunkIndex"`
 	Final      bool                 `json:"final"`
 	Timings    []engine.TableTiming `json:"timings,omitempty"`
@@ -1712,8 +1719,10 @@ func (s *Server) handleAdvanceStream(req RPCRequest, streamW streamWriter) RPCRe
 	}
 
 	err := group.eng.AdvanceStream(p.Changes, func(r engine.AdvanceStreamPartial) {
+		pc := toPositional(r.Changes)
 		streamW(req.ID, advanceStreamPartial{
-			Changes:    r.Changes,
+			Dict:       pc.Dict,
+			Rows:       pc.Rows,
 			ChunkIndex: r.ChunkIndex,
 			Final:      r.Final,
 			Timings:    r.Timings,
@@ -2050,6 +2059,7 @@ func handleConnection(conn net.Conn, server *Server) {
 //   - GO_IVM_GOMEMLIMIT=<bytes> — soft memory cap (debug.SetMemoryLimit). The
 //     principled high-throughput config: set this to the container budget and
 //     run a high/off GOGC so GC only fires near the cap.
+//
 // The standard GOGC env (already applied by the runtime) takes precedence when
 // GO_IVM_GOGC is unset, so existing deployments that tuned GOGC are unaffected.
 func tuneRuntime() {

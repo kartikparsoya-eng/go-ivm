@@ -323,7 +323,9 @@ func (s *Server) handleAdvanceToHead(req RPCRequest) RPCResponse {
 // handler emits a single Final frame carrying Reset + Version and the caller
 // re-hydrates at Version.
 type advanceToHeadStreamPartial struct {
-	Changes    []engine.RowChange   `json:"changes"`
+	// Positional (rev 9) RowChange encoding — see positional.go.
+	Dict       []dictEntry          `json:"d,omitempty"`
+	Rows       [][]interface{}      `json:"r,omitempty"`
 	ChunkIndex int                  `json:"chunkIndex"`
 	Final      bool                 `json:"final"`
 	Timings    []engine.TableTiming `json:"timings,omitempty"`
@@ -453,8 +455,10 @@ func (s *Server) handleAdvanceToHeadStream(req RPCRequest, streamW streamWriter)
 	// panic and returns nil) — the TS accumulator re-throws it as a DriftError.
 	numChanges := diff.Changes
 	streamErr := group.eng.AdvanceStream(snapChanges, func(r engine.AdvanceStreamPartial) {
+		pc := toPositional(r.Changes)
 		part := advanceToHeadStreamPartial{
-			Changes:    r.Changes,
+			Dict:       pc.Dict,
+			Rows:       pc.Rows,
 			ChunkIndex: r.ChunkIndex,
 			Final:      r.Final,
 			Timings:    r.Timings,

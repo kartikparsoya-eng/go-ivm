@@ -170,8 +170,8 @@ func TestAdvanceToHeadStream_DriveTruncateEmitsResetFrame(t *testing.T) {
 	if f.Version != "0000000002" {
 		t.Errorf("version = %q, want 0000000002", f.Version)
 	}
-	if len(f.Changes) != 0 {
-		t.Errorf("reset frame must carry no RowChanges, got %+v", f.Changes)
+	if len(f.Rows) != 0 {
+		t.Errorf("reset frame must carry no RowChanges, got %+v", f.Rows)
 	}
 }
 
@@ -248,7 +248,7 @@ func TestAdvanceToHeadStream_DriveReassembles(t *testing.T) {
 	// non-streaming RowChanges (one add of id=2 for q1).
 	var reassembled []engineRowChangeAlias
 	for _, f := range *frames {
-		for _, rc := range f.Changes {
+		for _, rc := range fromPositional(positionalChanges{Dict: f.Dict, Rows: f.Rows}) {
 			reassembled = append(reassembled, engineRowChangeAlias{rc.Type, rc.QueryID, rc.Table, rc.RowKey})
 		}
 	}
