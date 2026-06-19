@@ -143,11 +143,11 @@ func TestNormalizeRow(t *testing.T) {
 	// Mimic a row arriving from msgpack: numbers as float64, booleans as
 	// JSON-shaped 1/0 numbers. NormalizeRow must coerce to TS shapes.
 	row := ivm.Row{
-		"id":     int64(7),     // → float64 via "number"
-		"name":   "dave",       // → string (untouched)
+		"id":     int64(7), // → float64 via "number"
+		"name":   "dave",   // → string (untouched)
 		"score":  float64(42.5),
-		"active": int64(1), // → bool true via "boolean"
-		"junk":   "ignored",    // not in schema; left as-is
+		"active": int64(1),  // → bool true via "boolean"
+		"junk":   "ignored", // not in schema; left as-is
 	}
 	src.NormalizeRow(row)
 
@@ -854,6 +854,102 @@ func TestDestroyRemovesConnection(t *testing.T) {
 	src.mu.Unlock()
 	if after != 0 {
 		t.Fatalf("connections after destroy = %d, want 0", after)
+	}
+}
+
+// TestOnAdvanceEndSkipsRollbackWhenOverlaySet pins the Fix #4 TOCTOU guard.
+// RefreshSnapshot reads s.overlay WITHOUT holding s.mu, so a Push can install
+// the overlay in the window between that unlocked read and OnAdvanceEnd
+// acquiring the lock. If OnAdvanceEnd then rolls the prev tx and re-pins to
+// head, it tears the pre-Push snapshot that the in-flight fanout's downstream
+// Fetches read from. The guard (source.go: `if s.overlay != nil { return }`
+// after Lock) makes OnAdvanceEnd a no-op whenever an overlay is live.
+//
+// Observable: an externally-committed row that lands AFTER the pin must stay
+// invisible across OnAdvanceEnd. Without the guard, the roll+re-pin jumps the
+// snapshot to head and the row leaks in (Fetch returns 4 instead of 3).
+func TestOnAdvanceEndSkipsRollbackWhenOverlaySet(t *testing.T) {
+	path := seedTypedReplica(t)
+	db, err := Open(path, OpenOptions{})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+	wdb := openWritableForTest(t, path)
+	defer wdb.Close()
+	src, err := New(db, wdb, "users", userSchema(), []string{"id"})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer src.Close()
+	writer, err := sql.Open("sqlite3", path)
+	if err != nil {
+		t.Fatalf("writer: %v", err)
+	}
+	defer writer.Close()
+
+	in := src.Connect(nil, nil, nil)
+	in.SetOutput(&recordingOutput{})
+
+	// First Fetch pins the prev tx at the seeded 3 rows.
+	if got := len(in.Fetch(ivm.FetchRequest{})); got != 3 {
+		t.Fatalf("baseline = %d, want 3", got)
+	}
+	// External writer commits a 4th row AFTER the pin; a correctly pinned
+	// snapshot must not see it. This also proves the tx is actually pinned.
+	if _, err := writer.Exec("INSERT INTO users VALUES (10, 'eve', 100, 1)"); err != nil {
+		t.Fatalf("external insert: %v", err)
+	}
+	if got := len(in.Fetch(ivm.FetchRequest{})); got != 3 {
+		t.Fatalf("pre-overlay = %d, want 3 (tx still pinned)", got)
+	}
+
+	// Simulate the race: a Push set the overlay (under s.mu, exactly as
+	// genPushAndWrite does at source.go:667) and the engine's signalAdvanceEnd
+	// fires before the Push's fanout clears it.
+	src.mu.Lock()
+	src.overlay = &ivm.Overlay{
+		Epoch: src.pushEpoch + 1,
+		Change: ivm.MakeSourceChangeAdd(ivm.Row{
+			"id": float64(99), "name": "dave", "score": float64(50), "active": true,
+		}),
+	}
+	src.mu.Unlock()
+
+	src.OnAdvanceEnd()
+
+	// Clear the overlay the way the real Push would once fanout completes.
+	src.mu.Lock()
+	src.overlay = nil
+	src.mu.Unlock()
+
+	// The guard must have made OnAdvanceEnd a no-op: the prev tx is still the
+	// ORIGINAL pinned snapshot, so the Fetch still sees 3 — not the externally
+	// committed 4. Without the guard this returns 4 (the mid-push snapshot tear).
+	if got := len(in.Fetch(ivm.FetchRequest{})); got != 3 {
+		t.Fatalf("OnAdvanceEnd tore the pinned snapshot while overlay was live: Fetch = %d, want 3", got)
+	}
+}
+
+// TestCloseCancelsContext pins the Fix #5 lifecycle guarantee: Close cancels
+// the Source's context so an in-flight SQLite call (e.g. a Fetch blocked on a
+// WAL busy-wait) unblocks instead of leaking its goroutine past teardown.
+func TestCloseCancelsContext(t *testing.T) {
+	src, db := newUserSource(t)
+	defer db.Close()
+
+	if err := src.ctx.Err(); err != nil {
+		t.Fatalf("Source ctx canceled before Close: %v", err)
+	}
+	if err := src.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if src.ctx.Err() == nil {
+		t.Fatal("Close did not cancel the Source context")
+	}
+	// Idempotent: a second Close must not panic (double cancel is safe).
+	if err := src.Close(); err != nil {
+		t.Fatalf("second Close: %v", err)
 	}
 }
 
