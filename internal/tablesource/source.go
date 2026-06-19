@@ -41,6 +41,13 @@ import (
 
 // Source is the read-only TableSource leaf. One instance per (CG, table).
 type Source struct {
+	// ctx is derived from the CG's lifetime context. All SQLite calls use
+	// this rather than context.Background() so that CG teardown / sidecar
+	// shutdown can cancel blocked queries (e.g. WAL contention busy-wait)
+	// instead of leaking goroutines. cancel is called from Close().
+	ctx    context.Context
+	cancel context.CancelFunc
+
 	// db is the original read-only pool from `tablesource.Open`. Kept
 	// only for the initial `SELECT 1 FROM <table> LIMIT 0` table-presence
 	// probe in New() — the prev-tx path below uses writableDB exclusively.
@@ -155,6 +162,13 @@ type connection struct {
 // missing gets dropped silently from fetched rows. primaryKey must be
 // non-empty and every entry must be present in columns.
 func New(db *sql.DB, writableDB *sql.DB, tableName string, columns map[string]sqlite.ColumnSchema, primaryKey []string) (*Source, error) {
+	return NewWithContext(context.Background(), db, writableDB, tableName, columns, primaryKey)
+}
+
+// NewWithContext constructs a Source whose SQLite operations are cancellable
+// via the provided context. Use this when the caller owns a CG-scoped context
+// that should abort in-flight queries on teardown.
+func NewWithContext(parent context.Context, db *sql.DB, writableDB *sql.DB, tableName string, columns map[string]sqlite.ColumnSchema, primaryKey []string) (*Source, error) {
 	if db == nil {
 		return nil, fmt.Errorf("tablesource.New: db is nil")
 	}
@@ -249,7 +263,10 @@ func New(db *sql.DB, writableDB *sql.DB, tableName string, columns map[string]sq
 		strings.Join(pkConds, " AND "),
 	)
 
+	ctx, cancel := context.WithCancel(parent)
 	return &Source{
+		ctx:            ctx,
+		cancel:         cancel,
 		db:             db,
 		writableDB:     writableDB,
 		tableName:      tableName,
@@ -265,8 +282,10 @@ func New(db *sql.DB, writableDB *sql.DB, tableName string, columns map[string]sq
 }
 
 // Close rolls back the prev tx (if started) and releases the dedicated
-// conn back to the writable pool. Idempotent.
+// conn back to the writable pool. Idempotent. Also cancels the Source's
+// context so any in-flight SQLite calls unblock.
 func (s *Source) Close() error {
+	s.cancel()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.closeAllCachedStmtsLocked()
@@ -442,6 +461,13 @@ func (s *Source) OnAdvanceEnd() {
 	// Frame-coordinated: the Snapshotter drives the leapfrog (resetToHead on its
 	// own prev conn). This Source must NOT roll back or re-pin externalConn.
 	if s.externalConn != nil {
+		return
+	}
+	// Guard against TOCTOU race with RefreshSnapshot: overlay may have been set
+	// between RefreshSnapshot's unlock and this lock acquisition. Rolling back
+	// mid-push would violate the snapshot-consistency guarantee that downstream
+	// Fetches inside Output.Push depend on.
+	if s.overlay != nil {
 		return
 	}
 	if s.prevConn == nil || !s.prevTxStarted {
