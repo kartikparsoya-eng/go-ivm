@@ -37,11 +37,11 @@ const (
 
 // RowChange is the flat output format — one per affected row per query.
 type RowChange struct {
-	Type    int            `json:"type"`    // 0=add, 1=remove, 2=edit
-	QueryID string         `json:"queryID"`
-	Table   string         `json:"table"`
+	Type    int                    `json:"type"` // 0=add, 1=remove, 2=edit
+	QueryID string                 `json:"queryID"`
+	Table   string                 `json:"table"`
 	RowKey  map[string]interface{} `json:"rowKey"`
-	Row     ivm.Row        `json:"row,omitempty"` // nil for remove
+	Row     ivm.Row                `json:"row,omitempty"` // nil for remove
 }
 
 // Streamer accumulates IVM changes and flattens them to RowChanges.
@@ -117,6 +117,12 @@ func streamChanges(queryID string, schema *ivm.SourceSchema, changes []ivm.Chang
 		case ivm.ChangeTypeRemove:
 			streamNodesInto(&result, queryID, schema, RowChangeRemove, change.Node)
 		case ivm.ChangeTypeEdit:
+			// IsScalar guard — mirrors streamNodesInto's check (:180). Without
+			// this, an Edit on a pre-resolved scalar CSQ row is emitted while
+			// Add/Remove for the same schema are correctly suppressed.
+			if schema.IsScalar {
+				continue
+			}
 			// Edit: emit the new row only (no relationship recursion for edits)
 			rowKey := make(map[string]interface{}, len(schema.PrimaryKey))
 			for _, pk := range schema.PrimaryKey {

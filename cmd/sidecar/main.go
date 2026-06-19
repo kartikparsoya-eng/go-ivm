@@ -2175,6 +2175,12 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Shutdown context for background goroutines (metrics reporter, idle reaper).
+	// Cancelled by the SIGINT/SIGTERM handler so goroutines exit cleanly.
+	shutdownCtx, shutdownCancel := context.WithCancel(context.Background())
+	defer shutdownCancel()
+	var pprofServer *http.Server
+
 	// Optional pprof endpoint. Off by default — opens only when
 	// GO_IVM_PPROF_ADDR is set (e.g., "127.0.0.1:6060" in a sandbox or
 	// "0.0.0.0:6060" when the container exposes the port). Enabling block
@@ -2184,9 +2190,10 @@ func main() {
 	if addr := os.Getenv("GO_IVM_PPROF_ADDR"); addr != "" {
 		runtime.SetBlockProfileRate(1)
 		runtime.SetMutexProfileFraction(1)
+		pprofServer = &http.Server{Addr: addr, Handler: http.DefaultServeMux}
 		go func() {
 			fmt.Fprintf(os.Stderr, "[GO-IVM] pprof listening on %s\n", addr)
-			if err := http.ListenAndServe(addr, nil); err != nil {
+			if err := pprofServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 				fmt.Fprintf(os.Stderr, "[GO-IVM] pprof server exited: %v\n", err)
 			}
 		}()
@@ -2282,7 +2289,12 @@ func main() {
 		ticker := time.NewTicker(10 * time.Second)
 		defer ticker.Stop()
 		var lastWait int64
-		for range ticker.C {
+		for {
+			select {
+			case <-shutdownCtx.Done():
+				return
+			case <-ticker.C:
+			}
 			metrics.reportAndReset()
 			// Replica-pool pressure: WaitCount growth means goroutines are
 			// blocking on conn acquisition — the precursor to TS-side RPC
@@ -2316,10 +2328,15 @@ func main() {
 	go func() {
 		ticker := time.NewTicker(5 * time.Minute)
 		defer ticker.Stop()
-		for now := range ticker.C {
-			n := server.reapIdleGroups(now.Add(-groupIdleTimeout))
-			if n > 0 {
-				fmt.Fprintf(os.Stderr, "[GO-IVM] reaped %d idle client groups\n", n)
+		for {
+			select {
+			case <-shutdownCtx.Done():
+				return
+			case now := <-ticker.C:
+				n := server.reapIdleGroups(now.Add(-groupIdleTimeout))
+				if n > 0 {
+					fmt.Fprintf(os.Stderr, "[GO-IVM] reaped %d idle client groups\n", n)
+				}
 			}
 		}
 	}()
@@ -2330,6 +2347,10 @@ func main() {
 	go func() {
 		<-sig
 		fmt.Println("\nShutting down...")
+		shutdownCancel()
+		if pprofServer != nil {
+			pprofServer.Shutdown(context.Background())
+		}
 		server.closeAll()
 		listener.Close()
 		os.Remove(socketPath)

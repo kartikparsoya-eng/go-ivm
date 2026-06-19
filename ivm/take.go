@@ -54,15 +54,15 @@ const takeFlightRecorderSize = 32
 
 // takeEvent is one entry in Take's flight recorder ring buffer.
 type takeEvent struct {
-	op       string // "push-add", "push-rem", "push-edit", "set-state"
-	rowID    interface{}
-	rowSort  interface{} // primary sort-key value (e.g., updatedAt)
-	oldRowID interface{}
-	oldSort  interface{}
-	boundID  interface{}
+	op        string // "push-add", "push-rem", "push-edit", "set-state"
+	rowID     interface{}
+	rowSort   interface{} // primary sort-key value (e.g., updatedAt)
+	oldRowID  interface{}
+	oldSort   interface{}
+	boundID   interface{}
 	boundSort interface{}
-	size     int
-	cmpInfo  string // free-form annotation (oldCmp, newCmp values)
+	size      int
+	cmpInfo   string // free-form annotation (oldCmp, newCmp values)
 }
 
 func NewTake(input Input, storage TakeStorage, limit int, partitionKey PartitionKey) *Take {
@@ -147,7 +147,7 @@ func (t *Take) Fetch(req FetchRequest) []Node {
 
 // initialFetch — Source: take.ts line 158-216
 func (t *Take) initialFetch(req FetchRequest) []Node {
-	if t.limit == 0 {
+	if t.limit <= 0 {
 		return nil
 	}
 
@@ -374,26 +374,26 @@ func (t *Take) pushEditChange(change Change) []Change {
 			if t.limit == 1 {
 				return replaceBoundAndForwardChange()
 			}
-		var beforeBoundNode *Node
-		for _, node := range t.input.Fetch(FetchRequest{
-			Start:      &Start{Row: takeState.Bound, Basis: "after"},
-			Constraint: constraint,
-			Reverse:    true,
-		}) {
-			n := node
-			beforeBoundNode = &n
-			break
-		}
-		if beforeBoundNode == nil {
-			// Match TS take.ts:502-505 assertion: at this point (oldCmp==0,
-			// newCmp<0, size>1) there must be a row before the bound. If we
-			// reach here something is wrong with bound tracking — panic loudly
-			// rather than silently fall back, so divergence surfaces.
-			// (Porting review HIGH-3.)
-			panic("Take.pushEditChange: beforeBoundNode must be found when oldCmp==0, newCmp<0, size>1")
-		}
-		t.setTakeState(takeStateKey, takeState.Size, beforeBoundNode.Row, maxBound)
-		return t.output.Push(change, t)
+			var beforeBoundNode *Node
+			for _, node := range t.input.Fetch(FetchRequest{
+				Start:      &Start{Row: takeState.Bound, Basis: "after"},
+				Constraint: constraint,
+				Reverse:    true,
+			}) {
+				n := node
+				beforeBoundNode = &n
+				break
+			}
+			if beforeBoundNode == nil {
+				// Match TS take.ts:502-505 assertion: at this point (oldCmp==0,
+				// newCmp<0, size>1) there must be a row before the bound. If we
+				// reach here something is wrong with bound tracking — panic loudly
+				// rather than silently fall back, so divergence surfaces.
+				// (Porting review HIGH-3.)
+				panic("Take.pushEditChange: beforeBoundNode must be found when oldCmp==0, newCmp<0, size>1")
+			}
+			t.setTakeState(takeStateKey, takeState.Size, beforeBoundNode.Row, maxBound)
+			return t.output.Push(change, t)
 		}
 
 		// newCmp > 0
@@ -656,7 +656,12 @@ func GetTakeStateKey(partitionKey PartitionKey, rowOrConstraint Row) string {
 			values = append(values, rowOrConstraint[key])
 		}
 	}
-	b, _ := json.Marshal(values)
+	b, err := json.Marshal(values)
+	if err != nil {
+		// Unreachable for scalar partition-key values; panic to surface the
+		// impossible rather than silently collide cache keys.
+		panic("GetTakeStateKey: json.Marshal: " + err.Error())
+	}
 	return string(b)
 }
 

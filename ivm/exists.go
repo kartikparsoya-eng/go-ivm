@@ -190,13 +190,14 @@ func (e *Exists) Push(change Change, pusher InputBase) []Change {
 					Relationships: withChildRels,
 				}), e)
 			}
-		existsVal := size > 0
-		return e.pushWithFilter(change, &existsVal)
+			existsVal := size > 0
+			return e.pushWithFilter(change, &existsVal)
 		default:
 			panic("Exists pushChild: unreachable child change type")
 		}
+	default:
+		panic("Exists.Push: unreachable change type")
 	}
-	return nil
 }
 
 // filterWithExists — applies the exists/not-exists logic.
@@ -218,7 +219,12 @@ func (e *Exists) getCacheKey(node Node, key CompoundKey) string {
 			values[i] = v
 		}
 	}
-	b, _ := json.Marshal(values)
+	b, err := json.Marshal(values)
+	if err != nil {
+		// Unreachable for scalar join-key values; panic to surface the
+		// impossible rather than silently collide cache keys.
+		panic("getCacheKey: json.Marshal: " + err.Error())
+	}
 	return string(b)
 }
 
