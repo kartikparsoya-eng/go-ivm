@@ -16,7 +16,9 @@ const (
 )
 
 // Source is the interface for a table data source.
-// In production this is *sqlite.TableSource.
+// In production this is the engine's leaf source — the in-memory
+// MemorySource (ModeMemory) or a SQLite-backed tablesource.Source
+// (ModeTable).
 type Source interface {
 	Connect(opts ConnectOptions) ivm.Input
 	PrimaryKey() []string

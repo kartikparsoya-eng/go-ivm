@@ -25,10 +25,10 @@ import "fmt"
 //   - Therefore the engine can drop the streamer's accumulated changes
 //     without leaving dangling references to half-applied state.
 type DriftError struct {
-	Table    string           `json:"table"`             // source table whose row was missing
-	Op       string           `json:"op"`                // "Add" (duplicate), "Edit", or "Remove"
-	PK       map[string]Value `json:"pk"`                // primary-key columns of the offending row
-	HasCount int              `json:"hasCount"`          // current source row count (for log diagnostics)
+	Table    string           `json:"table"`    // source table whose row was missing
+	Op       string           `json:"op"`       // "Add" (duplicate), "Edit", or "Remove"
+	PK       map[string]Value `json:"pk"`       // primary-key columns of the offending row
+	HasCount int              `json:"hasCount"` // current source row count (for log diagnostics)
 }
 
 func (e *DriftError) Error() string {
@@ -36,12 +36,4 @@ func (e *DriftError) Error() string {
 		"source drift: table=%s op=%s pk=%v has_count=%d",
 		e.Table, e.Op, e.PK, e.HasCount,
 	)
-}
-
-// IsDriftError reports whether `v` (typically a value recovered from a
-// panic) is a *DriftError signal. Lets engine code branch cleanly between
-// drift recovery and re-panicking on programmer errors.
-func IsDriftError(v interface{}) bool {
-	_, ok := v.(*DriftError)
-	return ok
 }

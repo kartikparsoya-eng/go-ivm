@@ -1,11 +1,11 @@
 // Package tablesource is the read-only TableSource port from TS.
 //
-// PHASE 0 (this commit): package scaffolding + mode flag only. The sidecar
-// reads GO_IVM_SOURCE_MODE at startup; "table" is recognized but not yet
-// implemented and falls back to memory with a clear log line. No behavior
-// change for any caller.
+// The sidecar reads GO_IVM_SOURCE_MODE at startup. "table" selects the
+// SQLite-backed Source (this package), which reads the replica directly;
+// any other value falls back to the in-memory MemorySource. Both modes
+// are fully wired in cmd/sidecar.
 //
-// See DESIGN-tablesource-port.md for the phased plan.
+// See DESIGN-tablesource-port.md for the original phased plan.
 package tablesource
 
 import "os"
@@ -18,8 +18,8 @@ const (
 	// Default and current production behavior.
 	ModeMemory Mode = iota
 
-	// ModeTable will (Phase 3+) use a SQLite-backed TableSource reading the
-	// replica directly. Recognized today but not yet wired.
+	// ModeTable uses a SQLite-backed tablesource.Source reading the replica
+	// directly, constructed per (cg, table) in cmd/sidecar.
 	ModeTable
 )
 

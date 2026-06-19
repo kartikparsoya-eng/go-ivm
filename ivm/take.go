@@ -764,6 +764,3 @@ func (t *Take) debugf(format string, args ...interface{}) {
 	msg := fmt.Sprintf(format, args...)
 	fmt.Fprintf(os.Stderr, "[TAKE-DEBUG][%s] limit=%d %s\n", t.DebugLabel, t.limit, msg)
 }
-
-// Ensure unused import doesn't cause issues
-var _ = fmt.Sprintf
