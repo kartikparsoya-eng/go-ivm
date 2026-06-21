@@ -59,7 +59,7 @@ func main() {
 	}
 
 	// Probe 1: full channel scan (no filter, no constraint). Should return 4.
-	chanIn := chanSrc.Connect(ivm.Ordering{{"id", "asc"}}, nil, nil)
+	chanIn := chanSrc.Connect(ivm.Ordering{{"id", "asc"}}, nil, nil, nil)
 	chanNodes := chanIn.Fetch(ivm.FetchRequest{})
 	fmt.Printf("Probe 1: channel_count=%d\n", len(chanNodes))
 	for _, n := range chanNodes {
@@ -75,7 +75,7 @@ func main() {
 		v, _ := row["userId"].(string)
 		return v == targetUser
 	}
-	cpIn := cpSrc.Connect(ivm.Ordering{{"id", "asc"}}, filter, map[string]bool{"channelId": true})
+	cpIn := cpSrc.Connect(ivm.Ordering{{"id", "asc"}}, nil, filter, map[string]bool{"channelId": true})
 	cpNodes := cpIn.Fetch(ivm.FetchRequest{})
 	fmt.Printf("\nProbe 2: channel_participants_count_after_filter=%d (filter: userId=%s)\n", len(cpNodes), targetUser)
 	for _, n := range cpNodes {

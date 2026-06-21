@@ -36,6 +36,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/kartikparsoya-eng/go-ivm/builder"
 	"github.com/kartikparsoya-eng/go-ivm/ivm"
 	"github.com/kartikparsoya-eng/go-ivm/sqlite"
 )
@@ -145,6 +146,7 @@ type connection struct {
 	splitEditKeys   map[string]bool
 	compareRows     ivm.Comparator
 	filterPredicate func(ivm.Row) bool
+	filterCondition *sqlite.Condition
 
 	// Set by SetOutput once the operator above us wires its receiver.
 	output ivm.Output
@@ -556,6 +558,7 @@ func (s *Source) NormalizeRow(row ivm.Row) {
 // Connect registers a new pipeline connection.
 func (s *Source) Connect(
 	sort ivm.Ordering,
+	filter *builder.Condition,
 	filterPredicate func(ivm.Row) bool,
 	splitEditKeys map[string]bool,
 ) ivm.Input {
@@ -574,6 +577,7 @@ func (s *Source) Connect(
 		splitEditKeys:   splitEditKeys,
 		compareRows:     cmp,
 		filterPredicate: filterPredicate,
+		filterCondition: s.convertFilter(filter),
 	}
 	schema := &ivm.SourceSchema{
 		TableName:     s.tableName,
@@ -988,7 +992,7 @@ func (s *Source) fetchForConn(req ivm.FetchRequest, conn *connection) []ivm.Node
 		s.tableName,
 		s.columns,
 		req.Constraint,
-		nil, // filter pushdown unused — we have only the Go predicate
+		conn.filterCondition,
 		order,
 		req.Reverse,
 		req.Start,
@@ -1143,6 +1147,85 @@ func (s *Source) fetchForConn(req ivm.FetchRequest, conn *connection) []ivm.Node
 		s.tableName, len(out),
 		float64(time.Since(start).Microseconds())/1000.0)
 	return out
+}
+
+// convertFilter converts a builder.Condition (AST-level) to a sqlite.Condition
+// for SQL pushdown. Sets ColType on literal sides from the column side's schema
+// so ToSQLiteType can handle booleans (true→1, false→0) and JSON marshalling.
+func (s *Source) convertFilter(cond *builder.Condition) *sqlite.Condition {
+	if cond == nil {
+		return nil
+	}
+	switch cond.Type {
+	case "simple":
+		return s.convertSimpleCondition(cond)
+	case "and":
+		if len(cond.Conditions) == 0 {
+			return nil
+		}
+		out := &sqlite.Condition{Type: "and"}
+		for i := range cond.Conditions {
+			child := s.convertFilter(&cond.Conditions[i])
+			if child != nil {
+				out.Conditions = append(out.Conditions, child)
+			}
+		}
+		if len(out.Conditions) == 0 {
+			return nil
+		}
+		return out
+	case "or":
+		if len(cond.Conditions) == 0 {
+			return nil
+		}
+		out := &sqlite.Condition{Type: "or"}
+		for i := range cond.Conditions {
+			child := s.convertFilter(&cond.Conditions[i])
+			if child != nil {
+				out.Conditions = append(out.Conditions, child)
+			}
+		}
+		if len(out.Conditions) == 0 {
+			return nil
+		}
+		return out
+	}
+	return nil
+}
+
+func (s *Source) convertSimpleCondition(cond *builder.Condition) *sqlite.Condition {
+	out := &sqlite.Condition{
+		Type: "simple",
+		Op:   cond.Op,
+	}
+	out.Left = s.convertValuePos(cond.Left)
+	out.Right = s.convertValuePos(cond.Right)
+	if cond.Left != nil && cond.Left.Type == "column" {
+		if cs, ok := s.columns[cond.Left.Name]; ok {
+			if out.Right.Type == "literal" {
+				out.Right.ColType = cs.Type
+			}
+		}
+	}
+	if cond.Right != nil && cond.Right.Type == "column" {
+		if cs, ok := s.columns[cond.Right.Name]; ok {
+			if out.Left.Type == "literal" {
+				out.Left.ColType = cs.Type
+			}
+		}
+	}
+	return out
+}
+
+func (s *Source) convertValuePos(vp *builder.ValuePos) sqlite.ValuePos {
+	if vp == nil {
+		return sqlite.ValuePos{}
+	}
+	return sqlite.ValuePos{
+		Type:  vp.Type,
+		Name:  vp.Name,
+		Value: vp.Value,
+	}
 }
 
 // quoteIdent escapes a SQL identifier (table or column name) by doubling

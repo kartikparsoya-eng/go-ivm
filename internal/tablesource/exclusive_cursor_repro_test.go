@@ -26,7 +26,7 @@ func TestExclusiveCursorPartialBound_FetchPath(t *testing.T) {
 
 	// (a) Source.Fetch directly with the Start that Skip.getStart synthesizes
 	//     for a partial exclusive bound: Basis="after", Row={score:90}.
-	in := src.Connect(sort, nil, nil)
+	in := src.Connect(sort, nil, nil, nil)
 	direct := in.Fetch(ivm.FetchRequest{
 		Start: &ivm.Start{Row: ivm.Row{"score": float64(90)}, Basis: "after"},
 	})
@@ -36,7 +36,7 @@ func TestExclusiveCursorPartialBound_FetchPath(t *testing.T) {
 	}
 
 	// (b) Full Skip path (what the pipeline actually builds).
-	in2 := src.Connect(sort, nil, nil)
+	in2 := src.Connect(sort, nil, nil, nil)
 	skip := ivm.NewSkip(in2, ivm.Bound{
 		Row:       ivm.Row{"score": float64(90)},
 		Exclusive: true,
@@ -121,7 +121,7 @@ func TestExclusiveCursorPartialBound_OptionalPK(t *testing.T) {
 
 	// Partial cursor: only createdAt specified, exclusive (basis "after").
 	// Should return rows STRICTLY AFTER createdAt=500 → conv-c (600) and conv-d (700).
-	in := src.Connect(sort, nil, nil)
+	in := src.Connect(sort, nil, nil, nil)
 	nodes := in.Fetch(ivm.FetchRequest{
 		Start: &ivm.Start{Row: ivm.Row{"createdAt": float64(500)}, Basis: "after"},
 	})
@@ -137,7 +137,7 @@ func TestExclusiveCursorPartialBound_OptionalPK(t *testing.T) {
 	}
 
 	// Also test via Skip (the actual pipeline path)
-	in2 := src.Connect(sort, nil, nil)
+	in2 := src.Connect(sort, nil, nil, nil)
 	skip := ivm.NewSkip(in2, ivm.Bound{
 		Row:       ivm.Row{"createdAt": float64(500)},
 		Exclusive: true,
@@ -153,7 +153,7 @@ func TestExclusiveCursorPartialBound_OptionalPK(t *testing.T) {
 	}
 
 	// Test inclusive (basis "at") with partial cursor — should include the boundary row
-	in3 := src.Connect(sort, nil, nil)
+	in3 := src.Connect(sort, nil, nil, nil)
 	nodesAt := in3.Fetch(ivm.FetchRequest{
 		Start: &ivm.Start{Row: ivm.Row{"createdAt": float64(500)}, Basis: "at"},
 	})

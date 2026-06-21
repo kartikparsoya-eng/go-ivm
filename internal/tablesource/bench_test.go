@@ -207,7 +207,7 @@ func BenchmarkSourceFetchRepeated(b *testing.B) {
 		b.Fatalf("New: %v", err)
 	}
 	defer src.Close()
-	in := src.Connect(nil, nil, nil)
+	in := src.Connect(nil, nil, nil, nil)
 
 	// Sweep fetch sizes: the prepared-statement cache eliminates a CONSTANT
 	// per-fetch sqlite3_prepare_v2, so its relative win grows as the per-row

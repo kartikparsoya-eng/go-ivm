@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kartikparsoya-eng/go-ivm/builder"
 	"github.com/kartikparsoya-eng/go-ivm/ivm"
 )
 
@@ -20,8 +21,8 @@ type blockingSource struct {
 func (b *blockingSource) TableName() string                  { return b.inner.TableName() }
 func (b *blockingSource) PrimaryKey() []string               { return b.inner.PrimaryKey() }
 func (b *blockingSource) NormalizeRow(r ivm.Row)             { b.inner.NormalizeRow(r) }
-func (b *blockingSource) Connect(sort ivm.Ordering, fp func(ivm.Row) bool, sek map[string]bool) ivm.Input {
-	return b.inner.Connect(sort, fp, sek)
+func (b *blockingSource) Connect(sort ivm.Ordering, filter *builder.Condition, fp func(ivm.Row) bool, sek map[string]bool) ivm.Input {
+	return b.inner.Connect(sort, filter, fp, sek)
 }
 func (b *blockingSource) Push(c ivm.SourceChange) []ivm.Change {
 	<-b.gate

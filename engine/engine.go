@@ -55,7 +55,7 @@ type Source interface {
 	PrimaryKey() []string
 	NormalizeRow(ivm.Row)
 	Push(ivm.SourceChange) []ivm.Change
-	Connect(sort ivm.Ordering, filterPredicate func(ivm.Row) bool, splitEditKeys map[string]bool) ivm.Input
+	Connect(sort ivm.Ordering, filter *builder.Condition, filterPredicate func(ivm.Row) bool, splitEditKeys map[string]bool) ivm.Input
 	Close() error
 }
 
@@ -68,7 +68,7 @@ func (a *memorySourceAdapter) TableName() string      { return a.ms.TableName() 
 func (a *memorySourceAdapter) PrimaryKey() []string   { return a.ms.PrimaryKey() }
 func (a *memorySourceAdapter) NormalizeRow(row ivm.Row) { a.ms.NormalizeRow(row) }
 func (a *memorySourceAdapter) Push(sc ivm.SourceChange) []ivm.Change { return a.ms.Push(sc) }
-func (a *memorySourceAdapter) Connect(sort ivm.Ordering, filterPredicate func(ivm.Row) bool, splitEditKeys map[string]bool) ivm.Input {
+func (a *memorySourceAdapter) Connect(sort ivm.Ordering, filter *builder.Condition, filterPredicate func(ivm.Row) bool, splitEditKeys map[string]bool) ivm.Input {
 	return a.ms.Connect(sort, filterPredicate, splitEditKeys)
 }
 
@@ -1472,7 +1472,7 @@ type engineSource struct {
 }
 
 func (es *engineSource) Connect(opts builder.ConnectOptions) ivm.Input {
-	return es.source.Connect(opts.Sort, opts.FilterPredicate, opts.SplitEditKeys)
+	return es.source.Connect(opts.Sort, opts.Filter, opts.FilterPredicate, opts.SplitEditKeys)
 }
 
 func (es *engineSource) PrimaryKey() []string {

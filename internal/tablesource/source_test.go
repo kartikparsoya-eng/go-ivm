@@ -169,7 +169,7 @@ func TestFetchDefaultOrderingByPK(t *testing.T) {
 	src, db := newUserSource(t)
 	defer db.Close()
 
-	in := src.Connect(nil, nil, nil)
+	in := src.Connect(nil, nil, nil, nil)
 	nodes := in.Fetch(ivm.FetchRequest{})
 	if len(nodes) != 3 {
 		t.Fatalf("got %d rows, want 3", len(nodes))
@@ -186,7 +186,7 @@ func TestFetchExplicitSortDesc(t *testing.T) {
 	src, db := newUserSource(t)
 	defer db.Close()
 
-	in := src.Connect(ivm.Ordering{{"score", "desc"}, {"id", "asc"}}, nil, nil)
+	in := src.Connect(ivm.Ordering{{"score", "desc"}, {"id", "asc"}}, nil, nil, nil)
 	nodes := in.Fetch(ivm.FetchRequest{})
 	wantIDs := []float64{1, 2, 3} // scores 90, 80, 70
 	if len(nodes) != 3 {
@@ -203,7 +203,7 @@ func TestFetchReverseFlipsDirection(t *testing.T) {
 	src, db := newUserSource(t)
 	defer db.Close()
 
-	in := src.Connect(nil, nil, nil)
+	in := src.Connect(nil, nil, nil, nil)
 	nodes := in.Fetch(ivm.FetchRequest{Reverse: true})
 	wantIDs := []float64{3, 2, 1}
 	if len(nodes) != 3 {
@@ -221,7 +221,7 @@ func TestFetchFilterPredicate(t *testing.T) {
 	defer db.Close()
 
 	// Only active=true users.
-	in := src.Connect(nil, func(r ivm.Row) bool {
+	in := src.Connect(nil, nil, func(r ivm.Row) bool {
 		v, _ := r["active"].(bool)
 		return v
 	}, nil)
@@ -258,7 +258,7 @@ func TestFetchLimitPushdown(t *testing.T) {
 	// filtered id=1 sits FIRST in id order — a correct limit must skip it
 	// without spending budget, returning id=2 as the first row.
 	pred := func(r ivm.Row) bool { s, _ := r["score"].(float64); return s <= 80 }
-	in := src.Connect(nil, pred, nil)
+	in := src.Connect(nil, nil, pred, nil)
 
 	cases := []struct {
 		name string
@@ -295,7 +295,7 @@ func TestPushFanoutAddToConnection(t *testing.T) {
 	src, db := newUserSource(t)
 	defer db.Close()
 
-	in := src.Connect(nil, nil, nil)
+	in := src.Connect(nil, nil, nil, nil)
 	rec := &recordingOutput{}
 	in.SetOutput(rec)
 
@@ -324,7 +324,7 @@ func TestPushDriftOnDuplicateAdd(t *testing.T) {
 	src, db := newUserSource(t)
 	defer db.Close()
 
-	in := src.Connect(nil, nil, nil)
+	in := src.Connect(nil, nil, nil, nil)
 	rec := &recordingOutput{}
 	in.SetOutput(rec)
 
@@ -356,7 +356,7 @@ func TestPushDriftOnRemoveMissing(t *testing.T) {
 	src, db := newUserSource(t)
 	defer db.Close()
 
-	in := src.Connect(nil, nil, nil)
+	in := src.Connect(nil, nil, nil, nil)
 	rec := &recordingOutput{}
 	in.SetOutput(rec)
 
@@ -383,7 +383,7 @@ func TestPushFilterDropsRow(t *testing.T) {
 	src, db := newUserSource(t)
 	defer db.Close()
 
-	in := src.Connect(nil, func(r ivm.Row) bool { v, _ := r["active"].(bool); return v }, nil)
+	in := src.Connect(nil, nil, func(r ivm.Row) bool { v, _ := r["active"].(bool); return v }, nil)
 	rec := &recordingOutput{}
 	in.SetOutput(rec)
 
@@ -400,7 +400,7 @@ func TestPushEditFilterTransitionEmitsRemove(t *testing.T) {
 	src, db := newUserSource(t)
 	defer db.Close()
 
-	in := src.Connect(nil, func(r ivm.Row) bool { v, _ := r["active"].(bool); return v }, nil)
+	in := src.Connect(nil, nil, func(r ivm.Row) bool { v, _ := r["active"].(bool); return v }, nil)
 	rec := &recordingOutput{}
 	in.SetOutput(rec)
 
@@ -422,7 +422,7 @@ func TestPushEditFilterTransitionEmitsAdd(t *testing.T) {
 	src, db := newUserSource(t)
 	defer db.Close()
 
-	in := src.Connect(nil, func(r ivm.Row) bool { v, _ := r["active"].(bool); return v }, nil)
+	in := src.Connect(nil, nil, func(r ivm.Row) bool { v, _ := r["active"].(bool); return v }, nil)
 	rec := &recordingOutput{}
 	in.SetOutput(rec)
 
@@ -445,7 +445,7 @@ func TestPushSplitEditEmitsRemoveAdd(t *testing.T) {
 	defer db.Close()
 
 	splitKeys := map[string]bool{"score": true}
-	in := src.Connect(nil, nil, splitKeys)
+	in := src.Connect(nil, nil, nil, splitKeys)
 	rec := &recordingOutput{}
 	in.SetOutput(rec)
 
@@ -508,7 +508,7 @@ func TestPrevTxAppliesWritesAndRollback(t *testing.T) {
 	}
 	defer src.Close()
 
-	in := src.Connect(nil, nil, nil)
+	in := src.Connect(nil, nil, nil, nil)
 	in.SetOutput(&recordingOutput{})
 
 	// Step 1: first Fetch starts the prev tx (3 seeded rows).
@@ -575,7 +575,7 @@ func TestRefreshSnapshotRollsTx(t *testing.T) {
 	}
 	defer writer.Close()
 
-	in := src.Connect(nil, nil, nil)
+	in := src.Connect(nil, nil, nil, nil)
 	in.SetOutput(&recordingOutput{})
 
 	// First Fetch pins tx at the seeded 3 rows.
@@ -613,7 +613,7 @@ func TestRefreshSnapshotNoOpDuringPush(t *testing.T) {
 		t.Skip("requires libsqlite3 build with SQLITE_ENABLE_SNAPSHOT — fallback path skips overlay by design")
 	}
 
-	in := src.Connect(nil, nil, nil)
+	in := src.Connect(nil, nil, nil, nil)
 	probe := &refreshDuringPushOutput{src: src, in: in}
 	in.SetOutput(probe)
 
@@ -659,7 +659,7 @@ func TestOverlayVisibleDuringPush(t *testing.T) {
 		t.Skip("requires libsqlite3 build with SQLITE_ENABLE_SNAPSHOT — fallback path skips overlay by design")
 	}
 
-	in := src.Connect(nil, nil, nil)
+	in := src.Connect(nil, nil, nil, nil)
 	probe := &overlayProbingOutput{in: in}
 	in.SetOutput(probe)
 
@@ -684,7 +684,7 @@ func TestFetchConstraintEquality(t *testing.T) {
 	src, db := newUserSource(t)
 	defer db.Close()
 
-	in := src.Connect(nil, nil, nil)
+	in := src.Connect(nil, nil, nil, nil)
 	c := ivm.Constraint{"id": float64(2)}
 	nodes := in.Fetch(ivm.FetchRequest{Constraint: &c})
 	if len(nodes) != 1 {
@@ -699,7 +699,7 @@ func TestFetchConstraintMultiKey(t *testing.T) {
 	src, db := newUserSource(t)
 	defer db.Close()
 
-	in := src.Connect(nil, nil, nil)
+	in := src.Connect(nil, nil, nil, nil)
 	// score=80 AND active=false → only bob
 	c := ivm.Constraint{"score": float64(80), "active": false}
 	nodes := in.Fetch(ivm.FetchRequest{Constraint: &c})
@@ -715,7 +715,7 @@ func TestFetchConstraintNoMatch(t *testing.T) {
 	src, db := newUserSource(t)
 	defer db.Close()
 
-	in := src.Connect(nil, nil, nil)
+	in := src.Connect(nil, nil, nil, nil)
 	c := ivm.Constraint{"id": float64(999)}
 	nodes := in.Fetch(ivm.FetchRequest{Constraint: &c})
 	if len(nodes) != 0 {
@@ -730,6 +730,7 @@ func TestFetchConstraintWithFilterAndSort(t *testing.T) {
 	// active=true users (cuts bob), sorted DESC by score → carol then alice
 	in := src.Connect(
 		ivm.Ordering{{"score", "asc"}},
+		nil,
 		func(r ivm.Row) bool { v, _ := r["active"].(bool); return v },
 		nil,
 	)
@@ -751,7 +752,7 @@ func TestFetchStartAtInclusive(t *testing.T) {
 	defer db.Close()
 
 	// PK ASC, cursor at id=2 "at" basis → rows from 2 onward, inclusive.
-	in := src.Connect(nil, nil, nil)
+	in := src.Connect(nil, nil, nil, nil)
 	nodes := in.Fetch(ivm.FetchRequest{
 		Start: &ivm.Start{Row: ivm.Row{"id": float64(2)}, Basis: "at"},
 	})
@@ -771,7 +772,7 @@ func TestFetchStartAfterExclusive(t *testing.T) {
 	defer db.Close()
 
 	// PK ASC, cursor at id=2 "after" → only id=3.
-	in := src.Connect(nil, nil, nil)
+	in := src.Connect(nil, nil, nil, nil)
 	nodes := in.Fetch(ivm.FetchRequest{
 		Start: &ivm.Start{Row: ivm.Row{"id": float64(2)}, Basis: "after"},
 	})
@@ -786,7 +787,7 @@ func TestFetchStartReverseFromTop(t *testing.T) {
 
 	// PK ASC + Reverse → effective DESC.
 	// Cursor at id=2 "after" in DESC direction = strictly less than 2 = id=1.
-	in := src.Connect(nil, nil, nil)
+	in := src.Connect(nil, nil, nil, nil)
 	nodes := in.Fetch(ivm.FetchRequest{
 		Start:   &ivm.Start{Row: ivm.Row{"id": float64(2)}, Basis: "after"},
 		Reverse: true,
@@ -804,7 +805,7 @@ func TestFetchStartMultiColumnOrder(t *testing.T) {
 	// Cursor at (score=80, id=2) "after" → (90, 1) only.
 	in := src.Connect(
 		ivm.Ordering{{"score", "asc"}, {"id", "asc"}},
-		nil, nil,
+		nil, nil, nil,
 	)
 	nodes := in.Fetch(ivm.FetchRequest{
 		Start: &ivm.Start{
@@ -823,7 +824,7 @@ func TestFetchStartCombinedWithConstraintAndFilter(t *testing.T) {
 
 	// active=true rows: id=1 (score 90), id=3 (score 70).
 	// PK ASC, cursor id=1 "after" → id=3 only.
-	in := src.Connect(nil, func(r ivm.Row) bool {
+	in := src.Connect(nil, nil, func(r ivm.Row) bool {
 		v, _ := r["active"].(bool)
 		return v
 	}, nil)
@@ -841,7 +842,7 @@ func TestDestroyRemovesConnection(t *testing.T) {
 	src, db := newUserSource(t)
 	defer db.Close()
 
-	in := src.Connect(nil, nil, nil)
+	in := src.Connect(nil, nil, nil, nil)
 	src.mu.Lock()
 	before := len(src.connections)
 	src.mu.Unlock()
@@ -888,7 +889,7 @@ func TestOnAdvanceEndSkipsRollbackWhenOverlaySet(t *testing.T) {
 	}
 	defer writer.Close()
 
-	in := src.Connect(nil, nil, nil)
+	in := src.Connect(nil, nil, nil, nil)
 	in.SetOutput(&recordingOutput{})
 
 	// First Fetch pins the prev tx at the seeded 3 rows.
