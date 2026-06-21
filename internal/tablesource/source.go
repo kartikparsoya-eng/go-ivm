@@ -31,6 +31,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -38,6 +39,8 @@ import (
 	"github.com/kartikparsoya-eng/go-ivm/ivm"
 	"github.com/kartikparsoya-eng/go-ivm/sqlite"
 )
+
+var explainedSQLs sync.Map
 
 // Source is the read-only TableSource leaf. One instance per (CG, table).
 type Source struct {
@@ -966,6 +969,7 @@ func (s *Source) disconnect(c *connection) {
 func (s *Source) fetchForConn(req ivm.FetchRequest, conn *connection) []ivm.Node {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	start := time.Now()
 
 	if err := s.ensurePrevTxLocked(); err != nil {
 		panic(fmt.Sprintf("tablesource.Source.Fetch %s: ensurePrevTx: %v", s.tableName, err))
@@ -1001,6 +1005,22 @@ func (s *Source) fetchForConn(req ivm.FetchRequest, conn *connection) []ivm.Node
 	if err != nil {
 		panic(fmt.Sprintf("tablesource.Source.Fetch %s: prepare: %v\nSQL: %s",
 			s.tableName, err, q.SQL))
+	}
+	if _, ok := explainedSQLs.Load(q.SQL); !ok {
+		explainedSQLs.Store(q.SQL, struct{}{})
+		if epRows, epErr := dbConn.QueryContext(ctx, "EXPLAIN QUERY PLAN "+q.SQL, q.Params...); epErr == nil {
+			var lines []string
+			for epRows.Next() {
+				var id, parent, notused int
+				var detail string
+				if err := epRows.Scan(&id, &parent, &notused, &detail); err == nil {
+					lines = append(lines, detail)
+				}
+			}
+			epRows.Close()
+			fmt.Fprintf(os.Stderr, "[GO-IVM][FETCH-PLAN] table=%s sql=%s plan=%s\n",
+				s.tableName, q.SQL, strings.Join(lines, " | "))
+		}
 	}
 	rows, err := stmt.QueryContext(ctx, q.Params...)
 	if err != nil {
@@ -1119,6 +1139,9 @@ func (s *Source) fetchForConn(req ivm.FetchRequest, conn *connection) []ivm.Node
 			out = filtered
 		}
 	}
+	fmt.Fprintf(os.Stderr, "[GO-IVM][FETCH-TIMING] table=%s rows=%d ms=%.1f\n",
+		s.tableName, len(out),
+		float64(time.Since(start).Microseconds())/1000.0)
 	return out
 }
 
