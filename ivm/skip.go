@@ -101,6 +101,13 @@ func (s *Skip) Fetch(req FetchRequest) []Node {
 		Start:      start, // may be nil (undefined) for reverse — means no start override
 		Reverse:    req.Reverse,
 	}
+	// Forward Limit in the forward case only. In reverse, Skip's
+	// shouldBePresent post-filter can discard rows, so forwarding
+	// Limit to Source risks under-fetch (Source returns N rows, Skip
+	// discards some, Take sets takeState with fewer than N — wrong bound).
+	if !req.Reverse {
+		newReq.Limit = req.Limit
+	}
 	nodes := s.input.Fetch(newReq)
 
 	if !req.Reverse {

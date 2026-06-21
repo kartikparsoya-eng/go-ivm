@@ -71,14 +71,28 @@ func (fs *FilterStart) Push(change Change, pusher InputBase) []Change {
 }
 
 // Fetch — filters nodes from upstream through the filter chain.
+//
+// Limit handling: Filter is non-transparent (it can drop rows), so it
+// MUST NOT forward req.Limit to upstream — the source would truncate
+// before Filter runs, causing an under-fetch. Instead, Filter strips
+// Limit from the upstream request and enforces early termination in its
+// own loop: once len(result) >= req.Limit, it breaks. This matches TS's
+// lazy-generator behavior where Take's break propagates through Filter,
+// stopping the EXISTS predicate from running on the entire upstream result.
 func (fs *FilterStart) Fetch(req FetchRequest) []Node {
 	fs.output.BeginFilter()
 	defer fs.output.EndFilter()
 
+	upstreamReq := req
+	upstreamReq.Limit = 0
+
 	var result []Node
-	for _, node := range fs.input.Fetch(req) {
+	for _, node := range fs.input.Fetch(upstreamReq) {
 		if fs.output.Filter(node) {
 			result = append(result, node)
+			if req.Limit > 0 && len(result) >= req.Limit {
+				break
+			}
 		}
 	}
 	return result

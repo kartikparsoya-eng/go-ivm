@@ -153,15 +153,12 @@ func (t *Take) initialFetch(req FetchRequest) []Node {
 
 	takeStateKey := GetTakeStateKey(t.partitionKey, constraintToRow(req.Constraint))
 
-	// Limit pushdown: when our input is a base source (no intervening Filter/
-	// Join/Skip that could drop rows after the source truncates), hint it to
-	// stop after t.limit rows so it doesn't materialise the whole table. This is
-	// transparent — we keep exactly the same first t.limit rows and record the
-	// same bound/size — it just avoids building throwaway Row maps. See
-	// FetchRequest.Limit / LeafSource. (Non-leaf inputs leave req.Limit at 0.)
-	if _, ok := t.input.(LeafSource); ok {
-		req.Limit = t.limit
-	}
+	// Limit pushdown: always set req.Limit so downstream operators can
+	// early-terminate. Filter strips it before forwarding upstream (it
+	// can drop rows, so a source Limit would under-fetch) and breaks its
+	// own loop at req.Limit post-filter rows. Skip forwards it in the
+	// forward case only. See FetchRequest.Limit.
+	req.Limit = t.limit
 
 	var result []Node
 	var size int

@@ -21,21 +21,24 @@ type FetchRequest struct {
 	// FetchRequest is unaffected). It restores the early-termination that TS
 	// gets for free from lazy generators — see operator.go's Stream→[]Node note.
 	//
-	// SAFETY: only ever set by Take.initialFetch, and only when Take's input is
-	// a LeafSource (so no intervening Filter/Join can drop rows AFTER the source
-	// truncates, which would under-fetch). Operators MUST NOT forward this field
-	// to upstream inputs; since the marker confines it to the Take→source case,
-	// no operator ever receives a non-zero Limit to forward.
+	// SAFETY: set by Take.initialFetch to t.limit. Operators handle it:
+	//   - Source: truncates output to req.Limit rows (early scan termination).
+	//   - Filter (FilterStart): STRIPS Limit before calling upstream (Filter
+	//     is non-transparent — it can drop rows, so a source Limit would
+	//     under-fetch). Filter breaks its own loop at req.Limit post-filter
+	//     rows, so EXISTS only runs for ~limit/filter_rate rows.
+	//   - Skip: forwards Limit in the forward case (transparent — only changes
+	//     Start, doesn't drop rows). In reverse, withholds it (shouldBePresent
+	//     can discard rows → under-fetch risk).
+	//   - Join: forwards Limit transparently (doesn't filter parent rows).
 	Limit int
 }
 
 // LeafSource marks an Input that reads directly from a base source (table or
-// memory source) rather than from upstream operators. Take consults this to
-// decide whether FetchRequest.Limit can be pushed safely: only when its input
-// is a leaf does "first N rows from the fetch" equal "first N rows Take keeps"
-// — any intervening Filter/Join/Skip could drop rows post-fetch and cause an
-// under-fetch. The marker method keeps the gate to the proven-safe topology
-// without auditing every operator's Fetch.
+// memory source) rather than from upstream operators. Previously used by Take
+// to gate req.Limit pushdown; now vestigial since Take always sets req.Limit
+// and each operator handles it independently. Retained for documentation and
+// potential future use (e.g. query planning).
 type LeafSource interface {
 	// LeafSourceMarker is a no-op marker; its presence is the signal.
 	LeafSourceMarker()
