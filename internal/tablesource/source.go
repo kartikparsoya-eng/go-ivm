@@ -98,6 +98,16 @@ type Source struct {
 	// Mirrors TS MemorySource's `#overlay` field (memory-source.ts).
 	overlay *ivm.Overlay
 
+	// batchDirty is true once a writeChange has been applied to the prev
+	// tx (externalConn or prevConn) in the current advance batch. While
+	// false (before the first Push of the batch), Fetches can use the
+	// read-only pool (s.db) instead of the pinned externalConn — each
+	// pool conn gets snapshot isolation at whatever frame is current,
+	// allowing different Sources to read in parallel. Once true, all
+	// subsequent Fetches must use the pinned conn (read-your-own-writes
+	// within the tx). Cleared by OnAdvanceEnd (rollback + re-pin).
+	batchDirty bool
+
 	// Prev-tx state.
 	//
 	// prevConn is the *sql.Conn dedicated to this Source's prev snapshot.
@@ -466,6 +476,7 @@ func (s *Source) OnAdvanceEnd() {
 	// Frame-coordinated: the Snapshotter drives the leapfrog (resetToHead on its
 	// own prev conn). This Source must NOT roll back or re-pin externalConn.
 	if s.externalConn != nil {
+		s.batchDirty = false
 		return
 	}
 	// Guard against TOCTOU race with RefreshSnapshot: overlay may have been set
@@ -475,6 +486,7 @@ func (s *Source) OnAdvanceEnd() {
 	if s.overlay != nil {
 		return
 	}
+	s.batchDirty = false
 	if s.prevConn == nil || !s.prevTxStarted {
 		return
 	}
@@ -696,6 +708,7 @@ func (s *Source) genPushAndWrite(change ivm.SourceChange, conns []*connection) [
 	s.mu.Lock()
 	err := s.writeChangeLocked(change)
 	s.overlay = nil
+	s.batchDirty = true
 	s.mu.Unlock()
 	if err != nil {
 		// Stale prev tx is unrecoverable from inside Push; surface
@@ -975,8 +988,12 @@ func (s *Source) fetchForConn(req ivm.FetchRequest, conn *connection) []ivm.Node
 	defer s.mu.Unlock()
 	start := time.Now()
 
-	if err := s.ensurePrevTxLocked(); err != nil {
-		panic(fmt.Sprintf("tablesource.Source.Fetch %s: ensurePrevTx: %v", s.tableName, err))
+	usePool := s.externalConn != nil && s.overlay == nil && !s.batchDirty && s.db != nil
+
+	if !usePool {
+		if err := s.ensurePrevTxLocked(); err != nil {
+			panic(fmt.Sprintf("tablesource.Source.Fetch %s: ensurePrevTx: %v", s.tableName, err))
+		}
 	}
 
 	// ORDER BY clause from connection sort (PK ascending if unset).
@@ -998,21 +1015,10 @@ func (s *Source) fetchForConn(req ivm.FetchRequest, conn *connection) []ivm.Node
 		req.Start,
 	)
 	ctx := context.Background()
-	// Reuse a prepared statement for this (conn, SQL) instead of letting
-	// database/sql re-compile via sqlite3_prepare_v2 on every QueryContext
-	// (14.6% of cgo time in the live read-path profile). activeConn is a
-	// stable, single-flight conn (this Source's prevConn, or a Snapshotter
-	// frame conn bound via BindConn), so the cached Conn-bound stmt stays valid
-	// across advances and re-reads the new frame after each leapfrog.
-	dbConn := s.activeConn()
-	stmt, err := s.preparedSelectLocked(dbConn, q.SQL)
-	if err != nil {
-		panic(fmt.Sprintf("tablesource.Source.Fetch %s: prepare: %v\nSQL: %s",
-			s.tableName, err, q.SQL))
-	}
+
 	if _, ok := explainedSQLs.Load(q.SQL); !ok {
 		explainedSQLs.Store(q.SQL, struct{}{})
-		if epRows, epErr := dbConn.QueryContext(ctx, "EXPLAIN QUERY PLAN "+q.SQL, q.Params...); epErr == nil {
+		if epRows, epErr := s.db.QueryContext(ctx, "EXPLAIN QUERY PLAN "+q.SQL, q.Params...); epErr == nil {
 			var lines []string
 			for epRows.Next() {
 				var id, parent, notused int
@@ -1026,7 +1032,20 @@ func (s *Source) fetchForConn(req ivm.FetchRequest, conn *connection) []ivm.Node
 				s.tableName, q.SQL, strings.Join(lines, " | "))
 		}
 	}
-	rows, err := stmt.QueryContext(ctx, q.Params...)
+
+	var rows *sql.Rows
+	var err error
+	if usePool {
+		rows, err = s.db.QueryContext(ctx, q.SQL, q.Params...)
+	} else {
+		dbConn := s.activeConn()
+		stmt, err2 := s.preparedSelectLocked(dbConn, q.SQL)
+		if err2 != nil {
+			panic(fmt.Sprintf("tablesource.Source.Fetch %s: prepare: %v\nSQL: %s",
+				s.tableName, err2, q.SQL))
+		}
+		rows, err = stmt.QueryContext(ctx, q.Params...)
+	}
 	if err != nil {
 		panic(fmt.Sprintf("tablesource.Source.Fetch %s: query: %v\nSQL: %s",
 			s.tableName, err, q.SQL))
@@ -1143,9 +1162,13 @@ func (s *Source) fetchForConn(req ivm.FetchRequest, conn *connection) []ivm.Node
 			out = filtered
 		}
 	}
-	fmt.Fprintf(os.Stderr, "[GO-IVM][FETCH-TIMING] table=%s rows=%d ms=%.1f\n",
+	poolTag := "pinned"
+	if usePool {
+		poolTag = "pool"
+	}
+	fmt.Fprintf(os.Stderr, "[GO-IVM][FETCH-TIMING] table=%s rows=%d ms=%.1f conn=%s\n",
 		s.tableName, len(out),
-		float64(time.Since(start).Microseconds())/1000.0)
+		float64(time.Since(start).Microseconds())/1000.0, poolTag)
 	return out
 }
 
