@@ -113,8 +113,12 @@ func (s *Server) buildSnapshotterLocked(group *ClientGroup, p *initParams) error
 	// Snapshotter is pinned at. Each advanceToHead flips the binding to prev for
 	// the apply, then back to curr. (Non-drive P1 leaves binding untouched.)
 	if s.advanceDriveEnabled {
-		if cur, cerr := snap.Current(); cerr == nil {
+		cur, cerr := snap.Current()
+		if cerr != nil {
+			fmt.Fprintf(os.Stderr, "[GO-IVM][POOL-DEBUG] snap.Current() failed: %v\n", cerr)
+		} else {
 			group.eng.BindTableSourcesToConn(cur.Conn())
+			fmt.Fprintf(os.Stderr, "[GO-IVM][POOL-DEBUG] buildReaderPoolLocked called, wantVersion=%q hydrateReaders=%d\n", cur.Version(), s.hydrateReaders)
 			s.buildReaderPoolLocked(group, cur.Version())
 		}
 	}
@@ -145,6 +149,7 @@ func (s *Server) buildReaderPoolLocked(group *ClientGroup, wantVersion string) {
 			"[GO-IVM] hydrate reader pool not built (falling back to serial): %v\n", perr)
 		return
 	}
+	fmt.Fprintf(os.Stderr, "[GO-IVM][POOL-DEBUG] reader pool BUILT and BOUND, k=%d version=%q\n", s.hydrateReaders, wantVersion)
 	group.readerPool = pool
 	group.eng.BindTableSourcesToReaderPool(pool)
 }

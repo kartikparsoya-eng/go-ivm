@@ -1,0 +1,265 @@
+  [hdr] raising --max-http-header-size to 262144 via re-exec (set NODE_OPTIONS=--max-http-header-size=262144 to skip)
+
+=== Go IVM Soak Traffic Generator ===
+  Sandbox:    rust-test
+  Users:      10 concurrent
+  CG fanout:  10 CGs × 1 client(s)/CG = 10 connections
+  Seed:       1781872130301  (replay with --seed 1781872130301)
+  Duration:   300s
+  Cycle:      5000ms (query churn interval)
+  Mutations:  enabled (3-10s interval)
+  Proxy:      ws://rust-test.localhost/zero
+
+  Healthy containers: 4
+  pprof baseline: goroutines=24 heapInuse=3.3MB (http://localhost:6060)
+
+  All 10 clients launched (10 CGs × 1 client(s)). Running for 300s...
+
+  [mutate] move msg 5-3-4 → conv-2-3
+[12s] active=10 conns=10 queries=171 frames=203 errors=0 reconnects=0 drift=0
+  [mutate] ticket-13 metadata jsonb edit
+[22s] active=10 conns=10 queries=190 frames=351 errors=0 reconnects=0 drift=0
+  [mutate] PK round-trip ticket-4
+[32s] active=10 conns=10 queries=209 frames=526 errors=0 reconnects=0 drift=0
+  [mutate] bulk priority→MEDIUM on tickets in chan-4
+  [mutate] ticket-1 priority→CRITICAL
+[42s] active=10 conns=10 queries=226 frames=688 errors=0 reconnects=0 drift=0
+  [mutate] chan-3 lastActivityAt = NOW() (forces to top)
+  [mutate] edit msg-4-1-4
+[52s] active=10 conns=10 queries=243 frames=793 errors=0 reconnects=0 drift=0
+  [mutate] insert+delete cancel-out chan-cancel-2-1781873786419
+[62s] active=10 conns=10 queries=261 frames=961 errors=0 reconnects=0 drift=0
+  [mutate] user-2 name updated
+  [mutate] no-op edit ticket-19
+[72s] active=10 conns=10 queries=278 frames=1090 errors=0 reconnects=0 drift=0
+  [mutate] assign ticket-18 to user-8
+  [mutate] move user-3 from chan-4 to chan-5
+[82s] active=10 conns=10 queries=296 frames=1215 errors=0 reconnects=0 drift=0
+  [mutate] insert+rename chan-insup-4-1781873814005 in one tx
+[92s] active=10 conns=10 queries=313 frames=1317 errors=0 reconnects=0 drift=0
+  [mutate] ticket-19 metadata jsonb edit
+  [mutate] ticket-14 metadata jsonb edit
+[102s] active=10 conns=10 queries=331 frames=1485 errors=0 reconnects=0 drift=0
+  [mutate] ticket-12 assignedTo→NULL
+  [mutate] PK round-trip ticket-16
+[112s] active=10 conns=10 queries=349 frames=1653 errors=0 reconnects=0 drift=0
+  [mutate] insert channel chan-soak-6-1781873846303
+  [mutate] msg-2-2-2 createdAt = NOW()
+[122s] active=10 conns=10 queries=366 frames=1759 errors=0 reconnects=0 drift=0
+  [mutate] cascade-style delete of 2 bulk msgs
+  [mutate] archive a soak channel
+[132s] active=10 conns=10 queries=383 frames=1863 errors=0 reconnects=0 drift=0
+  [mutate] ticket-10 assignedTo→user-8
+[142s] active=10 conns=10 queries=399 frames=1991 errors=0 reconnects=0 drift=0
+  [mutate] move ticket-16 → chan-2
+[152s] active=10 conns=10 queries=418 frames=2135 errors=0 reconnects=0 drift=0
+  [mutate] bulk insert 3 msgs to conv-3-3
+  [mutate] insert+delete cancel-out chan-cancel-10-1781873890975
+[162s] active=10 conns=10 queries=436 frames=2261 errors=0 reconnects=0 drift=0
+  [mutate] msg-4-3-0 msgType→USER
+[172s] active=10 conns=10 queries=452 frames=2358 errors=0 reconnects=0 drift=0
+  [mutate] ticket-4 assignedTo→NULL
+  [mutate] ticket-6 updatedAt bump
+[182s] active=10 conns=10 queries=471 frames=2532 errors=0 reconnects=0 drift=0
+  [mutate] restore participant cp-mut-restore-11-1781873921069
+[192s] active=10 conns=10 queries=489 frames=2640 errors=0 reconnects=0 drift=0
+  [mutate] user-8 name updated
+[202s] active=10 conns=10 queries=503 frames=2725 errors=0 reconnects=0 drift=0
+  [mutate] hard delete a soak channel
+[212s] active=10 conns=10 queries=521 frames=2863 errors=0 reconnects=0 drift=0
+  [mutate] PK round-trip ticket-16
+[222s] active=10 conns=10 queries=540 frames=3007 errors=0 reconnects=0 drift=0
+  [mutate] ticket-16 assignedTo→NULL
+  [mutate] hard delete a soak channel
+[232s] active=10 conns=10 queries=556 frames=3133 errors=0 reconnects=0 drift=0
+  [mutate] move conv-3-3 chan-3→chan-1
+[242s] active=10 conns=10 queries=576 frames=3254 errors=0 reconnects=0 drift=0
+  [mutate] bulk priority→LOW on tickets in chan-5
+  [mutate] assign ticket-19 to user-6
+[252s] active=10 conns=10 queries=590 frames=3395 errors=0 reconnects=0 drift=0
+  [mutate] user-9 name updated
+[262s] active=10 conns=10 queries=608 frames=3503 errors=0 reconnects=0 drift=0
+  [mutate] add participant cp-mut-14-1781873998298 to chan-2
+[272s] active=10 conns=10 queries=625 frames=3611 errors=0 reconnects=0 drift=0
+  [mutate] chan-4 participantCount -1
+[282s] active=10 conns=10 queries=645 frames=3732 errors=0 reconnects=0 drift=0
+  [mutate] insert+delete cancel-out chan-cancel-15-1781874014392
+[292s] active=10 conns=10 queries=660 frames=3822 errors=0 reconnects=0 drift=0
+  [mutate] ticket-7 assignedTo→NULL
+  [mutate] move msg 5-1-4 → conv-1-3
+
+=== Final Report ===
+[304s] active=0 conns=10 queries=679 frames=3964 errors=0 reconnects=0 drift=0
+
+  Total [GO-IVM][drift] events in shadow zero-cache: 0
+
+  Template usage (160/160 indices fired):
+    [136]   10  gap-int64-boundary-ordering
+    [126]    9  gap-IS-NULL-on-bool-col
+    [ 9]    9  convs-chan-5
+    [39]    9  tickets-with-assignments-exists-convs
+    [110]    8  gap-CSQ-subquery-with-start
+    [41]    8  tickets-with-metadata-cols
+    [144]    8  gap-LIMIT-no-explicit-orderBy
+    [140]    7  gap-CSQ-system-test
+    [32]    7  tickets-multi-join
+    [122]    7  gap-col-eq-NULL-literal
+    [132]    7  gap-insert-then-update-target
+    [133]    7  gap-noop-edit-target
+    [37]    7  convs-with-msgs-exists-limit
+    [107]    7  gap-related-LWW-dedup
+    [119]    7  gap-LIKE-on-number
+    [10]    6  participants-chan-1
+    [80]    6  gap-related-with-inner-EXISTS
+    [120]    6  gap-bool-ordered-comparison
+    [130]    6  gap-bulk-insert-target
+    [102]    6  gap-Skip-after-last
+    [13]    6  sent-msgs-3
+    [93]    6  gap-AND-EXISTS-OR-with-EXISTS
+    [44]    6  channels-or-public-or-member-PROD-REPRO
+    [114]    6  gap-NOT-IN-against-nullable-col
+    [134]    6  gap-empty-string-filter
+    [154]    6  ord-multikey-priority-created
+    [ 5]    6  urgent-tickets
+    [35]    6  tickets-null-assigned-limit
+    [115]    6  gap-IN-against-nullable-col
+    [16]    6  tickets-with-assignments
+    [27]    6  tickets-unassigned-null
+    [117]    6  gap-cross-type-num-eq-str
+    [108]    6  gap-CSQ-hidden-true
+    [128]    6  gap-Take-partitionKey-edit
+    [40]    5  assigned-tickets-sorted
+    [ 1]    5  all-users
+    [111]    5  gap-CSQ-with-related-inside
+    [ 2]    5  recent-messages
+    [12]    5  ticket-assignments
+    [42]    5  channels-with-convs-and-participants
+    [72]    5  related-AND-where-exists
+    [82]    5  gap-EXISTS-in-nested-ORs
+    [112]    5  gap-IN-empty-list
+    [152]    5  ord-nullable-assignedTo-asc
+    [ 3]    5  msgs-conv-4
+    [63]    5  shape-OR-EXISTS-NOT-EXISTS
+    [143]    5  gap-LIMIT-exceeds-rowcount
+    [14]    5  open-tickets
+    [24]    5  oldest-3-messages
+    [34]    5  all-conversations
+    [84]    5  gap-Skip-with-EXISTS
+    [104]    5  gap-LIMIT-0
+    [124]    5  gap-OR-with-NULL-branch
+    [55]    5  op-range-AND
+    [95]    5  gap-OR-mixed-AND-branches
+    [135]    5  gap-Unicode-LIKE
+    [26]    5  messages-large-limit
+    [66]    5  shape-OR-simple-OR-AND-with-EXISTS
+    [76]    5  gap-empty-OR-sentinel
+    [57]    5  exists-or-inner
+    [67]    5  take-LIMIT-1-boundary
+    [77]    5  gap-3-level-nested-bool
+    [127]    5  gap-edit-multi-branch
+    [28]    5  tickets-assigned-notnull
+    [98]    5  gap-Skip-Take-EXISTS
+    [118]    5  gap-cross-type-str-eq-num
+    [158]    5  mult-fanout-channels-participants-users
+    [29]    5  tickets-complex-predicate
+    [69]    5  skip-cursor-exclusive
+    [149]    5  gap-NOT-LIKE-prefix
+    [50]    4  op-IN-string
+    [60]    4  exists-parent-AND-simple
+    [70]    4  skip-take-filter-combined
+    [90]    4  gap-AND-3-CSQ-mixed
+    [100]    4  gap-Skip-multi-col-orderBy
+    [11]    4  my-tickets-1
+    [31]    4  tickets-with-user-assignments-1
+    [141]    4  gap-empty-AND-sentinel
+    [22]    4  channels-convs-msgs-nested
+    [142]    4  gap-empty-result
+    [73]    4  deep-nested-related-4-levels
+    [103]    4  gap-Skip-before-first
+    [153]    4  ord-nullable-assignedTo-desc
+    [ 4]    4  high-priority-open-tickets
+    [64]    4  shape-AND-of-two-ORs-with-EXISTS
+    [25]    4  latest-single-ticket
+    [75]    4  gap-composite-key-correlation
+    [125]    4  gap-IS-NULL-on-json-col
+    [ 6]    4  active-channels
+    [106]    4  gap-related-with-OR-inner
+    [47]    4  op-LIKE-underscore
+    [87]    4  gap-AND-NOT-EXISTS-EXISTS
+    [97]    4  gap-5-level-pathological-nesting
+    [147]    4  gap-LIKE-underscore
+    [18]    4  convs-with-messages-exists
+    [78]    4  gap-permissions-system-CSQ
+    [138]    4  gap-orderBy-3-cols
+    [148]    4  gap-LIKE-escaped-percent
+    [19]    4  unassigned-tickets
+    [129]    4  gap-related-inner-sort-edit
+    [159]    4  cursor-ord-text-tickets-priority
+    [30]    3  default-channels-with-convs
+    [51]    3  op-IN-number
+    [71]    3  multi-sibling-related
+    [81]    3  gap-alias-collision-csq-vs-related
+    [101]    3  gap-Skip-exact-match-inclusive
+    [23]    3  tickets-multi-sort
+    [33]    3  recent-edited-messages
+    [83]    3  gap-sort-column-edit
+    [54]    3  op-IS-NOT-NULL
+    [74]    3  gap-NOT-ILIKE
+    [94]    3  gap-AND-OR-of-EXISTS-and-simple
+    [15]    3  conv-with-msgs-1
+    [45]    3  channels-or-private-or-not-blocked-PROD-REPRO
+    [85]    3  gap-Skip-inclusive
+    [105]    3  gap-related-4-levels-deep
+    [155]    3  ord-multikey-status-assignee-created
+    [36]    3  msgs-partitioned-conv-2
+    [56]    3  exists-compound-inner
+    [86]    3  gap-JSON-IS-NOT-NULL
+    [96]    3  gap-4-level-nested-bool
+    [146]    3  gap-ILIKE-mixed-case
+    [17]    3  channels-with-participants
+    [137]    3  gap-top-level-alias
+    [ 8]    3  messages-with-attachments
+    [68]    3  take-with-OR-EXISTS
+    [88]    3  gap-AND-NOT-NOT-EXISTS
+    [49]    3  op-NOT-LIKE
+    [79]    3  gap-self-ref-EXISTS
+    [109]    3  gap-CSQ-scalar-true
+    [139]    3  gap-explicit-schema-field
+    [ 0]    2  users-by-status
+    [20]    2  channels-with-convs-exists
+    [150]    2  ord-enum-priority-asc
+    [21]    2  empty-conversations
+    [61]    2  shape-flat-OR-with-EXISTS
+    [91]    2  gap-OR-3-children-2-CSQ
+    [131]    2  gap-cascade-delete-target
+    [151]    2  ord-enum-status-desc
+    [52]    2  op-NOT-IN
+    [62]    2  shape-OR-of-two-EXISTS
+    [43]    2  open-unassigned-tickets-notexists
+    [53]    2  op-IS-NULL
+    [113]    2  gap-IN-single-value
+    [123]    2  gap-AND-with-NULL-branch
+    [65]    2  shape-OR-of-ANDs-with-EXISTS
+    [145]    2  gap-LIKE-contains
+    [46]    2  op-LIKE-pct
+    [116]    2  gap-IN-mixed-types
+    [ 7]    2  all-tickets-sorted
+    [157]    2  ord-text-channel-name-asc
+    [48]    2  op-ILIKE
+    [58]    2  exists-nested-3-levels
+    [59]    2  exists-two-siblings-different-wheres
+    [89]    2  gap-OR-NOT-NOT-EXISTS
+    [99]    2  gap-Skip-without-Take
+    [121]    1  gap-IS-NULL-on-non-null-col
+    [92]    1  gap-OR-with-mixed-sign-AND-inner
+    [156]    1  ord-text-name-desc
+    [38]    1  channels-no-participants-limit
+
+  Draining 45s for idle-reaper before final pprof snapshot...
+  pprof final:    goroutines=26 (Δ+2)  heapInuse=98.8MB (Δ+95.4MB)
+  ⚠️  heapInuse delta +95.4MB exceeds HEAP_DELTA_MAX_MB=12 — possible leak
+
+  drift:  PASS (0 events)
+  leak:   FAIL (delta exceeded)
+
+FAIL: Soak test completed.

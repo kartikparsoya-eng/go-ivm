@@ -1,0 +1,325 @@
+{
+  "label": "fat-go-concurrent",
+  "timestamp": "2026-06-16T13:35:06.574Z",
+  "config": {
+    "N_CGS": 8,
+    "HYDRATE_DWELL_S": 15,
+    "ADVANCE_S": 0,
+    "BASE": "http://rust-test.localhost"
+  },
+  "totals": {
+    "totalQueries": 0,
+    "gotQueries": 0,
+    "totalRows": 0,
+    "totalSent": 0
+  },
+  "hydration": {
+    "clientRTT_e2e_p50_acrossCGs": {
+      "n": 0,
+      "p50": null,
+      "p95": null,
+      "max": null,
+      "min": null
+    },
+    "clientRTT_e2e_p95_acrossCGs": {
+      "n": 0,
+      "p50": null,
+      "p95": null,
+      "max": null,
+      "min": null
+    },
+    "serverInternal_p50_acrossCGs": {
+      "n": 0,
+      "p50": null,
+      "p95": null,
+      "max": null,
+      "min": null
+    },
+    "serverInternal_p95_acrossCGs": {
+      "n": 0,
+      "p50": null,
+      "p95": null,
+      "max": null,
+      "min": null
+    },
+    "perQueryClientRTT_pool": {
+      "n": 0,
+      "p50": null,
+      "p95": null,
+      "max": null,
+      "min": null
+    }
+  },
+  "advance": {
+    "clientLocalApply_p50_acrossCGs": {
+      "n": 1,
+      "p50": 0,
+      "p95": 0,
+      "max": 0,
+      "min": 0
+    },
+    "clientLocalApply_p95_acrossCGs": {
+      "n": 1,
+      "p50": 0.1,
+      "p95": 0.1,
+      "max": 0.1,
+      "min": 0.1
+    },
+    "serverCompute_p50_acrossCGs": {
+      "n": 0,
+      "p50": null,
+      "p95": null,
+      "max": null,
+      "min": null
+    },
+    "serverCompute_p95_acrossCGs": {
+      "n": 0,
+      "p50": null,
+      "p95": null,
+      "max": null,
+      "min": null
+    }
+  },
+  "perCG": [
+    {
+      "tag": "cg0",
+      "channelsVisited": [
+        {
+          "channel": "optc-fat-ch-cmoc/optc-fat-1k-cmoc",
+          "ready": false
+        }
+      ],
+      "hydratePhase": {
+        "clientGroupID": "tel7nig90vpfs42pvu",
+        "pooled": null,
+        "queries": [],
+        "errors": [
+          "metrics: inspect-timeout",
+          "queries: inspect-timeout"
+        ]
+      },
+      "advancePhase": {
+        "clientGroupID": "tel7nig90vpfs42pvu",
+        "pooled": {
+          "hydrateE2E_p50": 5638.899999991059,
+          "hydrateE2E_p95": 7042.6800000131125,
+          "hydrateServer_p50": 8.150492999935523,
+          "hydrateServer_p95": 262.13404700006214,
+          "advanceClient_p50": 0,
+          "advanceClient_p95": 0.09999999403953552,
+          "advanceServer_p50": null,
+          "advanceServer_p95": null
+        },
+        "queries": [],
+        "errors": [
+          "queries: Missing property query-materialization-server at value.6.metrics"
+        ]
+      },
+      "sent": 0,
+      "error": null
+    },
+    {
+      "tag": "cg1",
+      "channelsVisited": [
+        {
+          "channel": "optc-fat-ch-cmoc/optc-fat-1k-cmoc",
+          "ready": false
+        }
+      ],
+      "hydratePhase": {
+        "clientGroupID": "kei7pl269mlkdqkm42",
+        "pooled": null,
+        "queries": [],
+        "errors": [
+          "metrics: inspect-timeout",
+          "queries: inspect-timeout"
+        ]
+      },
+      "advancePhase": {
+        "clientGroupID": "kei7pl269mlkdqkm42",
+        "pooled": null,
+        "queries": [],
+        "errors": [
+          "metrics: inspect-timeout",
+          "queries: Missing property query-materialization-server at value.0.metrics"
+        ]
+      },
+      "sent": 0,
+      "error": null
+    },
+    {
+      "tag": "cg2",
+      "channelsVisited": [
+        {
+          "channel": "optc-fat-ch-cmoc/optc-fat-1k-cmoc",
+          "ready": false
+        }
+      ],
+      "hydratePhase": {
+        "clientGroupID": "m1lf00qbfqbrq9kgr3",
+        "pooled": null,
+        "queries": [],
+        "errors": [
+          "metrics: inspect-timeout",
+          "queries: Connection attempt timed out after 10 seconds"
+        ]
+      },
+      "advancePhase": {
+        "clientGroupID": "m1lf00qbfqbrq9kgr3",
+        "pooled": null,
+        "queries": [],
+        "errors": [
+          "metrics: inspect-timeout",
+          "queries: Missing property query-materialization-server at value.2.metrics"
+        ]
+      },
+      "sent": 0,
+      "error": null
+    },
+    {
+      "tag": "cg3",
+      "channelsVisited": [
+        {
+          "channel": "optc-fat-ch-cmoc/optc-fat-1k-cmoc",
+          "ready": false
+        }
+      ],
+      "hydratePhase": {
+        "clientGroupID": "k7jlud4qpjv65l0tde",
+        "pooled": null,
+        "queries": [],
+        "errors": [
+          "metrics: inspect-timeout",
+          "queries: Connection attempt timed out after 10 seconds"
+        ]
+      },
+      "advancePhase": {
+        "clientGroupID": "k7jlud4qpjv65l0tde",
+        "pooled": null,
+        "queries": [],
+        "errors": [
+          "metrics: Connection attempt timed out after 10 seconds",
+          "queries: inspect-timeout"
+        ]
+      },
+      "sent": 0,
+      "error": null
+    },
+    {
+      "tag": "cg4",
+      "channelsVisited": [
+        {
+          "channel": "optc-fat-ch-cmoc/optc-fat-1k-cmoc",
+          "ready": false
+        }
+      ],
+      "hydratePhase": {
+        "clientGroupID": "6q5driu5stp46hjugt",
+        "pooled": null,
+        "queries": [],
+        "errors": [
+          "metrics: Connection attempt timed out after 10 seconds",
+          "queries: inspect-timeout"
+        ]
+      },
+      "advancePhase": {
+        "clientGroupID": "6q5driu5stp46hjugt",
+        "pooled": null,
+        "queries": [],
+        "errors": [
+          "metrics: inspect-timeout",
+          "queries: Missing property query-materialization-server at value.8.metrics"
+        ]
+      },
+      "sent": 0,
+      "error": null
+    },
+    {
+      "tag": "cg5",
+      "channelsVisited": [
+        {
+          "channel": "optc-fat-ch-cmoc/optc-fat-1k-cmoc",
+          "ready": false
+        }
+      ],
+      "hydratePhase": {
+        "clientGroupID": "74h6k2v4ah7809emdk",
+        "pooled": null,
+        "queries": [],
+        "errors": [
+          "metrics: inspect-timeout",
+          "queries: inspect-timeout"
+        ]
+      },
+      "advancePhase": {
+        "clientGroupID": "74h6k2v4ah7809emdk",
+        "pooled": null,
+        "queries": [],
+        "errors": [
+          "metrics: inspect-timeout",
+          "queries: Missing property query-materialization-server at value.6.metrics"
+        ]
+      },
+      "sent": 0,
+      "error": null
+    },
+    {
+      "tag": "cg6",
+      "channelsVisited": [
+        {
+          "channel": "optc-fat-ch-cmoc/optc-fat-1k-cmoc",
+          "ready": false
+        }
+      ],
+      "hydratePhase": {
+        "clientGroupID": "3fa72mjf24kg4li0vn",
+        "pooled": null,
+        "queries": [],
+        "errors": [
+          "metrics: inspect-timeout",
+          "queries: Connection attempt timed out after 10 seconds"
+        ]
+      },
+      "advancePhase": {
+        "clientGroupID": "3fa72mjf24kg4li0vn",
+        "pooled": null,
+        "queries": [],
+        "errors": [
+          "metrics: Connection attempt timed out after 10 seconds",
+          "queries: inspect-timeout"
+        ]
+      },
+      "sent": 0,
+      "error": null
+    },
+    {
+      "tag": "cg7",
+      "channelsVisited": [
+        {
+          "channel": "optc-fat-ch-cmoc/optc-fat-1k-cmoc",
+          "ready": false
+        }
+      ],
+      "hydratePhase": {
+        "clientGroupID": "1uci3jmnu8sjs82dqr",
+        "pooled": null,
+        "queries": [],
+        "errors": [
+          "metrics: inspect-timeout",
+          "queries: inspect-timeout"
+        ]
+      },
+      "advancePhase": {
+        "clientGroupID": "1uci3jmnu8sjs82dqr",
+        "pooled": null,
+        "queries": [],
+        "errors": [
+          "metrics: Connection attempt timed out after 10 seconds",
+          "queries: inspect-timeout"
+        ]
+      },
+      "sent": 0,
+      "error": null
+    }
+  ]
+}

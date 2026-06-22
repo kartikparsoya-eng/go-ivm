@@ -1,0 +1,130 @@
+{
+  "label": "restore-check",
+  "timestamp": "2026-06-16T13:15:14.616Z",
+  "config": {
+    "N_CGS": 1,
+    "HYDRATE_DWELL_S": 10,
+    "ADVANCE_S": 1,
+    "BASE": "http://rust-test.localhost"
+  },
+  "totals": {
+    "totalQueries": 0,
+    "gotQueries": 0,
+    "totalRows": 0,
+    "totalSent": 0
+  },
+  "hydration": {
+    "clientRTT_e2e_p50_acrossCGs": {
+      "n": 1,
+      "p50": 2580.4,
+      "p95": 2580.4,
+      "max": 2580.4,
+      "min": 2580.4
+    },
+    "clientRTT_e2e_p95_acrossCGs": {
+      "n": 1,
+      "p50": 3212.71,
+      "p95": 3212.71,
+      "max": 3212.71,
+      "min": 3212.71
+    },
+    "serverInternal_p50_acrossCGs": {
+      "n": 1,
+      "p50": 0.13,
+      "p95": 0.13,
+      "max": 0.13,
+      "min": 0.13
+    },
+    "serverInternal_p95_acrossCGs": {
+      "n": 1,
+      "p50": 22.69,
+      "p95": 22.69,
+      "max": 22.69,
+      "min": 22.69
+    },
+    "perQueryClientRTT_pool": {
+      "n": 0,
+      "p50": null,
+      "p95": null,
+      "max": null,
+      "min": null
+    }
+  },
+  "advance": {
+    "clientLocalApply_p50_acrossCGs": {
+      "n": 1,
+      "p50": 0,
+      "p95": 0,
+      "max": 0,
+      "min": 0
+    },
+    "clientLocalApply_p95_acrossCGs": {
+      "n": 1,
+      "p50": 0.1,
+      "p95": 0.1,
+      "max": 0.1,
+      "min": 0.1
+    },
+    "serverCompute_p50_acrossCGs": {
+      "n": 0,
+      "p50": null,
+      "p95": null,
+      "max": null,
+      "min": null
+    },
+    "serverCompute_p95_acrossCGs": {
+      "n": 0,
+      "p50": null,
+      "p95": null,
+      "max": null,
+      "min": null
+    }
+  },
+  "perCG": [
+    {
+      "tag": "cg0",
+      "channelsVisited": [
+        {
+          "channel": "optc-fat-ch-cmoc/optc-fat-1k-cmoc",
+          "ready": false
+        }
+      ],
+      "hydratePhase": {
+        "clientGroupID": "js9odbk11c3ern96kn",
+        "pooled": {
+          "hydrateE2E_p50": 2580.3999999910593,
+          "hydrateE2E_p95": 3212.709999999404,
+          "hydrateServer_p50": 0.13037400000030175,
+          "hydrateServer_p95": 22.688287249998094,
+          "advanceClient_p50": 0,
+          "advanceClient_p95": 0.09999999403953552,
+          "advanceServer_p50": null,
+          "advanceServer_p95": null
+        },
+        "queries": [],
+        "errors": [
+          "queries: Missing property query-materialization-server at value.0.metrics"
+        ]
+      },
+      "advancePhase": {
+        "clientGroupID": "js9odbk11c3ern96kn",
+        "pooled": {
+          "hydrateE2E_p50": 2580.3999999910593,
+          "hydrateE2E_p95": 3212.709999999404,
+          "hydrateServer_p50": 4.587440000002971,
+          "hydrateServer_p95": 202.27051165000532,
+          "advanceClient_p50": 0,
+          "advanceClient_p95": 0.09999999403953552,
+          "advanceServer_p50": null,
+          "advanceServer_p95": null
+        },
+        "queries": [],
+        "errors": [
+          "queries: Missing property query-materialization-server at value.1.metrics"
+        ]
+      },
+      "sent": 0,
+      "error": null
+    }
+  ]
+}

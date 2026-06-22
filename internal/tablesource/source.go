@@ -992,6 +992,7 @@ func (s *Source) fetchForConn(req ivm.FetchRequest, conn *connection) []ivm.Node
 	// is bound only during the advance-free hydrate window, so there is no
 	// in-flight Push (s.overlay is nil) and no prev-tx writeChange to observe.
 	if pool := s.readerPool.Load(); pool != nil {
+		fmt.Fprintf(os.Stderr, "[GO-IVM][POOL-DEBUG] fetchViaPool active for table=%s\n", s.tableName)
 		return s.fetchViaPool(req, conn, pool)
 	}
 

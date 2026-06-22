@@ -1,0 +1,105 @@
+{
+  "label": "go-primary-smoke",
+  "timestamp": "2026-06-16T10:39:02.713Z",
+  "config": {
+    "N_CGS": 1,
+    "HYDRATE_DWELL_S": 4,
+    "ADVANCE_S": 6,
+    "BASE": "http://rust-test.localhost"
+  },
+  "totals": {
+    "totalQueries": 0,
+    "gotQueries": 0,
+    "totalRows": 0,
+    "totalSent": 3
+  },
+  "hydration": {
+    "clientE2E_perQuery": {
+      "n": 0,
+      "p50": null,
+      "p95": null,
+      "max": null,
+      "min": null
+    },
+    "serverHydrate_perQuery": {
+      "n": 0,
+      "p50": null,
+      "p95": null,
+      "max": null,
+      "min": null
+    },
+    "clientE2E_pooledP50_acrossCGs": {
+      "n": 0,
+      "p50": null,
+      "p95": null,
+      "max": null,
+      "min": null
+    },
+    "clientE2E_pooledP95_acrossCGs": {
+      "n": 0,
+      "p50": null,
+      "p95": null,
+      "max": null,
+      "min": null
+    }
+  },
+  "advance": {
+    "clientUpdate_pooledP50_acrossCGs": {
+      "n": 0,
+      "p50": null,
+      "p95": null,
+      "max": null,
+      "min": null
+    },
+    "clientUpdate_pooledP95_acrossCGs": {
+      "n": 0,
+      "p50": null,
+      "p95": null,
+      "max": null,
+      "min": null
+    }
+  },
+  "perCG": [
+    {
+      "tag": "cg0",
+      "channelsVisited": [
+        {
+          "channel": "cmpmblj2z002",
+          "ready": true
+        },
+        {
+          "channel": "cmpmjimyo00a",
+          "ready": true
+        },
+        {
+          "channel": "cmpmjrgn900b",
+          "ready": true
+        },
+        {
+          "channel": "cmp2cqlq900f",
+          "ready": true
+        }
+      ],
+      "hydratePhase": {
+        "clientGroupID": "ugh2kv78kbe610c3tr",
+        "pooled": null,
+        "queries": [],
+        "errors": [
+          "metrics: Failed to fetch dynamically imported module: http://rust-test.localhost/node_modules/.vite/deps/lazy-inspector-YUBSRRUG.js?v=786cacde",
+          "queries: Failed to fetch dynamically imported module: http://rust-test.localhost/node_modules/.vite/deps/lazy-inspector-YUBSRRUG.js?v=786cacde"
+        ]
+      },
+      "advancePhase": {
+        "clientGroupID": "ugh2kv78kbe610c3tr",
+        "pooled": null,
+        "queries": [],
+        "errors": [
+          "metrics: Failed to fetch dynamically imported module: http://rust-test.localhost/node_modules/.vite/deps/lazy-inspector-YUBSRRUG.js?v=786cacde",
+          "queries: Failed to fetch dynamically imported module: http://rust-test.localhost/node_modules/.vite/deps/lazy-inspector-YUBSRRUG.js?v=786cacde"
+        ]
+      },
+      "sent": 3,
+      "error": null
+    }
+  ]
+}

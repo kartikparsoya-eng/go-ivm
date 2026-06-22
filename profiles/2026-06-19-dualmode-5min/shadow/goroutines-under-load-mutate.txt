@@ -1,0 +1,84 @@
+goroutine profile: total 56
+12 @ 0x481c4e 0x45e657 0x532047 0x489fc1
+#	0x532046	database/sql.(*DB).connectionOpener+0x86	database/sql/sql.go:1261
+
+10 @ 0x481c4e 0x416373 0x415ed2 0x5376c9 0x489fc1
+#	0x5376c8	database/sql.(*Tx).awaitDone+0x28	database/sql/sql.go:2212
+
+10 @ 0x481c4e 0x45e657 0xc72acd 0x489fc1
+#	0xc72acc	main.(*ClientGroup).worker+0xec	github.com/kartikparsoya-eng/go-ivm/cmd/sidecar/main.go:832
+
+8 @ 0x481c4e 0x416373 0x415ef2 0xc7ddee 0x489fc1
+#	0xc7dded	main.handleConnection.func2+0x8d	github.com/kartikparsoya-eng/go-ivm/cmd/sidecar/main.go:1943
+
+8 @ 0x481c4e 0x443e97 0x480e25 0x504a07 0x505cf9 0x505ce7 0x620d65 0x6304a5 0x54a217 0x4bd54e 0xc70649 0xc70613 0xc7d10b 0x489fc1
+#	0x480e24	internal/poll.runtime_pollWait+0x84		runtime/netpoll.go:351
+#	0x504a06	internal/poll.(*pollDesc).wait+0x26		internal/poll/fd_poll_runtime.go:84
+#	0x505cf8	internal/poll.(*pollDesc).waitRead+0x278	internal/poll/fd_poll_runtime.go:89
+#	0x505ce6	internal/poll.(*FD).Read+0x266			internal/poll/fd_unix.go:165
+#	0x620d64	net.(*netFD).Read+0x24				net/fd_posix.go:68
+#	0x6304a4	net.(*conn).Read+0x44				net/net.go:196
+#	0x54a216	bufio.(*Reader).Read+0x196			bufio/bufio.go:245
+#	0x4bd54d	io.ReadAtLeast+0x8d				io/io.go:335
+#	0xc70648	io.ReadFull+0x48				io/io.go:354
+#	0xc70612	main.readFrame+0x12				github.com/kartikparsoya-eng/go-ivm/cmd/sidecar/main.go:199
+#	0xc7d10a	main.handleConnection+0x40a			github.com/kartikparsoya-eng/go-ivm/cmd/sidecar/main.go:1989
+
+1 @ 0x41bac9 0x483b89 0x5f2fb3 0x489fc1
+#	0x483b88	os/signal.signal_recv+0x28	runtime/sigqueue.go:152
+#	0x5f2fb2	os/signal.loop+0x12		os/signal/signal_unix.go:23
+
+1 @ 0x440931 0x480a7d 0x9de0d1 0x9ddee5 0x9dad4b 0x9f61ca 0x9f6c7a 0x997969 0x999847 0x9b6ece 0x995a65 0x489fc1
+#	0x9de0d0	runtime/pprof.writeRuntimeProfile+0xb0	runtime/pprof/pprof.go:788
+#	0x9ddee4	runtime/pprof.writeGoroutine+0x44	runtime/pprof/pprof.go:747
+#	0x9dad4a	runtime/pprof.(*Profile).WriteTo+0x14a	runtime/pprof/pprof.go:371
+#	0x9f61c9	net/http/pprof.handler.ServeHTTP+0x529	net/http/pprof/pprof.go:272
+#	0x9f6c79	net/http/pprof.Index+0xd9		net/http/pprof/pprof.go:389
+#	0x997968	net/http.HandlerFunc.ServeHTTP+0x28	net/http/server.go:2322
+#	0x999846	net/http.(*ServeMux).ServeHTTP+0x1c6	net/http/server.go:2861
+#	0x9b6ecd	net/http.serverHandler.ServeHTTP+0x8d	net/http/server.go:3340
+#	0x995a64	net/http.(*conn).serve+0x664		net/http/server.go:2109
+
+1 @ 0x481c4e 0x416373 0x415ed2 0xc7f8bb 0x489fc1
+#	0xc7f8ba	main.main.func5+0x5a	github.com/kartikparsoya-eng/go-ivm/cmd/sidecar/main.go:2331
+
+1 @ 0x481c4e 0x416373 0x415ef2 0xc7fa56 0x489fc1
+#	0xc7fa55	main.main.func4+0x95	github.com/kartikparsoya-eng/go-ivm/cmd/sidecar/main.go:2319
+
+1 @ 0x481c4e 0x416373 0x415ef2 0xc7fc54 0x489fc1
+#	0xc7fc53	main.main.func3+0xb3	github.com/kartikparsoya-eng/go-ivm/cmd/sidecar/main.go:2285
+
+1 @ 0x481c4e 0x443e97 0x480e25 0x504a07 0x509e2c 0x509e1a 0x622c09 0x63927b 0x638450 0x99b34c 0x99af32 0xc8022c 0xc8022d 0x489fc1
+#	0x480e24	internal/poll.runtime_pollWait+0x84		runtime/netpoll.go:351
+#	0x504a06	internal/poll.(*pollDesc).wait+0x26		internal/poll/fd_poll_runtime.go:84
+#	0x509e2b	internal/poll.(*pollDesc).waitRead+0x28b	internal/poll/fd_poll_runtime.go:89
+#	0x509e19	internal/poll.(*FD).Accept+0x279		internal/poll/fd_unix.go:613
+#	0x622c08	net.(*netFD).accept+0x28			net/fd_unix.go:161
+#	0x63927a	net.(*TCPListener).accept+0x1a			net/tcpsock_posix.go:159
+#	0x63844f	net.(*TCPListener).Accept+0x2f			net/tcpsock.go:380
+#	0x99b34b	net/http.(*Server).Serve+0x30b			net/http/server.go:3463
+#	0x99af31	net/http.(*Server).ListenAndServe+0x71		net/http/server.go:3389
+#	0xc8022b	net/http.ListenAndServe+0xab			net/http/server.go:3704
+#	0xc8022c	main.main.func1+0xac				github.com/kartikparsoya-eng/go-ivm/cmd/sidecar/main.go:2189
+
+1 @ 0x481c4e 0x443e97 0x480e25 0x504a07 0x509e2c 0x509e1a 0x622c09 0x63f596 0x63e130 0xc7f747 0x44b63d 0x489fc1
+#	0x480e24	internal/poll.runtime_pollWait+0x84		runtime/netpoll.go:351
+#	0x504a06	internal/poll.(*pollDesc).wait+0x26		internal/poll/fd_poll_runtime.go:84
+#	0x509e2b	internal/poll.(*pollDesc).waitRead+0x28b	internal/poll/fd_poll_runtime.go:89
+#	0x509e19	internal/poll.(*FD).Accept+0x279		internal/poll/fd_unix.go:613
+#	0x622c08	net.(*netFD).accept+0x28			net/fd_unix.go:161
+#	0x63f595	net.(*UnixListener).accept+0x15			net/unixsock_posix.go:172
+#	0x63e12f	net.(*UnixListener).Accept+0x2f			net/unixsock.go:260
+#	0xc7f746	main.main+0x8e6					github.com/kartikparsoya-eng/go-ivm/cmd/sidecar/main.go:2343
+#	0x44b63c	runtime.main+0x29c				runtime/proc.go:285
+
+1 @ 0x4a3725 0x4a1d78 0x505d2e 0x505d16 0x505bb1 0x620d65 0x6304a5 0x98fef3 0x489fc1
+#	0x4a3724	syscall.Syscall+0x24				syscall/syscall_linux.go:74
+#	0x4a1d77	syscall.read+0x37				syscall/zsyscall_linux_amd64.go:736
+#	0x505d2d	syscall.Read+0x2ad				syscall/syscall_unix.go:183
+#	0x505d15	internal/poll.ignoringEINTRIO+0x295		internal/poll/fd_unix.go:738
+#	0x505bb0	internal/poll.(*FD).Read+0x130			internal/poll/fd_unix.go:161
+#	0x620d64	net.(*netFD).Read+0x24				net/fd_posix.go:68
+#	0x6304a4	net.(*conn).Read+0x44				net/net.go:196
+#	0x98fef2	net/http.(*connReader).backgroundRead+0x32	net/http/server.go:702
+

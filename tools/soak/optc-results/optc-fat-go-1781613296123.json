@@ -1,0 +1,185 @@
+{
+  "label": "fat-go",
+  "timestamp": "2026-06-16T12:34:56.108Z",
+  "config": {
+    "N_CGS": 4,
+    "HYDRATE_DWELL_S": 8,
+    "ADVANCE_S": 1,
+    "BASE": "http://rust-test.localhost"
+  },
+  "totals": {
+    "totalQueries": 0,
+    "gotQueries": 0,
+    "totalRows": 0,
+    "totalSent": 0
+  },
+  "hydration": {
+    "clientRTT_e2e_p50_acrossCGs": {
+      "n": 1,
+      "p50": 1757.6,
+      "p95": 1757.6,
+      "max": 1757.6,
+      "min": 1757.6
+    },
+    "clientRTT_e2e_p95_acrossCGs": {
+      "n": 1,
+      "p50": 5044.42,
+      "p95": 5044.42,
+      "max": 5044.42,
+      "min": 5044.42
+    },
+    "serverInternal_p50_acrossCGs": {
+      "n": 1,
+      "p50": 0.08,
+      "p95": 0.08,
+      "max": 0.08,
+      "min": 0.08
+    },
+    "serverInternal_p95_acrossCGs": {
+      "n": 1,
+      "p50": 42.9,
+      "p95": 42.9,
+      "max": 42.9,
+      "min": 42.9
+    },
+    "perQueryClientRTT_pool": {
+      "n": 0,
+      "p50": null,
+      "p95": null,
+      "max": null,
+      "min": null
+    }
+  },
+  "advance": {
+    "clientLocalApply_p50_acrossCGs": {
+      "n": 0,
+      "p50": null,
+      "p95": null,
+      "max": null,
+      "min": null
+    },
+    "clientLocalApply_p95_acrossCGs": {
+      "n": 0,
+      "p50": null,
+      "p95": null,
+      "max": null,
+      "min": null
+    },
+    "serverCompute_p50_acrossCGs": {
+      "n": 0,
+      "p50": null,
+      "p95": null,
+      "max": null,
+      "min": null
+    },
+    "serverCompute_p95_acrossCGs": {
+      "n": 0,
+      "p50": null,
+      "p95": null,
+      "max": null,
+      "min": null
+    }
+  },
+  "perCG": [
+    {
+      "tag": "cg0",
+      "channelsVisited": [
+        {
+          "channel": "optc-fat-ch-cmoc/optc-fat-1k-cmoc",
+          "ready": false
+        }
+      ],
+      "hydratePhase": {
+        "clientGroupID": "qkghn9bglajmqta94n",
+        "pooled": {
+          "hydrateE2E_p50": 1757.5999999791384,
+          "hydrateE2E_p95": 5044.419999992848,
+          "hydrateServer_p50": 0.07533300016075373,
+          "hydrateServer_p95": 42.90016644992835,
+          "advanceClient_p50": 0,
+          "advanceClient_p95": 0.09999999403953552,
+          "advanceServer_p50": null,
+          "advanceServer_p95": null
+        },
+        "queries": [],
+        "errors": [
+          "queries: Missing property query-materialization-server at value.0.metrics"
+        ]
+      },
+      "advancePhase": {
+        "clientGroupID": "qkghn9bglajmqta94n",
+        "pooled": null,
+        "queries": [],
+        "errors": [
+          "metrics: inspect-timeout",
+          "queries: inspect-timeout"
+        ]
+      },
+      "sent": 0,
+      "error": null
+    },
+    {
+      "tag": "cg1",
+      "channelsVisited": [
+        {
+          "channel": "optc-fat-ch-cmoc/optc-fat-1k-cmoc",
+          "ready": false
+        }
+      ],
+      "hydratePhase": {
+        "clientGroupID": "8gau21ib8fg8ds2587",
+        "pooled": null,
+        "queries": [],
+        "errors": [
+          "metrics: inspect-timeout",
+          "queries: inspect-timeout"
+        ]
+      },
+      "advancePhase": null,
+      "sent": 0,
+      "error": "page.evaluate: Execution context was destroyed, most likely because of a navigation."
+    },
+    {
+      "tag": "cg2",
+      "channelsVisited": [
+        {
+          "channel": "optc-fat-ch-cmoc/optc-fat-1k-cmoc",
+          "ready": false
+        }
+      ],
+      "hydratePhase": {
+        "clientGroupID": "00mam14etkji692ftq",
+        "pooled": null,
+        "queries": [],
+        "errors": [
+          "metrics: inspect-timeout",
+          "queries: inspect-timeout"
+        ]
+      },
+      "advancePhase": null,
+      "sent": 0,
+      "error": "page.evaluate: Execution context was destroyed, most likely because of a navigation."
+    },
+    {
+      "tag": "cg3",
+      "channelsVisited": [
+        {
+          "channel": "optc-fat-ch-cmoc/optc-fat-1k-cmoc",
+          "ready": false
+        }
+      ],
+      "hydratePhase": {
+        "clientGroupID": "eledvj8ckd3j4r299t",
+        "pooled": null,
+        "queries": [],
+        "errors": [
+          "metrics: inspect-timeout",
+          "queries: inspect-timeout"
+        ]
+      },
+      "advancePhase": null,
+      "sent": 0,
+      "error": "page.evaluate: Execution context was destroyed, most likely because of a navigation."
+    }
+  ]
+}

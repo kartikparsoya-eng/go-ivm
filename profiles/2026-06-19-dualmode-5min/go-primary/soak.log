@@ -1,0 +1,15 @@
+[LEAN] 3 CGs (cap 5), 300s (cap 240), msg/4s, rotate/3 + scroll-paginate, stagger 6000ms, nav-timeout 90000ms, renderers 3 + blocked image/font/media
+[cg0] editor missing (attempt 1) — reloading
+[cg1] ERROR: page.goto: Timeout 90000ms exceeded.
+Call log:
+[2m  - navigating to "http://rust-test.localhost/cmp2cmoc800ctiphvwurmbair/chat/dir/cmpmjimyo00a110zqzd2u18dp", waiting until "domcontentloaded"[22m
+
+[cg0] online → ch=cmpmblj2z002c1 editor=ready
+[cg2] online → ch=cmpmjrgn900bc1 editor=ready
+[cg0] write: no-editor
+[cg0] write: no-editor
+[cg0] write: no-editor
+[cg2] write: no-editor
+[cg2] write: no-editor
+[cg2] write: no-editor
+[cg0] done — sent 9, scrolls 8, switches 3, edits 0, reacts 3, threads 3
