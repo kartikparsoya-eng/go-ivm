@@ -11,7 +11,6 @@ import (
 	"fmt"
 	"os"
 	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -253,7 +252,7 @@ func bumpRowVersions(changes []RowChange, mrv map[string]string) []RowChange {
 // EngineConfig configures the engine.
 type EngineConfig struct {
 	StoragePath       string // path for operator storage DB
-	ParallelThreshold int    // min connections for parallel fan-out (default: 4)
+	ParallelThreshold int // min connections for parallel fan-out (default: 2, set below when 0)
 }
 
 // NewEngine creates a new IVM engine.
@@ -537,6 +536,17 @@ func (e *Engine) AddQuery(queryID string, ast builder.AST) ([]RowChange, float64
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
+	// Bail on a closed engine. Close sets e.pipelines = nil; without this guard
+	// buildAndRegisterLocked would write e.pipelines[queryID] = entry on a nil
+	// map and panic. The sidecar handler serializes AddQuery vs Close on
+	// group.mu (handleAddQuery:1427 vs shutdownGroup:1012), so this is not
+	// reachable from the production handler path — but the Engine is a reusable
+	// library surface, and the invariant currently lives in a different file
+	// than the nil-map write. The one-line guard is cheap insurance.
+	if e.closed {
+		return nil, 0, ErrEngineClosed
+	}
+
 	// Remove existing pipeline if any
 	e.removeQueryLocked(queryID)
 
@@ -671,6 +681,11 @@ func hydrateEntry(entry *pipelineEntry) []RowChange {
 func (e *Engine) AddQueries(queries []QuerySpec) ([]QueryResult, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+
+	// Bail on a closed engine — see AddQuery for the nil-map-write rationale.
+	if e.closed {
+		return nil, ErrEngineClosed
+	}
 
 	// Phase 1: Build all pipelines sequentially (mutates shared state).
 	// Scalar-subquery resolution runs here too — see buildAndRegisterLocked.
@@ -1485,18 +1500,6 @@ func (d *engineDelegate) CreateStorage(name string) ivm.TakeStorage {
 		d.cgs = d.engine.storage.CreateClientGroupStorage(d.queryID)
 	}
 	return d.cgs.CreateTakeStorage()
-}
-
-// rowPKSummary returns a brief string showing the row's primary key values.
-func rowPKSummary(row ivm.Row, pk []string) string {
-	if row == nil {
-		return "<nil>"
-	}
-	parts := make([]string, len(pk))
-	for i, col := range pk {
-		parts[i] = fmt.Sprintf("%s=%v", col, row[col])
-	}
-	return fmt.Sprintf("{%s}", strings.Join(parts, ","))
 }
 
 // --- engineSource wraps Source as builder.Source ---

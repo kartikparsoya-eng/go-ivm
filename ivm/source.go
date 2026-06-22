@@ -7,6 +7,7 @@ package ivm
 
 import (
 	"encoding/json"
+	"fmt"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -106,6 +107,16 @@ func NewMemorySourceWithConverter(
 	primaryKey []string,
 	converter ValueConverter,
 ) *MemorySource {
+	// V5: an empty primary key is a programmer/config error, not a runtime
+	// condition. With no PK, primarySort and the comparator degenerate and
+	// every row's extracted key map is empty — all rows silently collide on
+	// the empty key, producing corruption that surfaces far downstream as
+	// mysterious dedup/order bugs instead of a clear failure at the source.
+	// Fail fast at construction (init path, never the hot path) rather than
+	// corrupt silently. A table with no PK cannot be an IVM source.
+	if len(primaryKey) == 0 {
+		panic(fmt.Sprintf("NewMemorySourceWithConverter: table %q has an empty primary key; an IVM source requires a non-empty PK", tableName))
+	}
 	primarySort := make(Ordering, len(primaryKey))
 	for i, k := range primaryKey {
 		primarySort[i] = [2]string{k, "asc"}

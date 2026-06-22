@@ -151,9 +151,36 @@ func filtersToSQL(cond *Condition) (string, []interface{}) {
 	return "TRUE", nil
 }
 
+// allowedOps is the exhaustive set of operators simpleConditionToSQL will
+// emit into generated SQL. S4: cond.Op originates from a CLIENT-SENT AST
+// (the sidecar accepts addQuery with an `ast` field over the wire), so it is
+// untrusted and was previously interpolated raw at the Sprintf below — a
+// malicious op like "; DROP TABLE x; --" would be spliced straight into the
+// query. The whitelist closes that: any op not in this set is treated as
+// unsupported and short-circuits to "1=0" (a safe no-match that interpolates
+// NO client data), rather than panicking — this is a client-input boundary
+// shared across an entire client group, and a bad op must not take the engine
+// down (same reasoning as matchLike returning false on a bad pattern). The
+// no-match is observable as an empty result; a genuinely-unsupported op query
+// simply yields no rows. Every op the Zero client emits is listed here; if a
+// new op is added upstream it must be added to this set or it will silently
+// no-match.
+var allowedOps = map[string]bool{
+	"=": true, "!=": true, ">": true, "<": true, ">=": true, "<=": true,
+	"LIKE": true, "NOT LIKE": true,
+	"ILIKE": true, "NOT ILIKE": true, // mapped to LIKE/NOT LIKE below
+	"IN": true, "NOT IN": true,
+	"IS": true, "IS NOT": true,
+}
+
 // simpleConditionToSQL handles a simple condition.
 func simpleConditionToSQL(cond *Condition) (string, []interface{}) {
 	op := cond.Op
+	// S4: reject any operator outside the whitelist BEFORE it reaches the
+	// Sprintf that interpolates op raw. Safe no-match, no crash, no injection.
+	if !allowedOps[op] {
+		return "1=0", nil
+	}
 	// SQLite LIKE is case-insensitive, so ILIKE → LIKE
 	switch op {
 	case "ILIKE":

@@ -2204,7 +2204,16 @@ func main() {
 	// + mutex profiling carries ~5% overhead at sample rate 1, which is
 	// acceptable during a profile run but should stay off in prod. The
 	// _ "net/http/pprof" import registers handlers on http.DefaultServeMux.
+	//
+	// S3: a bare port (":6060") with no host binds 0.0.0.0 and exposes pprof on
+	// every interface — pprof is an RCE-grade surface (read heap, fetch goroutine
+	// state, even trigger GC/allocs). Default a hostless addr to 127.0.0.1 so it
+	// stays loopback-only unless the operator EXPLICITLY asks for a bind (an
+	// addr already carrying a host, including "0.0.0.0:…", is honored verbatim).
 	if addr := os.Getenv("GO_IVM_PPROF_ADDR"); addr != "" {
+		if strings.HasPrefix(addr, ":") {
+			addr = "127.0.0.1" + addr
+		}
 		runtime.SetBlockProfileRate(1)
 		runtime.SetMutexProfileFraction(1)
 		pprofServer = &http.Server{Addr: addr, Handler: http.DefaultServeMux}
@@ -2216,12 +2225,33 @@ func main() {
 		}()
 	}
 
-	// Remove stale socket
-	os.Remove(socketPath)
+	// Remove stale socket — but ONLY if the path is an actual leftover socket,
+	// not a live file or directory someone (or another process) placed there.
+	// Blind os.Remove would clobber a non-socket file and silently mask a
+	// misconfiguration (S2). A missing path is the normal first-run case.
+	if info, err := os.Stat(socketPath); err == nil {
+		if info.Mode()&os.ModeSocket != 0 {
+			if err := os.Remove(socketPath); err != nil {
+				fmt.Fprintf(os.Stderr, "Failed to remove stale socket %s: %v\n", socketPath, err)
+				os.Exit(1)
+			}
+		} else {
+			fmt.Fprintf(os.Stderr, "Socket path %s exists but is not a socket (mode=%v); refusing to remove\n", socketPath, info.Mode())
+			os.Exit(1)
+		}
+	}
 
 	listener, err := net.Listen("unix", socketPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to listen: %v\n", err)
+		os.Exit(1)
+	}
+	// Restrict the socket to owner-only access (S1). The sidecar is a local
+	// subprocess of zero-cache, so only the same-uid zero-cache process needs
+	// to connect; 0600 prevents any other local user from talking to it.
+	if err := os.Chmod(socketPath, 0o600); err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to chmod socket %s: %v\n", socketPath, err)
+		_ = listener.Close()
 		os.Exit(1)
 	}
 	defer listener.Close()

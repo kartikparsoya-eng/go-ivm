@@ -5,10 +5,12 @@ package builder
 
 import (
 	"fmt"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/kartikparsoya-eng/go-ivm/ivm"
 )
@@ -275,7 +277,20 @@ func numericCmpCoerced(a, b ivm.Value) (int, bool) {
 // matchLike implements SQL LIKE pattern matching (% and _ wildcards).
 // likeRegexCache memoizes compiled LIKE patterns. The pattern (RHS) is
 // constant per condition but matchLike runs per row, so compile once and reuse.
-var likeRegexCache sync.Map // key string -> *regexp.Regexp (typed nil = bad pattern)
+//
+// Bounded: a hostile or high-cardinality query stream (e.g. parametrized LIKE
+// with ever-changing RHS) could grow this map without limit (D3). We keep
+// sync.Map's lock-free Load fastpath (the per-row hot path) and cap the entry
+// count; on overflow we do a one-shot clear-and-reset (generational reset —
+// the working set re-populates from the live queries). This avoids a
+// heavyweight LRU with per-access locking that would slow the hot path. The
+// cap is generous (typical apps have a small fixed set of LIKE patterns); a
+// clear costs O(n) but fires only on the rare miss-after-overflow path.
+var (
+	likeRegexCache    sync.Map        // key string -> *regexp.Regexp (typed nil = bad pattern)
+	likeRegexCacheLen atomic.Int64    // approximate entry count; accurate except mid-overflow
+	likeRegexCacheCap = int64(1 << 14) // 16k compiled patterns; tune via GO_IVM_LIKE_CACHE_CAP
+)
 
 // matchLike reports whether s matches a SQL LIKE/ILIKE pattern, using SQLite's
 // default LIKE semantics (the engine both TS and Go ultimately read through):
@@ -309,9 +324,38 @@ func likeRegexpFor(pattern string, caseInsensitive bool) *regexp.Regexp {
 		return re
 	}
 	re := compileLikePattern(pattern, caseInsensitive)
+	// Bound the cache (D3): if we're at/over cap, clear before inserting so a
+	// high-cardinality pattern stream can't grow the map without limit. The
+	// clear is racy by design (Range+Delete under no lock) but safe —
+	// concurrent Store/Load on sync.Map is fine; at worst two goroutines both
+	// clear and both reset the counter to a small number, which is
+	// self-correcting on the next overflow. The fastpath Load above is
+	// unaffected. applyCacheCap() reads the env override once at init.
+	if n := likeRegexCacheLen.Add(1); n > applyLikeCacheCap() {
+		// Over cap: drop everything and start fresh. The live queries' patterns
+		// recompile on their next miss (a few regexp.Compile calls, cheap
+		// relative to a hydrate).
+		likeRegexCache.Range(func(k, _ any) bool {
+			likeRegexCache.Delete(k)
+			return true
+		})
+		likeRegexCacheLen.Store(1) // we're about to add this entry
+	}
 	likeRegexCache.Store(key, re) // store nil too, so bad patterns aren't recompiled
 	return re
 }
+
+// applyLikeCacheCap returns the effective cache cap, honoring a one-time
+// GO_IVM_LIKE_CACHE_CAP override (parsed at first use, then cached). A
+// non-positive override disables the cap (unbounded — only for tests/diagnostics).
+var applyLikeCacheCap = sync.OnceValue(func() int64 {
+	if v := os.Getenv("GO_IVM_LIKE_CACHE_CAP"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			return n
+		}
+	}
+	return likeRegexCacheCap
+})
 
 // compileLikePattern translates a SQL LIKE pattern to a Go regexp, mirroring TS
 // patternToRegExp. Returns nil on an invalid pattern (TS throws).
