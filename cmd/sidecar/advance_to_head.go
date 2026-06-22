@@ -19,6 +19,7 @@ import (
 
 	"github.com/kartikparsoya-eng/go-ivm/engine"
 	"github.com/kartikparsoya-eng/go-ivm/internal/snapshotter"
+	"github.com/kartikparsoya-eng/go-ivm/internal/tablesource"
 	"github.com/kartikparsoya-eng/go-ivm/ivm"
 )
 
@@ -65,6 +66,10 @@ type advanceToHeadResult struct {
 // called with group.mu held (it is, from handleInit). Pins curr at the current
 // replica head — the same frame the hydrate reads from.
 func (s *Server) buildSnapshotterLocked(group *ClientGroup, p *initParams) error {
+	// Re-init: drop any reader pool left over from a prior snapshotter (its
+	// frame is about to be replaced).
+	s.tearDownReaderPool(group)
+
 	db, err := s.getReplicaDB()
 	if err != nil {
 		return fmt.Errorf("replica not ready: %w", err)
@@ -110,9 +115,53 @@ func (s *Server) buildSnapshotterLocked(group *ClientGroup, p *initParams) error
 	if s.advanceDriveEnabled {
 		if cur, cerr := snap.Current(); cerr == nil {
 			group.eng.BindTableSourcesToConn(cur.Conn())
+			s.buildReaderPoolLocked(group, cur.Version())
 		}
 	}
 	return nil
+}
+
+// buildReaderPoolLocked builds and binds a CG-shared frame-pinned reader pool
+// for the cold-start parallel hydrate, when GO_IVM_HYDRATE_READERS>1. The pool's
+// K connections are all pinned at wantVersion (curr's stateVersion), so hydrate
+// reads run in parallel while staying byte-identical to the single bound-conn
+// path. If the pool can't be built — feature off, replica not ready, or the
+// replicator already advanced past wantVersion so K conns can't all pin it —
+// we silently keep the single-conn path (correctness over speedup). MUST hold
+// group.mu (called from buildSnapshotterLocked / handleInit).
+func (s *Server) buildReaderPoolLocked(group *ClientGroup, wantVersion string) {
+	if s.hydrateReaders <= 1 || wantVersion == "" {
+		return
+	}
+	rdb, derr := s.getReplicaDB()
+	if derr != nil {
+		return
+	}
+	pool, perr := tablesource.NewReaderPool(context.Background(), rdb, wantVersion, s.hydrateReaders)
+	if perr != nil {
+		// Expected under sustained write load (head moved past wantVersion);
+		// not an error — just no parallel hydrate this cold start.
+		fmt.Fprintf(os.Stderr,
+			"[GO-IVM] hydrate reader pool not built (falling back to serial): %v\n", perr)
+		return
+	}
+	group.readerPool = pool
+	group.eng.BindTableSourcesToReaderPool(pool)
+}
+
+// tearDownReaderPool unbinds and closes the group's cold-start reader pool, if
+// any. Called at the first advance (curr is about to rotate off the pinned
+// frame, making the pool stale) and on group teardown/re-init. MUST hold
+// group.mu.
+func (s *Server) tearDownReaderPool(group *ClientGroup) {
+	if group.readerPool == nil {
+		return
+	}
+	if group.eng != nil {
+		group.eng.UnbindTableSourcesReaderPool()
+	}
+	group.readerPool.Close()
+	group.readerPool = nil
 }
 
 // buildSnapshotterSpecs maps the init table schemas to snapshotter.TableSpecs.
@@ -203,6 +252,11 @@ func (s *Server) handleAdvanceToHead(req RPCRequest) RPCResponse {
 	if resp, stale := checkInitEpoch(group, req.ID, p.InitEpoch); stale {
 		return resp
 	}
+
+	// The cold-start hydrate window ends at the first advance: curr is about to
+	// rotate off the pinned frame, so the reader pool's frame goes stale. Drop
+	// it (reads revert to the single bound-conn path).
+	s.tearDownReaderPool(group)
 
 	diff, err := group.snap.Advance(group.snapSpecs, group.snapAllNames)
 	if err != nil {
@@ -391,6 +445,10 @@ func (s *Server) handleAdvanceToHeadStream(req RPCRequest, streamW streamWriter)
 	if resp, stale := checkInitEpoch(group, req.ID, p.InitEpoch); stale {
 		return resp
 	}
+
+	// First advance ends the cold-start hydrate window; drop the reader pool
+	// before curr rotates off its pinned frame.
+	s.tearDownReaderPool(group)
 
 	diff, err := group.snap.Advance(group.snapSpecs, group.snapAllNames)
 	if err != nil {

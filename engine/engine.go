@@ -480,6 +480,40 @@ func (e *Engine) UnbindTableSources() {
 	}
 }
 
+// readerPoolBinder is implemented by sources that can route their hydrate reads
+// through a CG-shared frame-pinned reader pool (tablesource.Source). The pool is
+// passed as `any` so this package need not import internal/tablesource (which
+// imports this package — that would cycle). MemorySource adapters don't
+// implement it.
+type readerPoolBinder interface {
+	BindReaderPool(pool any)
+	UnbindReaderPool()
+}
+
+// BindTableSourcesToReaderPool routes every leaf source's hydrate reads through
+// pool — a set of connections all pinned to one WAL frame — so the per-query
+// hydrate goroutines read in parallel instead of serializing on the single
+// bound conn. Bind ONLY during the advance-free cold-start window; pair with
+// UnbindTableSourcesReaderPool before the first advance (the pool's pinned frame
+// goes stale once curr rotates). pool is the opaque *tablesource.ReaderPool.
+func (e *Engine) BindTableSourcesToReaderPool(pool any) {
+	for _, src := range e.sourcesView() {
+		if b, ok := src.(readerPoolBinder); ok {
+			b.BindReaderPool(pool)
+		}
+	}
+}
+
+// UnbindTableSourcesReaderPool detaches the reader pool from every leaf source;
+// reads revert to the single-conn path. Does not Close the pool.
+func (e *Engine) UnbindTableSourcesReaderPool() {
+	for _, src := range e.sourcesView() {
+		if b, ok := src.(readerPoolBinder); ok {
+			b.UnbindReaderPool()
+		}
+	}
+}
+
 // GetMemorySource returns the registered MemorySource for tableName, or nil
 // if either no source is registered for the table or the registered source is
 // not a MemorySource. Used by the sidecar's loadRows handler to append rows

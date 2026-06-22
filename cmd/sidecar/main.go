@@ -509,6 +509,13 @@ type ClientGroup struct {
 	snap         *snapshotter.Snapshotter
 	snapSpecs    map[string]*snapshotter.TableSpec
 	snapAllNames map[string]bool
+
+	// readerPool is the cold-start parallel-hydrate reader pool (drive mode,
+	// GO_IVM_HYDRATE_READERS>1). Built+bound in buildSnapshotterLocked at curr's
+	// stateVersion; torn down at the first advance (tearDownReaderPool) and on
+	// shutdownGroup / re-init. Nil when the feature is off or the pool couldn't
+	// pin (replica advanced past curr) — both fall back to the single-conn path.
+	readerPool *tablesource.ReaderPool
 }
 
 type clientGroupReq struct {
@@ -583,13 +590,22 @@ type Server struct {
 	// the apply), so Go's own derived diff drives Go's engine with no TS-shipped
 	// changes and no frame-timing drift. Implies advanceToHeadEnabled.
 	advanceDriveEnabled bool
+
+	// hydrateReaders is GO_IVM_HYDRATE_READERS — the size of the per-CG
+	// frame-pinned reader pool used to parallelize cold-start hydrate (drive
+	// mode only). 1 (default) keeps the legacy single-conn serial path: no pool
+	// is built and the feature is fully dark. >1 builds a K-connection pool at
+	// init (all pinned to curr's stateVersion) so the per-query hydrate
+	// goroutines read in parallel; torn down at the first advance.
+	hydrateReaders int
 }
 
 func NewServer(mode tablesource.Mode, replicaPath string) *Server {
 	return &Server{
-		groups:      make(map[string]*ClientGroup),
-		sourceMode:  mode,
-		replicaPath: replicaPath,
+		groups:         make(map[string]*ClientGroup),
+		sourceMode:     mode,
+		replicaPath:    replicaPath,
+		hydrateReaders: 1,
 	}
 }
 
@@ -994,6 +1010,7 @@ func (s *Server) shutdownGroup(g *ClientGroup) {
 	// handler will finish and respCh-send before re-entering the worker
 	// loop, at which point the drain branch fires).
 	g.mu.Lock()
+	s.tearDownReaderPool(g)
 	if g.eng != nil {
 		g.eng.Close()
 		g.eng = nil
@@ -2267,6 +2284,13 @@ func main() {
 	server.advanceDriveEnabled = os.Getenv("GO_IVM_ADVANCE_DRIVE") == "true"
 	if server.advanceDriveEnabled {
 		server.advanceToHeadEnabled = true
+	}
+	// GO_IVM_HYDRATE_READERS>1 enables the cold-start parallel-hydrate reader
+	// pool (drive mode only). Default 1 = legacy single-conn serial hydrate.
+	if v := os.Getenv("GO_IVM_HYDRATE_READERS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 1 {
+			server.hydrateReaders = n
+		}
 	}
 	if server.advanceToHeadEnabled {
 		if sourceMode != tablesource.ModeTable {

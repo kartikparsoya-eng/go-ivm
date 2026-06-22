@@ -34,6 +34,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/kartikparsoya-eng/go-ivm/builder"
@@ -138,6 +139,18 @@ type Source struct {
 	// auto-recompiles it on the rare replica-schema change). Invalidated
 	// whenever a conn is torn down. Guarded by s.mu (held across the fetch).
 	stmtCache map[*sql.Conn]map[string]*sql.Stmt
+
+	// readerPool, when non-nil, is a CG-shared pool of read connections ALL
+	// pinned to the same WAL frame (one stateVersion). It is bound ONLY during
+	// the advance-free cold-start hydrate window (GO_IVM_HYDRATE_READERS>1),
+	// where it lets the per-query hydrate goroutines read this Source in
+	// parallel instead of serializing on the single bound externalConn. While
+	// bound, fetchForConn takes the lock-free fetchViaPool path: the pool is
+	// bound only when no Push is in flight, so s.overlay is always nil and the
+	// per-connection fields read during a fetch are immutable post-Connect.
+	// atomic so fetchForConn can read it without s.mu. Set/cleared via
+	// BindReaderPool / UnbindReaderPool (engine.BindTableSourcesToReaderPool).
+	readerPool atomic.Pointer[ReaderPool]
 }
 
 // connection is one downstream pipeline subscribed to this source.
@@ -971,6 +984,17 @@ func (s *Source) disconnect(c *connection) {
 // connections that have already received the push via Output.Push
 // don't re-see it via overlay (their lastPushedEpoch matches/exceeds).
 func (s *Source) fetchForConn(req ivm.FetchRequest, conn *connection) []ivm.Node {
+	// Cold-start parallel-hydrate fast path: when a frame-pinned reader pool is
+	// bound (GO_IVM_HYDRATE_READERS>1), read via a borrowed pool conn WITHOUT
+	// holding s.mu. Every pool conn is pinned at the same stateVersion as this
+	// Source's bound frame, so the read is byte-identical to the single-conn
+	// path — it just runs concurrently with sibling queries' fetches. The pool
+	// is bound only during the advance-free hydrate window, so there is no
+	// in-flight Push (s.overlay is nil) and no prev-tx writeChange to observe.
+	if pool := s.readerPool.Load(); pool != nil {
+		return s.fetchViaPool(req, conn, pool)
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	start := time.Now()
@@ -1039,53 +1063,7 @@ func (s *Source) fetchForConn(req ivm.FetchRequest, conn *connection) []ivm.Node
 			s.tableName, err))
 	}
 
-	var out []ivm.Node
-	// Reuse the scan buffers across rows. `raw` holds one row's column values and
-	// `ptrs` the &raw[i] pointers Scan writes through; both are fixed-shape for
-	// the query, so allocating them per-row (this was ~588MB / 13% of all sidecar
-	// allocations in the 20-user profile — the #2/#3 alloc lines after the row
-	// map) is pure waste. Safe to reuse: each rows.Scan OVERWRITES raw[i] with a
-	// freshly-materialised value, and FromSQLiteType copies that value into the
-	// per-row `row` map (line below) — it never retains a reference to `raw` or
-	// its slots — so the previous row's data, already handed to its own map, is
-	// untouched by the next iteration.
-	raw := make([]any, len(colNames))
-	ptrs := make([]any, len(colNames))
-	for i := range raw {
-		ptrs[i] = &raw[i]
-	}
-	for rows.Next() {
-		if err := rows.Scan(ptrs...); err != nil {
-			panic(fmt.Sprintf("tablesource.Source.Fetch %s: scan: %v",
-				s.tableName, err))
-		}
-		row := make(ivm.Row, len(colNames))
-		for i, c := range colNames {
-			cs, ok := s.columns[c]
-			if !ok {
-				continue
-			}
-			row[c] = sqlite.FromSQLiteType(raw[i], cs.Type)
-		}
-		if conn.filterPredicate != nil && !conn.filterPredicate(row) {
-			continue
-		}
-		out = append(out, ivm.Node{Row: row})
-		// Limit pushdown (Take.initialFetch): once we have req.Limit
-		// post-predicate rows we can stop scanning. The SQLite cursor yields
-		// lazily via rows.Next(), so breaking here avoids materialising a Row
-		// map for every remaining replica row (a Limit:50 dashboard query over
-		// 1k rows built ~950 throwaway maps). Disabled when an in-flight overlay
-		// is present: applyOverlay below may splice a row into the top-N, so
-		// correctness needs the full candidate set in that (rare) case.
-		if req.Limit > 0 && s.overlay == nil && len(out) >= req.Limit {
-			break
-		}
-	}
-	if err := rows.Err(); err != nil {
-		panic(fmt.Sprintf("tablesource.Source.Fetch %s: rows: %v",
-			s.tableName, err))
-	}
+	out := s.scanRows(rows, colNames, conn, req, s.overlay != nil)
 
 	// Apply in-flight overlay (the push currently fanning out, whose
 	// writeChange hasn't run yet against the prev tx).
@@ -1147,6 +1125,138 @@ func (s *Source) fetchForConn(req ivm.FetchRequest, conn *connection) []ivm.Node
 		s.tableName, len(out),
 		float64(time.Since(start).Microseconds())/1000.0)
 	return out
+}
+
+// scanRows materialises rows into Nodes, applying the connection's residual
+// (non-pushed-down) filterPredicate and the Take limit-pushdown early-stop.
+// Shared by the locked single-conn path and the lock-free pool path — it reads
+// only immutable Source state (s.columns) plus per-connection fields fixed at
+// Connect, so it is safe to run from multiple goroutines on distinct rows/conns.
+//
+// overlayActive disables the limit-pushdown break: when an in-flight overlay is
+// present the caller may splice a row into the top-N below, so the full
+// candidate set is needed. The pool path always passes false (it is bound only
+// in the advance-free window, where no overlay can exist).
+func (s *Source) scanRows(
+	rows *sql.Rows,
+	colNames []string,
+	conn *connection,
+	req ivm.FetchRequest,
+	overlayActive bool,
+) []ivm.Node {
+	var out []ivm.Node
+	// Reuse the scan buffers across rows. `raw` holds one row's column values and
+	// `ptrs` the &raw[i] pointers Scan writes through; both are fixed-shape for
+	// the query, so allocating them per-row (this was ~588MB / 13% of all sidecar
+	// allocations in the 20-user profile — the #2/#3 alloc lines after the row
+	// map) is pure waste. Safe to reuse: each rows.Scan OVERWRITES raw[i] with a
+	// freshly-materialised value, and FromSQLiteType copies that value into the
+	// per-row `row` map (line below) — it never retains a reference to `raw` or
+	// its slots — so the previous row's data, already handed to its own map, is
+	// untouched by the next iteration.
+	raw := make([]any, len(colNames))
+	ptrs := make([]any, len(colNames))
+	for i := range raw {
+		ptrs[i] = &raw[i]
+	}
+	for rows.Next() {
+		if err := rows.Scan(ptrs...); err != nil {
+			panic(fmt.Sprintf("tablesource.Source.Fetch %s: scan: %v",
+				s.tableName, err))
+		}
+		row := make(ivm.Row, len(colNames))
+		for i, c := range colNames {
+			cs, ok := s.columns[c]
+			if !ok {
+				continue
+			}
+			row[c] = sqlite.FromSQLiteType(raw[i], cs.Type)
+		}
+		if conn.filterPredicate != nil && !conn.filterPredicate(row) {
+			continue
+		}
+		out = append(out, ivm.Node{Row: row})
+		// Limit pushdown (Take.initialFetch): once we have req.Limit
+		// post-predicate rows we can stop scanning. The SQLite cursor yields
+		// lazily via rows.Next(), so breaking here avoids materialising a Row
+		// map for every remaining replica row (a Limit:50 dashboard query over
+		// 1k rows built ~950 throwaway maps).
+		if req.Limit > 0 && !overlayActive && len(out) >= req.Limit {
+			break
+		}
+	}
+	if err := rows.Err(); err != nil {
+		panic(fmt.Sprintf("tablesource.Source.Fetch %s: rows: %v",
+			s.tableName, err))
+	}
+	return out
+}
+
+// fetchViaPool is the lock-free hydrate read: it borrows a frame-pinned reader
+// from the bound pool, runs the SELECT on it via the reader's own prepared-stmt
+// cache, and returns the materialised Nodes. No s.mu is taken — every field
+// touched (s.tableName/columns/primaryKey, conn.sort/filterCondition/
+// filterPredicate) is immutable for the lifetime of the bound pool, and the
+// borrowed reader is exclusive to this call. The overlay path is intentionally
+// absent: the pool is bound only in the advance-free window, so no Push is in
+// flight (invariant asserted by the engine's bind/unbind discipline).
+func (s *Source) fetchViaPool(req ivm.FetchRequest, conn *connection, pool *ReaderPool) []ivm.Node {
+	order := conn.sort
+	if order == nil {
+		order = make(ivm.Ordering, len(s.primaryKey))
+		for i, k := range s.primaryKey {
+			order[i] = [2]string{k, "asc"}
+		}
+	}
+	q := sqlite.BuildSelectQuery(
+		s.tableName,
+		s.columns,
+		req.Constraint,
+		conn.filterCondition,
+		order,
+		req.Reverse,
+		req.Start,
+	)
+	r, err := pool.acquire(s.ctx)
+	if err != nil {
+		panic(fmt.Sprintf("tablesource.Source.Fetch %s: pool acquire: %v", s.tableName, err))
+	}
+	defer pool.release(r)
+	stmt, err := r.prepared(s.ctx, q.SQL)
+	if err != nil {
+		panic(fmt.Sprintf("tablesource.Source.Fetch %s: pool prepare: %v\nSQL: %s",
+			s.tableName, err, q.SQL))
+	}
+	rows, err := stmt.QueryContext(s.ctx, q.Params...)
+	if err != nil {
+		panic(fmt.Sprintf("tablesource.Source.Fetch %s: pool query: %v\nSQL: %s",
+			s.tableName, err, q.SQL))
+	}
+	defer rows.Close()
+	colNames, err := rows.Columns()
+	if err != nil {
+		panic(fmt.Sprintf("tablesource.Source.Fetch %s: pool columns: %v", s.tableName, err))
+	}
+	return s.scanRows(rows, colNames, conn, req, false)
+}
+
+// BindReaderPool binds a CG-shared frame-pinned reader pool for the cold-start
+// parallel-hydrate window. pool is passed as `any` so engine/ (which must not
+// import this package — that would cycle) can fan it out across its leaf
+// sources via BindTableSourcesToReaderPool. A nil or wrong-typed value is
+// ignored. MUST be paired with UnbindReaderPool before the first advance (after
+// which the pool's pinned frame is stale).
+func (s *Source) BindReaderPool(pool any) {
+	if p, ok := pool.(*ReaderPool); ok && p != nil {
+		s.readerPool.Store(p)
+	}
+}
+
+// UnbindReaderPool detaches the reader pool; subsequent fetches revert to the
+// single-conn locked path. Does not Close the pool — the owner (sidecar
+// ClientGroup) owns its lifecycle.
+func (s *Source) UnbindReaderPool() {
+	s.readerPool.Store(nil)
 }
 
 // convertFilter converts a builder.Condition (AST-level) to a sqlite.Condition
