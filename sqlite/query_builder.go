@@ -45,7 +45,7 @@ type ValuePos struct {
 // is case-sensitive on field names — without the tag, TS's `{"type":"number"}`
 // would leave Type empty.
 type ColumnSchema struct {
-	Type     string `json:"type"`     // "boolean", "number", "string", "null", "json"
+	Type     string `json:"type"` // "boolean", "number", "string", "null", "json"
 	Optional bool   `json:"optional"`
 }
 
@@ -330,6 +330,17 @@ func gatherStartConstraints(
 			params = append(params, value)
 		}
 		orClauses = append(orClauses, "("+strings.Join(andParts, " AND ")+")")
+	}
+
+	// Defensive: if the cursor specified no usable order column (start.Row lacks
+	// the FIRST sort column and basis != "at"), orClauses is empty. Returning
+	// "(" + "" + ")" = "()" is a SQL syntax error that panics every Fetch. A
+	// cursor that pins no position imposes no lower bound, so the correct
+	// constraint is "no constraint" (TRUE). Not reachable from today's Take/Skip
+	// cursors (a partial cursor is always a prefix of the sort, so column 0 is
+	// present), but unguarded interpolation of "()" is a latent crash.
+	if len(orClauses) == 0 {
+		return "TRUE", nil
 	}
 
 	return "(" + strings.Join(orClauses, " OR ") + ")", params

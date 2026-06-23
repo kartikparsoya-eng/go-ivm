@@ -153,9 +153,12 @@ func (j *Join) pushParent(change Change) []Change {
 			j,
 		)
 	case ChangeTypeEdit:
-		// Assert the edit could not change the relationship
+		// Assert the edit could not change the relationship. A key-changing edit
+		// should have been split into Remove(old)+Add(new) at the source; if it
+		// wasn't, recover via *DriftError (drop this advance + re-init) instead
+		// of crashing the shared sidecar. See joinKeyChangeDrift.
 		if !RowEqualsForCompoundKey(change.OldNode.Row, change.Node.Row, j.parentKey) {
-			panic("Parent edit must not change relationship.")
+			panic(joinKeyChangeDrift(j.parent.GetSchema(), change.OldNode.Row, "Join-parent-key-change"))
 		}
 		return j.output.Push(
 			MakeEditChange(
@@ -177,7 +180,7 @@ func (j *Join) pushChild(change Change) []Change {
 		return j.pushChildChange(change.Node.Row, change)
 	case ChangeTypeEdit:
 		if !RowEqualsForCompoundKey(change.OldNode.Row, change.Node.Row, j.childKey) {
-			panic("Child edit must not change relationship.")
+			panic(joinKeyChangeDrift(j.child.GetSchema(), change.OldNode.Row, "Join-child-key-change"))
 		}
 		return j.pushChildChange(change.Node.Row, change)
 	}
