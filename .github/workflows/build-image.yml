@@ -69,10 +69,26 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-  # After a successful push of a new sidecar image, notify the downstream
-  # mono-better repo so it rebuilds its zero-cache+go image against the
-  # fresh go-ivm:latest. Without this, a marker commit to mono-better
-  # could race the go-ivm publish job and bundle the previous binary.
+  # After a successful push of a new sidecar image, trigger the downstream
+  # mono-better build so it rebuilds its zero-cache+go image against the
+  # freshly published go-ivm:feat-snapshotter-in-go binary. Without this,
+  # a marker commit to mono-better could race the go-ivm publish job and
+  # bundle the previous binary.
+  #
+  # We use a workflow_dispatch (NOT repository_dispatch) pinned to the
+  # feat/snapshotter-in-go ref. This is load-bearing: a repository_dispatch
+  # ALWAYS runs the workflow from mono-better's DEFAULT branch
+  # (feat/go-ivm-sidecar-async-advance), whose legacy workflow builds the
+  # primary/shadow `latest` lineage from go-ivm:latest — NOT the
+  # tablesrc-/shadow-tablesrc- images we actually deploy. So the dispatch
+  # silently rebuilt the wrong image and the deployed tag kept a stale
+  # binary (observed 2026-06-23: dispatch ran on the default branch and
+  # produced shadow-latest instead of tablesrc-feat-snapshotter-in-go).
+  # workflow_dispatch with an explicit ref runs the feat/snapshotter-in-go
+  # workflow file in its own context (correct tablesrc matrix + build-args
+  # + pulls go-ivm:feat-snapshotter-in-go), so the deployed image gets the
+  # new binary. The mono workflow must exist on the default branch with a
+  # workflow_dispatch trigger for the API to accept this (it does).
   #
   # Requires repo secret MONO_DISPATCH_TOKEN — a PAT (classic with `repo`
   # scope, OR fine-grained on kartikparsoya-eng/mono-better with
@@ -82,40 +98,38 @@ jobs:
   # so the workflow stays green during initial setup.
   notify-downstream:
     needs: build
-    # Fire on EVERY publishing push (any configured branch + version
-    # tags), not just main: the mono image bundles this repo's binary, so
-    # a feature-branch publish that doesn't dispatch leaves the
-    # downstream rebuild racing the binary publish — mono builds
-    # triggered by the same logical change pulled the PREVIOUS sidecar
-    # (observed 2026-06-11: mono 87e6fa259 bundled b1c1a58 instead of
-    # b6c5c39 because this gate skipped on feat/snapshotter-in-go).
-    # PRs and forks never carry the secret, so the push gate suffices.
-    if: github.event_name == 'push'
+    # Only a feat/snapshotter-in-go publish should rebuild the mono
+    # feat/snapshotter-in-go image — that's the branch whose tablesrc
+    # image bundles THIS branch's binary. main/tag pushes publish
+    # go-ivm:latest for other lineages and must not retag the feat image
+    # with a mismatched binary. PRs and forks never carry the secret.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/feat/snapshotter-in-go'
     runs-on: ubuntu-latest
     steps:
-      - name: Dispatch repository_dispatch event to mono-better
+      - name: Trigger mono-better build on feat/snapshotter-in-go (workflow_dispatch)
         env:
           MONO_DISPATCH_TOKEN: ${{ secrets.MONO_DISPATCH_TOKEN }}
+          # The mono-better branch whose workflow file + zero-cache source
+          # is (re)built against the freshly published sidecar binary.
+          MONO_TARGET_REF: feat/snapshotter-in-go
+          MONO_WORKFLOW_FILE: build-zero-cache-go.yml
         run: |
           if [ -z "${MONO_DISPATCH_TOKEN}" ]; then
             echo "::warning::MONO_DISPATCH_TOKEN secret not set — skipping downstream notify. See workflow comment for setup."
             exit 0
           fi
-          payload=$(jq -n \
-            --arg sha "${GITHUB_SHA}" \
-            --arg ref "${GITHUB_REF}" \
-            --arg repo "${GITHUB_REPOSITORY}" \
-            '{event_type:"go-ivm-published", client_payload:{go_ivm_sha:$sha, go_ivm_ref:$ref, go_ivm_repo:$repo}}')
+          payload=$(jq -n --arg ref "${MONO_TARGET_REF}" '{ref:$ref}')
           http_code=$(curl -sS -o /tmp/resp.json -w "%{http_code}" \
             -X POST \
             -H "Accept: application/vnd.github+json" \
             -H "Authorization: Bearer ${MONO_DISPATCH_TOKEN}" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
-            https://api.github.com/repos/kartikparsoya-eng/mono-better/dispatches \
+            "https://api.github.com/repos/kartikparsoya-eng/mono-better/actions/workflows/${MONO_WORKFLOW_FILE}/dispatches" \
             -d "${payload}")
+          # workflow_dispatch returns 204 No Content on success.
           if [ "${http_code}" != "204" ]; then
-            echo "::error::Dispatch failed with HTTP ${http_code}"
+            echo "::error::workflow_dispatch failed with HTTP ${http_code}"
             cat /tmp/resp.json
             exit 1
           fi
-          echo "Dispatched go-ivm-published event to mono-better for go-ivm@${GITHUB_SHA}"
+          echo "Triggered mono-better ${MONO_WORKFLOW_FILE} on ${MONO_TARGET_REF} for go-ivm@${GITHUB_SHA}"
