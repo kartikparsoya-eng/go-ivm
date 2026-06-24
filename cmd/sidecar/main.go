@@ -223,6 +223,31 @@ func writeFrame(w io.Writer, data []byte) error {
 	return err
 }
 
+// errCodeFrameTooLarge is returned when a response frame would exceed the wire
+// cap. The TS reader SILENTLY SKIPS frames larger than its matching
+// MAX_FRAME_SIZE (go-ivm-client.ts), orphaning the RPC into a 60s timeout that
+// freezes the client group. We convert oversize frames into this attributable
+// error so the call rejects immediately instead. The real fix is to chunk large
+// results via the streaming RPCs (addQueriesStream / advanceStream / *Stream);
+// this is the defense-in-depth net for any non-streaming path that slips
+// through (e.g. a single node whose subtree exceeds softChunkBytes).
+const errCodeFrameTooLarge = -32011
+
+// capFrameBytes returns the bytes to actually write for a response. If the
+// marshaled frame exceeds maxFrameSize it returns a marshaled RPC error for the
+// SAME request id (a small, valid frame the reader will accept and route as a
+// rejection) plus true to signal the substitution. Otherwise it returns the
+// original bytes and false.
+func capFrameBytes(id interface{}, data []byte, maxFrameSize int) ([]byte, bool) {
+	if len(data) <= maxFrameSize {
+		return data, false
+	}
+	errData, _ := mpMarshal(rpcError(id, errCodeFrameTooLarge,
+		fmt.Sprintf("response too large: %d bytes exceeds %d-byte frame cap; "+
+			"this query must use a streaming RPC", len(data), maxFrameSize)))
+	return errData, true
+}
+
 // --- Performance metrics ---
 
 type perfMetrics struct {
@@ -1940,6 +1965,14 @@ func handleConnection(conn net.Conn, server *Server) {
 		data, err := mpMarshal(resp)
 		if err != nil {
 			data, _ = mpMarshal(rpcError(resp.ID, -32603, "encode response: "+err.Error()))
+		}
+		// Defense-in-depth: never silently emit a frame the TS reader will skip
+		// (which orphans the RPC into a 60s timeout). Substitute a loud error.
+		if capped, over := capFrameBytes(resp.ID, data, maxFrameSize); over {
+			fmt.Fprintf(os.Stderr,
+				"[GO-IVM] response frame too large: %d > %d (id=%v) — sending error instead of orphaning the RPC\n",
+				len(data), maxFrameSize, resp.ID)
+			data = capped
 		}
 		writeMu.Lock()
 		_ = writeFrame(conn, data) // socket close handled by reader-loop exit
