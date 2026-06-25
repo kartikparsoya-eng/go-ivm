@@ -122,6 +122,20 @@ type Source struct {
 	// cleared via BindConn/UnbindConn around a driven advance or hydrate.
 	externalConn *sql.Conn
 
+	// removedInBatch tracks PKs removed by writeChangeLocked in the
+	// current advance batch. Used to distinguish intra-batch duplicate
+	// Removes (skipped, matching TS's no-op filter) from genuine drift
+	// (panics with DriftError). Allocated lazily in trackRemoved and
+	// cleared by ClearBatchState at the end of each advance batch.
+	//
+	// IMPORTANT: it is cleared ONLY via ClearBatchState (engine
+	// signalAdvanceEnd), NOT via OnAdvanceEnd. OnAdvanceEnd is also reached
+	// by the drift audit's RefreshSnapshot, which runs lock-free and
+	// CONCURRENTLY with an in-flight advance batch (engine.RefreshAllSources).
+	// Clearing here would let a concurrent audit wipe the set mid-batch —
+	// between two pushes, when overlay is nil — and resurface the very
+	// false-drift this set exists to suppress.
+	removedInBatch map[string]bool
 	// stmtCache memoizes prepared SELECT statements for fetchForConn, keyed by
 	// (active conn, SQL text). database/sql's one-shot QueryContext re-runs
 	// sqlite3_prepare_v2 on every call (14.6% of cgo time in the live read-path
@@ -676,6 +690,10 @@ func (s *Source) genPushAndWrite(change ivm.SourceChange, conns []*connection) [
 	// writeChange (a dup-Add) which was NOT a *DriftError and would crash the
 	// cg/sidecar instead of triggering a clean re-hydrate.
 	if d := s.driftCheckLocked(change); d != nil {
+		if change.Type == ivm.ChangeTypeRemove && s.removedInBatch != nil && s.removedInBatch[s.pkKey(change.Row)] {
+			s.mu.Unlock()
+			return nil
+		}
 		s.mu.Unlock()
 		panic(d)
 	}
@@ -804,6 +822,7 @@ func (s *Source) writeChangeLocked(change ivm.SourceChange) error {
 		if _, err := conn.ExecContext(ctx, s.deleteSQL, args...); err != nil {
 			return fmt.Errorf("DELETE: %w", err)
 		}
+		s.trackRemoved(change.Row)
 		return nil
 
 	case ivm.ChangeTypeEdit:
@@ -820,6 +839,7 @@ func (s *Source) writeChangeLocked(change ivm.SourceChange) error {
 		if _, err := conn.ExecContext(ctx, s.deleteSQL, delArgs...); err != nil {
 			return fmt.Errorf("EDIT.DELETE: %w", err)
 		}
+		s.trackRemoved(change.OldRow)
 		insArgs := s.rowToInsertArgs(change.Row)
 		if _, err := conn.ExecContext(ctx, s.insertSQL, insArgs...); err != nil {
 			return fmt.Errorf("EDIT.INSERT: %w", err)
@@ -827,6 +847,37 @@ func (s *Source) writeChangeLocked(change ivm.SourceChange) error {
 		return nil
 	}
 	return fmt.Errorf("writeChange: unknown change type %v", change.Type)
+}
+
+func (s *Source) trackRemoved(row ivm.Row) {
+	if s.removedInBatch == nil {
+		s.removedInBatch = make(map[string]bool)
+	}
+	s.removedInBatch[s.pkKey(row)] = true
+}
+
+// ClearBatchState drops the intra-batch removed-PK set. Called by
+// engine.signalAdvanceEnd at the end of every advance batch (success OR
+// drift), so the set never outlives the batch that built it and can never
+// mask genuine cross-batch drift.
+//
+// Deliberately NOT folded into OnAdvanceEnd: OnAdvanceEnd is also reached by
+// the drift audit's RefreshSnapshot (engine.RefreshAllSources), which runs
+// lock-free and concurrently with an in-flight advance. Keeping the clear on
+// the signalAdvanceEnd-only path guarantees it fires at true batch
+// boundaries and never mid-batch. Mirrors ivm.MemorySource.ClearBatchState.
+func (s *Source) ClearBatchState() {
+	s.mu.Lock()
+	s.removedInBatch = nil
+	s.mu.Unlock()
+}
+
+func (s *Source) pkKey(row ivm.Row) string {
+	parts := make([]string, len(s.primaryKey))
+	for i, k := range s.primaryKey {
+		parts[i] = fmt.Sprintf("%v", row[k])
+	}
+	return strings.Join(parts, "\x00")
 }
 
 // canUseUpdate returns true if the edit can use UPDATE (PK unchanged

@@ -63,9 +63,9 @@ type memorySourceAdapter struct {
 	ms *ivm.MemorySource
 }
 
-func (a *memorySourceAdapter) TableName() string      { return a.ms.TableName() }
-func (a *memorySourceAdapter) PrimaryKey() []string   { return a.ms.PrimaryKey() }
-func (a *memorySourceAdapter) NormalizeRow(row ivm.Row) { a.ms.NormalizeRow(row) }
+func (a *memorySourceAdapter) TableName() string                     { return a.ms.TableName() }
+func (a *memorySourceAdapter) PrimaryKey() []string                  { return a.ms.PrimaryKey() }
+func (a *memorySourceAdapter) NormalizeRow(row ivm.Row)              { a.ms.NormalizeRow(row) }
 func (a *memorySourceAdapter) Push(sc ivm.SourceChange) []ivm.Change { return a.ms.Push(sc) }
 func (a *memorySourceAdapter) Connect(sort ivm.Ordering, filter *builder.Condition, filterPredicate func(ivm.Row) bool, splitEditKeys map[string]bool) ivm.Input {
 	return a.ms.Connect(sort, filterPredicate, splitEditKeys)
@@ -76,6 +76,10 @@ func (a *memorySourceAdapter) Connect(sort ivm.Ordering, filter *builder.Conditi
 // Close — which DOES roll back the prev tx and return its writable conn to the
 // pool — is callable polymorphically from Engine.Close.
 func (a *memorySourceAdapter) Close() error { return nil }
+
+func (a *memorySourceAdapter) OnAdvanceEnd() {
+	a.ms.ClearBatchState()
+}
 
 // SnapshotChange represents a single row change from the snapshot diff.
 type SnapshotChange struct {
@@ -105,8 +109,8 @@ type AdvanceResult struct {
 // for a table during Engine.Advance.
 type TableTiming struct {
 	Table   string  `json:"table"`
-	ChangeT int     `json:"type"`           // ivm.ChangeType (0=add,1=remove,2=edit)
-	Ms      float64 `json:"ms"`             // wall-time millis
+	ChangeT int     `json:"type"` // ivm.ChangeType (0=add,1=remove,2=edit)
+	Ms      float64 `json:"ms"`   // wall-time millis
 }
 
 // PipelineEntry tracks a registered pipeline.
@@ -252,7 +256,7 @@ func bumpRowVersions(changes []RowChange, mrv map[string]string) []RowChange {
 // EngineConfig configures the engine.
 type EngineConfig struct {
 	StoragePath       string // path for operator storage DB
-	ParallelThreshold int // min connections for parallel fan-out (default: 2, set below when 0)
+	ParallelThreshold int    // min connections for parallel fan-out (default: 2, set below when 0)
 }
 
 // NewEngine creates a new IVM engine.
@@ -437,6 +441,17 @@ func (e *Engine) signalAdvanceEnd() {
 	for _, src := range e.sourcesView() {
 		if h, ok := src.(interface{ OnAdvanceEnd() }); ok {
 			h.OnAdvanceEnd()
+		}
+		// Clear per-batch state (intra-batch removed-PK set) at the true
+		// batch boundary. This is deliberately separate from OnAdvanceEnd:
+		// the drift audit reaches OnAdvanceEnd via RefreshSnapshot while an
+		// advance is in flight, but it never calls ClearBatchState — so the
+		// dedup set is only ever dropped between batches, not mid-batch.
+		// (MemorySource clears via its adapter's OnAdvanceEnd, which the
+		// audit can't reach since RefreshAllSources skips snapshot-less
+		// sources; TableSource needs this explicit hook.)
+		if c, ok := src.(interface{ ClearBatchState() }); ok {
+			c.ClearBatchState()
 		}
 	}
 }
@@ -1124,11 +1139,11 @@ func (e *Engine) Advance(changes []SnapshotChange) *AdvanceResult {
 //
 // See Engine.AdvanceStream for the chunking contract.
 type AdvanceStreamPartial struct {
-	Changes    []RowChange      `json:"changes"`
-	ChunkIndex int              `json:"chunkIndex"`
-	Final      bool             `json:"final"`
-	Timings    []TableTiming    `json:"timings,omitempty"`
-	Drift      *ivm.DriftError  `json:"drift,omitempty"`
+	Changes    []RowChange     `json:"changes"`
+	ChunkIndex int             `json:"chunkIndex"`
+	Final      bool            `json:"final"`
+	Timings    []TableTiming   `json:"timings,omitempty"`
+	Drift      *ivm.DriftError `json:"drift,omitempty"`
 }
 
 // advanceChunkSize is the max number of RowChanges per partial frame in

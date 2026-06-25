@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 )
@@ -69,15 +70,15 @@ type Connection struct {
 //     fan-out have a documented happens-before edge (MEDIUM-5 from the
 //     parallelism review). Push paths Store; Fetch paths Load.
 type MemorySource struct {
-	tableName   string
-	columns     map[string]string
-	primaryKey  []string
-	primarySort Ordering
-	data        []Row // sorted by primarySort comparator
-	comparator  Comparator
-	connsMu     sync.RWMutex
-	connections []*Connection
-	overlay     atomic.Pointer[Overlay]
+	tableName         string
+	columns           map[string]string
+	primaryKey        []string
+	primarySort       Ordering
+	data              []Row // sorted by primarySort comparator
+	comparator        Comparator
+	connsMu           sync.RWMutex
+	connections       []*Connection
+	overlay           atomic.Pointer[Overlay]
 	pushEpoch         int
 	parallel          bool
 	parallelThreshold int // min connections to trigger parallel (default 2)
@@ -85,7 +86,8 @@ type MemorySource struct {
 	// converter, if set, replaces the default partial-coverage NormalizeRow
 	// behavior with a per-column conversion (e.g. sqlite.FromSQLiteType).
 	// REVIEW-ts-integration CRITICAL-3 / REVIEW-porting MEDIUM-2.
-	converter ValueConverter
+	converter      ValueConverter
+	removedInBatch map[string]bool // PKs removed in the current advance batch
 }
 
 // ValueConverter coerces a raw decoded value to its canonical Value for the
@@ -238,6 +240,11 @@ func (ms *MemorySource) genPushAndWriteWithSplitEdit(change SourceChange) []Chan
 
 // genPushAndWrite — Source: memory-source.ts line 508-520
 func (ms *MemorySource) genPushAndWrite(change SourceChange) []Change {
+	if change.Type == ChangeTypeRemove && !ms.has(change.Row) {
+		if ms.removedInBatch != nil && ms.removedInBatch[ms.pkKey(change.Row)] {
+			return nil
+		}
+	}
 	results := ms.genPush(change)
 	ms.writeChange(change)
 	return results
@@ -328,8 +335,10 @@ func (ms *MemorySource) writeChange(change SourceChange) {
 		ms.insert(change.Row)
 	case ChangeTypeRemove:
 		ms.remove(change.Row)
+		ms.trackRemoved(change.Row)
 	case ChangeTypeEdit:
 		ms.remove(change.OldRow)
+		ms.trackRemoved(change.OldRow)
 		ms.insert(change.Row)
 	}
 }
@@ -356,6 +365,25 @@ func (ms *MemorySource) remove(row Row) {
 	} else {
 		panic("MemorySource.remove: row not found in source data")
 	}
+}
+
+func (ms *MemorySource) trackRemoved(row Row) {
+	if ms.removedInBatch == nil {
+		ms.removedInBatch = make(map[string]bool)
+	}
+	ms.removedInBatch[ms.pkKey(row)] = true
+}
+
+func (ms *MemorySource) pkKey(row Row) string {
+	parts := make([]string, len(ms.primaryKey))
+	for i, k := range ms.primaryKey {
+		parts[i] = fmt.Sprintf("%v", row[k])
+	}
+	return strings.Join(parts, "\x00")
+}
+
+func (ms *MemorySource) ClearBatchState() {
+	ms.removedInBatch = nil
 }
 
 // search returns the index where row would be inserted (binary search).

@@ -190,15 +190,21 @@ func (ms *MemorySource) genPushAndWriteParallel(change SourceChange) []Change {
 
 	if change.Type == ChangeTypeEdit && shouldSplit {
 		var results []Change
-		r1 := ms.GenPushParallel(MakeSourceChangeRemove(change.OldRow))
-		ms.writeChange(MakeSourceChangeRemove(change.OldRow))
-		results = append(results, r1...)
+		skipRemove := !ms.has(change.OldRow) && ms.removedInBatch != nil && ms.removedInBatch[ms.pkKey(change.OldRow)]
+		if !skipRemove {
+			r1 := ms.GenPushParallel(MakeSourceChangeRemove(change.OldRow))
+			ms.writeChange(MakeSourceChangeRemove(change.OldRow))
+			results = append(results, r1...)
+		}
 		r2 := ms.GenPushParallel(MakeSourceChangeAdd(change.Row))
 		ms.writeChange(MakeSourceChangeAdd(change.Row))
 		results = append(results, r2...)
 		return results
 	}
 
+	if change.Type == ChangeTypeRemove && !ms.has(change.Row) && ms.removedInBatch != nil && ms.removedInBatch[ms.pkKey(change.Row)] {
+		return nil
+	}
 	results := ms.GenPushParallel(change)
 	ms.writeChange(change)
 	return results
