@@ -1043,6 +1043,14 @@ func (e *Engine) removeQueryLocked(queryID string) {
 func (e *Engine) Advance(changes []SnapshotChange) *AdvanceResult {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	// End-of-batch hook for every registered source — rotates TableSource
+	// snapshots + clears their batch-scoped delta (incl. the removedInBatch
+	// dedup set) so the next batch starts clean. Deferred (not inline after the
+	// push loop) so it ALSO fires when a NON-drift panic re-raises out of the
+	// recover()-guarded loop — matching AdvanceStream and guaranteeing the set
+	// never leaks across a batch boundary. Registered after e.mu.Unlock so it
+	// still runs while e.mu is held.
+	defer e.signalAdvanceEnd()
 
 	var allRowChanges []RowChange
 	var timings []TableTiming
@@ -1107,15 +1115,6 @@ func (e *Engine) Advance(changes []SnapshotChange) *AdvanceResult {
 			}
 		}
 	}()
-
-	// End-of-batch hook for every registered source — rotates TableSource
-	// snapshots + clears their batch-scoped delta so the next batch
-	// reads from a frame that reflects this batch's committed mutations.
-	// Runs on BOTH the success and drift paths: on drift the engine
-	// will be re-inited from SQLite truth anyway, but until that lands
-	// we want batchDelta cleared so a follow-up Advance call between
-	// drift and re-init starts clean.
-	e.signalAdvanceEnd()
 
 	if drift != nil {
 		// Partial-emit-then-drift: prior successful pushes' output goes to
