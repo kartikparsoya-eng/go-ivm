@@ -329,3 +329,99 @@ func TestAddQuery_RemoveQueryCleansCompanions(t *testing.T) {
 		}
 	}
 }
+
+// TestAddQuery_ScalarNoMatchToMatchedNullThenValue exercises the no-match →
+// matched-NULL → matched-value transition the review flagged as a regression.
+//
+// Hydrate with NO matching user (users empty) bakes ALWAYS_FALSE, so the issue
+// is filtered out. A later INSERT of users{id:u1, name:NULL} moves the scalar
+// from "no row" to "row, NULL value" — but scalarValuesEqual(nil, nil)==true
+// (engine.go:1419, matching TS null===null), so NO reset fires and the issue
+// stays filtered. The output is identical to the no-match state: matched-NULL
+// is a no-op, NOT a regression. Only when the value becomes non-NULL
+// (name: NULL→"Zoe") does the baked literal genuinely go stale and a reset fire.
+func TestAddQuery_ScalarNoMatchToMatchedNullThenValue(t *testing.T) {
+	// users starts EMPTY — the scalar subquery (id='u1') matches nothing.
+	users := ivm.NewMemorySource("users",
+		map[string]string{"id": "string", "name": "string"},
+		[]string{"id"})
+	issues := ivm.NewMemorySource("issues",
+		map[string]string{"id": "string", "ownerId": "string"},
+		[]string{"id"})
+	issues.BulkInsert([]ivm.Row{{"id": "i1", "ownerId": "Alice"}})
+
+	eng, err := NewEngine(EngineConfig{StoragePath: tempStoragePath(t)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+	eng.RegisterMemorySource(users)
+	eng.RegisterMemorySource(issues)
+	eng.SetTableUniqueKeys("users", [][]string{{"id"}})
+
+	ast := builder.AST{
+		Table: "issues",
+		Where: &builder.Condition{
+			Type:   "correlatedSubquery",
+			Op:     "EXISTS",
+			Scalar: true,
+			Related: &builder.CorrelatedSubquery{
+				Correlation: builder.Correlation{
+					ParentField: []string{"ownerId"},
+					ChildField:  []string{"name"},
+				},
+				Subquery: builder.AST{
+					Table: "users",
+					Where: &builder.Condition{
+						Type:  "simple",
+						Op:    "=",
+						Left:  &builder.ValuePos{Type: "column", Name: "id"},
+						Right: &builder.ValuePos{Type: "literal", Value: "u1"},
+					},
+				},
+			},
+		},
+	}
+
+	// Hydrate: no match → ALWAYS_FALSE baked → no issue rows emitted.
+	changes, _, err := eng.AddQuery("q", ast)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range changes {
+		if c.Table == "issues" {
+			t.Fatalf("no-match hydrate must emit zero issue rows (ALWAYS_FALSE); got %+v", c)
+		}
+	}
+
+	// Transition 1: INSERT users{id:u1, name:NULL} — matched, but value NULL.
+	// scalarValuesEqual(nil, resolvedValue=nil)==true → NO reset, issue stays
+	// filtered (output-equivalent to the no-match state).
+	res := eng.Advance([]SnapshotChange{
+		{Table: "users", NextValue: ivm.Row{"id": "u1", "name": nil}},
+	})
+	if res.Drift != nil {
+		t.Fatalf("no-match→matched-NULL must NOT reset (nil==nil); got Drift=%+v", res.Drift)
+	}
+	for _, c := range res.Changes {
+		if c.Table == "issues" {
+			t.Fatalf("matched-NULL must not surface an issue row (ALWAYS_FALSE still holds); got %+v", c)
+		}
+	}
+
+	// Transition 2: EDIT users{id:u1} name NULL→"Zoe" — now the baked literal
+	// is genuinely stale, so a scalar-subquery reset MUST fire.
+	res = eng.Advance([]SnapshotChange{
+		{
+			Table:      "users",
+			PrevValues: []ivm.Row{{"id": "u1", "name": nil}},
+			NextValue:  ivm.Row{"id": "u1", "name": "Zoe"},
+		},
+	})
+	if res.Drift == nil {
+		t.Fatalf("matched-NULL→matched-value must reset (Drift set); got nil, changes=%+v", res.Changes)
+	}
+	if res.Drift.Op != "ScalarSubquery" {
+		t.Fatalf("expected Drift.Op=ScalarSubquery, got %q", res.Drift.Op)
+	}
+}

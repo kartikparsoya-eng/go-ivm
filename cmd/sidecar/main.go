@@ -1832,6 +1832,11 @@ func (s *Server) handleAdvanceStream(req RPCRequest, streamW streamWriter) RPCRe
 
 type destroyParams struct {
 	ClientGroupID string `json:"clientGroupID"`
+	// InitEpoch must match the cgID's current epoch (returned by handleInit).
+	// A stale destroy from a torn-down view-syncer whose RPC raced past a
+	// fresh init for the same cgID must not tear down the live successor's
+	// engine. 0 = caller didn't send one (pre-protocolRev-9 client) → reject.
+	InitEpoch uint64 `json:"initEpoch"`
 }
 
 func (s *Server) handleDestroy(req RPCRequest) RPCResponse {
@@ -1843,6 +1848,24 @@ func (s *Server) handleDestroy(req RPCRequest) RPCResponse {
 	cgID := p.ClientGroupID
 	if cgID == "" {
 		cgID = "default"
+	}
+
+	// Epoch guard: verify the caller's epoch matches before tearing down.
+	// We look up the group under s.mu (released immediately, same as every
+	// other handler via getGroup), then check epoch under group.mu. We canNOT
+	// hold group.mu across removeGroup because shutdownGroup takes group.mu
+	// — holding it would self-deadlock. The TOCTOU between the epoch check
+	// and removeGroup is benign: a stale view-syncer's destroy and the live
+	// instance's init are separated by network latency + TS startup time,
+	// not microseconds.
+	group := s.getGroup(cgID, false)
+	if group != nil {
+		group.mu.Lock()
+		if resp, stale := checkInitEpoch(group, req.ID, p.InitEpoch); stale {
+			group.mu.Unlock()
+			return resp
+		}
+		group.mu.Unlock()
 	}
 
 	s.removeGroup(cgID)

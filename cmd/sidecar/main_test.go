@@ -98,9 +98,18 @@ func TestMultiGroupParallel(t *testing.T) {
 				return
 			}
 
-			// Destroy
+			// Destroy — must send the matching initEpoch so the epoch guard
+			// accepts the call (D2 fix).
+			g := server.getGroup(cgID, false)
+			var epoch uint64
+			if g != nil {
+				g.mu.Lock()
+				epoch = g.initEpoch
+				g.mu.Unlock()
+			}
 			destroyP := map[string]interface{}{
 				"clientGroupID": cgID,
+				"initEpoch":     epoch,
 			}
 			resp = sendRPC(conn, reader, "destroy", destroyP)
 			if resp.Error != nil {

@@ -34,12 +34,19 @@ func sourceChangeToChange(sc ivm.SourceChange) *ivm.Change {
 // editChangesSplitKeys reports whether an Edit changed any column listed
 // in splitKeys. When true the connection processes it as remove+add
 // (matches the TS partition-key semantics).
+//
+// Uses ValuesEqual (not CompareValues) to match TS memory-source.ts:466
+// (`!valuesEqual(change.row[k], change.oldRow[k])`). valuesEqual treats
+// null≠null (data.ts:112-118), so a NULL→NULL transition on a split key
+// SPLITS the edit — CompareValues(nil,nil)==0 would wrongly treat it as
+// unchanged and skip the split, diverging from TS. Mirrors the ivm path's
+// genPushAndWriteWithSplitEdit (source.go), which already uses ValuesEqual.
 func editChangesSplitKeys(change ivm.SourceChange, splitKeys map[string]bool) bool {
 	if change.Type != ivm.ChangeTypeEdit {
 		return false
 	}
 	for k := range splitKeys {
-		if ivm.CompareValues(change.Row[k], change.OldRow[k]) != 0 {
+		if !ivm.ValuesEqual(change.Row[k], change.OldRow[k]) {
 			return true
 		}
 	}
@@ -122,9 +129,14 @@ func overlayRowAtOrAfterStart(row ivm.Row, start *ivm.Start, comparator ivm.Comp
 	return true
 }
 
+// constraintMatchesRow — TS uses valuesEqual (constraint.ts:21), which treats
+// null/null as UNEQUAL (data.ts:112-118). CompareValues treats nil/nil as equal
+// (returns 0), which would over-include an overlay row whose constraint column
+// is NULL — diverging from TS, which drops it. Mirror the ValuesEqual
+// convention already used by constraintsAreCompatible (flipped_join.go:416).
 func constraintMatchesRow(constraint ivm.Constraint, row ivm.Row) bool {
 	for k, v := range constraint {
-		if ivm.CompareValues(row[k], v) != 0 {
+		if !ivm.ValuesEqual(row[k], v) {
 			return false
 		}
 	}

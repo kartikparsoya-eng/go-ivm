@@ -637,8 +637,21 @@ func (ms *MemorySource) computeOverlays(start *Start, constraint *Constraint, co
 	// overlaysForStartAt — Source: memory-source.ts line 696-707
 	// Filter out overlay rows that sort before the start position in the scan
 	// direction. TS uses indexComparator (which is reversed for reverse fetches).
+	//
+	// PARTIAL-bound comparator: start.Row may be a partial pagination cursor
+	// (e.g. {createdAt} while the sort is [createdAt, conversationId]). With the
+	// plain MakeComparator the missing cursor column hits CompareValues(rowVal,
+	// nil) → ±1 (nil < non-nil), so for a FORWARD fetch the gate over-includes a
+	// Basis:"after" boundary row (ranked strictly after → kept), and for a
+	// REVERSE "at" (inclusive) fetch the reversed comparator returns -1 → the
+	// gate DROPS the boundary overlay before applyStart can keep it — a real
+	// missing-row bug. MakePartialBoundComparator stops at the first sort column
+	// absent from the cursor, ranking the boundary EQUAL so the Basis (applied
+	// later by applyStart via CompareWithPartialBound) decides. Identical to
+	// MakeComparator when start.Row is a complete row. Mirrors the tablesource
+	// gate at internal/tablesource/source.go (MakePartialBoundComparator).
 	if start != nil {
-		compare := MakeComparator(conn.Sort, reverse)
+		compare := MakePartialBoundComparator(conn.Sort, reverse)
 		if o.Add != nil && compare(o.Add, start.Row) < 0 {
 			o.Add = nil
 		}

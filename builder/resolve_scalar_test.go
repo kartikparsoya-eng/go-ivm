@@ -341,6 +341,73 @@ func TestResolve_NoMatchReturnsAlwaysFalse(t *testing.T) {
 	}
 }
 
+// TestResolve_MatchedNullReturnsAlwaysFalse proves the matched-but-NULL case
+// bakes the SAME ALWAYS_FALSE predicate as the no-match case — the refutation
+// of the review's "no-match→matched-NULL regression" claim.
+//
+// resolve_scalar.go:171 collapses both states via `!matched || value == nil`.
+// In SQL `parentField = NULL` is false, exactly like the no-row case, so TS
+// collapses both to ALWAYS_FALSE too (resolve-scalar-subqueries.ts:171) and the
+// engine's resolvedValue==nil (engine.go:618) makes the two indistinguishable
+// downstream. The only surviving difference is the companion's Matched flag,
+// which is redundant with value==nil for output purposes.
+func TestResolve_MatchedNullReturnsAlwaysFalse(t *testing.T) {
+	tableUniqueKeys := map[string][][]string{"users": {{"id"}}}
+	mkAST := func() AST {
+		return AST{
+			Table: "issues",
+			Where: &Condition{
+				Type:   "correlatedSubquery",
+				Op:     "EXISTS",
+				Scalar: true,
+				Related: &CorrelatedSubquery{
+					Correlation: Correlation{
+						ParentField: []string{"ownerId"},
+						ChildField:  []string{"name"},
+					},
+					Subquery: AST{
+						Table: "users",
+						Where: &Condition{
+							Type:  "simple",
+							Op:    "=",
+							Left:  &ValuePos{Type: "column", Name: "id"},
+							Right: &ValuePos{Type: "literal", Value: "u1"},
+						},
+					},
+				},
+			},
+		}
+	}
+
+	// matched=true but value=nil (row exists, child field is NULL).
+	matchedNull := ResolveSimpleScalarSubqueries(
+		mkAST(), tableUniqueKeys,
+		func(_ AST, _ string) (interface{}, bool) { return nil, true },
+	)
+	w := matchedNull.AST.Where
+	if w == nil || w.Type != "simple" || w.Op != "=" ||
+		w.Left.Type != "literal" || w.Left.Value != float64(1) ||
+		w.Right.Type != "literal" || w.Right.Value != float64(0) {
+		t.Fatalf("matched-NULL must bake ALWAYS_FALSE (1=0), got: %+v", w)
+	}
+	// Companion records the match (distinct from no-match) but with nil value.
+	if len(matchedNull.Companions) != 1 ||
+		!matchedNull.Companions[0].Matched ||
+		matchedNull.Companions[0].ResolvedValue != nil {
+		t.Fatalf("expected one matched companion with nil value, got: %+v", matchedNull.Companions)
+	}
+
+	// The baked predicate must be byte-identical to the no-match case.
+	noMatch := ResolveSimpleScalarSubqueries(
+		mkAST(), tableUniqueKeys,
+		func(_ AST, _ string) (interface{}, bool) { return nil, false },
+	)
+	if !reflect.DeepEqual(noMatch.AST.Where, matchedNull.AST.Where) {
+		t.Fatalf("no-match and matched-NULL must bake identical predicates:\n no-match=%+v\n matched-NULL=%+v",
+			noMatch.AST.Where, matchedNull.AST.Where)
+	}
+}
+
 func TestResolve_NonSimpleScalarLeftAlone(t *testing.T) {
 	// Subquery WHERE doesn't fully cover any unique key — resolver must
 	// leave the EXISTS in place so the regular join machinery handles it.

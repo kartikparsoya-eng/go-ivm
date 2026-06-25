@@ -487,18 +487,24 @@ func FromSQLiteType(v interface{}, colType string) ivm.Value {
 			return v
 		}
 	case "json":
-		// JSON columns are stored as text; parse them
+		// JSON columns are stored as text; parse them. TS's coerceValue
+		// (table-source.ts:632-641) throws UnsupportedValueError on
+		// JSON.parse failure — surfacing the error instead of silently
+		// shipping the raw string to the client (which would desync the
+		// init-vs-advance shape: init sends a parsed object, advance sends
+		// the raw string). Panic to match; the engine's recover surfaces
+		// it as an RPC error.
 		switch val := v.(type) {
 		case string:
 			var parsed interface{}
 			if err := json.Unmarshal([]byte(val), &parsed); err != nil {
-				return val // Return raw string on parse failure
+				panic(fmt.Sprintf("FromSQLiteType(json): parse failed for %q: %v", val, err))
 			}
 			return parsed
 		case []byte:
 			var parsed interface{}
 			if err := json.Unmarshal(val, &parsed); err != nil {
-				return string(val)
+				panic(fmt.Sprintf("FromSQLiteType(json): parse failed for %q: %v", string(val), err))
 			}
 			return parsed
 		default:

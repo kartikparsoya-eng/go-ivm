@@ -231,3 +231,73 @@ func BenchmarkSourceFetchRepeated(b *testing.B) {
 		})
 	}
 }
+
+// BenchmarkUnorderedOrderByCost measures whether the ORDER BY that Go's
+// tablesource always emits (even in unordered mode — source.go:1085-1092
+// substitutes pkSort when conn.sort is nil) is actually free for a rowid PK.
+//
+// TS skips ORDER BY in unordered mode (table-source.ts:216,231 passes
+// sort=undefined → buildSelectQuery omits the clause) and uses a separate
+// generateWithOverlayUnordered path that appends the overlay add instead of
+// sorted-inserting it. Go instead always emits ORDER BY <pk> and sorted-
+// inserts via applyOverlay. If ORDER BY on an INTEGER PRIMARY KEY is free
+// (SQLite scans the rowid index in natural order — no sort pass), the
+// unordered-skip optimization is not worth the separate overlay path. This
+// benchmark compares the two raw SQL shapes to isolate the clause cost.
+//
+// DECISION (measured on Apple M4 Pro, 1000 rows, limit=100, 3 runs each):
+//
+//	with_ORDER_BY_id   ~30,057 ns/op   4144 B/op   374 allocs/op
+//	without_ORDER_BY   ~29,739 ns/op   4144 B/op   374 allocs/op
+//	→ ~1% delta, within noise, identical allocs. ORDER BY on a rowid PK is
+//	FREE (SQLite reuses the rowid index, no sort pass). Implementing the
+//	TS-style unordered-skip path (separate generateWithOverlayUnordered +
+//	omit ORDER BY) is NOT worth the complexity for this negligible gain.
+//	Revisit only if a tablesource ever uses a non-indexed PK where ORDER BY
+//	would force a real sort.
+func BenchmarkUnorderedOrderByCost(b *testing.B) {
+	const rows = 1000
+	const limit = 100
+	path := seedReplicaLarge(b, rows)
+	db, err := Open(path, OpenOptions{})
+	if err != nil {
+		b.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+	if _, err := db.Exec("SELECT COUNT(*) FROM t"); err != nil {
+		b.Fatalf("warm: %v", err)
+	}
+
+	scan := func(b *testing.B, q string) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			rs, err := db.Query(q, limit)
+			if err != nil {
+				b.Fatalf("query: %v", err)
+			}
+			var id, val int
+			var name string
+			n := 0
+			for rs.Next() {
+				if err := rs.Scan(&id, &name, &val); err != nil {
+					rs.Close()
+					b.Fatalf("scan: %v", err)
+				}
+				n++
+			}
+			rs.Close()
+			if n != limit {
+				b.Fatalf("scanned %d, want %d", n, limit)
+			}
+		}
+	}
+
+	// What Go currently emits in unordered mode (ORDER BY pk).
+	b.Run("with_ORDER_BY_id", func(b *testing.B) {
+		scan(b, "SELECT id, name, val FROM t ORDER BY id LIMIT ?")
+	})
+	// What the unordered-skip optimization would emit (no ORDER BY).
+	b.Run("without_ORDER_BY", func(b *testing.B) {
+		scan(b, "SELECT id, name, val FROM t LIMIT ?")
+	})
+}
