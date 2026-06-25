@@ -126,33 +126,23 @@ func (s *Server) buildSnapshotterLocked(group *ClientGroup, p *initParams) error
 	return nil
 }
 
-// buildReaderPoolLocked builds and binds a CG-shared frame-pinned reader pool
-// for the cold-start parallel hydrate, when GO_IVM_HYDRATE_READERS>1. The pool's
-// K connections are all pinned at wantVersion (curr's stateVersion), so hydrate
-// reads run in parallel while staying byte-identical to the single bound-conn
-// path. If the pool can't be built — feature off, replica not ready, or the
-// replicator already advanced past wantVersion so K conns can't all pin it —
-// we silently keep the single-conn path (correctness over speedup). MUST hold
-// group.mu (called from buildSnapshotterLocked / handleInit).
-// buildReaderPoolLocked returns nil on success (pool built + bound) OR when the
-// feature is off (hydrateReaders<=1) — both are "no error" for the caller's
-// converge loop. A non-nil error means the pin lost the race to a fresh commit;
-// the caller re-pins curr and retries on a newer frame. MUST hold group.mu.
-func (s *Server) buildReaderPoolLocked(group *ClientGroup, wantVersion string) error {
-	if s.hydrateReaders <= 1 || wantVersion == "" {
-		return nil // feature off / no version: serial by design, not a failure
+// buildReaderPoolLocked builds a reader pool whose K connections are all
+// converged onto the same WAL frame (the replica head at build time).
+// NewReaderPool handles the internal convergence (converge-upward) so all K
+// readers agree on one frame without requiring a pre-computed target version.
+// Returns (pool, nil) on success, (nil, nil) when the feature is off
+// (hydrateReaders<=1), or (nil, err) on a hard failure. The caller MUST verify
+// pool.Version() matches the Snapshotter's curr and retry if not. MUST hold
+// group.mu.
+func (s *Server) buildReaderPoolLocked() (*tablesource.ReaderPool, error) {
+	if s.hydrateReaders <= 1 {
+		return nil, nil // feature off: serial by design, not a failure
 	}
 	rdb, derr := s.getReplicaDB()
 	if derr != nil {
-		return derr
+		return nil, derr
 	}
-	pool, perr := tablesource.NewReaderPool(context.Background(), rdb, wantVersion, s.hydrateReaders)
-	if perr != nil {
-		return perr
-	}
-	group.readerPool = pool
-	group.eng.BindTableSourcesToReaderPool(pool)
-	return nil
+	return tablesource.NewReaderPool(context.Background(), rdb, "", s.hydrateReaders)
 }
 
 // tearDownReaderPool unbinds and closes the group's cold-start reader pool, if
@@ -217,14 +207,15 @@ func readAllTableNames(db *sql.DB) (map[string]bool, error) {
 // (rare "Go produced 0" shadow misses for rows that landed in that window).
 // No-op once any pipeline exists: re-pinning curr would desync hydrated
 // pipelines. MUST hold group.mu.
-// maxReaderPoolConvergeAttempts bounds the refresh-curr + pin-pool retry. Each
-// attempt re-pins curr at the CURRENT head (a fresh target) and tries to pin the
-// reader pool there, so a drive-mode commit landing mid-pin costs one more cheap
-// attempt instead of a permanent serial fallback. Capped low so the rare
-// unconvergeable case (sustained writes) adds only a few hundred ms before
-// degrading to the serial path — the pin itself is ~tens of ms and is on the
-// cold-hydrate critical path under group.mu.
-const maxReaderPoolConvergeAttempts = 3
+//
+// maxReaderPoolConvergeAttempts bounds the converge loop. Each attempt refreshes
+// curr to head, builds the pool (which converges K readers to the same frame
+// internally via converge-upward), and checks that pool.Version() == curr's
+// version. If the replicator advanced between the curr refresh and the pool
+// build, the versions disagree and we retry. Capped at 10 so the rare
+// unconvergeable case (sustained writes) degrades to the serial path after
+// ~10×(K+1) ms — acceptable on the cold-hydrate critical path under group.mu.
+const maxReaderPoolConvergeAttempts = 10
 
 func (s *Server) refreshSnapForInitialHydrateLocked(group *ClientGroup) {
 	if !s.advanceDriveEnabled || group.snap == nil || group.eng == nil {
@@ -233,17 +224,24 @@ func (s *Server) refreshSnapForInitialHydrateLocked(group *ClientGroup) {
 	if group.eng.PipelineCount() > 0 {
 		return
 	}
+
 	// Converge curr AND the cold-start reader pool onto ONE fresh frame, right
-	// before the first hydrate. Building the pool at init pinned a version the
-	// replicator advanced past by hydrate time, so the pin failed and every cold
-	// batch fell back to serial single-conn reads. Re-pinning curr to head and
-	// pinning the pool to THAT same version, in the tightest possible window, is
-	// what lets the pin land under drive-mode writes.
+	// before the first hydrate. The pool's K readers converge to the same frame
+	// internally (NewReaderPool, converge-upward); we then check that pool and
+	// curr agree. If the replicator advanced between the curr refresh and the
+	// pool build, the pool lands on a newer frame — we detect the mismatch and
+	// retry, ratcheting both forward. This eliminates the old TOCTOU where a
+	// pre-computed wantVersion was already stale by the time the pool tried to
+	// pin it (the old inner loop retried 5x against an impossible-to-rewind
+	// target, all futile, wasting ~50ms per outer attempt).
 	var lastErr error
 	for attempt := 0; attempt < maxReaderPoolConvergeAttempts; attempt++ {
 		if err := group.snap.RefreshCurrentToHead(); err != nil {
 			fmt.Fprintf(os.Stderr,
 				"[GO-IVM] refresh curr before initial hydrate failed: %v\n", err)
+			if s.hydrateReaders > 1 {
+				metrics.recordReaderPoolBind(false, attempt+1)
+			}
 			return // can't refresh curr at all — serial path, nothing more to try
 		}
 		cur, cerr := group.snap.Current()
@@ -257,14 +255,33 @@ func (s *Server) refreshSnapForInitialHydrateLocked(group *ClientGroup) {
 		if s.hydrateReaders <= 1 {
 			return // feature off: curr refreshed, serial by design
 		}
-		err := s.buildReaderPoolLocked(group, cur.Version())
-		if err == nil {
-			return // pool bound at the refreshed frame — parallel hydrate ready
+
+		// Build pool — K readers converge to the same frame internally.
+		pool, perr := s.buildReaderPoolLocked()
+		if perr != nil {
+			lastErr = perr
+			continue // pool build failed; retry with a fresh curr
 		}
-		lastErr = err
-		// Pool pin lost the race to a fresh commit; loop re-pins curr at the new
-		// head and tries again on that fresher frame.
+		if pool == nil {
+			return // feature off (guarded above, defensive)
+		}
+
+		// Check alignment: pool and curr must be on the same frame.
+		if pool.Version() == cur.Version() {
+			group.readerPool = pool
+			group.eng.BindTableSourcesToReaderPool(pool)
+			metrics.recordReaderPoolBind(true, attempt+1)
+			return // pool + curr aligned — parallel hydrate ready
+		}
+
+		// Misaligned: replicator advanced between curr refresh and pool build.
+		// Close pool and retry — next iteration re-pins curr at the new head.
+		poolVer := pool.Version()
+		pool.Close()
+		lastErr = fmt.Errorf("pool at %q, curr at %q (attempt %d/%d)",
+			poolVer, cur.Version(), attempt+1, maxReaderPoolConvergeAttempts)
 	}
+	metrics.recordReaderPoolBind(false, maxReaderPoolConvergeAttempts)
 	fmt.Fprintf(os.Stderr,
 		"[GO-IVM] hydrate reader pool not built after %d converge attempts (serial fallback): %v\n",
 		maxReaderPoolConvergeAttempts, lastErr)

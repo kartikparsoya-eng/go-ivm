@@ -122,10 +122,11 @@ func TestReaderPool_PinsAllToVersion(t *testing.T) {
 	}
 }
 
-// TestReaderPool_RejectsWrongVersion: asking for a version the replica is not at
-// fails (readers cannot pin a frame that doesn't exist) rather than silently
-// returning a wrong-frame pool.
-func TestReaderPool_RejectsWrongVersion(t *testing.T) {
+// TestReaderPool_ConvergesToHead_IgnoresStaleTarget: the pool converges to the
+// replica's actual head regardless of the (now-ignored) wantVersion parameter.
+// The old code rejected a stale target; the converge-upward strategy simply
+// pins all readers at whatever head they land on.
+func TestReaderPool_ConvergesToHead_IgnoresStaleTarget(t *testing.T) {
 	path := seedReplicaWithStateVersion(t, "v42")
 	db, err := Open(path, OpenOptions{})
 	if err != nil {
@@ -133,10 +134,16 @@ func TestReaderPool_RejectsWrongVersion(t *testing.T) {
 	}
 	defer db.Close()
 
+	// Pass a stale/wrong version — the pool should ignore it and converge
+	// to whatever the replica is actually at ("v42").
 	pool, err := NewReaderPool(context.Background(), db, "v999", 4)
-	if err == nil {
-		pool.Close()
-		t.Fatal("NewReaderPool succeeded for a version the replica is not at; want error")
+	if err != nil {
+		t.Fatalf("NewReaderPool: %v", err)
+	}
+	defer pool.Close()
+
+	if pool.Version() != "v42" {
+		t.Fatalf("pool.Version() = %q, want v42 (actual head)", pool.Version())
 	}
 }
 

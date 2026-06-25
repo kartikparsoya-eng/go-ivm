@@ -20,13 +20,12 @@ import (
 // (returns SQLITE_ERROR) — without any cross-reader frame skew.
 const stateVersionSQL = `SELECT stateVersion FROM "_zero.replicationState"`
 
-// maxPinAttempts bounds the re-pin retries when a reader's BEGIN lands on a
-// newer frame than the target (the replicator committed between the target pin
-// and this reader's BEGIN). Under a quiet replica the first attempt matches;
-// once the replica has advanced PAST the target version a fresh BEGIN can never
-// reach it (you cannot rewind to a past frame without snapshot_open), so the
-// pool build fails and the caller falls back to the single-conn serial path.
-const maxPinAttempts = 5
+// maxConvergeAttempts bounds the re-pin retries when readers land on different
+// frames (the replicator committed between opening reader N and reader N+1).
+// Each retry ROLLBACKs the laggards and re-BEGINs them — a fresh BEGIN always
+// lands on the latest (or same) frame, so convergence is guaranteed under a
+// quiescent replica and bounded under sustained writes.
+const maxConvergeAttempts = 10
 
 // poolReader is one frame-pinned read connection plus its own prepared-statement
 // cache. It is borrowed exclusively (one goroutine at a time) via ReaderPool,
@@ -75,63 +74,111 @@ type ReaderPool struct {
 	version string
 }
 
-// NewReaderPool opens k read connections from db, each pinned (via BEGIN + a
-// validating stateVersion read) to wantVersion. It fails if any reader cannot be
-// pinned to wantVersion within maxPinAttempts (the replica advanced past it) —
-// the caller should then keep the single-conn path. db must be a WAL-family read
-// pool (e.g. tablesource.Open); wantVersion is the Snapshotter's current frame
-// version so the pool reads exactly what the single bound-conn path would.
-func NewReaderPool(ctx context.Context, db *sql.DB, wantVersion string, k int) (*ReaderPool, error) {
+// NewReaderPool opens k read connections from db, all converged onto the same
+// WAL frame. Instead of requiring a pre-determined wantVersion (the old strategy
+// that lost the race when the replicator advanced past it), it uses a
+// "converge-to-latest" strategy:
+//
+//  1. Open all K readers — each BEGINs and reads whatever stateVersion it lands on.
+//  2. Find the max version V_max among all readers.
+//  3. ROLLBACK + re-BEGIN any reader behind V_max — they'll land on V_max or newer.
+//  4. Repeat until all agree (or give up after maxConvergeAttempts).
+//
+// This always succeeds under a quiescent replica (all readers land on the same
+// frame on the first try) and converges quickly under sustained writes (each
+// iteration ratchets forward — a fresh BEGIN never lands on an older frame).
+// The returned pool's Version() is whatever the readers converged to; the caller
+// should refresh curr to match.
+func NewReaderPool(ctx context.Context, db *sql.DB, _ string, k int) (*ReaderPool, error) {
 	if db == nil {
 		return nil, fmt.Errorf("tablesource.NewReaderPool: db is nil")
-	}
-	if wantVersion == "" {
-		return nil, fmt.Errorf("tablesource.NewReaderPool: wantVersion is empty")
 	}
 	if k < 1 {
 		k = 1
 	}
-	p := &ReaderPool{free: make(chan *poolReader, k), version: wantVersion}
-	for i := 0; i < k; i++ {
-		r, err := openPinnedReader(ctx, db, wantVersion)
-		if err != nil {
-			p.Close()
-			return nil, err
-		}
-		p.all = append(p.all, r)
-		p.free <- r
-	}
-	return p, nil
-}
 
-func openPinnedReader(ctx context.Context, db *sql.DB, wantVersion string) (*poolReader, error) {
-	conn, err := db.Conn(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("reader pin: acquire conn: %w", err)
-	}
-	var lastVer string
-	for attempt := 0; attempt < maxPinAttempts; attempt++ {
+	readers := make([]*poolReader, k)
+	versions := make([]string, k)
+
+	for i := 0; i < k; i++ {
+		conn, err := db.Conn(ctx)
+		if err != nil {
+			for j := 0; j < i; j++ {
+				readers[j].close(ctx)
+			}
+			return nil, fmt.Errorf("reader pool: acquire conn %d: %w", i, err)
+		}
 		if _, err := conn.ExecContext(ctx, "BEGIN"); err != nil {
 			_ = conn.Close()
-			return nil, fmt.Errorf("reader pin: BEGIN: %w", err)
+			for j := 0; j < i; j++ {
+				readers[j].close(ctx)
+			}
+			return nil, fmt.Errorf("reader pool: BEGIN conn %d: %w", i, err)
 		}
 		var ver string
 		if err := conn.QueryRowContext(ctx, stateVersionSQL).Scan(&ver); err != nil {
 			_ = conn.Close()
-			return nil, fmt.Errorf("reader pin: read stateVersion: %w", err)
+			for j := 0; j < i; j++ {
+				readers[j].close(ctx)
+			}
+			return nil, fmt.Errorf("reader pool: read stateVersion conn %d: %w", i, err)
 		}
-		if ver == wantVersion {
-			return &poolReader{conn: conn, stmts: map[string]*sql.Stmt{}}, nil
+		readers[i] = &poolReader{conn: conn, stmts: map[string]*sql.Stmt{}}
+		versions[i] = ver
+	}
+
+	for attempt := 0; attempt < maxConvergeAttempts; attempt++ {
+		maxVer := versions[0]
+		for _, v := range versions {
+			if v > maxVer {
+				maxVer = v
+			}
 		}
-		lastVer = ver
-		if _, err := conn.ExecContext(ctx, "ROLLBACK"); err != nil {
-			_ = conn.Close()
-			return nil, fmt.Errorf("reader pin: ROLLBACK: %w", err)
+		allMatch := true
+		for i, r := range readers {
+			if versions[i] != maxVer {
+				if _, err := r.conn.ExecContext(ctx, "ROLLBACK"); err != nil {
+					for _, r2 := range readers {
+						r2.close(ctx)
+					}
+					return nil, fmt.Errorf("reader pool: converge ROLLBACK: %w", err)
+				}
+				if _, err := r.conn.ExecContext(ctx, "BEGIN"); err != nil {
+					for _, r2 := range readers {
+						r2.close(ctx)
+					}
+					return nil, fmt.Errorf("reader pool: converge BEGIN: %w", err)
+				}
+				var ver string
+				if err := r.conn.QueryRowContext(ctx, stateVersionSQL).Scan(&ver); err != nil {
+					for _, r2 := range readers {
+						r2.close(ctx)
+					}
+					return nil, fmt.Errorf("reader pool: converge read: %w", err)
+				}
+				versions[i] = ver
+				if ver != maxVer {
+					allMatch = false
+				}
+			}
+		}
+		if allMatch {
+			p := &ReaderPool{
+				free:    make(chan *poolReader, k),
+				all:     readers,
+				version: maxVer,
+			}
+			for _, r := range readers {
+				p.free <- r
+			}
+			return p, nil
 		}
 	}
-	_ = conn.Close()
-	return nil, fmt.Errorf("reader pin: want stateVersion %q, replica at %q after %d attempts",
-		wantVersion, lastVer, maxPinAttempts)
+
+	for _, r := range readers {
+		r.close(ctx)
+	}
+	return nil, fmt.Errorf("reader pool: could not converge %d readers after %d attempts", k, maxConvergeAttempts)
 }
 
 // acquire borrows an exclusive frame-pinned reader, blocking until one frees or

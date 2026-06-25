@@ -271,6 +271,15 @@ type perfMetrics struct {
 	// values mean the payload crossed advanceChunkSize / hydrateChunkSize.
 	hydrateChunkCounts []int
 	advanceChunkCounts []int
+
+	// Cold-start reader-pool bind outcomes (last 10s window). Lets us
+	// correlate bind-success-rate with replicator commit frequency: under fast
+	// drive-mode writes the converge loop races a moving head, so a falling
+	// bind-rate / rising avg-converge-attempts is the signal the pin is losing
+	// and cold hydrates are degrading to the serial single-conn path.
+	readerPoolBindSuccess      atomic.Int64
+	readerPoolBindFallback     atomic.Int64
+	readerPoolConvergeAttempts atomic.Int64 // summed converge passes consumed
 }
 
 var metrics = &perfMetrics{}
@@ -308,6 +317,21 @@ func (m *perfMetrics) recordAdvanceChunks(n int) {
 	m.mu.Unlock()
 }
 
+// recordReaderPoolBind tracks one cold-start reader-pool convergence outcome.
+// success=true means all K readers + curr converged on one frame (parallel
+// hydrate ready); false means the converge loop exhausted its attempts and the
+// hydrate fell back to the serial single-conn path. attempts is the number of
+// converge passes consumed (1 = bound first try; higher = the replicator
+// advanced mid-pin and forced retries). Reported as [GO-IVM][PERF-POOL].
+func (m *perfMetrics) recordReaderPoolBind(success bool, attempts int) {
+	m.readerPoolConvergeAttempts.Add(int64(attempts))
+	if success {
+		m.readerPoolBindSuccess.Add(1)
+	} else {
+		m.readerPoolBindFallback.Add(1)
+	}
+}
+
 func (m *perfMetrics) reportAndReset() {
 	m.mu.Lock()
 	advLats := m.advanceLatencies
@@ -324,8 +348,11 @@ func (m *perfMetrics) reportAndReset() {
 	hydCount := m.hydrateCount.Swap(0)
 	peakAdv := m.peakAdvConc.Swap(0)
 	peakHyd := m.peakHydConc.Swap(0)
+	bindOK := m.readerPoolBindSuccess.Swap(0)
+	bindFallback := m.readerPoolBindFallback.Swap(0)
+	convergeAttempts := m.readerPoolConvergeAttempts.Swap(0)
 
-	if advCount == 0 && hydCount == 0 {
+	if advCount == 0 && hydCount == 0 && bindOK == 0 && bindFallback == 0 {
 		return
 	}
 
@@ -359,6 +386,19 @@ func (m *perfMetrics) reportAndReset() {
 	fmt.Fprintf(os.Stderr, "[GO-IVM][PERF] 10s window: advances=%d (p50=%v p95=%v max=%v peakConc=%d) hydrates=%d (p50=%v p95=%v max=%v peakConc=%d)\n",
 		advCount, advP50, advP95, advMax, peakAdv,
 		hydCount, hydP50, hydP95, hydMax, peakHyd)
+
+	// Reader-pool bind-success-rate (drive mode only). bind-rate falling +
+	// avg-converge-attempts rising under load = the pin losing the race to the
+	// replicator → cold hydrates degrading to serial. Correlate against the
+	// replicator commit rate to see where the converge loop runs out of margin.
+	if bindOK > 0 || bindFallback > 0 {
+		total := bindOK + bindFallback
+		rate := float64(bindOK) / float64(total) * 100
+		avgAttempts := float64(convergeAttempts) / float64(total)
+		fmt.Fprintf(os.Stderr,
+			"[GO-IVM][PERF-POOL] 10s window: reader-pool binds ok=%d fallback=%d (bind-rate=%.1f%% avg-converge-attempts=%.1f)\n",
+			bindOK, bindFallback, rate, avgAttempts)
+	}
 }
 
 // updatePeak performs an atomic max — fixes parallelism review HIGH-2.
