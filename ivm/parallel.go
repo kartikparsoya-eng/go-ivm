@@ -162,6 +162,21 @@ func (ms *MemorySource) PushWithMode(change SourceChange) []Change {
 }
 
 func (ms *MemorySource) genPushAndWriteParallel(change SourceChange) []Change {
+	// BUG 1b: if this Edit's OldRow was removed earlier in this batch,
+	// convert to Add (same as sequential path).
+	if change.Type == ChangeTypeEdit && !ms.has(change.OldRow) {
+		if ms.removedInBatch != nil && ms.removedInBatch[ms.pkKey(change.OldRow)] {
+			change = MakeSourceChangeAdd(change.Row)
+		}
+	}
+	// BUG 1c: Convert duplicate Add to Edit (same as sequential path).
+	if change.Type == ChangeTypeAdd && ms.has(change.Row) {
+		if ms.addedInBatch != nil {
+			if prevRow, ok := ms.addedInBatch[ms.pkKey(change.Row)]; ok {
+				change = MakeSourceChangeEdit(change.Row, prevRow)
+			}
+		}
+	}
 	// Handle split-edit same as sequential.
 	// connsMu guards the slice header against Connect/Disconnect
 	// torn-reads — see genPushAndWriteWithSplitEdit for the full
@@ -202,6 +217,7 @@ func (ms *MemorySource) genPushAndWriteParallel(change SourceChange) []Change {
 		return results
 	}
 
+	// BUG 1: skip duplicate Remove
 	if change.Type == ChangeTypeRemove && !ms.has(change.Row) && ms.removedInBatch != nil && ms.removedInBatch[ms.pkKey(change.Row)] {
 		return nil
 	}

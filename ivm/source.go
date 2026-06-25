@@ -88,6 +88,7 @@ type MemorySource struct {
 	// REVIEW-ts-integration CRITICAL-3 / REVIEW-porting MEDIUM-2.
 	converter      ValueConverter
 	removedInBatch map[string]bool // PKs removed in the current advance batch
+	addedInBatch   map[string]Row  // PKs → rows added in the current advance batch
 }
 
 // ValueConverter coerces a raw decoded value to its canonical Value for the
@@ -240,6 +241,26 @@ func (ms *MemorySource) genPushAndWriteWithSplitEdit(change SourceChange) []Chan
 
 // genPushAndWrite — Source: memory-source.ts line 508-520
 func (ms *MemorySource) genPushAndWrite(change SourceChange) []Change {
+	// BUG 1b: if this Edit's OldRow was removed earlier in this batch,
+	// convert to Add (matching TS's lazy iteration: the prev row was
+	// already deleted by a previous writeChange, so TS's prev.getRows
+	// returns empty and TS emits an Add, not an Edit).
+	if change.Type == ChangeTypeEdit && !ms.has(change.OldRow) {
+		if ms.removedInBatch != nil && ms.removedInBatch[ms.pkKey(change.OldRow)] {
+			change = MakeSourceChangeAdd(change.Row)
+		}
+	}
+	// BUG 1c: if this Add duplicates a row added earlier in this batch,
+	// convert to Edit (matching TS's lazy iteration: TS's prev.getRows sees
+	// the just-INSERTed row and produces an Edit, not a duplicate Add).
+	if change.Type == ChangeTypeAdd && ms.has(change.Row) {
+		if ms.addedInBatch != nil {
+			if prevRow, ok := ms.addedInBatch[ms.pkKey(change.Row)]; ok {
+				change = MakeSourceChangeEdit(change.Row, prevRow)
+			}
+		}
+	}
+	// BUG 1: skip duplicate Remove (row already removed in this batch)
 	if change.Type == ChangeTypeRemove && !ms.has(change.Row) {
 		if ms.removedInBatch != nil && ms.removedInBatch[ms.pkKey(change.Row)] {
 			return nil
@@ -333,6 +354,7 @@ func (ms *MemorySource) writeChange(change SourceChange) {
 	switch change.Type {
 	case ChangeTypeAdd:
 		ms.insert(change.Row)
+		ms.trackAdded(change.Row)
 	case ChangeTypeRemove:
 		ms.remove(change.Row)
 		ms.trackRemoved(change.Row)
@@ -340,6 +362,7 @@ func (ms *MemorySource) writeChange(change SourceChange) {
 		ms.remove(change.OldRow)
 		ms.trackRemoved(change.OldRow)
 		ms.insert(change.Row)
+		ms.trackAdded(change.Row)
 	}
 }
 
@@ -374,6 +397,13 @@ func (ms *MemorySource) trackRemoved(row Row) {
 	ms.removedInBatch[ms.pkKey(row)] = true
 }
 
+func (ms *MemorySource) trackAdded(row Row) {
+	if ms.addedInBatch == nil {
+		ms.addedInBatch = make(map[string]Row)
+	}
+	ms.addedInBatch[ms.pkKey(row)] = row
+}
+
 func (ms *MemorySource) pkKey(row Row) string {
 	parts := make([]string, len(ms.primaryKey))
 	for i, k := range ms.primaryKey {
@@ -384,6 +414,7 @@ func (ms *MemorySource) pkKey(row Row) string {
 
 func (ms *MemorySource) ClearBatchState() {
 	ms.removedInBatch = nil
+	ms.addedInBatch = nil
 }
 
 // search returns the index where row would be inserted (binary search).

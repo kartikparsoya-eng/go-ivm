@@ -136,6 +136,7 @@ type Source struct {
 	// between two pushes, when overlay is nil — and resurface the very
 	// false-drift this set exists to suppress.
 	removedInBatch map[string]bool
+	addedInBatch   map[string]ivm.Row
 	// stmtCache memoizes prepared SELECT statements for fetchForConn, keyed by
 	// (active conn, SQL text). database/sql's one-shot QueryContext re-runs
 	// sqlite3_prepare_v2 on every call (14.6% of cgo time in the live read-path
@@ -680,6 +681,25 @@ func (s *Source) Push(change ivm.SourceChange) []ivm.Change {
 // Direct port of TS's genPushAndWrite (memory-source.ts).
 func (s *Source) genPushAndWrite(change ivm.SourceChange, conns []*connection) []ivm.Change {
 	s.mu.Lock()
+	// BUG 1b: if this Edit's OldRow was removed earlier in this batch,
+	// convert to Add (matching TS's lazy iteration: the prev row was
+	// already deleted by a previous writeChange, so TS's prev.getRows
+	// returns empty and TS emits an Add, not an Edit).
+	if change.Type == ivm.ChangeTypeEdit && !s.existsLocked(change.OldRow) {
+		if s.removedInBatch != nil && s.removedInBatch[s.pkKey(change.OldRow)] {
+			change = ivm.MakeSourceChangeAdd(change.Row)
+		}
+	}
+	// BUG 1c: if this Add duplicates a row added earlier in this batch,
+	// convert to Edit (matching TS's lazy iteration: TS's prev.getRows sees
+	// the just-INSERTed row and produces an Edit, not a duplicate Add).
+	if change.Type == ivm.ChangeTypeAdd && s.existsLocked(change.Row) {
+		if s.addedInBatch != nil {
+			if prevRow, ok := s.addedInBatch[s.pkKey(change.Row)]; ok {
+				change = ivm.MakeSourceChangeEdit(change.Row, prevRow)
+			}
+		}
+	}
 	// Drift validation BEFORE any state mutation or fanout — matches TS
 	// MemorySource.genPush (memory-source.ts:529-550) and the in-memory
 	// MemorySource port (ivm/source.go genPush). Raising here, before
@@ -690,6 +710,7 @@ func (s *Source) genPushAndWrite(change ivm.SourceChange, conns []*connection) [
 	// writeChange (a dup-Add) which was NOT a *DriftError and would crash the
 	// cg/sidecar instead of triggering a clean re-hydrate.
 	if d := s.driftCheckLocked(change); d != nil {
+		// BUG 1: skip Remove against a row removed earlier in this batch
 		if change.Type == ivm.ChangeTypeRemove && s.removedInBatch != nil && s.removedInBatch[s.pkKey(change.Row)] {
 			s.mu.Unlock()
 			return nil
@@ -815,6 +836,7 @@ func (s *Source) writeChangeLocked(change ivm.SourceChange) error {
 		if _, err := conn.ExecContext(ctx, s.insertSQL, args...); err != nil {
 			return fmt.Errorf("INSERT: %w", err)
 		}
+		s.trackAdded(change.Row)
 		return nil
 
 	case ivm.ChangeTypeRemove:
@@ -832,6 +854,7 @@ func (s *Source) writeChangeLocked(change ivm.SourceChange) error {
 			if _, err := conn.ExecContext(ctx, s.updateSQL, args...); err != nil {
 				return fmt.Errorf("UPDATE: %w", err)
 			}
+			s.trackAdded(change.Row)
 			return nil
 		}
 		// PK changed: DELETE + INSERT.
@@ -844,6 +867,7 @@ func (s *Source) writeChangeLocked(change ivm.SourceChange) error {
 		if _, err := conn.ExecContext(ctx, s.insertSQL, insArgs...); err != nil {
 			return fmt.Errorf("EDIT.INSERT: %w", err)
 		}
+		s.trackAdded(change.Row)
 		return nil
 	}
 	return fmt.Errorf("writeChange: unknown change type %v", change.Type)
@@ -854,6 +878,13 @@ func (s *Source) trackRemoved(row ivm.Row) {
 		s.removedInBatch = make(map[string]bool)
 	}
 	s.removedInBatch[s.pkKey(row)] = true
+}
+
+func (s *Source) trackAdded(row ivm.Row) {
+	if s.addedInBatch == nil {
+		s.addedInBatch = make(map[string]ivm.Row)
+	}
+	s.addedInBatch[s.pkKey(row)] = row
 }
 
 // ClearBatchState drops the intra-batch removed-PK set. Called by
@@ -869,6 +900,7 @@ func (s *Source) trackRemoved(row ivm.Row) {
 func (s *Source) ClearBatchState() {
 	s.mu.Lock()
 	s.removedInBatch = nil
+	s.addedInBatch = nil
 	s.mu.Unlock()
 }
 
