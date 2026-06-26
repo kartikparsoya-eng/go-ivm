@@ -134,15 +134,32 @@ func (s *Server) buildSnapshotterLocked(group *ClientGroup, p *initParams) error
 // (hydrateReaders<=1), or (nil, err) on a hard failure. The caller MUST verify
 // pool.Version() matches the Snapshotter's curr and retry if not. MUST hold
 // group.mu.
-func (s *Server) buildReaderPoolLocked() (*tablesource.ReaderPool, error) {
+func (s *Server) buildReaderPoolLocked(cur *snapshotter.Snapshot) (*tablesource.ReaderPool, *tablesource.CoRead, error) {
 	if s.hydrateReaders <= 1 {
-		return nil, nil // feature off: serial by design, not a failure
+		return nil, nil, nil // feature off: serial by design, not a failure
 	}
 	rdb, derr := s.getReplicaDB()
 	if derr != nil {
-		return nil, derr
+		return nil, nil, derr
 	}
-	return tablesource.NewReaderPool(context.Background(), rdb, "", s.hydrateReaders)
+
+	// Coread-fast path: capture from the anchor conn, arm K readers onto
+	// the same wal2 frame. Falls through to converge-upward on any error
+	// (not wal2 mode, SQLITE_ERROR, etc.).
+	if cur != nil {
+		if cr, cerr := tablesource.CaptureCoReadFromConn(cur.Conn()); cerr == nil {
+			pool, perr := tablesource.NewCoReadReaderPool(context.Background(), rdb, cr, s.hydrateReaders)
+			if perr == nil {
+				return pool, cr, nil
+			}
+			// Coread pool failed; free the handle and fall through.
+			cr.Free()
+		}
+	}
+
+	// Converge-fallback path (shipped pool: K readers converge-upward).
+	pool, err := tablesource.NewReaderPool(context.Background(), rdb, "", s.hydrateReaders)
+	return pool, nil, err
 }
 
 // tearDownReaderPool unbinds and closes the group's cold-start reader pool, if
@@ -158,6 +175,103 @@ func (s *Server) tearDownReaderPool(group *ClientGroup) {
 	}
 	group.readerPool.Close()
 	group.readerPool = nil
+	if group.coread != nil {
+		group.coread.Free()
+		group.coread = nil
+	}
+}
+
+// buildWarmReaderPoolLocked builds an EPHEMERAL co-read reader pool for a WARM
+// hydrate — an addQueriesStream on a CG that already has live pipelines. Unlike
+// the cold pool, it pins to curr's CURRENT frame (no RefreshCurrentToHead): the
+// new queries must hydrate at exactly the frame the existing pipelines sit on,
+// or they desync. That constraint forces co-read-ONLY: a converge-upward
+// fallback would land on a NEWER head than the live pipelines, so on any co-read
+// failure we return (nil,nil) and the warm add reads the bound curr.Conn()
+// serially — correct, just not parallel.
+//
+// Safe because handleAddQueriesStream holds group.mu for the whole call and
+// advances also take group.mu, so curr cannot rotate mid-hydrate: the co-read
+// frame stays identical to the Source's bound frame (fetchViaPool's invariant).
+//
+// Returns (pool, coread) bound and ready, or (nil, nil) when warm pooling is
+// off / not applicable / co-read unavailable. The caller MUST pair a non-nil
+// return with tearDownWarmReaderPool after AddQueriesStream. The pool is NOT
+// stored on the group (it is per-call); group.readerPool is the cold pool's
+// slot and is left untouched. MUST hold group.mu.
+func (s *Server) buildWarmReaderPoolLocked(group *ClientGroup) (*tablesource.ReaderPool, *tablesource.CoRead) {
+	if !s.warmHydratePoolEnabled || !s.advanceDriveEnabled || s.hydrateReaders <= 1 {
+		return nil, nil
+	}
+	if group.snap == nil || group.eng == nil {
+		return nil, nil
+	}
+	// Cold path's job: the FIRST hydrate (no live pipelines) is handled by
+	// refreshSnapForInitialHydrateLocked, which also gets to refresh curr.
+	if group.eng.PipelineCount() == 0 {
+		return nil, nil
+	}
+	// A cold pool is still bound (queries hydrated but no advance yet). It is
+	// already pinned to curr's frame and bound on the sources, so this warm add's
+	// fetches ALREADY run through it — don't build a second pool.
+	if group.readerPool != nil {
+		return nil, nil
+	}
+
+	rdb, derr := s.getReplicaDB()
+	if derr != nil {
+		metrics.recordWarmReaderPoolBind(false)
+		return nil, nil
+	}
+	cur, cerr := group.snap.Current()
+	if cerr != nil {
+		metrics.recordWarmReaderPoolBind(false)
+		return nil, nil
+	}
+
+	// Co-read-ONLY capture of curr's existing frame. No converge fallback.
+	cr, capErr := tablesource.CaptureCoReadFromConn(cur.Conn())
+	if capErr != nil {
+		metrics.recordWarmReaderPoolBind(false) // non-wal2 or capture error → serial
+		return nil, nil
+	}
+	pool, perr := tablesource.NewCoReadReaderPool(context.Background(), rdb, cr, s.hydrateReaders)
+	if perr != nil {
+		cr.Free()
+		metrics.recordWarmReaderPoolBind(false)
+		return nil, nil
+	}
+	// Defensive: the co-read latches K readers to curr's frame, so versions must
+	// agree. If they somehow don't (curr moved under us despite group.mu), drop
+	// the pool rather than hydrate the new query at a frame the live pipelines
+	// aren't on.
+	if pool.Version() != cur.Version() {
+		pool.Close()
+		cr.Free()
+		metrics.recordWarmReaderPoolBind(false)
+		return nil, nil
+	}
+
+	group.eng.BindTableSourcesToReaderPool(pool)
+	metrics.recordWarmReaderPoolBind(true)
+	return pool, cr
+}
+
+// tearDownWarmReaderPool unbinds and closes a pool built by
+// buildWarmReaderPoolLocked. Unbinding reverts the sources to their still-set
+// single-conn binding (curr.Conn(), via BindConn) — no rebind needed. The pool
+// is ephemeral and not tracked on the group. MUST hold group.mu.
+func (s *Server) tearDownWarmReaderPool(group *ClientGroup, pool *tablesource.ReaderPool, cr *tablesource.CoRead) {
+	if pool == nil {
+		return
+	}
+	if group.eng != nil {
+		group.eng.UnbindTableSourcesReaderPool()
+	}
+	pool.Close()
+	if cr != nil {
+		cr.Free()
+	}
 }
 
 // buildSnapshotterSpecs maps the init table schemas to snapshotter.TableSpecs.
@@ -217,7 +331,7 @@ func readAllTableNames(db *sql.DB) (map[string]bool, error) {
 // ~10×(K+1) ms — acceptable on the cold-hydrate critical path under group.mu.
 const maxReaderPoolConvergeAttempts = 10
 
-func (s *Server) refreshSnapForInitialHydrateLocked(group *ClientGroup) {
+func (s *Server) refreshSnapForInitialHydrateLocked(cgID string, group *ClientGroup) {
 	if !s.advanceDriveEnabled || group.snap == nil || group.eng == nil {
 		return
 	}
@@ -240,7 +354,7 @@ func (s *Server) refreshSnapForInitialHydrateLocked(group *ClientGroup) {
 			fmt.Fprintf(os.Stderr,
 				"[GO-IVM] refresh curr before initial hydrate failed: %v\n", err)
 			if s.hydrateReaders > 1 {
-				metrics.recordReaderPoolBind(false, attempt+1)
+				metrics.recordReaderPoolBind(poolBindSerial, attempt+1)
 			}
 			return // can't refresh curr at all — serial path, nothing more to try
 		}
@@ -256,8 +370,9 @@ func (s *Server) refreshSnapForInitialHydrateLocked(group *ClientGroup) {
 			return // feature off: curr refreshed, serial by design
 		}
 
-		// Build pool — K readers converge to the same frame internally.
-		pool, perr := s.buildReaderPoolLocked()
+		// Build pool — coread-fast (K readers latched to anchor's frame) or
+		// converge-fallback (K readers converge-upward).
+		pool, cr, perr := s.buildReaderPoolLocked(cur)
 		if perr != nil {
 			lastErr = perr
 			continue // pool build failed; retry with a fresh curr
@@ -269,8 +384,21 @@ func (s *Server) refreshSnapForInitialHydrateLocked(group *ClientGroup) {
 		// Check alignment: pool and curr must be on the same frame.
 		if pool.Version() == cur.Version() {
 			group.readerPool = pool
+			group.coread = cr
 			group.eng.BindTableSourcesToReaderPool(pool)
-			metrics.recordReaderPoolBind(true, attempt+1)
+			// cr is non-nil ONLY on the coread-fast success path
+			// (buildReaderPoolLocked:153) — every converge/serial path leaves it
+			// nil. So this is the one site that can distinguish a co-read pin (all K
+			// readers latched to the anchor's wal2 frame) from a converge-upward pin
+			// (K independent BEGINs ratcheted to the same head). Record + log it here.
+			outcome, via := poolBindConverge, "converge"
+			if cr != nil {
+				outcome, via = poolBindCoread, "coread"
+			}
+			metrics.recordReaderPoolBind(outcome, attempt+1)
+			fmt.Fprintf(os.Stderr,
+				"[GO-IVM][POOL] cg=%s cold-hydrate pin via %s: readers=%d frame=%s attempt=%d/%d\n",
+				cgID, via, s.hydrateReaders, pool.Version(), attempt+1, maxReaderPoolConvergeAttempts)
 			return // pool + curr aligned — parallel hydrate ready
 		}
 
@@ -278,10 +406,13 @@ func (s *Server) refreshSnapForInitialHydrateLocked(group *ClientGroup) {
 		// Close pool and retry — next iteration re-pins curr at the new head.
 		poolVer := pool.Version()
 		pool.Close()
+		if cr != nil {
+			cr.Free()
+		}
 		lastErr = fmt.Errorf("pool at %q, curr at %q (attempt %d/%d)",
 			poolVer, cur.Version(), attempt+1, maxReaderPoolConvergeAttempts)
 	}
-	metrics.recordReaderPoolBind(false, maxReaderPoolConvergeAttempts)
+	metrics.recordReaderPoolBind(poolBindSerial, maxReaderPoolConvergeAttempts)
 	fmt.Fprintf(os.Stderr,
 		"[GO-IVM] hydrate reader pool not built after %d converge attempts (serial fallback): %v\n",
 		maxReaderPoolConvergeAttempts, lastErr)

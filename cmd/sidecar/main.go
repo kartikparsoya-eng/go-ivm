@@ -277,9 +277,18 @@ type perfMetrics struct {
 	// drive-mode writes the converge loop races a moving head, so a falling
 	// bind-rate / rising avg-converge-attempts is the signal the pin is losing
 	// and cold hydrates are degrading to the serial single-conn path.
-	readerPoolBindSuccess      atomic.Int64
-	readerPoolBindFallback     atomic.Int64
+	readerPoolBindCoread       atomic.Int64 // K readers latched to anchor via wal2 co-read
+	readerPoolBindConverge     atomic.Int64 // K readers converged-upward to head
+	readerPoolBindSerial       atomic.Int64 // no pool bound — serial single-conn fallback
 	readerPoolConvergeAttempts atomic.Int64 // summed converge passes consumed
+
+	// Warm-hydrate pool bind outcomes (addQueriesStream on a live-pipeline CG).
+	// coread = K readers latched to curr's frame via co-read; serial = co-read
+	// unavailable (non-wal2 / capture error / frame mismatch) so the warm add ran
+	// single-conn. There is deliberately no "converge" bucket: the warm path
+	// never converges to head (it would desync the new query from live pipelines).
+	readerPoolWarmCoread atomic.Int64
+	readerPoolWarmSerial atomic.Int64
 }
 
 var metrics = &perfMetrics{}
@@ -317,18 +326,44 @@ func (m *perfMetrics) recordAdvanceChunks(n int) {
 	m.mu.Unlock()
 }
 
+// poolBindOutcome is HOW a cold-start hydrate got its K-reader frame: latched
+// to the anchor frame via wal2 co-read (coread-fast), converged-upward across K
+// independent BEGINs (the shipped fallback), or neither — no pool bound, so the
+// hydrate runs serial on the single curr conn.
+type poolBindOutcome int
+
+const (
+	poolBindSerial   poolBindOutcome = iota // no pool — serial single-conn fallback
+	poolBindConverge                        // K readers converged-upward to head
+	poolBindCoread                          // K readers latched to anchor via co-read
+)
+
 // recordReaderPoolBind tracks one cold-start reader-pool convergence outcome.
-// success=true means all K readers + curr converged on one frame (parallel
-// hydrate ready); false means the converge loop exhausted its attempts and the
-// hydrate fell back to the serial single-conn path. attempts is the number of
-// converge passes consumed (1 = bound first try; higher = the replicator
-// advanced mid-pin and forced retries). Reported as [GO-IVM][PERF-POOL].
-func (m *perfMetrics) recordReaderPoolBind(success bool, attempts int) {
+// poolBindCoread/poolBindConverge both mean a parallel-hydrate pool bound (the
+// pin worked); poolBindSerial means the converge loop exhausted its attempts (or
+// curr couldn't refresh) and the hydrate fell back to the serial single-conn
+// path. attempts is the converge passes consumed (1 = bound first try; higher =
+// the replicator advanced mid-pin and forced retries). Reported as
+// [GO-IVM][PERF-POOL].
+func (m *perfMetrics) recordReaderPoolBind(outcome poolBindOutcome, attempts int) {
 	m.readerPoolConvergeAttempts.Add(int64(attempts))
-	if success {
-		m.readerPoolBindSuccess.Add(1)
+	switch outcome {
+	case poolBindCoread:
+		m.readerPoolBindCoread.Add(1)
+	case poolBindConverge:
+		m.readerPoolBindConverge.Add(1)
+	default:
+		m.readerPoolBindSerial.Add(1)
+	}
+}
+
+// recordWarmReaderPoolBind tracks whether a warm hydrate ran parallel (co-read
+// pool bound at curr's frame) or fell back to the serial single-conn path.
+func (m *perfMetrics) recordWarmReaderPoolBind(bound bool) {
+	if bound {
+		m.readerPoolWarmCoread.Add(1)
 	} else {
-		m.readerPoolBindFallback.Add(1)
+		m.readerPoolWarmSerial.Add(1)
 	}
 }
 
@@ -348,11 +383,15 @@ func (m *perfMetrics) reportAndReset() {
 	hydCount := m.hydrateCount.Swap(0)
 	peakAdv := m.peakAdvConc.Swap(0)
 	peakHyd := m.peakHydConc.Swap(0)
-	bindOK := m.readerPoolBindSuccess.Swap(0)
-	bindFallback := m.readerPoolBindFallback.Swap(0)
+	bindCoread := m.readerPoolBindCoread.Swap(0)
+	bindConverge := m.readerPoolBindConverge.Swap(0)
+	bindSerial := m.readerPoolBindSerial.Swap(0)
 	convergeAttempts := m.readerPoolConvergeAttempts.Swap(0)
+	warmCoread := m.readerPoolWarmCoread.Swap(0)
+	warmSerial := m.readerPoolWarmSerial.Swap(0)
 
-	if advCount == 0 && hydCount == 0 && bindOK == 0 && bindFallback == 0 {
+	if advCount == 0 && hydCount == 0 && bindCoread == 0 && bindConverge == 0 &&
+		bindSerial == 0 && warmCoread == 0 && warmSerial == 0 {
 		return
 	}
 
@@ -387,17 +426,34 @@ func (m *perfMetrics) reportAndReset() {
 		advCount, advP50, advP95, advMax, peakAdv,
 		hydCount, hydP50, hydP95, hydMax, peakHyd)
 
-	// Reader-pool bind-success-rate (drive mode only). bind-rate falling +
-	// avg-converge-attempts rising under load = the pin losing the race to the
-	// replicator → cold hydrates degrading to serial. Correlate against the
-	// replicator commit rate to see where the converge loop runs out of margin.
-	if bindOK > 0 || bindFallback > 0 {
-		total := bindOK + bindFallback
-		rate := float64(bindOK) / float64(total) * 100
+	// Cold-start reader-pool pin breakdown (drive mode only). coread = latched to
+	// the anchor frame via wal2 co-read; converge = K readers converged-upward;
+	// serial = no pool bound (the pin lost the race to the replicator and the
+	// hydrate ran single-conn). pin-rate falling + avg-converge-attempts rising
+	// under load = the pin losing margin to the replicator commit rate; a coread
+	// share collapsing toward converge means the anchor capture is erroring (e.g.
+	// the replica dropped out of wal2 mode).
+	if bindCoread > 0 || bindConverge > 0 || bindSerial > 0 {
+		bound := bindCoread + bindConverge
+		total := bound + bindSerial
+		pinRate := float64(bound) / float64(total) * 100
 		avgAttempts := float64(convergeAttempts) / float64(total)
 		fmt.Fprintf(os.Stderr,
-			"[GO-IVM][PERF-POOL] 10s window: reader-pool binds ok=%d fallback=%d (bind-rate=%.1f%% avg-converge-attempts=%.1f)\n",
-			bindOK, bindFallback, rate, avgAttempts)
+			"[GO-IVM][PERF-POOL] 10s window: cold-hydrate pins coread=%d converge=%d serial=%d (pin-rate=%.1f%% avg-converge-attempts=%.1f)\n",
+			bindCoread, bindConverge, bindSerial, pinRate, avgAttempts)
+	}
+
+	// Warm-hydrate pool breakdown (GO_IVM_WARM_HYDRATE_POOL). coread = the warm
+	// add hydrated in parallel on curr's frame; serial = co-read was unavailable
+	// (non-wal2 / capture error / frame moved) and it ran single-conn. A serial
+	// share climbing means warm adds are losing parallelism — check the replica
+	// is in wal2 mode and the add isn't racing an advance that moved curr.
+	if warmCoread > 0 || warmSerial > 0 {
+		warmTotal := warmCoread + warmSerial
+		warmRate := float64(warmCoread) / float64(warmTotal) * 100
+		fmt.Fprintf(os.Stderr,
+			"[GO-IVM][PERF-POOL] 10s window: warm-hydrate pins coread=%d serial=%d (pin-rate=%.1f%%)\n",
+			warmCoread, warmSerial, warmRate)
 	}
 }
 
@@ -581,6 +637,7 @@ type ClientGroup struct {
 	// shutdownGroup / re-init. Nil when the feature is off or the pool couldn't
 	// pin (replica advanced past curr) — both fall back to the single-conn path.
 	readerPool *tablesource.ReaderPool
+	coread    *tablesource.CoRead
 }
 
 type clientGroupReq struct {
@@ -663,6 +720,17 @@ type Server struct {
 	// init (all pinned to curr's stateVersion) so the per-query hydrate
 	// goroutines read in parallel; torn down at the first advance.
 	hydrateReaders int
+
+	// warmHydratePoolEnabled extends the parallel-hydrate reader pool to WARM
+	// hydrates (addQueriesStream on a CG that already has live pipelines), not
+	// just the first cold one. From GO_IVM_WARM_HYDRATE_POOL=true; default OFF so
+	// the shipped cold-only path is untouched. Unlike the cold pool, the warm
+	// pool is co-read-ONLY and pinned to curr's EXISTING frame (no
+	// RefreshCurrentToHead): a converge-upward fallback would read a NEWER frame
+	// than the live pipelines and desync the new query, so on any co-read failure
+	// the warm path stays serial (reads the bound curr.Conn()) rather than
+	// converging. Requires hydrateReaders>1 + advanceDrive.
+	warmHydratePoolEnabled bool
 }
 
 func NewServer(mode tablesource.Mode, replicaPath string) *Server {
@@ -1503,7 +1571,7 @@ func (s *Server) handleAddQuery(req RPCRequest) RPCResponse {
 		return resp
 	}
 
-	s.refreshSnapForInitialHydrateLocked(group)
+	s.refreshSnapForInitialHydrateLocked(cgID, group)
 	changes, timingMs, err := group.eng.AddQuery(p.QueryID, p.AST)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[GO-IVM] addQuery ERROR cg=%s query=%s: %v\n", cgID, p.QueryID, err)
@@ -1582,7 +1650,11 @@ func (s *Server) handleAddQueries(req RPCRequest) RPCResponse {
 		specs[i] = engine.QuerySpec{QueryID: q.QueryID, AST: q.AST}
 	}
 
-	s.refreshSnapForInitialHydrateLocked(group)
+	s.refreshSnapForInitialHydrateLocked(cgID, group)
+	warmPool, warmCR := s.buildWarmReaderPoolLocked(group)
+	if warmPool != nil {
+		defer s.tearDownWarmReaderPool(group, warmPool, warmCR)
+	}
 	results, err := group.eng.AddQueries(specs)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[GO-IVM] addQueries ERROR cg=%s: %v\n", cgID, err)
@@ -1657,7 +1729,15 @@ func (s *Server) handleAddQueriesStream(req RPCRequest, streamW streamWriter) RP
 	// On the Final frame, ChunkIndex+1 is the total chunk count for that
 	// query — engine_streaming_test.go locks in the invariant that Final
 	// is always on the last (highest-ChunkIndex) frame.
-	s.refreshSnapForInitialHydrateLocked(group)
+	s.refreshSnapForInitialHydrateLocked(cgID, group)
+	// Warm hydrate (live-pipeline CG): parallelize the added queries' fetches on
+	// a co-read pool pinned to curr's current frame. No-op for the cold first
+	// hydrate (handled above) or when GO_IVM_WARM_HYDRATE_POOL is off. Ephemeral
+	// — torn down right after AddQueriesStream so the next advance is unaffected.
+	warmPool, warmCR := s.buildWarmReaderPoolLocked(group)
+	if warmPool != nil {
+		defer s.tearDownWarmReaderPool(group, warmPool, warmCR)
+	}
 	err := group.eng.AddQueriesStream(specs, func(r engine.QueryResult) {
 		pc := toPositional(r.Changes)
 		streamW(req.ID, addQueriesStreamPartial{
@@ -2418,6 +2498,10 @@ func main() {
 			server.hydrateReaders = n
 		}
 	}
+	// GO_IVM_WARM_HYDRATE_POOL=true extends the parallel-hydrate pool to warm
+	// adds (existing-pipeline CGs). Co-read-only, pinned to curr's current frame.
+	// Off by default; needs HYDRATE_READERS>1 + ADVANCE_DRIVE to do anything.
+	server.warmHydratePoolEnabled = os.Getenv("GO_IVM_WARM_HYDRATE_POOL") == "true"
 	if server.advanceToHeadEnabled {
 		if sourceMode != tablesource.ModeTable {
 			fmt.Fprintln(os.Stderr,

@@ -58,6 +58,7 @@ RUN gcc -O2 -fPIC -c c/sqlite3/sqlite3.c -o /tmp/sqlite3.o \
         -DSQLITE_ENABLE_RTREE \
         -DSQLITE_OMIT_LOAD_EXTENSION \
         -DSQLITE_ENABLE_SNAPSHOT \
+        -DSQLITE_ENABLE_WAL2_COREAD \
     && ar rcs /usr/lib/libsqlite3.a /tmp/sqlite3.o \
     && cp c/sqlite3/sqlite3.h /usr/include/sqlite3.h \
     && cp c/sqlite3/sqlite3ext.h /usr/include/sqlite3ext.h
