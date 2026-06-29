@@ -1,7 +1,18 @@
 package ivm
 
-// Key translation: Stream<T> (generator) → []T (slice)
-// The 'yield' scheduling signal is dropped entirely.
+import "iter"
+
+// Key translation: Stream<T> (TS generator) → iter.Seq[T] (Go lazy iterator).
+// The 'yield' scheduling signal is dropped entirely — Go's runtime scheduler
+// is preemptive (since 1.14), so there is no single-threaded event loop to
+// yield to. iter.Seq[Node] is the faithful translation of TS's
+// Stream<Node | 'yield'> → Stream<Node> (operator.ts:43, stream.ts:8).
+
+// emptyNodeSeq is a non-nil iter.Seq[Node] that yields no values. Fetch
+// implementations MUST return this (not nil) when they have no results —
+// slices.Collect(nil) and `for v := range nilSeq` panic because they call
+// the nil function value.
+var emptyNodeSeq iter.Seq[Node] = func(yield func(Node) bool) {}
 
 type Constraint map[string]Value
 
@@ -57,10 +68,10 @@ type SourceSchema struct {
 	// side and its child rows are never streamed. Go gets the unresolved
 	// AST, so we build the join — but we mark the relationship IsScalar
 	// so the streamer drops the entire subtree, matching TS.
-	IsScalar      bool
-	System        string // "client" | "permissions" | "server"
-	CompareRows   Comparator
-	Sort          Ordering
+	IsScalar    bool
+	System      string // "client" | "permissions" | "server"
+	CompareRows Comparator
+	Sort        Ordering
 }
 
 type InputBase interface {
@@ -68,11 +79,14 @@ type InputBase interface {
 	Destroy()
 }
 
-// fetch returns []Node (TS Stream<Node | 'yield'> → Go []Node, dropping 'yield')
+// Fetch returns iter.Seq[Node] (TS Stream<Node | 'yield'> → Go iter.Seq[Node],
+// dropping 'yield'). The seq is lazy: the cursor/reader is held for the
+// lifetime of the seq, released on exhaustion or early stop (yield returns
+// false). See DESIGN-streaming-hydrate.md §3e.
 type Input interface {
 	InputBase
 	SetOutput(output Output)
-	Fetch(req FetchRequest) []Node
+	Fetch(req FetchRequest) iter.Seq[Node]
 }
 
 // push returns []Change (TS Stream<'yield'> → Go []Change as output changes)

@@ -1,5 +1,10 @@
 package ivm
 
+import (
+	"iter"
+	"slices"
+)
+
 // The Join operator joins output from two upstream inputs (parent + child).
 // Unlike SQL join, it outputs hierarchical data — parent nodes gain a new
 // relationship containing their matching child nodes.
@@ -122,13 +127,13 @@ func (j *Join) GetSchema() *SourceSchema {
 }
 
 // Fetch — fetches parent nodes and attaches child relationship.
-func (j *Join) Fetch(req FetchRequest) []Node {
-	parentNodes := j.parent.Fetch(req)
+func (j *Join) Fetch(req FetchRequest) iter.Seq[Node] {
+	parentNodes := slices.Collect(j.parent.Fetch(req))
 	result := make([]Node, 0, len(parentNodes))
 	for _, pn := range parentNodes {
 		result = append(result, j.processParentNode(pn.Row, pn.Relationships))
 	}
-	return result
+	return slices.Values(result)
 }
 
 // pushParent — handles changes from the parent input.
@@ -199,7 +204,7 @@ func (j *Join) pushChildChange(childRow Row, change Change) []Change {
 	}
 
 	var allChanges []Change
-	parentNodes := j.parent.Fetch(FetchRequest{Constraint: constraint})
+	parentNodes := slices.Collect(j.parent.Fetch(FetchRequest{Constraint: constraint}))
 	for _, parentNode := range parentNodes {
 		j.inprogressChildChangePosition = parentNode.Row
 		childChange := MakeChildChange(
@@ -220,7 +225,7 @@ func (j *Join) processParentNode(parentNodeRow Row, parentNodeRelations map[stri
 		constraint := BuildJoinConstraint(parentNodeRow, j.parentKey, j.childKey)
 		var nodes []Node
 		if constraint != nil {
-			nodes = j.child.Fetch(FetchRequest{Constraint: constraint})
+			nodes = slices.Collect(j.child.Fetch(FetchRequest{Constraint: constraint}))
 		}
 
 		if j.inprogressChildChange != nil &&

@@ -28,7 +28,10 @@ package ivm
 //     side). Requires an exact tie on the cursor value, so it is rare in
 //     live traffic.
 
-import "testing"
+import (
+	"slices"
+	"testing"
+)
 
 // skipCaptureOutput records pushes forwarded by the Skip under test.
 type skipCaptureOutput struct {
@@ -81,7 +84,7 @@ func TestSkipGetStartPartialBoundFullComparatorParity(t *testing.T) {
 	// Functional consequence: fetching from that explicit start INCLUDES the
 	// boundary-tied rows b and c even though the bound is exclusive — same
 	// quirk in TS. The bound only takes over when it ranks >= req.Start.
-	nodes := sk.Fetch(FetchRequest{Start: reqStart})
+	nodes := slices.Collect(sk.Fetch(FetchRequest{Start: reqStart}))
 	gotIDs := idsOf(nodes)
 	wantIDs := []string{"b", "c", "d"}
 	if !stringSlicesEqual(gotIDs, wantIDs) {
@@ -96,7 +99,7 @@ func TestSkipGetStartPartialBoundFullComparatorParity(t *testing.T) {
 func TestSkipFetchPartialExclusiveBoundExcludesTies(t *testing.T) {
 	_, sk, _ := newSkipParityFixture(t, true)
 
-	gotIDs := idsOf(sk.Fetch(FetchRequest{}))
+	gotIDs := idsOf(slices.Collect(sk.Fetch(FetchRequest{})))
 	wantIDs := []string{"d"}
 	if !stringSlicesEqual(gotIDs, wantIDs) {
 		t.Fatalf("Fetch = %v, want %v (rows at createdAt==100 must be excluded)", gotIDs, wantIDs)
@@ -104,7 +107,7 @@ func TestSkipFetchPartialExclusiveBoundExcludesTies(t *testing.T) {
 
 	// Inclusive bound keeps the ties.
 	_, skIncl, _ := newSkipParityFixture(t, false)
-	gotIDs = idsOf(skIncl.Fetch(FetchRequest{}))
+	gotIDs = idsOf(slices.Collect(skIncl.Fetch(FetchRequest{})))
 	wantIDs = []string{"b", "c", "d"}
 	if !stringSlicesEqual(gotIDs, wantIDs) {
 		t.Fatalf("inclusive Fetch = %v, want %v", gotIDs, wantIDs)

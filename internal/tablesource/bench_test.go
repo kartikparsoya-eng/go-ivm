@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 	"path/filepath"
+	"slices"
 	"testing"
 
 	"github.com/kartikparsoya-eng/go-ivm/ivm"
@@ -218,13 +219,13 @@ func BenchmarkSourceFetchRepeated(b *testing.B) {
 		req := ivm.FetchRequest{Limit: limit}
 		// Establish the prev tx + warm pages + (for the cached variant) prime
 		// the statement cache so we measure steady state, not first-touch.
-		if got := len(in.Fetch(req)); got != limit {
+		if got := len(slices.Collect(in.Fetch(req))); got != limit {
 			b.Fatalf("warm fetch got %d rows, want %d", got, limit)
 		}
 		b.Run(fmt.Sprintf("limit=%d", limit), func(b *testing.B) {
 			b.ReportAllocs()
 			for i := 0; i < b.N; i++ {
-				if got := len(in.Fetch(req)); got != limit {
+				if got := len(slices.Collect(in.Fetch(req))); got != limit {
 					b.Fatalf("fetch got %d rows, want %d", got, limit)
 				}
 			}

@@ -9,6 +9,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"slices"
 
 	"github.com/kartikparsoya-eng/go-ivm/internal/tablesource"
 	"github.com/kartikparsoya-eng/go-ivm/ivm"
@@ -60,7 +61,7 @@ func main() {
 
 	// Probe 1: full channel scan (no filter, no constraint). Should return 4.
 	chanIn := chanSrc.Connect(ivm.Ordering{{"id", "asc"}}, nil, nil, nil)
-	chanNodes := chanIn.Fetch(ivm.FetchRequest{})
+	chanNodes := slices.Collect(chanIn.Fetch(ivm.FetchRequest{}))
 	fmt.Printf("Probe 1: channel_count=%d\n", len(chanNodes))
 	for _, n := range chanNodes {
 		fmt.Printf("  channel: id=%v name=%v visibility=%v\n",
@@ -76,7 +77,7 @@ func main() {
 		return v == targetUser
 	}
 	cpIn := cpSrc.Connect(ivm.Ordering{{"id", "asc"}}, nil, filter, map[string]bool{"channelId": true})
-	cpNodes := cpIn.Fetch(ivm.FetchRequest{})
+	cpNodes := slices.Collect(cpIn.Fetch(ivm.FetchRequest{}))
 	fmt.Printf("\nProbe 2: channel_participants_count_after_filter=%d (filter: userId=%s)\n", len(cpNodes), targetUser)
 	for _, n := range cpNodes {
 		fmt.Printf("  cp: id=%v channelId=%v userId=%v\n",
@@ -87,9 +88,9 @@ func main() {
 	// Constraint = {channelId: <seeded channel id>}. Should return the
 	// cp-test-sandbox-1 row if present.
 	seededChannel := "cmp2cqlq900f7iphvij992i5e"
-	constrained := cpIn.Fetch(ivm.FetchRequest{
+	constrained := slices.Collect(cpIn.Fetch(ivm.FetchRequest{
 		Constraint: &ivm.Constraint{"channelId": seededChannel},
-	})
+	}))
 	fmt.Printf("\nProbe 3: cp_count_for_channel(%s)=%d\n", seededChannel, len(constrained))
 	for _, n := range constrained {
 		fmt.Printf("  cp: id=%v channelId=%v userId=%v\n",

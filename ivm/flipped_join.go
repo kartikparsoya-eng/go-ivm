@@ -1,12 +1,10 @@
 package ivm
 
-// An *inner* join which fetches nodes from its child input first and then
-// fetches their related nodes from its parent input. Output nodes are the
-// nodes from parent input (in parent input order), which have at least one
-// related child. These output nodes have a new relationship added to them,
-// which has the name `relationshipName`.
-
-import "sort"
+import (
+	"iter"
+	"slices"
+	"sort"
+)
 
 type FlippedJoinArgs struct {
 	Parent           Input
@@ -100,7 +98,7 @@ func (fj *FlippedJoin) GetSchema() *SourceSchema {
 }
 
 // Fetch fetches child nodes first, then finds related parents, merges, and deduplicates.
-func (fj *FlippedJoin) Fetch(req FetchRequest) []Node {
+func (fj *FlippedJoin) Fetch(req FetchRequest) iter.Seq[Node] {
 	// Translate constraints for the parent on parts of the join key to constraints for the child.
 	var childConstraint Constraint
 	hasChildConstraint := false
@@ -119,7 +117,7 @@ func (fj *FlippedJoin) Fetch(req FetchRequest) []Node {
 	if hasChildConstraint {
 		childReq = FetchRequest{Constraint: &childConstraint}
 	}
-	childNodes := fj.child.Fetch(childReq)
+	childNodes := slices.Collect(fj.child.Fetch(childReq))
 
 	// For remove overlay: re-insert the removed node so parents that haven't
 	// been pushed yet still see it.
@@ -152,7 +150,7 @@ func (fj *FlippedJoin) Fetch(req FetchRequest) []Node {
 				Start:      req.Start,
 				Reverse:    req.Reverse,
 			}
-			parentIters[i] = &parentIter{nodes: fj.parent.Fetch(parentReq)}
+			parentIters[i] = &parentIter{nodes: slices.Collect(fj.parent.Fetch(parentReq))}
 		}
 	}
 
@@ -254,7 +252,7 @@ func (fj *FlippedJoin) Fetch(req FetchRequest) []Node {
 		}
 	}
 
-	return result
+	return slices.Values(result)
 }
 
 // --- Push from child side ---
@@ -293,7 +291,7 @@ func (fj *FlippedJoin) pushChildChange(change Change, exists bool) []Change {
 		return nil
 	}
 
-	parentNodes := fj.parent.Fetch(FetchRequest{Constraint: constraint})
+	parentNodes := slices.Collect(fj.parent.Fetch(FetchRequest{Constraint: constraint}))
 	var allChanges []Change
 
 	for _, parentNode := range parentNodes {
@@ -305,7 +303,7 @@ func (fj *FlippedJoin) pushChildChange(change Change, exists bool) []Change {
 			if c == nil {
 				return nil
 			}
-			return fj.child.Fetch(FetchRequest{Constraint: c})
+			return slices.Collect(fj.child.Fetch(FetchRequest{Constraint: c}))
 		}
 
 		if !exists {
@@ -367,7 +365,7 @@ func (fj *FlippedJoin) pushParent(change Change) []Change {
 			if c == nil {
 				return nil
 			}
-			return fj.child.Fetch(FetchRequest{Constraint: c})
+			return slices.Collect(fj.child.Fetch(FetchRequest{Constraint: c}))
 		}
 	}
 

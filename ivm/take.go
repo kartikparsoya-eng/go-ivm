@@ -9,7 +9,9 @@ package ivm
 import (
 	"encoding/json"
 	"fmt"
+	"iter"
 	"os"
+	"slices"
 )
 
 const maxBoundKey = "maxBound"
@@ -100,7 +102,7 @@ func (t *Take) Destroy() {
 }
 
 // Fetch — Source: take.ts line 93-156
-func (t *Take) Fetch(req FetchRequest) []Node {
+func (t *Take) Fetch(req FetchRequest) iter.Seq[Node] {
 	if len(t.partitionKey) == 0 ||
 		(req.Constraint != nil && ConstraintMatchesPartitionKey(req.Constraint, t.partitionKey)) {
 		takeStateKey := GetTakeStateKey(t.partitionKey, constraintToRow(req.Constraint))
@@ -109,10 +111,10 @@ func (t *Take) Fetch(req FetchRequest) []Node {
 			return t.initialFetch(req)
 		}
 		if takeState.Bound == nil {
-			return nil
+			return emptyNodeSeq
 		}
 		var result []Node
-		for _, inputNode := range t.input.Fetch(req) {
+		for inputNode := range t.input.Fetch(req) {
 			if t.GetSchema().CompareRows(takeState.Bound, inputNode.Row) < 0 {
 				break
 			}
@@ -122,16 +124,16 @@ func (t *Take) Fetch(req FetchRequest) []Node {
 			}
 			result = append(result, inputNode)
 		}
-		return result
+		return slices.Values(result)
 	}
 
 	// Partition key exists but fetch not constrained on it
 	maxBound := t.storage.GetMaxBound()
 	if maxBound == nil {
-		return nil
+		return emptyNodeSeq
 	}
 	var result []Node
-	for _, inputNode := range t.input.Fetch(req) {
+	for inputNode := range t.input.Fetch(req) {
 		if t.GetSchema().CompareRows(inputNode.Row, maxBound) > 0 {
 			break
 		}
@@ -142,28 +144,23 @@ func (t *Take) Fetch(req FetchRequest) []Node {
 			result = append(result, inputNode)
 		}
 	}
-	return result
+	return slices.Values(result)
 }
 
 // initialFetch — Source: take.ts line 158-216
-func (t *Take) initialFetch(req FetchRequest) []Node {
+func (t *Take) initialFetch(req FetchRequest) iter.Seq[Node] {
 	if t.limit <= 0 {
-		return nil
+		return emptyNodeSeq
 	}
 
 	takeStateKey := GetTakeStateKey(t.partitionKey, constraintToRow(req.Constraint))
 
-	// Limit pushdown: always set req.Limit so downstream operators can
-	// early-terminate. Filter strips it before forwarding upstream (it
-	// can drop rows, so a source Limit would under-fetch) and breaks its
-	// own loop at req.Limit post-filter rows. Skip forwards it in the
-	// forward case only. See FetchRequest.Limit.
 	req.Limit = t.limit
 
 	var result []Node
 	var size int
 	var bound Row
-	for _, inputNode := range t.input.Fetch(req) {
+	for inputNode := range t.input.Fetch(req) {
 		result = append(result, inputNode)
 		bound = inputNode.Row
 		size++
@@ -173,7 +170,7 @@ func (t *Take) initialFetch(req FetchRequest) []Node {
 	}
 
 	t.setTakeState(takeStateKey, size, bound, t.storage.GetMaxBound())
-	return result
+	return slices.Values(result)
 }
 
 // Push — Source: take.ts line 247-430
@@ -224,7 +221,7 @@ func (t *Take) Push(change Change, pusher InputBase) []Change {
 		// added row < bound
 		var beforeBoundNode, boundNode *Node
 		if t.limit == 1 {
-			for _, node := range t.input.Fetch(FetchRequest{
+			for node := range t.input.Fetch(FetchRequest{
 				Start:      &Start{Row: takeState.Bound, Basis: "at"},
 				Constraint: constraint,
 			}) {
@@ -233,7 +230,7 @@ func (t *Take) Push(change Change, pusher InputBase) []Change {
 				break
 			}
 		} else {
-			for _, node := range t.input.Fetch(FetchRequest{
+			for node := range t.input.Fetch(FetchRequest{
 				Start:      &Start{Row: takeState.Bound, Basis: "at"},
 				Constraint: constraint,
 				Reverse:    true,
@@ -274,7 +271,7 @@ func (t *Take) Push(change Change, pusher InputBase) []Change {
 		t.debugf("Push REMOVE row=%v: inside (cmp=%d), bound=%v size=%d", row["id"], compToBound, takeState.Bound["id"], takeState.Size)
 
 		var beforeBoundNode *Node
-		for _, node := range t.input.Fetch(FetchRequest{
+		for node := range t.input.Fetch(FetchRequest{
 			Start:      &Start{Row: takeState.Bound, Basis: "after"},
 			Constraint: constraint,
 			Reverse:    true,
@@ -294,7 +291,7 @@ func (t *Take) Push(change Change, pusher InputBase) []Change {
 			newBound = &newBoundInfo{node: beforeBoundNode, push: push}
 		}
 		if newBound == nil || !newBound.push {
-			for _, node := range t.input.Fetch(FetchRequest{
+			for node := range t.input.Fetch(FetchRequest{
 				Start:      &Start{Row: takeState.Bound, Basis: "at"},
 				Constraint: constraint,
 			}) {
@@ -372,7 +369,7 @@ func (t *Take) pushEditChange(change Change) []Change {
 				return replaceBoundAndForwardChange()
 			}
 			var beforeBoundNode *Node
-			for _, node := range t.input.Fetch(FetchRequest{
+			for node := range t.input.Fetch(FetchRequest{
 				Start:      &Start{Row: takeState.Bound, Basis: "after"},
 				Constraint: constraint,
 				Reverse:    true,
@@ -395,7 +392,7 @@ func (t *Take) pushEditChange(change Change) []Change {
 
 		// newCmp > 0
 		var newBoundNode *Node
-		for _, node := range t.input.Fetch(FetchRequest{
+		for node := range t.input.Fetch(FetchRequest{
 			Start:      &Start{Row: takeState.Bound, Basis: "at"},
 			Constraint: constraint,
 		}) {
@@ -436,7 +433,7 @@ func (t *Take) pushEditChange(change Change) []Change {
 		}
 		// old outside, new inside
 		var oldBoundNode, newBoundNode *Node
-		for _, node := range t.input.Fetch(FetchRequest{
+		for node := range t.input.Fetch(FetchRequest{
 			Start:      &Start{Row: takeState.Bound, Basis: "at"},
 			Constraint: constraint,
 			Reverse:    true,
@@ -492,7 +489,7 @@ func (t *Take) pushEditChange(change Change) []Change {
 	}
 	// old inside, new > bound
 	var afterBoundNode *Node
-	for _, node := range t.input.Fetch(FetchRequest{
+	for node := range t.input.Fetch(FetchRequest{
 		Start:      &Start{Row: takeState.Bound, Basis: "after"},
 		Constraint: constraint,
 	}) {

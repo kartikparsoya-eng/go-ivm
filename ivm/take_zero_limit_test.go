@@ -1,6 +1,9 @@
 package ivm
 
-import "testing"
+import (
+	"slices"
+	"testing"
+)
 
 // Test for audit fix #10: Take.initialFetch (and Fetch) must return nil/empty
 // when limit is 0 — no rows should be fetched or state recorded.
@@ -24,7 +27,7 @@ func TestTake_ZeroLimit_FetchReturnsNil(t *testing.T) {
 	out := &testOutput{}
 	take.SetOutput(out)
 
-	result := take.Fetch(FetchRequest{})
+	result := slices.Collect(take.Fetch(FetchRequest{}))
 	if len(result) != 0 {
 		t.Fatalf("expected 0 rows from Take with limit=0, got %d", len(result))
 	}

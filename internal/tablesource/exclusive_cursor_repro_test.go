@@ -3,6 +3,7 @@ package tablesource
 import (
 	"database/sql"
 	"path/filepath"
+	"slices"
 	"testing"
 
 	"github.com/kartikparsoya-eng/go-ivm/ivm"
@@ -27,9 +28,9 @@ func TestExclusiveCursorPartialBound_FetchPath(t *testing.T) {
 	// (a) Source.Fetch directly with the Start that Skip.getStart synthesizes
 	//     for a partial exclusive bound: Basis="after", Row={score:90}.
 	in := src.Connect(sort, nil, nil, nil)
-	direct := in.Fetch(ivm.FetchRequest{
+	direct := slices.Collect(in.Fetch(ivm.FetchRequest{
 		Start: &ivm.Start{Row: ivm.Row{"score": float64(90)}, Basis: "after"},
-	})
+	}))
 	if len(direct) != 0 {
 		t.Errorf("Source.Fetch(after partial {score:90}): got %d rows, want 0; rows=%v",
 			len(direct), rowsOf(direct))
@@ -41,7 +42,7 @@ func TestExclusiveCursorPartialBound_FetchPath(t *testing.T) {
 		Row:       ivm.Row{"score": float64(90)},
 		Exclusive: true,
 	})
-	viaSkip := skip.Fetch(ivm.FetchRequest{})
+	viaSkip := slices.Collect(skip.Fetch(ivm.FetchRequest{}))
 	if len(viaSkip) != 0 {
 		t.Errorf("Skip.Fetch(exclusive partial {score:90}): got %d rows, want 0; rows=%v",
 			len(viaSkip), rowsOf(viaSkip))
@@ -122,9 +123,9 @@ func TestExclusiveCursorPartialBound_OptionalPK(t *testing.T) {
 	// Partial cursor: only createdAt specified, exclusive (basis "after").
 	// Should return rows STRICTLY AFTER createdAt=500 → conv-c (600) and conv-d (700).
 	in := src.Connect(sort, nil, nil, nil)
-	nodes := in.Fetch(ivm.FetchRequest{
+	nodes := slices.Collect(in.Fetch(ivm.FetchRequest{
 		Start: &ivm.Start{Row: ivm.Row{"createdAt": float64(500)}, Basis: "after"},
-	})
+	}))
 
 	// Verify: should NOT include conv-b (createdAt=500, the cursor boundary row)
 	for _, n := range nodes {
@@ -142,7 +143,7 @@ func TestExclusiveCursorPartialBound_OptionalPK(t *testing.T) {
 		Row:       ivm.Row{"createdAt": float64(500)},
 		Exclusive: true,
 	})
-	viaSkip := skip.Fetch(ivm.FetchRequest{})
+	viaSkip := slices.Collect(skip.Fetch(ivm.FetchRequest{}))
 	for _, n := range viaSkip {
 		if n.Row["createdAt"] == float64(500) {
 			t.Errorf("Skip path: boundary row (createdAt=500) incorrectly included; got %v", n.Row)
@@ -154,9 +155,9 @@ func TestExclusiveCursorPartialBound_OptionalPK(t *testing.T) {
 
 	// Test inclusive (basis "at") with partial cursor — should include the boundary row
 	in3 := src.Connect(sort, nil, nil, nil)
-	nodesAt := in3.Fetch(ivm.FetchRequest{
+	nodesAt := slices.Collect(in3.Fetch(ivm.FetchRequest{
 		Start: &ivm.Start{Row: ivm.Row{"createdAt": float64(500)}, Basis: "at"},
-	})
+	}))
 	if len(nodesAt) != 3 {
 		t.Errorf("basis=at: expected 3 rows (createdAt=500, 600, 700), got %d: %v",
 			len(nodesAt), rowsOf(nodesAt))

@@ -1,6 +1,8 @@
 package ivm
 
 import (
+	"iter"
+	"slices"
 	"sync/atomic"
 	"testing"
 )
@@ -13,13 +15,13 @@ type countingInput struct {
 }
 
 func (c *countingInput) GetSchema() *SourceSchema { return c.inner.GetSchema() }
-func (c *countingInput) Destroy()                  { c.inner.Destroy() }
-func (c *countingInput) SetOutput(o Output)        { c.inner.SetOutput(o) }
-func (c *countingInput) Fetch(req FetchRequest) []Node {
+func (c *countingInput) Destroy()                 { c.inner.Destroy() }
+func (c *countingInput) SetOutput(o Output)       { c.inner.SetOutput(o) }
+func (c *countingInput) Fetch(req FetchRequest) iter.Seq[Node] {
 	atomic.AddInt32(&c.fetchCount, 1)
-	nodes := c.inner.Fetch(req)
+	nodes := slices.Collect(c.inner.Fetch(req))
 	atomic.AddInt32(&c.rowsReturned, int32(len(nodes)))
-	return nodes
+	return slices.Values(nodes)
 }
 
 func makeTestSource(t *testing.T, name string, cols map[string]string, pk []string, sort Ordering, rows []Row) *MemorySource {
@@ -59,7 +61,7 @@ func TestLimitThroughFilter_Correctness(t *testing.T) {
 	out := &testOutput{}
 	take.SetOutput(out)
 
-	result := take.Fetch(FetchRequest{})
+	result := slices.Collect(take.Fetch(FetchRequest{}))
 	if len(result) != 3 {
 		t.Fatalf("expected 3 results, got %d", len(result))
 	}
@@ -105,7 +107,7 @@ func TestLimitThroughFilter_EarlyTermination(t *testing.T) {
 	out := &testOutput{}
 	take.SetOutput(out)
 
-	result := take.Fetch(FetchRequest{})
+	result := slices.Collect(take.Fetch(FetchRequest{}))
 	if len(result) != 3 {
 		t.Fatalf("expected 3 results, got %d", len(result))
 	}
@@ -143,7 +145,7 @@ func TestLimitThroughFilter_AllPass(t *testing.T) {
 	out := &testOutput{}
 	take.SetOutput(out)
 
-	result := take.Fetch(FetchRequest{})
+	result := slices.Collect(take.Fetch(FetchRequest{}))
 	if len(result) != 5 {
 		t.Fatalf("expected 5 results, got %d", len(result))
 	}
@@ -169,7 +171,7 @@ func TestLimitThroughFilter_NonePass(t *testing.T) {
 	out := &testOutput{}
 	take.SetOutput(out)
 
-	result := take.Fetch(FetchRequest{})
+	result := slices.Collect(take.Fetch(FetchRequest{}))
 	if len(result) != 0 {
 		t.Fatalf("expected 0 results (none pass filter), got %d", len(result))
 	}
@@ -200,7 +202,7 @@ func TestLimitThroughSkip_Correctness(t *testing.T) {
 	out := &testOutput{}
 	take.SetOutput(out)
 
-	result := take.Fetch(FetchRequest{})
+	result := slices.Collect(take.Fetch(FetchRequest{}))
 	if len(result) != 3 {
 		t.Fatalf("expected 3 results, got %d", len(result))
 	}
@@ -239,7 +241,7 @@ func TestLimitThroughSkip_ForwardedToSource(t *testing.T) {
 	out := &testOutput{}
 	take.SetOutput(out)
 
-	result := take.Fetch(FetchRequest{})
+	result := slices.Collect(take.Fetch(FetchRequest{}))
 	if len(result) != 3 {
 		t.Fatalf("expected 3 results, got %d", len(result))
 	}
@@ -301,7 +303,7 @@ func TestLimitThroughExists_EarlyTermination(t *testing.T) {
 	out := &testOutput{}
 	take.SetOutput(out)
 
-	result := take.Fetch(FetchRequest{})
+	result := slices.Collect(take.Fetch(FetchRequest{}))
 	if len(result) != 2 {
 		t.Fatalf("expected 2 results, got %d", len(result))
 	}
@@ -336,7 +338,7 @@ func TestLimitDirectSource_Regression(t *testing.T) {
 	out := &testOutput{}
 	take.SetOutput(out)
 
-	result := take.Fetch(FetchRequest{})
+	result := slices.Collect(take.Fetch(FetchRequest{}))
 	if len(result) != 3 {
 		t.Fatalf("expected 3 results, got %d", len(result))
 	}
@@ -392,7 +394,7 @@ func TestLimitThroughFilterThenJoin(t *testing.T) {
 
 	out := &testOutput{}
 	join.SetOutput(out)
-	result := join.Fetch(FetchRequest{})
+	result := slices.Collect(join.Fetch(FetchRequest{}))
 	if len(result) != 2 {
 		t.Fatalf("expected 2 results, got %d", len(result))
 	}
@@ -442,7 +444,7 @@ func TestLimitLargerThanSource(t *testing.T) {
 	out := &testOutput{}
 	take.SetOutput(out)
 
-	result := take.Fetch(FetchRequest{})
+	result := slices.Collect(take.Fetch(FetchRequest{}))
 	if len(result) != 3 {
 		t.Fatalf("expected 3 results (all rows, limit > source), got %d", len(result))
 	}
@@ -469,7 +471,7 @@ func TestLimitThroughSkipReverse(t *testing.T) {
 	out := &testOutput{}
 	take.SetOutput(out)
 
-	result := take.Fetch(FetchRequest{Reverse: true})
+	result := slices.Collect(take.Fetch(FetchRequest{Reverse: true}))
 	if len(result) > 3 {
 		t.Errorf("expected at most 3 results, got %d", len(result))
 	}

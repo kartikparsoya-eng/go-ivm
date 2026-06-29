@@ -1,5 +1,10 @@
 package ivm
 
+import (
+	"iter"
+	"slices"
+)
+
 // The FilterOperator abstraction enables efficient fetch for WHERE clauses
 // containing OR conditions. FilterOperators don't have fetch — they have
 // filter(node) → bool. They also have push (like normal operators).
@@ -79,7 +84,7 @@ func (fs *FilterStart) Push(change Change, pusher InputBase) []Change {
 // own loop: once len(result) >= req.Limit, it breaks. This matches TS's
 // lazy-generator behavior where Take's break propagates through Filter,
 // stopping the EXISTS predicate from running on the entire upstream result.
-func (fs *FilterStart) Fetch(req FetchRequest) []Node {
+func (fs *FilterStart) Fetch(req FetchRequest) iter.Seq[Node] {
 	fs.output.BeginFilter()
 	defer fs.output.EndFilter()
 
@@ -87,7 +92,7 @@ func (fs *FilterStart) Fetch(req FetchRequest) []Node {
 	upstreamReq.Limit = 0
 
 	var result []Node
-	for _, node := range fs.input.Fetch(upstreamReq) {
+	for node := range fs.input.Fetch(upstreamReq) {
 		if fs.output.Filter(node) {
 			result = append(result, node)
 			if req.Limit > 0 && len(result) >= req.Limit {
@@ -95,7 +100,7 @@ func (fs *FilterStart) Fetch(req FetchRequest) []Node {
 			}
 		}
 	}
-	return result
+	return slices.Values(result)
 }
 
 // FilterEnd adapts from FilterOperator FilterOutput back to normal Input.
@@ -115,7 +120,7 @@ func NewFilterEnd(start *FilterStart, input FilterInput) *FilterEnd {
 	return fe
 }
 
-func (fe *FilterEnd) Fetch(req FetchRequest) []Node {
+func (fe *FilterEnd) Fetch(req FetchRequest) iter.Seq[Node] {
 	return fe.start.Fetch(req)
 }
 

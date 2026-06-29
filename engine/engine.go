@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -598,7 +599,7 @@ func (e *Engine) buildAndRegisterLocked(queryID string, ast builder.AST) *pipeli
 	executor := func(subqueryAST builder.AST, childField string) (interface{}, bool) {
 		subPipeline := builder.BuildPipeline(subqueryAST, delegate)
 		subSchema := subPipeline.Input.GetSchema()
-		nodes := subPipeline.Input.Fetch(ivm.FetchRequest{})
+		nodes := slices.Collect(subPipeline.Input.Fetch(ivm.FetchRequest{}))
 		ce := &companionEntry{
 			pipeline:   subPipeline,
 			schema:     subSchema,
@@ -672,7 +673,7 @@ func (e *Engine) wireCompanionOutputsLocked(entry *pipelineEntry) {
 // responsible for timing.
 func hydrateEntry(entry *pipelineEntry) []RowChange {
 	var hydration []RowChange
-	nodes := entry.pipeline.Input.Fetch(ivm.FetchRequest{})
+	nodes := slices.Collect(entry.pipeline.Input.Fetch(ivm.FetchRequest{}))
 	for _, node := range nodes {
 		hydration = append(hydration, streamNodes(entry.queryID, entry.schema, RowChangeAdd, node)...)
 	}
@@ -823,7 +824,7 @@ func (e *Engine) AddQueriesStream(
 				}
 			}()
 			start := time.Now()
-			nodes := entry.pipeline.Input.Fetch(ivm.FetchRequest{})
+			nodes := slices.Collect(entry.pipeline.Input.Fetch(ivm.FetchRequest{}))
 
 			var chunk []RowChange
 			chunkBytes := 0

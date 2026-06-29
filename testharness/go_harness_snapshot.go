@@ -21,6 +21,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"slices"
 
 	"github.com/kartikparsoya-eng/go-ivm/builder"
 	"github.com/kartikparsoya-eng/go-ivm/ivm"
@@ -33,9 +34,9 @@ import (
 // loader re-hydrates from the .db and the caller compares to ExpectedHydration
 // (the captured goChanges) to reproduce the divergence offline.
 type SnapshotTestCase struct {
-	Schema      map[string]TableSchema `json:"schema"`
-	AST         builder.AST            `json:"ast"`
-	SnapshotFile string                `json:"snapshotFile"`
+	Schema       map[string]TableSchema `json:"schema"`
+	AST          builder.AST            `json:"ast"`
+	SnapshotFile string                 `json:"snapshotFile"`
 	// ExpectedHydration is the captured Go side's hydrate output (the
 	// goChanges from the .json metadata, as CaughtNodes). The loader's
 	// re-hydrate is compared against this to reproduce the divergence.
@@ -133,7 +134,7 @@ func RunTestCaseFromSnapshot(tc SnapshotTestCase) (*SnapshotResult, error) {
 	pipeline := builder.BuildPipeline(tc.AST, delegate)
 	collector := &changeCollector{}
 	pipeline.Input.SetOutput(collector)
-	nodes := pipeline.Input.Fetch(ivm.FetchRequest{})
+	nodes := slices.Collect(pipeline.Input.Fetch(ivm.FetchRequest{}))
 	hydration := make([]*CaughtNode, 0, len(nodes))
 	for _, node := range nodes {
 		hydration = append(hydration, expandNode(node))

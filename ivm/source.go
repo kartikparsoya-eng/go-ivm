@@ -8,6 +8,8 @@ package ivm
 import (
 	"encoding/json"
 	"fmt"
+	"iter"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -558,7 +560,7 @@ func (si *SourceInput) Destroy() {
 
 // Fetch — Source: memory-source.ts line 256-364 (simplified)
 // Uses overlay + constraint + start + filter logic.
-func (si *SourceInput) Fetch(req FetchRequest) []Node {
+func (si *SourceInput) Fetch(req FetchRequest) iter.Seq[Node] {
 	ms := si.source
 	conn := si.conn
 	compareRows := conn.CompareRows
@@ -599,7 +601,7 @@ func (si *SourceInput) Fetch(req FetchRequest) []Node {
 		nodes = nodes[:req.Limit]
 	}
 
-	return nodes
+	return slices.Values(nodes)
 }
 
 // LeafSourceMarker marks SourceInput as a base source for Take's limit pushdown.

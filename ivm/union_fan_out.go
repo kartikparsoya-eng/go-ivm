@@ -1,5 +1,7 @@
 package ivm
 
+import "iter"
+
 // UnionFanOut broadcasts pushes to multiple outputs (OR condition branches),
 // coordinating with UnionFanIn to accumulate and deduplicate results.
 
@@ -47,7 +49,7 @@ func (ufo *UnionFanOut) GetSchema() *SourceSchema {
 	return ufo.input.GetSchema()
 }
 
-func (ufo *UnionFanOut) Fetch(req FetchRequest) []Node {
+func (ufo *UnionFanOut) Fetch(req FetchRequest) iter.Seq[Node] {
 	return ufo.input.Fetch(req)
 }
 

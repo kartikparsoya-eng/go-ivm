@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"path/filepath"
+	"slices"
 	"sort"
 	"sync"
 	"testing"
@@ -182,7 +183,7 @@ func TestSourceFetch_PoolEqualsSingleConn(t *testing.T) {
 			// Single-conn (no pool) reference.
 			srcA := newUserSourceAt(t, path)
 			inA := srcA.Connect(c.sort, nil, c.pred, nil)
-			want := nodeIDs(inA.Fetch(c.req))
+			want := nodeIDs(slices.Collect(inA.Fetch(c.req)))
 
 			// Pool path.
 			srcB := newUserSourceAt(t, path)
@@ -198,7 +199,7 @@ func TestSourceFetch_PoolEqualsSingleConn(t *testing.T) {
 			defer pool.Close()
 			srcB.BindReaderPool(pool)
 			inB := srcB.Connect(c.sort, nil, c.pred, nil)
-			got := nodeIDs(inB.Fetch(c.req))
+			got := nodeIDs(slices.Collect(inB.Fetch(c.req)))
 
 			if len(got) != len(want) {
 				t.Fatalf("pool path len=%d ids=%v, single-conn len=%d ids=%v",
@@ -213,7 +214,7 @@ func TestSourceFetch_PoolEqualsSingleConn(t *testing.T) {
 
 			// Unbind reverts to the locked path and must still work.
 			srcB.UnbindReaderPool()
-			again := nodeIDs(inB.Fetch(c.req))
+			again := nodeIDs(slices.Collect(inB.Fetch(c.req)))
 			if len(again) != len(want) {
 				t.Fatalf("post-unbind len=%d, want %d", len(again), len(want))
 			}
@@ -249,7 +250,7 @@ func TestSourceFetch_PoolConcurrent(t *testing.T) {
 		wg.Add(1)
 		go func(idx int, input ivm.Input) {
 			defer wg.Done()
-			ids := nodeIDs(input.Fetch(ivm.FetchRequest{}))
+			ids := nodeIDs(slices.Collect(input.Fetch(ivm.FetchRequest{})))
 			sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
 			want := []int64{1, 2, 3, 4, 5}
 			ok := len(ids) == len(want)

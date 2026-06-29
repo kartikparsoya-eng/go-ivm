@@ -31,6 +31,8 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"iter"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1033,8 +1035,8 @@ func (i *sourceInput) Destroy() {
 	i.src.disconnect(i.conn)
 }
 
-func (i *sourceInput) Fetch(req ivm.FetchRequest) []ivm.Node {
-	return i.src.fetchForConn(req, i.conn)
+func (i *sourceInput) Fetch(req ivm.FetchRequest) iter.Seq[ivm.Node] {
+	return slices.Values(i.src.fetchForConn(req, i.conn))
 }
 
 // disconnect removes conn from the source's connection list.

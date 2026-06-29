@@ -9,6 +9,7 @@ package testharness
 import (
 	"encoding/json"
 	"fmt"
+	"slices"
 
 	"github.com/kartikparsoya-eng/go-ivm/builder"
 	"github.com/kartikparsoya-eng/go-ivm/ivm"
@@ -43,8 +44,8 @@ type Mutation struct {
 // --- Output Types (matching TS Catch output format) ---
 
 type CaughtNode struct {
-	Row           ivm.Row                   `json:"row"`
-	Relationships map[string][]*CaughtNode  `json:"relationships"`
+	Row           ivm.Row                  `json:"row"`
+	Relationships map[string][]*CaughtNode `json:"relationships"`
 }
 
 type CaughtChildData struct {
@@ -53,11 +54,11 @@ type CaughtChildData struct {
 }
 
 type CaughtChange struct {
-	Type   string          `json:"type"`            // "add", "remove", "edit", "child"
-	Node   *CaughtNode     `json:"node,omitempty"`  // for add/remove
-	Row    ivm.Row         `json:"row,omitempty"`   // for edit and child (the parent row)
-	OldRow ivm.Row         `json:"oldRow,omitempty"` // for edit (old row)
-	Child  *CaughtChildData `json:"child,omitempty"` // for child
+	Type   string           `json:"type"`             // "add", "remove", "edit", "child"
+	Node   *CaughtNode      `json:"node,omitempty"`   // for add/remove
+	Row    ivm.Row          `json:"row,omitempty"`    // for edit and child (the parent row)
+	OldRow ivm.Row          `json:"oldRow,omitempty"` // for edit (old row)
+	Child  *CaughtChildData `json:"child,omitempty"`  // for child
 }
 
 // --- Harness Execution ---
@@ -105,7 +106,7 @@ func RunTestCase(tc TestCase) (*HarnessResult, error) {
 	pipeline.Input.SetOutput(collector)
 
 	// Hydration: fetch initial state
-	nodes := pipeline.Input.Fetch(ivm.FetchRequest{})
+	nodes := slices.Collect(pipeline.Input.Fetch(ivm.FetchRequest{}))
 	hydration := make([]*CaughtNode, 0, len(nodes))
 	for _, node := range nodes {
 		hydration = append(hydration, expandNode(node))

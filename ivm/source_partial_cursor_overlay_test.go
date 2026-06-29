@@ -1,6 +1,9 @@
 package ivm
 
-import "testing"
+import (
+	"slices"
+	"testing"
+)
 
 // TestFetch_PartialCursor_LiveOverlay_Masking proves the FORWARD end-to-end
 // correctness of SourceInput.Fetch when the start cursor is PARTIAL (a subset
@@ -67,7 +70,7 @@ func TestFetch_PartialCursor_LiveOverlay_Masking(t *testing.T) {
 		req := FetchRequest{
 			Start: &Start{Row: Row{"createdAt": cursorTs}, Basis: "after"},
 		}
-		nodes := si.Fetch(req)
+		nodes := slices.Collect(si.Fetch(req))
 		if has(nodes, "8ec82a40") {
 			t.Fatalf("Basis 'after' must EXCLUDE the boundary overlay row; got it included: %v", ids(nodes))
 		}
@@ -83,7 +86,7 @@ func TestFetch_PartialCursor_LiveOverlay_Masking(t *testing.T) {
 		req := FetchRequest{
 			Start: &Start{Row: Row{"createdAt": cursorTs}, Basis: "at"},
 		}
-		nodes := si.Fetch(req)
+		nodes := slices.Collect(si.Fetch(req))
 		if !has(nodes, "8ec82a40") {
 			t.Fatalf("Basis 'at' must INCLUDE the boundary overlay row; got it dropped: %v", ids(nodes))
 		}
@@ -97,7 +100,7 @@ func TestFetch_PartialCursor_LiveOverlay_Masking(t *testing.T) {
 
 	// No-cursor control: the overlay is always spliced in regardless of basis.
 	t.Run("no start cursor keeps the boundary overlay row", func(t *testing.T) {
-		nodes := si.Fetch(FetchRequest{})
+		nodes := slices.Collect(si.Fetch(FetchRequest{}))
 		if !has(nodes, "8ec82a40") {
 			t.Fatalf("without a start cursor the boundary overlay row must be present; got %v", ids(nodes))
 		}
@@ -162,7 +165,7 @@ func TestFetch_PartialCursor_LiveOverlay_ReverseInclusive(t *testing.T) {
 			Start:   &Start{Row: Row{"createdAt": cursorTs}, Basis: "at"},
 			Reverse: true,
 		}
-		nodes := si.Fetch(req)
+		nodes := slices.Collect(si.Fetch(req))
 		if !has(nodes, "8ec82a40") {
 			t.Fatalf("reverse Basis 'at' must INCLUDE the boundary overlay row (C1 fix); got it dropped: %v", ids(nodes))
 		}
@@ -182,7 +185,7 @@ func TestFetch_PartialCursor_LiveOverlay_ReverseInclusive(t *testing.T) {
 			Start:   &Start{Row: Row{"createdAt": cursorTs}, Basis: "after"},
 			Reverse: true,
 		}
-		nodes := si.Fetch(req)
+		nodes := slices.Collect(si.Fetch(req))
 		if has(nodes, "8ec82a40") {
 			t.Fatalf("reverse Basis 'after' must EXCLUDE the boundary overlay row; got it included: %v", ids(nodes))
 		}

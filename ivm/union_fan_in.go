@@ -1,16 +1,21 @@
 package ivm
 
+import (
+	"iter"
+	"slices"
+)
+
 // UnionFanIn merges results from multiple OR-condition branches back together,
 // deduplicating rows that appear in multiple branches.
 
 // UnionFanIn implements Operator. It receives pushes from multiple branches
 // that share a UnionFanOut, and merges/deduplicates them.
 type UnionFanIn struct {
-	inputs             []Input
-	schema             *SourceSchema
-	fanOutPushStarted  bool
-	output             Output
-	accumulatedPushes  []Change
+	inputs            []Input
+	schema            *SourceSchema
+	fanOutPushStarted bool
+	output            Output
+	accumulatedPushes []Change
 }
 
 func NewUnionFanIn(fanOut *UnionFanOut, inputs []Input) *UnionFanIn {
@@ -80,12 +85,12 @@ func (ufi *UnionFanIn) Destroy() {
 }
 
 // Fetch merges sorted fetches from all inputs, deduplicating by row identity.
-func (ufi *UnionFanIn) Fetch(req FetchRequest) []Node {
+func (ufi *UnionFanIn) Fetch(req FetchRequest) iter.Seq[Node] {
 	fetches := make([][]Node, len(ufi.inputs))
 	for i, input := range ufi.inputs {
-		fetches[i] = input.Fetch(req)
+		fetches[i] = slices.Collect(input.Fetch(req))
 	}
-	return MergeFetches(fetches, ufi.schema.CompareRows)
+	return slices.Values(MergeFetches(fetches, ufi.schema.CompareRows))
 }
 
 func (ufi *UnionFanIn) GetSchema() *SourceSchema {
@@ -123,7 +128,7 @@ func (ufi *UnionFanIn) pushInternalChange(change Change, pusher InputBase) []Cha
 		for _, key := range ufi.schema.PrimaryKey {
 			constraint[key] = change.Node.Row[key]
 		}
-		fetchResult := input.Fetch(FetchRequest{Constraint: &constraint})
+		fetchResult := slices.Collect(input.Fetch(FetchRequest{Constraint: &constraint}))
 		if len(fetchResult) > 0 {
 			// Another branch has the row
 			return nil

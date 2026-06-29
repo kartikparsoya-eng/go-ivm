@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"testing"
 
 	"github.com/kartikparsoya-eng/go-ivm/ivm"
@@ -170,7 +171,7 @@ func TestFetchDefaultOrderingByPK(t *testing.T) {
 	defer db.Close()
 
 	in := src.Connect(nil, nil, nil, nil)
-	nodes := in.Fetch(ivm.FetchRequest{})
+	nodes := slices.Collect(in.Fetch(ivm.FetchRequest{}))
 	if len(nodes) != 3 {
 		t.Fatalf("got %d rows, want 3", len(nodes))
 	}
@@ -187,7 +188,7 @@ func TestFetchExplicitSortDesc(t *testing.T) {
 	defer db.Close()
 
 	in := src.Connect(ivm.Ordering{{"score", "desc"}, {"id", "asc"}}, nil, nil, nil)
-	nodes := in.Fetch(ivm.FetchRequest{})
+	nodes := slices.Collect(in.Fetch(ivm.FetchRequest{}))
 	wantIDs := []float64{1, 2, 3} // scores 90, 80, 70
 	if len(nodes) != 3 {
 		t.Fatalf("got %d rows, want 3", len(nodes))
@@ -204,7 +205,7 @@ func TestFetchReverseFlipsDirection(t *testing.T) {
 	defer db.Close()
 
 	in := src.Connect(nil, nil, nil, nil)
-	nodes := in.Fetch(ivm.FetchRequest{Reverse: true})
+	nodes := slices.Collect(in.Fetch(ivm.FetchRequest{Reverse: true}))
 	wantIDs := []float64{3, 2, 1}
 	if len(nodes) != 3 {
 		t.Fatalf("got %d rows, want 3", len(nodes))
@@ -225,7 +226,7 @@ func TestFetchFilterPredicate(t *testing.T) {
 		v, _ := r["active"].(bool)
 		return v
 	}, nil)
-	nodes := in.Fetch(ivm.FetchRequest{})
+	nodes := slices.Collect(in.Fetch(ivm.FetchRequest{}))
 	wantIDs := []float64{1, 3}
 	if len(nodes) != 2 {
 		t.Fatalf("got %d rows, want 2 (active only)", len(nodes))
@@ -272,7 +273,7 @@ func TestFetchLimitPushdown(t *testing.T) {
 		{"reverse_limit1_first_in_desc_order", ivm.FetchRequest{Reverse: true, Limit: 1}, []float64{3}},
 	}
 	for _, c := range cases {
-		got := ids(in.Fetch(c.req))
+		got := ids(slices.Collect(in.Fetch(c.req)))
 		if !reflect.DeepEqual(got, c.want) {
 			t.Errorf("%s: Fetch(%+v) ids = %v, want %v", c.name, c.req, got, c.want)
 		}
@@ -474,7 +475,7 @@ type overlayProbingOutput struct {
 }
 
 func (o *overlayProbingOutput) Push(_ ivm.Change, _ ivm.InputBase) []ivm.Change {
-	nodes := o.in.Fetch(ivm.FetchRequest{})
+	nodes := slices.Collect(o.in.Fetch(ivm.FetchRequest{}))
 	o.observedAfter = len(nodes)
 	return nil
 }
@@ -512,7 +513,7 @@ func TestPrevTxAppliesWritesAndRollback(t *testing.T) {
 	in.SetOutput(&recordingOutput{})
 
 	// Step 1: first Fetch starts the prev tx (3 seeded rows).
-	if got := len(in.Fetch(ivm.FetchRequest{})); got != 3 {
+	if got := len(slices.Collect(in.Fetch(ivm.FetchRequest{}))); got != 3 {
 		t.Fatalf("baseline fetch = %d rows, want 3", got)
 	}
 
@@ -522,7 +523,7 @@ func TestPrevTxAppliesWritesAndRollback(t *testing.T) {
 	}))
 
 	// Step 3: re-fetch within batch — Push's writeChange visible.
-	nodes := in.Fetch(ivm.FetchRequest{})
+	nodes := slices.Collect(in.Fetch(ivm.FetchRequest{}))
 	if len(nodes) != 4 {
 		t.Fatalf("post-Push fetch = %d rows, want 4", len(nodes))
 	}
@@ -540,7 +541,7 @@ func TestPrevTxAppliesWritesAndRollback(t *testing.T) {
 	src.OnAdvanceEnd()
 
 	// Step 5: re-fetch — back to 3 rows (rollback discarded the write).
-	nodes = in.Fetch(ivm.FetchRequest{})
+	nodes = slices.Collect(in.Fetch(ivm.FetchRequest{}))
 	if len(nodes) != 3 {
 		t.Fatalf("post-OnAdvanceEnd fetch = %d rows, want 3 (rollback should discard)", len(nodes))
 	}
@@ -579,7 +580,7 @@ func TestRefreshSnapshotRollsTx(t *testing.T) {
 	in.SetOutput(&recordingOutput{})
 
 	// First Fetch pins tx at the seeded 3 rows.
-	if got := len(in.Fetch(ivm.FetchRequest{})); got != 3 {
+	if got := len(slices.Collect(in.Fetch(ivm.FetchRequest{}))); got != 3 {
 		t.Fatalf("baseline = %d, want 3", got)
 	}
 	// External commit.
@@ -587,12 +588,12 @@ func TestRefreshSnapshotRollsTx(t *testing.T) {
 		t.Fatalf("external insert: %v", err)
 	}
 	// Still 3 — tx pinned.
-	if got := len(in.Fetch(ivm.FetchRequest{})); got != 3 {
+	if got := len(slices.Collect(in.Fetch(ivm.FetchRequest{}))); got != 3 {
 		t.Fatalf("pre-refresh = %d, want 3 (tx still pinned)", got)
 	}
 	// External caller (drift audit) refreshes.
 	src.RefreshSnapshot()
-	if got := len(in.Fetch(ivm.FetchRequest{})); got != 4 {
+	if got := len(slices.Collect(in.Fetch(ivm.FetchRequest{}))); got != 4 {
 		t.Fatalf("post-refresh = %d, want 4 (tx rolled)", got)
 	}
 }
@@ -640,7 +641,7 @@ func (o *refreshDuringPushOutput) Push(_ ivm.Change, _ ivm.InputBase) []ivm.Chan
 	o.src.RefreshSnapshot()
 	// SQLite has 3 rows; overlay adds the 4th. If we double-applied,
 	// we'd see 5.
-	nodes := o.in.Fetch(ivm.FetchRequest{})
+	nodes := slices.Collect(o.in.Fetch(ivm.FetchRequest{}))
 	o.observedOverlay = len(nodes) == 4
 	return nil
 }
@@ -675,7 +676,7 @@ func TestOverlayVisibleDuringPush(t *testing.T) {
 	}
 
 	// After push completes, overlay clears; re-fetch should be back to 3.
-	if got := len(in.Fetch(ivm.FetchRequest{})); got != 3 {
+	if got := len(slices.Collect(in.Fetch(ivm.FetchRequest{}))); got != 3 {
 		t.Fatalf("overlay should clear post-Push: got %d nodes, want 3", got)
 	}
 }
@@ -686,7 +687,7 @@ func TestFetchConstraintEquality(t *testing.T) {
 
 	in := src.Connect(nil, nil, nil, nil)
 	c := ivm.Constraint{"id": float64(2)}
-	nodes := in.Fetch(ivm.FetchRequest{Constraint: &c})
+	nodes := slices.Collect(in.Fetch(ivm.FetchRequest{Constraint: &c}))
 	if len(nodes) != 1 {
 		t.Fatalf("got %d rows, want 1", len(nodes))
 	}
@@ -702,7 +703,7 @@ func TestFetchConstraintMultiKey(t *testing.T) {
 	in := src.Connect(nil, nil, nil, nil)
 	// score=80 AND active=false → only bob
 	c := ivm.Constraint{"score": float64(80), "active": false}
-	nodes := in.Fetch(ivm.FetchRequest{Constraint: &c})
+	nodes := slices.Collect(in.Fetch(ivm.FetchRequest{Constraint: &c}))
 	if len(nodes) != 1 {
 		t.Fatalf("got %d rows, want 1", len(nodes))
 	}
@@ -717,7 +718,7 @@ func TestFetchConstraintNoMatch(t *testing.T) {
 
 	in := src.Connect(nil, nil, nil, nil)
 	c := ivm.Constraint{"id": float64(999)}
-	nodes := in.Fetch(ivm.FetchRequest{Constraint: &c})
+	nodes := slices.Collect(in.Fetch(ivm.FetchRequest{Constraint: &c}))
 	if len(nodes) != 0 {
 		t.Fatalf("got %d rows, want 0 (no match)", len(nodes))
 	}
@@ -735,7 +736,7 @@ func TestFetchConstraintWithFilterAndSort(t *testing.T) {
 		nil,
 	)
 	c := ivm.Constraint{"active": true}
-	nodes := in.Fetch(ivm.FetchRequest{Constraint: &c, Reverse: true})
+	nodes := slices.Collect(in.Fetch(ivm.FetchRequest{Constraint: &c, Reverse: true}))
 	wantIDs := []float64{1, 3} // score 90 then 70 (DESC of asc = DESC)
 	if len(nodes) != 2 {
 		t.Fatalf("got %d rows, want 2", len(nodes))
@@ -753,9 +754,9 @@ func TestFetchStartAtInclusive(t *testing.T) {
 
 	// PK ASC, cursor at id=2 "at" basis → rows from 2 onward, inclusive.
 	in := src.Connect(nil, nil, nil, nil)
-	nodes := in.Fetch(ivm.FetchRequest{
+	nodes := slices.Collect(in.Fetch(ivm.FetchRequest{
 		Start: &ivm.Start{Row: ivm.Row{"id": float64(2)}, Basis: "at"},
-	})
+	}))
 	wantIDs := []float64{2, 3}
 	if len(nodes) != 2 {
 		t.Fatalf("got %d rows, want 2", len(nodes))
@@ -773,9 +774,9 @@ func TestFetchStartAfterExclusive(t *testing.T) {
 
 	// PK ASC, cursor at id=2 "after" → only id=3.
 	in := src.Connect(nil, nil, nil, nil)
-	nodes := in.Fetch(ivm.FetchRequest{
+	nodes := slices.Collect(in.Fetch(ivm.FetchRequest{
 		Start: &ivm.Start{Row: ivm.Row{"id": float64(2)}, Basis: "after"},
-	})
+	}))
 	if len(nodes) != 1 || nodes[0].Row["id"] != float64(3) {
 		t.Fatalf("got %v, want single row id=3", nodes)
 	}
@@ -788,10 +789,10 @@ func TestFetchStartReverseFromTop(t *testing.T) {
 	// PK ASC + Reverse → effective DESC.
 	// Cursor at id=2 "after" in DESC direction = strictly less than 2 = id=1.
 	in := src.Connect(nil, nil, nil, nil)
-	nodes := in.Fetch(ivm.FetchRequest{
+	nodes := slices.Collect(in.Fetch(ivm.FetchRequest{
 		Start:   &ivm.Start{Row: ivm.Row{"id": float64(2)}, Basis: "after"},
 		Reverse: true,
-	})
+	}))
 	if len(nodes) != 1 || nodes[0].Row["id"] != float64(1) {
 		t.Fatalf("got %v, want single row id=1", nodes)
 	}
@@ -807,12 +808,12 @@ func TestFetchStartMultiColumnOrder(t *testing.T) {
 		ivm.Ordering{{"score", "asc"}, {"id", "asc"}},
 		nil, nil, nil,
 	)
-	nodes := in.Fetch(ivm.FetchRequest{
+	nodes := slices.Collect(in.Fetch(ivm.FetchRequest{
 		Start: &ivm.Start{
 			Row:   ivm.Row{"score": float64(80), "id": float64(2)},
 			Basis: "after",
 		},
-	})
+	}))
 	if len(nodes) != 1 || nodes[0].Row["id"] != float64(1) {
 		t.Fatalf("got %v, want single row id=1 (score 90)", nodes)
 	}
@@ -829,10 +830,10 @@ func TestFetchStartCombinedWithConstraintAndFilter(t *testing.T) {
 		return v
 	}, nil)
 	c := ivm.Constraint{"active": true}
-	nodes := in.Fetch(ivm.FetchRequest{
+	nodes := slices.Collect(in.Fetch(ivm.FetchRequest{
 		Constraint: &c,
 		Start:      &ivm.Start{Row: ivm.Row{"id": float64(1)}, Basis: "after"},
-	})
+	}))
 	if len(nodes) != 1 || nodes[0].Row["id"] != float64(3) {
 		t.Fatalf("got %v, want single row id=3", nodes)
 	}
@@ -893,7 +894,7 @@ func TestOnAdvanceEndSkipsRollbackWhenOverlaySet(t *testing.T) {
 	in.SetOutput(&recordingOutput{})
 
 	// First Fetch pins the prev tx at the seeded 3 rows.
-	if got := len(in.Fetch(ivm.FetchRequest{})); got != 3 {
+	if got := len(slices.Collect(in.Fetch(ivm.FetchRequest{}))); got != 3 {
 		t.Fatalf("baseline = %d, want 3", got)
 	}
 	// External writer commits a 4th row AFTER the pin; a correctly pinned
@@ -901,7 +902,7 @@ func TestOnAdvanceEndSkipsRollbackWhenOverlaySet(t *testing.T) {
 	if _, err := writer.Exec("INSERT INTO users VALUES (10, 'eve', 100, 1)"); err != nil {
 		t.Fatalf("external insert: %v", err)
 	}
-	if got := len(in.Fetch(ivm.FetchRequest{})); got != 3 {
+	if got := len(slices.Collect(in.Fetch(ivm.FetchRequest{}))); got != 3 {
 		t.Fatalf("pre-overlay = %d, want 3 (tx still pinned)", got)
 	}
 
@@ -927,7 +928,7 @@ func TestOnAdvanceEndSkipsRollbackWhenOverlaySet(t *testing.T) {
 	// The guard must have made OnAdvanceEnd a no-op: the prev tx is still the
 	// ORIGINAL pinned snapshot, so the Fetch still sees 3 — not the externally
 	// committed 4. Without the guard this returns 4 (the mid-push snapshot tear).
-	if got := len(in.Fetch(ivm.FetchRequest{})); got != 3 {
+	if got := len(slices.Collect(in.Fetch(ivm.FetchRequest{}))); got != 3 {
 		t.Fatalf("OnAdvanceEnd tore the pinned snapshot while overlay was live: Fetch = %d, want 3", got)
 	}
 }

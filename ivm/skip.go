@@ -1,5 +1,10 @@
 package ivm
 
+import (
+	"iter"
+	"slices"
+)
+
 // Skip sets the start position for the pipeline. No rows before the bound
 // will be output. It requires sorted input.
 
@@ -90,10 +95,10 @@ func CompareWithPartialBound(bound Row, row Row, sort Ordering) int {
 }
 
 // Fetch — fetches nodes respecting the skip bound.
-func (s *Skip) Fetch(req FetchRequest) []Node {
+func (s *Skip) Fetch(req FetchRequest) iter.Seq[Node] {
 	start, empty := s.getStart(req)
 	if empty {
-		return nil
+		return emptyNodeSeq
 	}
 
 	newReq := FetchRequest{
@@ -108,10 +113,10 @@ func (s *Skip) Fetch(req FetchRequest) []Node {
 	if !req.Reverse {
 		newReq.Limit = req.Limit
 	}
-	nodes := s.input.Fetch(newReq)
+	nodes := slices.Collect(s.input.Fetch(newReq))
 
 	if !req.Reverse {
-		return nodes
+		return slices.Values(nodes)
 	}
 
 	// For reverse, filter out nodes before bound
@@ -122,7 +127,7 @@ func (s *Skip) Fetch(req FetchRequest) []Node {
 		}
 		result = append(result, node)
 	}
-	return result
+	return slices.Values(result)
 }
 
 // Push — handles incremental changes respecting the bound.

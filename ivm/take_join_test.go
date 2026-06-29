@@ -2,6 +2,7 @@ package ivm
 
 import (
 	"fmt"
+	"slices"
 	"testing"
 )
 
@@ -66,7 +67,7 @@ func TestTakeWithJoinBoundaryDisplacement(t *testing.T) {
 	join.SetOutput(out)
 
 	// Hydrate by fetching — this triggers initialFetch, setting Take state (size=2, bound=t2)
-	fetched := join.Fetch(FetchRequest{})
+	fetched := slices.Collect(join.Fetch(FetchRequest{}))
 	if len(fetched) != 2 {
 		t.Fatalf("expected 2 fetched nodes, got %d", len(fetched))
 	}
@@ -77,7 +78,7 @@ func TestTakeWithJoinBoundaryDisplacement(t *testing.T) {
 
 	// Now push an EDIT that changes t2's updatedAt from 200 → 50
 	// In DESC order: t2(50) now sorts AFTER t3(100), so t2 leaves the window, t3 enters
-	// The bound is t2{updatedAt:200}. 
+	// The bound is t2{updatedAt:200}.
 	// oldCmp = compareRows(oldRow{updatedAt:200}, bound{updatedAt:200}) = 0
 	// newCmp = compareRows(newRow{updatedAt:50}, bound{updatedAt:200}):
 	//   CompareValues(50, 200) = -1, negated for desc → +1

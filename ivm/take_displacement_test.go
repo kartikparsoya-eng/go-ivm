@@ -12,6 +12,7 @@ package ivm
 import (
 	"encoding/json"
 	"fmt"
+	"slices"
 	"testing"
 )
 
@@ -139,7 +140,7 @@ func setupTakeTest(t *testing.T, storage TakeStorage, limit int, rows []Row) (*M
 	ms.BulkInsert(rows)
 
 	// Hydrate: initial Fetch through Take to populate TakeState
-	hydrated := take.Fetch(FetchRequest{})
+	hydrated := slices.Collect(take.Fetch(FetchRequest{}))
 	t.Logf("Hydrated %d rows", len(hydrated))
 	for i, n := range hydrated {
 		if i < 5 || i >= len(hydrated)-2 {
@@ -519,7 +520,7 @@ func TestTakeDisplacement_StressVerify(t *testing.T) {
 func verifyWindow(t *testing.T, take *Take, ms *MemorySource, limit int, mutNum int) bool {
 	t.Helper()
 
-	takeNodes := take.Fetch(FetchRequest{})
+	takeNodes := slices.Collect(take.Fetch(FetchRequest{}))
 
 	var matching []Row
 	for _, r := range ms.Data() {
@@ -619,8 +620,8 @@ func TestTakeDisplacement_MultiConnection_SplitEdit(t *testing.T) {
 	ms.BulkInsert(rows)
 
 	// Hydrate both Takes
-	h1 := take1.Fetch(FetchRequest{})
-	h2 := take2.Fetch(FetchRequest{})
+	h1 := slices.Collect(take1.Fetch(FetchRequest{}))
+	h2 := slices.Collect(take2.Fetch(FetchRequest{}))
 	t.Logf("Take1 hydrated %d rows, Take2 hydrated %d rows", len(h1), len(h2))
 
 	// Run mutations that change createdAt (sort key)
@@ -707,7 +708,7 @@ func TestTakeDisplacement_MultiConnection_SplitEdit(t *testing.T) {
 func verifyWindowDirect(t *testing.T, take *Take, ms *MemorySource, limit int, mutNum int, filterPred func(Row) bool) bool {
 	t.Helper()
 
-	takeNodes := take.Fetch(FetchRequest{})
+	takeNodes := slices.Collect(take.Fetch(FetchRequest{}))
 
 	var matching []Row
 	for _, r := range ms.Data() {
