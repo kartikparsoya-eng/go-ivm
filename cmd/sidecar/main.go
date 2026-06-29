@@ -657,8 +657,9 @@ type clientGroupReq struct {
 }
 
 // streamWriter writes a partial frame carrying part of a streaming RPC
-// response. Closes over the connection's writeMu so frames stay atomic on
-// the wire across multiple goroutines emitting concurrently.
+// response. Enqueues to the single flusher so partials and the final "done"
+// frame share one FIFO — frames are atomic on the wire and partials
+// structurally precede "done".
 type streamWriter func(reqID interface{}, partial interface{})
 
 // --- Server: manages multiple client groups ---
@@ -2088,31 +2089,20 @@ func handleConnection(conn net.Conn, server *Server) {
 	defer conn.Close()
 	reader := bufio.NewReaderSize(conn, 64*1024)
 
-	// Per-request writer goroutines + a shared write mutex (REVIEW-final
-	// CRITICAL-CROSS-1). The previous single-sequential-writer was queue-
-	// order on the wire but caused HOL blocking: one slow group's response
-	// at position K held back every group's responses at positions K+1...
-	// Now each pending response waits on its own respCh independently and
-	// races for `writeMu` when ready; cross-group requests no longer
-	// serialize. TS uses ID-based response correlation (see go-ivm-client.ts
-	// #onData), so out-of-order responses on the wire are safe.
+	// Single flusher: one goroutine owns the socket write, draining a bounded
+	// chan []byte. All response paths (immediate, respCh, streamW partials,
+	// "done") enqueue encoded frames here. This structurally guarantees FIFO
+	// ordering — partials enqueued by lanes before wg.Wait precede the "done"
+	// frame enqueued after — and replaces writeFrameLocked+writeMu+writerSem.
+	// See DESIGN-streaming-hydrate.md §3g.
 	//
-	// Goroutine bound (writerSem, cap maxWriterGoroutines): pre-fix this
-	// site claimed bounded by outC.cap=1024 — but that only bounded the
-	// reader→dispatcher queue. Each item dispatcher reads spawns a goroutine
-	// that lives until respCh fires; the reader can keep pushing new items
-	// (and dispatcher keeps spawning new goroutines) while existing ones
-	// wait on slow handlers. Under sustained adversarial load N CGs each
-	// with a slow handler, writer-goroutine count grows to N regardless of
-	// outC.cap. With the semaphore the dispatcher blocks on a full sem,
-	// which transitively blocks the reader at outC, applying real
-	// backpressure to the Node side. 4096 is generous for typical
-	// per-connection concurrency (one conn per worker; thousands of
-	// in-flight RPCs is already a hot worker).
-	const maxWriterGoroutines = 4096
-	writerSem := make(chan struct{}, maxWriterGoroutines)
-	var writeMu sync.Mutex
-	writeFrameLocked := func(resp RPCResponse) {
+	// Backpressure: the flusher's bounded channel (cap 256) blocks the
+	// enqueuing goroutine when the socket is slow. That goroutine is one of
+	// the dispatcher's per-response goroutines (below), so a full flusher
+	// transitively fills outC (cap 1024) which blocks the reader, applying
+	// TCP backpressure. The bound is outC.cap + flushCh.cap ≈ 1280 in-flight
+	// goroutines — tighter than the old writerSem's 4096.
+	encodeFrame := func(resp RPCResponse) []byte {
 		data, err := mpMarshal(resp)
 		if err != nil {
 			data, _ = mpMarshal(rpcError(resp.ID, -32603, "encode response: "+err.Error()))
@@ -2125,10 +2115,16 @@ func handleConnection(conn net.Conn, server *Server) {
 				len(data), maxFrameSize, resp.ID)
 			data = capped
 		}
-		writeMu.Lock()
-		_ = writeFrame(conn, data) // socket close handled by reader-loop exit
-		writeMu.Unlock()
+		return data
 	}
+	flushCh := make(chan []byte, 256)
+	flushDone := make(chan struct{})
+	go func() {
+		defer close(flushDone)
+		for data := range flushCh {
+			_ = writeFrame(conn, data) // socket close handled by reader-loop exit
+		}
+	}()
 
 	type pendingResp struct {
 		respCh chan RPCResponse
@@ -2142,25 +2138,19 @@ func handleConnection(conn net.Conn, server *Server) {
 	go func() {
 		defer close(dispatchDone)
 		for p := range outC {
-			// Acquire sem before spawning. Blocks when maxWriterGoroutines
-			// are already in flight; the reader sees outC fill (cap 1024)
-			// and itself blocks on enqueue, applying TCP backpressure.
-			writerSem <- struct{}{}
 			if p.immediate != nil {
 				writerWg.Add(1)
 				go func(resp RPCResponse) {
 					defer writerWg.Done()
-					defer func() { <-writerSem }()
-					writeFrameLocked(resp)
+					flushCh <- encodeFrame(resp)
 				}(*p.immediate)
 				continue
 			}
 			writerWg.Add(1)
 			go func(respCh chan RPCResponse) {
 				defer writerWg.Done()
-				defer func() { <-writerSem }()
 				resp := <-respCh
-				writeFrameLocked(resp)
+				flushCh <- encodeFrame(resp)
 			}(p.respCh)
 		}
 	}()
@@ -2168,18 +2158,21 @@ func handleConnection(conn net.Conn, server *Server) {
 		close(outC)
 		<-dispatchDone
 		writerWg.Wait()
+		close(flushCh)
+		<-flushDone
 	}()
 
 	enqueueImmediate := func(resp RPCResponse) {
 		outC <- pendingResp{immediate: &resp}
 	}
 
-	// Partial-frame writer for streaming RPCs. Goes through writeFrameLocked
-	// so concurrent goroutines from a single streaming handler stay frame-
-	// atomic; bypasses outC because partials don't have a respCh — the
-	// final "done" frame still goes through respCh.
+	// Partial-frame writer for streaming RPCs. Enqueues to the single flusher
+	// so partials and the final "done" frame share one FIFO queue — partials
+	// are enqueued synchronously by the lane before it finishes; "done" is
+	// enqueued after wg.Wait returns (all lanes complete) → FIFO guarantees
+	// partials precede "done". No bypass, no exceptions.
 	streamW := streamWriter(func(reqID interface{}, partial interface{}) {
-		writeFrameLocked(RPCResponse{
+		flushCh <- encodeFrame(RPCResponse{
 			JSONRPC: "2.0",
 			Result:  partial,
 			ID:      reqID,
