@@ -126,14 +126,18 @@ func (j *Join) GetSchema() *SourceSchema {
 	return j.schema
 }
 
-// Fetch — fetches parent nodes and attaches child relationship.
+// Fetch lazily streams parent nodes, attaching a child relationship closure
+// to each. The parent cursor is held open for the lifetime of the seq; the
+// child fetch happens on-demand when the consumer calls the relationship
+// closure (processParentNode). C_q = C_parent + C_child.
 func (j *Join) Fetch(req FetchRequest) iter.Seq[Node] {
-	parentNodes := slices.Collect(j.parent.Fetch(req))
-	result := make([]Node, 0, len(parentNodes))
-	for _, pn := range parentNodes {
-		result = append(result, j.processParentNode(pn.Row, pn.Relationships))
+	return func(yield func(Node) bool) {
+		for pn := range j.parent.Fetch(req) {
+			if !yield(j.processParentNode(pn.Row, pn.Relationships)) {
+				return
+			}
+		}
 	}
-	return slices.Values(result)
 }
 
 // pushParent — handles changes from the parent input.
@@ -204,8 +208,7 @@ func (j *Join) pushChildChange(childRow Row, change Change) []Change {
 	}
 
 	var allChanges []Change
-	parentNodes := slices.Collect(j.parent.Fetch(FetchRequest{Constraint: constraint}))
-	for _, parentNode := range parentNodes {
+	for parentNode := range j.parent.Fetch(FetchRequest{Constraint: constraint}) {
 		j.inprogressChildChangePosition = parentNode.Row
 		childChange := MakeChildChange(
 			j.processParentNode(parentNode.Row, parentNode.Relationships),

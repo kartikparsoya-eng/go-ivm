@@ -97,7 +97,12 @@ func (fj *FlippedJoin) GetSchema() *SourceSchema {
 	return fj.schema
 }
 
-// Fetch fetches child nodes first, then finds related parents, merges, and deduplicates.
+// Fetch fetches child nodes first (eager — small filtered set), then lazily
+// streams related parents via iter.Pull, merging by parent order and grouping
+// children per parent. Parent cursors are held open concurrently (one per
+// child); on early stop, defer calls stop() on all pull iterators. Children
+// stay materialized because the remove-overlay logic splices into the slice
+// and the overlay logic reads related children by index.
 func (fj *FlippedJoin) Fetch(req FetchRequest) iter.Seq[Node] {
 	// Translate constraints for the parent on parts of the join key to constraints for the child.
 	var childConstraint Constraint
@@ -133,126 +138,131 @@ func (fj *FlippedJoin) Fetch(req FetchRequest) iter.Seq[Node] {
 		childNodes[insertPos] = removedNode
 	}
 
-	// For each child, fetch related parents
-	type parentIter struct {
-		nodes []Node
-		pos   int
+	// For each child, create a lazy parent pull iterator
+	type parentPull struct {
+		next func() (Node, bool)
+		stop func()
+		head Node
+		ok   bool
 	}
-	parentIters := make([]*parentIter, len(childNodes))
+	pulls := make([]parentPull, len(childNodes))
 	for i, childNode := range childNodes {
 		constraintFromChild := BuildJoinConstraint(childNode.Row, fj.childKey, fj.parentKey)
 		if constraintFromChild == nil || (req.Constraint != nil && !constraintsAreCompatible(*constraintFromChild, *req.Constraint)) {
-			parentIters[i] = &parentIter{}
-		} else {
-			merged := mergeConstraints(req.Constraint, constraintFromChild)
-			parentReq := FetchRequest{
-				Constraint: merged,
-				Start:      req.Start,
-				Reverse:    req.Reverse,
-			}
-			parentIters[i] = &parentIter{nodes: slices.Collect(fj.parent.Fetch(parentReq))}
+			continue
 		}
+		merged := mergeConstraints(req.Constraint, constraintFromChild)
+		parentReq := FetchRequest{
+			Constraint: merged,
+			Start:      req.Start,
+			Reverse:    req.Reverse,
+		}
+		next, stop := iter.Pull(fj.parent.Fetch(parentReq))
+		pulls[i].next = next
+		pulls[i].stop = stop
+		pulls[i].head, pulls[i].ok = next()
 	}
 
-	// Initialize next parent nodes
-	nextParentNodes := make([]*Node, len(parentIters))
-	for i, pi := range parentIters {
-		if pi.pos < len(pi.nodes) {
-			nextParentNodes[i] = &pi.nodes[pi.pos]
-			pi.pos++
+	compare := func(a, b Node) int {
+		cmp := fj.schema.CompareRows(a.Row, b.Row)
+		if req.Reverse {
+			cmp = -cmp
 		}
+		return cmp
 	}
 
-	var result []Node
-	for {
-		// Find minimum parent node across all iterators
-		var minParentNode *Node
-		var minChildIndexes []int
-
-		for i, parentNode := range nextParentNodes {
-			if parentNode == nil {
-				continue
-			}
-			if minParentNode == nil {
-				minParentNode = parentNode
-				minChildIndexes = []int{i}
-			} else {
-				cmp := fj.schema.CompareRows(parentNode.Row, minParentNode.Row)
-				if req.Reverse {
-					cmp = -cmp
+	return func(yield func(Node) bool) {
+		defer func() {
+			for i := range pulls {
+				if pulls[i].stop != nil {
+					pulls[i].stop()
 				}
-				if cmp == 0 {
+			}
+		}()
+
+		for {
+			// Find minimum parent node across all pull iterators
+			minIdx := -1
+			for i := range pulls {
+				if !pulls[i].ok {
+					continue
+				}
+				if minIdx == -1 || compare(pulls[i].head, pulls[minIdx].head) < 0 {
+					minIdx = i
+				}
+			}
+
+			if minIdx == -1 {
+				return
+			}
+
+			minHead := pulls[minIdx].head
+
+			// Find all iterators with head equal to minHead
+			var minChildIndexes []int
+			for i := range pulls {
+				if !pulls[i].ok {
+					continue
+				}
+				if compare(pulls[i].head, minHead) == 0 {
 					minChildIndexes = append(minChildIndexes, i)
-				} else if cmp < 0 {
-					minParentNode = parentNode
-					minChildIndexes = []int{i}
 				}
 			}
-		}
 
-		if minParentNode == nil {
-			break
-		}
-
-		// Collect related children for this parent and advance iterators
-		relatedChildNodes := make([]Node, 0, len(minChildIndexes))
-		for _, idx := range minChildIndexes {
-			relatedChildNodes = append(relatedChildNodes, childNodes[idx])
-			pi := parentIters[idx]
-			if pi.pos < len(pi.nodes) {
-				nextParentNodes[idx] = &pi.nodes[pi.pos]
-				pi.pos++
-			} else {
-				nextParentNodes[idx] = nil
+			// Collect related children for this parent and advance iterators
+			relatedChildNodes := make([]Node, 0, len(minChildIndexes))
+			for _, idx := range minChildIndexes {
+				relatedChildNodes = append(relatedChildNodes, childNodes[idx])
+				pulls[idx].head, pulls[idx].ok = pulls[idx].next()
 			}
-		}
 
-		// Apply overlay
-		overlaidRelatedChildNodes := relatedChildNodes
-		if fj.inprogressChildChange != nil && fj.inprogressChildChangePosition != nil &&
-			IsJoinMatch(fj.inprogressChildChange.Node.Row, fj.childKey, minParentNode.Row, fj.parentKey) {
+			// Apply overlay
+			overlaidRelatedChildNodes := relatedChildNodes
+			if fj.inprogressChildChange != nil && fj.inprogressChildChangePosition != nil &&
+				IsJoinMatch(fj.inprogressChildChange.Node.Row, fj.childKey, minHead.Row, fj.parentKey) {
 
-			hasBeenPushed := fj.parent.GetSchema().CompareRows(minParentNode.Row, fj.inprogressChildChangePosition) <= 0
+				hasBeenPushed := fj.parent.GetSchema().CompareRows(minHead.Row, fj.inprogressChildChangePosition) <= 0
 
-			if fj.inprogressChildChange.Type == ChangeTypeRemove {
-				if hasBeenPushed {
-					// Filter out the removed node. TS filters by reference
-					// identity (flipped-join.ts:271-272: `n !== change.node`)
-					// because the removed node was spliced into childNodes by
-					// reference. Go copies nodes through slices, so identity
-					// is unavailable — we match by the child schema's full
-					// comparator instead. Equivalent ONLY because the child
-					// sort is total (Zero always appends the PK to the
-					// ordering), so CompareRows==0 ⟺ same row. If a non-total
-					// child sort is ever introduced, this could filter a
-					// DIFFERENT child that ties with the removed one.
-					filtered := make([]Node, 0, len(relatedChildNodes))
-					for _, n := range relatedChildNodes {
-						if fj.child.GetSchema().CompareRows(n.Row, fj.inprogressChildChange.Node.Row) != 0 {
-							filtered = append(filtered, n)
+				if fj.inprogressChildChange.Type == ChangeTypeRemove {
+					if hasBeenPushed {
+						// Filter out the removed node. TS filters by reference
+						// identity (flipped-join.ts:271-272: `n !== change.node`)
+						// because the removed node was spliced into childNodes by
+						// reference. Go copies nodes through slices, so identity
+						// is unavailable — we match by the child schema's full
+						// comparator instead. Equivalent ONLY because the child
+						// sort is total (Zero always appends the PK to the
+						// ordering), so CompareRows==0 ⟺ same row. If a non-total
+						// child sort is ever introduced, this could filter a
+						// DIFFERENT child that ties with the removed one.
+						filtered := make([]Node, 0, len(relatedChildNodes))
+						for _, n := range relatedChildNodes {
+							if fj.child.GetSchema().CompareRows(n.Row, fj.inprogressChildChange.Node.Row) != 0 {
+								filtered = append(filtered, n)
+							}
 						}
+						overlaidRelatedChildNodes = filtered
 					}
-					overlaidRelatedChildNodes = filtered
+				} else if !hasBeenPushed {
+					overlaidRelatedChildNodes = GenerateWithOverlay(relatedChildNodes, *fj.inprogressChildChange, fj.child.GetSchema())
 				}
-			} else if !hasBeenPushed {
-				overlaidRelatedChildNodes = GenerateWithOverlay(relatedChildNodes, *fj.inprogressChildChange, fj.child.GetSchema())
 			}
-		}
 
-		// Only yield if there are related children (inner join)
-		if len(overlaidRelatedChildNodes) > 0 {
-			captured := overlaidRelatedChildNodes
-			nodeOut := Node{
-				Row: minParentNode.Row,
-				Relationships: mergeRelationshipMaps(minParentNode.Relationships, Relationships{
-					fj.relationshipName: func() []Node { return captured },
-				}),
+			// Only yield if there are related children (inner join)
+			if len(overlaidRelatedChildNodes) > 0 {
+				captured := overlaidRelatedChildNodes
+				nodeOut := Node{
+					Row: minHead.Row,
+					Relationships: mergeRelationshipMaps(minHead.Relationships, Relationships{
+						fj.relationshipName: func() []Node { return captured },
+					}),
+				}
+				if !yield(nodeOut) {
+					return
+				}
 			}
-			result = append(result, nodeOut)
 		}
 	}
-
-	return slices.Values(result)
 }
 
 // --- Push from child side ---
