@@ -13,14 +13,14 @@ import (
 // pin e.mu inside Advance so the test can verify concurrent paths don't
 // serialize behind it.
 type blockingSource struct {
-	inner Source
-	gate  chan struct{} // closed by test to release Push
+	inner        Source
+	gate         chan struct{} // closed by test to release Push
 	refreshCount atomic.Int32
 }
 
-func (b *blockingSource) TableName() string                  { return b.inner.TableName() }
-func (b *blockingSource) PrimaryKey() []string               { return b.inner.PrimaryKey() }
-func (b *blockingSource) NormalizeRow(r ivm.Row)             { b.inner.NormalizeRow(r) }
+func (b *blockingSource) TableName() string      { return b.inner.TableName() }
+func (b *blockingSource) PrimaryKey() []string   { return b.inner.PrimaryKey() }
+func (b *blockingSource) NormalizeRow(r ivm.Row) { b.inner.NormalizeRow(r) }
 func (b *blockingSource) Connect(sort ivm.Ordering, filter *builder.Condition, fp func(ivm.Row) bool, sek map[string]bool) ivm.Input {
 	return b.inner.Connect(sort, filter, fp, sek)
 }

@@ -1,5 +1,9 @@
 package ivm
 
+import (
+	"iter"
+	"slices"
+)
 
 // CompoundKey is a list of column names forming a compound key.
 type CompoundKey []string
@@ -79,15 +83,23 @@ func GenerateWithOverlay(nodes []Node, overlay Change, schema *SourceSchema) []N
 					applied = true
 					// Apply child overlay to the matching relationship
 					childRelName := overlay.Child.RelationshipName
-					newRels := make(map[string]func() []Node)
+					newRels := make(map[string]func() iter.Seq[Node])
 					for k, v := range node.Relationships {
 						newRels[k] = v
 					}
 					childChange := overlay.Child.Change
 					childSchema := schema.Relationships[childRelName]
 					origStream := node.Relationships[childRelName]
-					newRels[childRelName] = func() []Node {
-						return GenerateWithOverlay(origStream(), childChange, childSchema)
+					newRels[childRelName] = func() iter.Seq[Node] {
+						return func(yield func(Node) bool) {
+							origNodes := slices.Collect(origStream())
+							overlaid := GenerateWithOverlay(origNodes, childChange, childSchema)
+							for _, n := range overlaid {
+								if !yield(n) {
+									return
+								}
+							}
+						}
 					}
 					result = append(result, Node{Row: node.Row, Relationships: newRels})
 					yieldNode = false
@@ -146,15 +158,23 @@ func GenerateWithOverlayUnordered(nodes []Node, overlay Change, schema *SourceSc
 				if RowEqualsForCompoundKey(overlay.Node.Row, node.Row, schema.PrimaryKey) {
 					suppressed = true
 					childRelName := overlay.Child.RelationshipName
-					newRels := make(map[string]func() []Node)
+					newRels := make(map[string]func() iter.Seq[Node])
 					for k, v := range node.Relationships {
 						newRels[k] = v
 					}
 					childChange := overlay.Child.Change
 					childSchema := schema.Relationships[childRelName]
 					origStream := node.Relationships[childRelName]
-					newRels[childRelName] = func() []Node {
-						return GenerateWithOverlay(origStream(), childChange, childSchema)
+					newRels[childRelName] = func() iter.Seq[Node] {
+						return func(yield func(Node) bool) {
+							origNodes := slices.Collect(origStream())
+							overlaid := GenerateWithOverlay(origNodes, childChange, childSchema)
+							for _, n := range overlaid {
+								if !yield(n) {
+									return
+								}
+							}
+						}
 					}
 					result = append(result, Node{Row: node.Row, Relationships: newRels})
 					continue

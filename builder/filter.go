@@ -287,8 +287,8 @@ func numericCmpCoerced(a, b ivm.Value) (int, bool) {
 // cap is generous (typical apps have a small fixed set of LIKE patterns); a
 // clear costs O(n) but fires only on the rare miss-after-overflow path.
 var (
-	likeRegexCache    sync.Map        // key string -> *regexp.Regexp (typed nil = bad pattern)
-	likeRegexCacheLen atomic.Int64    // approximate entry count; accurate except mid-overflow
+	likeRegexCache    sync.Map         // key string -> *regexp.Regexp (typed nil = bad pattern)
+	likeRegexCacheLen atomic.Int64     // approximate entry count; accurate except mid-overflow
 	likeRegexCacheCap = int64(1 << 14) // 16k compiled patterns; tune via GO_IVM_LIKE_CACHE_CAP
 )
 

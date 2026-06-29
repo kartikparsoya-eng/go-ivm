@@ -1,8 +1,8 @@
 package ivm
 
-
 import (
 	"fmt"
+	"iter"
 	"runtime/debug"
 	"strings"
 
@@ -141,7 +141,7 @@ func normalizeDecodedValue(v interface{}) interface{} {
 // Relationships are generated lazily as read.
 type Node struct {
 	Row           Row
-	Relationships map[string]func() []Node
+	Relationships map[string]func() iter.Seq[Node]
 }
 
 // Comparator compares two rows. Returns <0, 0, or >0.

@@ -170,12 +170,14 @@ func TestAdvanceStream_Small_SingleChunkWithTimings(t *testing.T) {
 // Wait — actually the flush happens when len(pending) >= chunkSize, so after
 // the source change that pushes us over the threshold, we flush. With 3
 // pipelines per source change adding 3 rows at a time and chunkSize=4:
-//   sc1: pending=3        no flush
-//   sc2: pending=6 ≥4 → FLUSH (6 rows), pending=0, chunkIdx=1
-//   sc3: pending=3        no flush
-//   sc4: pending=6 ≥4 → FLUSH (6 rows), pending=0, chunkIdx=2
-//   sc5: pending=3        no flush
-//   terminal flush(true): 3 rows + Final
+//
+//	sc1: pending=3        no flush
+//	sc2: pending=6 ≥4 → FLUSH (6 rows), pending=0, chunkIdx=1
+//	sc3: pending=3        no flush
+//	sc4: pending=6 ≥4 → FLUSH (6 rows), pending=0, chunkIdx=2
+//	sc5: pending=3        no flush
+//	terminal flush(true): 3 rows + Final
+//
 // → 3 frames total: 6, 6, 3. Total 15 rows.
 func TestAdvanceStream_CrossesChunkBoundary_MultipleFrames(t *testing.T) {
 	withAdvanceChunkSize(t, 4)

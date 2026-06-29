@@ -250,7 +250,7 @@ func expandNode(node ivm.Node) *CaughtNode {
 	rels := make(map[string][]*CaughtNode)
 	if node.Relationships != nil {
 		for relName, relFn := range node.Relationships {
-			children := relFn()
+			children := slices.Collect(relFn())
 			expanded := make([]*CaughtNode, 0, len(children))
 			for _, child := range children {
 				expanded = append(expanded, expandNode(child))

@@ -223,29 +223,44 @@ func (j *Join) pushChildChange(childRow Row, change Change) []Change {
 }
 
 // processParentNode — attaches the child relationship stream to a parent node.
-func (j *Join) processParentNode(parentNodeRow Row, parentNodeRelations map[string]func() []Node) Node {
-	childStream := func() []Node {
-		constraint := BuildJoinConstraint(parentNodeRow, j.parentKey, j.childKey)
-		var nodes []Node
-		if constraint != nil {
-			nodes = slices.Collect(j.child.Fetch(FetchRequest{Constraint: constraint}))
-		}
-
-		if j.inprogressChildChange != nil &&
-			IsJoinMatch(parentNodeRow, j.parentKey, j.inprogressChildChange.Node.Row, j.childKey) &&
-			j.inprogressChildChangePosition != nil &&
-			j.schema.CompareRows(parentNodeRow, j.inprogressChildChangePosition) > 0 {
-
-			childSchema := j.child.GetSchema()
-			if childSchema.Sort == nil {
-				return GenerateWithOverlayUnordered(nodes, *j.inprogressChildChange, childSchema)
+func (j *Join) processParentNode(parentNodeRow Row, parentNodeRelations map[string]func() iter.Seq[Node]) Node {
+	childStream := func() iter.Seq[Node] {
+		return func(yield func(Node) bool) {
+			constraint := BuildJoinConstraint(parentNodeRow, j.parentKey, j.childKey)
+			if constraint == nil {
+				return
 			}
-			return GenerateWithOverlay(nodes, *j.inprogressChildChange, childSchema)
+
+			if j.inprogressChildChange != nil &&
+				IsJoinMatch(parentNodeRow, j.parentKey, j.inprogressChildChange.Node.Row, j.childKey) &&
+				j.inprogressChildChangePosition != nil &&
+				j.schema.CompareRows(parentNodeRow, j.inprogressChildChangePosition) > 0 {
+
+				nodes := slices.Collect(j.child.Fetch(FetchRequest{Constraint: constraint}))
+				childSchema := j.child.GetSchema()
+				var overlaid []Node
+				if childSchema.Sort == nil {
+					overlaid = GenerateWithOverlayUnordered(nodes, *j.inprogressChildChange, childSchema)
+				} else {
+					overlaid = GenerateWithOverlay(nodes, *j.inprogressChildChange, childSchema)
+				}
+				for _, n := range overlaid {
+					if !yield(n) {
+						return
+					}
+				}
+				return
+			}
+
+			for n := range j.child.Fetch(FetchRequest{Constraint: constraint}) {
+				if !yield(n) {
+					return
+				}
+			}
 		}
-		return nodes
 	}
 
-	newRels := make(map[string]func() []Node)
+	newRels := make(map[string]func() iter.Seq[Node])
 	for k, v := range parentNodeRelations {
 		newRels[k] = v
 	}

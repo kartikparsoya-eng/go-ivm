@@ -93,7 +93,7 @@ func TestEngineClose_ReleasesTableSourceConn(t *testing.T) {
 	// Precondition: the hydrate must actually have a conn checked out, else
 	// this test would pass vacuously even with the leak present.
 	if got := wdb.Stats().InUse; got == 0 {
-		t.Fatalf("expected the hydrate to hold a writable conn (InUse>=1), got InUse=0 — "+
+		t.Fatalf("expected the hydrate to hold a writable conn (InUse>=1), got InUse=0 — " +
 			"test no longer exercises the leak path")
 	}
 

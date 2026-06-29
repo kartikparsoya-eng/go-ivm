@@ -369,8 +369,8 @@ func (f *Fuzzer) generateExistsCondition(parentTbl tableInfo, allTables []tableI
 
 	lim := 3
 	return &builder.Condition{
-		Type:  "correlatedSubquery",
-		Op: op,
+		Type: "correlatedSubquery",
+		Op:   op,
 		Related: &builder.CorrelatedSubquery{
 			Correlation: builder.Correlation{
 				ParentField: []string{"id"},

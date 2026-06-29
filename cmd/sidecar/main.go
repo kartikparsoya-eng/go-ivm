@@ -1580,7 +1580,7 @@ func (s *Server) handleAddQuery(req RPCRequest) RPCResponse {
 		return resp
 	}
 
-	s.refreshSnapForInitialHydrateLocked(cgID, group)
+	s.refreshSnapForInitialHydrateLocked(cgID, group, []engine.QuerySpec{{AST: p.AST}})
 	changes, timingMs, err := group.eng.AddQuery(p.QueryID, p.AST)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[GO-IVM] addQuery ERROR cg=%s query=%s: %v\n", cgID, p.QueryID, err)
@@ -1659,8 +1659,8 @@ func (s *Server) handleAddQueries(req RPCRequest) RPCResponse {
 		specs[i] = engine.QuerySpec{QueryID: q.QueryID, AST: q.AST}
 	}
 
-	s.refreshSnapForInitialHydrateLocked(cgID, group)
-	warmPool, warmCR := s.buildWarmReaderPoolLocked(group)
+	s.refreshSnapForInitialHydrateLocked(cgID, group, specs)
+	warmPool, warmCR := s.buildWarmReaderPoolLocked(group, engine.ConservativeHydrateCmaxForSpecs(specs))
 	if warmPool != nil {
 		defer s.tearDownWarmReaderPool(group, warmPool, warmCR)
 	}
@@ -1738,12 +1738,12 @@ func (s *Server) handleAddQueriesStream(req RPCRequest, streamW streamWriter) RP
 	// On the Final frame, ChunkIndex+1 is the total chunk count for that
 	// query — engine_streaming_test.go locks in the invariant that Final
 	// is always on the last (highest-ChunkIndex) frame.
-	s.refreshSnapForInitialHydrateLocked(cgID, group)
+	s.refreshSnapForInitialHydrateLocked(cgID, group, specs)
 	// Warm hydrate (live-pipeline CG): parallelize the added queries' fetches on
 	// a co-read pool pinned to curr's current frame. No-op for the cold first
 	// hydrate (handled above) or when GO_IVM_WARM_HYDRATE_POOL is off. Ephemeral
 	// — torn down right after AddQueriesStream so the next advance is unaffected.
-	warmPool, warmCR := s.buildWarmReaderPoolLocked(group)
+	warmPool, warmCR := s.buildWarmReaderPoolLocked(group, engine.ConservativeHydrateCmaxForSpecs(specs))
 	if warmPool != nil {
 		defer s.tearDownWarmReaderPool(group, warmPool, warmCR)
 	}
@@ -2500,8 +2500,8 @@ func main() {
 		}
 	}
 	// GO_IVM_HYDRATE_LANES sets P (worker lane count for bounded parallel
-	// hydrate). The reader pool is sized to max(hydrateReaders, hydrateLanes)
-	// so every lane can acquire a reader (deadlock-freedom: §3d).
+	// hydrate). The reader pool is sized to max(hydrateReaders, hydrateLanes×Cmax)
+	// so every lane can acquire all Cmax readers it needs (deadlock-freedom: §3d).
 	if v := os.Getenv("GO_IVM_HYDRATE_LANES"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			server.hydrateLanes = n

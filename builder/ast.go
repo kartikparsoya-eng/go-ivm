@@ -28,9 +28,9 @@ type Condition struct {
 	Type string `json:"type"` // "simple", "and", "or", "correlatedSubquery"
 
 	// For type == "simple"
-	Op    string        `json:"op,omitempty"`
-	Left  *ValuePos     `json:"left,omitempty"`
-	Right *ValuePos     `json:"right,omitempty"`
+	Op    string    `json:"op,omitempty"`
+	Left  *ValuePos `json:"left,omitempty"`
+	Right *ValuePos `json:"right,omitempty"`
 
 	// For type == "and" or "or"
 	Conditions []Condition `json:"conditions,omitempty"`
@@ -38,8 +38,8 @@ type Condition struct {
 	// For type == "correlatedSubquery"
 	Related *CorrelatedSubquery `json:"related,omitempty"`
 	// Note: For correlatedSubquery, the Op field holds "EXISTS" | "NOT EXISTS"
-	Flip    bool                `json:"flip,omitempty"`
-	Scalar  bool                `json:"scalar,omitempty"`
+	Flip   bool `json:"flip,omitempty"`
+	Scalar bool `json:"scalar,omitempty"`
 }
 
 // ValuePos is a value position in a condition.

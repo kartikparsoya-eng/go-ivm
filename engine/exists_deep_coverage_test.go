@@ -75,14 +75,14 @@ func TestTableSourceNestedExists_ThreeLevels(t *testing.T) {
 		Where: &builder.Condition{
 			Type: "correlatedSubquery", Op: "EXISTS",
 			Related: &builder.CorrelatedSubquery{
-				System: "client",
+				System:      "client",
 				Correlation: builder.Correlation{ParentField: []string{"id"}, ChildField: []string{"channelId"}},
 				Subquery: builder.AST{
 					Table: "conversations", Alias: "convs",
 					Where: &builder.Condition{
 						Type: "correlatedSubquery", Op: "EXISTS",
 						Related: &builder.CorrelatedSubquery{
-							System: "client",
+							System:      "client",
 							Correlation: builder.Correlation{ParentField: []string{"id"}, ChildField: []string{"conversationId"}},
 							Subquery: builder.AST{
 								Table: "messages", Alias: "msgs",
@@ -124,12 +124,13 @@ func TestTableSourceNestedExists_ThreeLevels(t *testing.T) {
 
 // TestTableSourceNotExistsCompoundKey_AdvanceEmitsTransition: tests both
 // directions of the NOT EXISTS transition during advance.
-//   * Start: chan-A has matching participant → NOT EXISTS false → not in
+//   - Start: chan-A has matching participant → NOT EXISTS false → not in
 //     result set. chan-B has no participant → NOT EXISTS true → in result.
-//   * Insert participant for chan-B → NOT EXISTS flips true→false →
+//   - Insert participant for chan-B → NOT EXISTS flips true→false →
 //     Remove(chan-B) must be emitted.
-//   * Delete participant from chan-A → NOT EXISTS flips false→true →
+//   - Delete participant from chan-A → NOT EXISTS flips false→true →
 //     Add(chan-A) must be emitted.
+//
 // Without the snapshotDisabled overlay fix (gap #1) this would fail the
 // same way the EXISTS-advance test did.
 func TestTableSourceNotExistsCompoundKey_AdvanceEmitsTransition(t *testing.T) {
@@ -215,7 +216,7 @@ func TestTableSourceNotExistsCompoundKey_AdvanceEmitsTransition(t *testing.T) {
 	// to the prev tx (no external INSERT — that would race the prev tx's
 	// read snapshot and deadlock under plain BEGIN).
 	result := eng.Advance([]SnapshotChange{{
-		Table: "channel_participants",
+		Table:     "channel_participants",
 		NextValue: ivm.Row{"id": "cp-b-X", "channelId": "chan-B", "userId": "user-X"},
 	}})
 	var sawRemove bool
@@ -275,7 +276,7 @@ func TestTableSourceExistsWithManyChildrenStraddlesLimit(t *testing.T) {
 		Where: &builder.Condition{
 			Type: "correlatedSubquery", Op: "EXISTS",
 			Related: &builder.CorrelatedSubquery{
-				System: "client",
+				System:      "client",
 				Correlation: builder.Correlation{ParentField: []string{"id"}, ChildField: []string{"parentId"}},
 				Subquery:    builder.AST{Table: "kids", Alias: "kids"},
 			},

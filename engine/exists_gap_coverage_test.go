@@ -400,7 +400,9 @@ func TestTableSourceExistsPlusCursorPagination(t *testing.T) {
 // Before the CompareWithPartialBound fix (ed7a302), Skip's shouldBePresent used
 // the full comparator which treated nil < non-nil for the second sort column.
 // A partial bound {createdAt:100} vs full row {createdAt:100, id:"X"}:
-//   full comparator: createdAt equal, id: nil < "X" → cmp = -1 → row passes
+//
+//	full comparator: createdAt equal, id: nil < "X" → cmp = -1 → row passes
+//
 // With CompareWithPartialBound: stops at first field not in bound → cmp = 0
 // + Exclusive=true → row blocked. This test catches regressions in that path.
 func TestPartialCursorExclusionWithMultiColumnSort(t *testing.T) {

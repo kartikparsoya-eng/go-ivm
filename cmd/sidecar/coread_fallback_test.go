@@ -81,7 +81,7 @@ func TestBuildReaderPool_FallsBackOnNonWal2(t *testing.T) {
 		t.Fatalf("anchor pinned at %q, want 0000000001", got)
 	}
 
-	pool, coread, err := srv.buildReaderPoolLocked(cur)
+	pool, coread, err := srv.buildReaderPoolLocked(cur, 1)
 	if err != nil {
 		t.Fatalf("buildReaderPoolLocked: unexpected error (should fall back cleanly): %v", err)
 	}

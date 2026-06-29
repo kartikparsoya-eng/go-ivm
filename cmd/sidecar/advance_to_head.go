@@ -134,14 +134,19 @@ func (s *Server) buildSnapshotterLocked(group *ClientGroup, p *initParams) error
 // (hydrateReaders<=1), or (nil, err) on a hard failure. The caller MUST verify
 // pool.Version() matches the Snapshotter's curr and retry if not. MUST hold
 // group.mu.
-func (s *Server) buildReaderPoolLocked(cur *snapshotter.Snapshot) (*tablesource.ReaderPool, *tablesource.CoRead, error) {
-	// Pool size K = max(hydrateReaders, hydrateLanes). hydrateLanes (P worker
-	// lanes) needs at least P readers so every lane can acquire one
-	// (deadlock-freedom: K = P × Cmax, Cmax=1 while eager → K=P). When both
-	// are ≤1, the feature is off: serial by design.
+func (s *Server) buildReaderPoolLocked(cur *snapshotter.Snapshot, cmax int) (*tablesource.ReaderPool, *tablesource.CoRead, error) {
+	// Pool size K = max(hydrateReaders, hydrateLanes × Cmax). Each of the P
+	// worker lanes may need up to Cmax concurrent readers (e.g. a 2-deep
+	// join holds a parent cursor while fetching the child → 2 readers per
+	// lane). K = P × Cmax guarantees every lane can acquire all the readers
+	// it needs without blocking (deadlock-freedom: §3d). When both
+	// hydrateReaders and hydrateLanes×cmax are ≤1, the feature is off.
+	if cmax < 1 {
+		cmax = 1
+	}
 	k := s.hydrateReaders
-	if s.hydrateLanes > k {
-		k = s.hydrateLanes
+	if lanesCmax := s.hydrateLanes * cmax; lanesCmax > k {
+		k = lanesCmax
 	}
 	if k <= 1 {
 		return nil, nil, nil // feature off: serial by design, not a failure
@@ -207,10 +212,13 @@ func (s *Server) tearDownReaderPool(group *ClientGroup) {
 // return with tearDownWarmReaderPool after AddQueriesStream. The pool is NOT
 // stored on the group (it is per-call); group.readerPool is the cold pool's
 // slot and is left untouched. MUST hold group.mu.
-func (s *Server) buildWarmReaderPoolLocked(group *ClientGroup) (*tablesource.ReaderPool, *tablesource.CoRead) {
+func (s *Server) buildWarmReaderPoolLocked(group *ClientGroup, cmax int) (*tablesource.ReaderPool, *tablesource.CoRead) {
+	if cmax < 1 {
+		cmax = 1
+	}
 	k := s.hydrateReaders
-	if s.hydrateLanes > k {
-		k = s.hydrateLanes
+	if lanesCmax := s.hydrateLanes * cmax; lanesCmax > k {
+		k = lanesCmax
 	}
 	if !s.warmHydratePoolEnabled || !s.advanceDriveEnabled || k <= 1 {
 		return nil, nil
@@ -346,7 +354,7 @@ func readAllTableNames(db *sql.DB) (map[string]bool, error) {
 //
 // No-op once any pipeline exists: re-pinning curr would desync hydrated
 // pipelines. MUST hold group.mu.
-func (s *Server) refreshSnapForInitialHydrateLocked(cgID string, group *ClientGroup) {
+func (s *Server) refreshSnapForInitialHydrateLocked(cgID string, group *ClientGroup, specs []engine.QuerySpec) {
 	if !s.advanceDriveEnabled || group.snap == nil || group.eng == nil {
 		return
 	}
@@ -371,7 +379,8 @@ func (s *Server) refreshSnapForInitialHydrateLocked(cgID string, group *ClientGr
 	// latches K readers to this frame; the converge-fallback path would
 	// ratchet to head (a different frame), so on misalignment we stay serial
 	// rather than hydrating at a frame that doesn't match TS.
-	pool, cr, perr := s.buildReaderPoolLocked(cur)
+	cmax := engine.ConservativeHydrateCmaxForSpecs(specs)
+	pool, cr, perr := s.buildReaderPoolLocked(cur, cmax)
 	if perr != nil || pool == nil {
 		if s.hydrateReaders > 1 {
 			metrics.recordReaderPoolBind(poolBindSerial, 1)

@@ -139,9 +139,9 @@ func ticketsAllQuery(queryID string) QuerySpec {
 	}
 }
 
-// 1. Hydrate with a result set larger than the chunk size produces multiple
-//    monotonic frames terminating in Final=true. This is the case the soak
-//    driver couldn't exercise (auth filter rendered every result empty).
+//  1. Hydrate with a result set larger than the chunk size produces multiple
+//     monotonic frames terminating in Final=true. This is the case the soak
+//     driver couldn't exercise (auth filter rendered every result empty).
 func TestTableSourceStream_Hydrate_MultiChunk(t *testing.T) {
 	withChunkSize(t, 100)
 	const rowCount = 547 // not a multiple of chunkSize → tail chunk has 47
@@ -177,8 +177,8 @@ func TestTableSourceStream_Hydrate_MultiChunk(t *testing.T) {
 	}
 }
 
-// 2. Small result fits in one chunk with Final=true. Confirms TableSource's
-//    AddQueriesStream behavior matches the MemorySource happy path.
+//  2. Small result fits in one chunk with Final=true. Confirms TableSource's
+//     AddQueriesStream behavior matches the MemorySource happy path.
 func TestTableSourceStream_Hydrate_SmallResult_SingleChunk(t *testing.T) {
 	withChunkSize(t, 100)
 	eng, _ := newTableSourceStreamingEngine(t, 5)
@@ -197,10 +197,10 @@ func TestTableSourceStream_Hydrate_SmallResult_SingleChunk(t *testing.T) {
 	}
 }
 
-// 3. AddQueriesStream of two independent queries — each gets its own chunk
-//    sequence with its own monotonic ChunkIndex starting at 0, and a Final
-//    boundary per query. Validates that chunkFor's per-queryID partitioning
-//    holds when TableSource backs the source.
+//  3. AddQueriesStream of two independent queries — each gets its own chunk
+//     sequence with its own monotonic ChunkIndex starting at 0, and a Final
+//     boundary per query. Validates that chunkFor's per-queryID partitioning
+//     holds when TableSource backs the source.
 func TestTableSourceStream_Hydrate_TwoQueries_IndependentChunking(t *testing.T) {
 	withChunkSize(t, 50)
 	eng, _ := newTableSourceStreamingEngine(t, 120)
@@ -227,15 +227,15 @@ func TestTableSourceStream_Hydrate_TwoQueries_IndependentChunking(t *testing.T) 
 	}
 }
 
-// 4. AdvanceStream against TableSource: prev row + next row diffs fan through
-//    Source.Push into multiple connections, producing N*pipelines RowChanges.
-//    Crosses the advance chunk boundary at 100; we expect at least 2 frames
-//    with monotonic ChunkIndex and Final=true on the last.
+//  4. AdvanceStream against TableSource: prev row + next row diffs fan through
+//     Source.Push into multiple connections, producing N*pipelines RowChanges.
+//     Crosses the advance chunk boundary at 100; we expect at least 2 frames
+//     with monotonic ChunkIndex and Final=true on the last.
 //
-//    Note: each Push fans the SAME change to every connection; with 3 active
-//    connections, one source-change adds 3 RowChanges to the pending buffer.
-//    50 source changes → 150 RowChanges → with advanceChunkSize=100 we see
-//    2 frames (one mid-stream flush at the boundary, one terminal flush).
+//     Note: each Push fans the SAME change to every connection; with 3 active
+//     connections, one source-change adds 3 RowChanges to the pending buffer.
+//     50 source changes → 150 RowChanges → with advanceChunkSize=100 we see
+//     2 frames (one mid-stream flush at the boundary, one terminal flush).
 func TestTableSourceStream_Advance_MultiChunk(t *testing.T) {
 	withAdvanceChunkSize(t, 100)
 	eng, _ := newTableSourceStreamingEngine(t, 0) // empty replica is fine for advance
@@ -286,9 +286,9 @@ func TestTableSourceStream_Advance_MultiChunk(t *testing.T) {
 	}
 }
 
-// 5. End-to-end: hydrate produces a large multi-chunk result AND a subsequent
-//    advance produces a multi-chunk result on the same engine. Validates the
-//    state machine isn't disturbed by mid-test chunk-boundary crossings.
+//  5. End-to-end: hydrate produces a large multi-chunk result AND a subsequent
+//     advance produces a multi-chunk result on the same engine. Validates the
+//     state machine isn't disturbed by mid-test chunk-boundary crossings.
 func TestTableSourceStream_HydrateThenAdvance_BothChunked(t *testing.T) {
 	withChunkSize(t, 50)
 	withAdvanceChunkSize(t, 40)

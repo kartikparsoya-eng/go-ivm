@@ -1,6 +1,7 @@
 package ivm
 
 import (
+	"iter"
 	"strings"
 	"testing"
 )
@@ -57,8 +58,8 @@ func TestGetCacheKey_NonSerializableValue_Panics(t *testing.T) {
 
 	bogusNode := Node{
 		Row: Row{"id": make(chan int)},
-		Relationships: map[string]func() []Node{
-			"children": func() []Node { return nil },
+		Relationships: map[string]func() iter.Seq[Node]{
+			"children": func() iter.Seq[Node] { return func(yield func(Node) bool) {} },
 		},
 	}
 	exists.Filter(bogusNode)

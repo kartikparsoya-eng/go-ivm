@@ -5,12 +5,12 @@
 // never commits; instead it holds TWO BEGIN CONCURRENT snapshots on the same
 // file and "leapfrogs" them to replay the timeline in isolation:
 //
-//	Replicator:  t1 --------------> t2 --------------> t3 -------------->
-//	ViewSyncer:       [snapshot_a] ----> [snapshot_b] ----> [snapshot_c]
-//	                    (conn_1)           (conn_2)           (conn_1)   ← reused
+//		Replicator:  t1 --------------> t2 --------------> t3 -------------->
+//		ViewSyncer:       [snapshot_a] ----> [snapshot_b] ----> [snapshot_c]
+//		                    (conn_1)           (conn_2)           (conn_1)   ← reused
 //
-//   - curr: the snapshot IVM is currently consistent at.
-//   - prev: the previous snapshot, re-pinned at head and reused as the next curr.
+//	  - curr: the snapshot IVM is currently consistent at.
+//	  - prev: the previous snapshot, re-pinned at head and reused as the next curr.
 //
 // The diff between two snapshots is derived NOT from a racing "head" pointer
 // but from the version-stamped, append-only `_zero.changeLog2` table (see

@@ -416,7 +416,7 @@ func TestLimitThroughFilterThenJoin(t *testing.T) {
 			t.Errorf("result %v has no 'children' relationship", n.Row["id"])
 			continue
 		}
-		children := childFn()
+		children := slices.Collect(childFn())
 		if len(children) != 1 {
 			t.Errorf("result %v expected 1 child, got %d", n.Row["id"], len(children))
 		}

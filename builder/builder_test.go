@@ -107,9 +107,9 @@ func TestBuildPipelineWithFilter(t *testing.T) {
 		Table:   "users",
 		OrderBy: ivm.Ordering{{"id", "asc"}},
 		Where: &Condition{
-			Type: "simple",
-			Op:   "=",
-			Left: &ValuePos{Type: "column", Name: "name"},
+			Type:  "simple",
+			Op:    "=",
+			Left:  &ValuePos{Type: "column", Name: "name"},
 			Right: &ValuePos{Type: "literal", Value: "Alice"},
 		},
 	}

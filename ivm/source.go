@@ -340,13 +340,13 @@ func (ms *MemorySource) sourceChangeToChange(sc SourceChange) Change {
 	switch sc.Type {
 	case ChangeTypeEdit:
 		return MakeEditChange(
-			Node{Row: sc.Row, Relationships: map[string]func() []Node{}},
-			Node{Row: sc.OldRow, Relationships: map[string]func() []Node{}},
+			Node{Row: sc.Row, Relationships: map[string]func() iter.Seq[Node]{}},
+			Node{Row: sc.OldRow, Relationships: map[string]func() iter.Seq[Node]{}},
 		)
 	case ChangeTypeAdd:
-		return MakeAddChange(Node{Row: sc.Row, Relationships: map[string]func() []Node{}})
+		return MakeAddChange(Node{Row: sc.Row, Relationships: map[string]func() iter.Seq[Node]{}})
 	case ChangeTypeRemove:
-		return MakeRemoveChange(Node{Row: sc.Row, Relationships: map[string]func() []Node{}})
+		return MakeRemoveChange(Node{Row: sc.Row, Relationships: map[string]func() iter.Seq[Node]{}})
 	}
 	panic("unreachable")
 }
@@ -694,7 +694,7 @@ func generateWithOverlayInner(rows []Row, overlays Overlays, compare Comparator)
 			cmp := compare(overlays.Add, row)
 			if cmp < 0 {
 				addYielded = true
-				result = append(result, Node{Row: overlays.Add, Relationships: map[string]func() []Node{}})
+				result = append(result, Node{Row: overlays.Add, Relationships: map[string]func() iter.Seq[Node]{}})
 			}
 		}
 		if !removeSkipped && overlays.Remove != nil {
@@ -704,11 +704,11 @@ func generateWithOverlayInner(rows []Row, overlays Overlays, compare Comparator)
 				continue
 			}
 		}
-		result = append(result, Node{Row: row, Relationships: map[string]func() []Node{}})
+		result = append(result, Node{Row: row, Relationships: map[string]func() iter.Seq[Node]{}})
 	}
 
 	if !addYielded && overlays.Add != nil {
-		result = append(result, Node{Row: overlays.Add, Relationships: map[string]func() []Node{}})
+		result = append(result, Node{Row: overlays.Add, Relationships: map[string]func() iter.Seq[Node]{}})
 	}
 
 	return result

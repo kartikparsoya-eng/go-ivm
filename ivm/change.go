@@ -1,6 +1,5 @@
 package ivm
 
-
 // ChangeType mirrors change-type-enum.ts
 type ChangeType int
 

@@ -488,8 +488,8 @@ func TestExistsMembershipFilter(t *testing.T) {
 // after pulling the actual AST from xyne-spaces-zero-external (queryID
 // 1lbed0jdn1taa, 2026-05-25). The production query is shaped as:
 //
-//   WHERE updatedAt > X
-//     AND (visibility = 'PUBLIC' OR EXISTS(channel_participants matching user))
+//	WHERE updatedAt > X
+//	  AND (visibility = 'PUBLIC' OR EXISTS(channel_participants matching user))
 //
 // Difference from TestExistsMembershipFilter: the EXISTS is now one
 // branch of an OR (alongside a column-equality branch), not the entire
@@ -498,7 +498,7 @@ func TestExistsMembershipFilter(t *testing.T) {
 //
 // Test shape:
 //   - 4 channels: ch1 (PUBLIC), ch2/ch3 (PRIVATE, user is member),
-//                 ch4 (PRIVATE, user NOT a member)
+//     ch4 (PRIVATE, user NOT a member)
 //   - 2 participants: user-A in ch2 and ch3
 //   - Expected: 3 channels returned (ch1, ch2, ch3). ch4 must be excluded
 //     (private + user not a participant).

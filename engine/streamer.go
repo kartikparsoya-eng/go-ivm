@@ -224,8 +224,10 @@ func streamNodesInto(out *[]RowChange, queryID string, schema *ivm.SourceSchema,
 			if childSchema == nil {
 				continue
 			}
-			for _, childNode := range node.Relationships[relName]() {
-				streamNodesInto(out, queryID, childSchema, op, childNode)
+			if seq := node.Relationships[relName](); seq != nil {
+				for childNode := range seq {
+					streamNodesInto(out, queryID, childSchema, op, childNode)
+				}
 			}
 		}
 	}

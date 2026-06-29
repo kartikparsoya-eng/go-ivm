@@ -115,7 +115,7 @@ func TestLazyThreeDeepJoin(t *testing.T) {
 			t.Errorf("node[%d] (%s): no 'assignments' relationship", i, want[i].id)
 			continue
 		}
-		assignments := assignStream()
+		assignments := slices.Collect(assignStream())
 		if len(assignments) != len(want[i].assignments) {
 			t.Errorf("node[%d] (%s): %d assignments, want %d",
 				i, want[i].id, len(assignments), len(want[i].assignments))
@@ -135,7 +135,7 @@ func TestLazyThreeDeepJoin(t *testing.T) {
 					i, j, want[i].assignments[j].id)
 				continue
 			}
-			comments := commentStream()
+			comments := slices.Collect(commentStream())
 			if len(comments) != len(want[i].assignments[j].comments) {
 				t.Errorf("node[%d].assignments[%d] (%s): %d comments, want %d",
 					i, j, want[i].assignments[j].id,
@@ -220,7 +220,7 @@ func TestLazyThreeDeepJoinWithTake(t *testing.T) {
 	if a1Stream == nil {
 		t.Fatal("t1 has no assignments relationship")
 	}
-	assignments := a1Stream()
+	assignments := slices.Collect(a1Stream())
 	if len(assignments) != 1 || assignments[0].Row["id"] != "a1" {
 		t.Errorf("t1 assignments: expected [a1], got %v", assignments)
 	}
@@ -228,7 +228,7 @@ func TestLazyThreeDeepJoinWithTake(t *testing.T) {
 	if c1Stream == nil {
 		t.Fatal("a1 has no comments relationship")
 	}
-	comments := c1Stream()
+	comments := slices.Collect(c1Stream())
 	if len(comments) != 1 || comments[0].Row["id"] != "c1" {
 		t.Errorf("a1 comments: expected [c1], got %v", comments)
 	}

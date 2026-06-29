@@ -3,6 +3,8 @@ package ivm
 import (
 	"encoding/json"
 	"fmt"
+	"iter"
+	"slices"
 	"sync"
 	"sync/atomic"
 )
@@ -157,11 +159,11 @@ func (e *Exists) Push(change Change, pusher InputBase) []Change {
 			if size == 1 {
 				if e.not {
 					// Push remove with empty relationship
-					emptyRels := make(map[string]func() []Node)
+					emptyRels := make(map[string]func() iter.Seq[Node])
 					for k, v := range change.Node.Relationships {
 						emptyRels[k] = v
 					}
-					emptyRels[e.relationshipName] = func() []Node { return nil }
+					emptyRels[e.relationshipName] = func() iter.Seq[Node] { return func(yield func(Node) bool) {} }
 					return e.output.Push(MakeRemoveChange(Node{
 						Row:           change.Node.Row,
 						Relationships: emptyRels,
@@ -179,12 +181,12 @@ func (e *Exists) Push(change Change, pusher InputBase) []Change {
 					return e.output.Push(MakeAddChange(change.Node), e)
 				}
 				// Push remove with the removed child included
-				withChildRels := make(map[string]func() []Node)
+				withChildRels := make(map[string]func() iter.Seq[Node])
 				for k, v := range change.Node.Relationships {
 					withChildRels[k] = v
 				}
 				removedChild := change.Child.Change.Node
-				withChildRels[e.relationshipName] = func() []Node { return []Node{removedChild} }
+				withChildRels[e.relationshipName] = func() iter.Seq[Node] { return slices.Values([]Node{removedChild}) }
 				return e.output.Push(MakeRemoveChange(Node{
 					Row:           change.Node.Row,
 					Relationships: withChildRels,
@@ -244,7 +246,15 @@ func (e *Exists) pushWithFilter(change Change, exists *bool) []Change {
 
 // fetchExists — checks if relationship has any nodes.
 func (e *Exists) fetchExists(node Node) bool {
-	return e.fetchSize(node) > 0
+	relationship := node.Relationships[e.relationshipName]
+	if relationship == nil {
+		panic(fmt.Sprintf("Exists: relationship %q not found on node", e.relationshipName))
+	}
+	seq := relationship()
+	if seq == nil {
+		return false
+	}
+	return len(slices.Collect(seq)) > 0
 }
 
 // fetchSize — counts nodes in the relationship.
@@ -253,8 +263,13 @@ func (e *Exists) fetchSize(node Node) int {
 	if relationship == nil {
 		panic(fmt.Sprintf("Exists: relationship %q not found on node", e.relationshipName))
 	}
-	nodes := relationship()
-	return len(nodes)
+	count := 0
+	if seq := relationship(); seq != nil {
+		for range seq {
+			count++
+		}
+	}
+	return count
 }
 
 // compoundKeysEqual checks if two compound keys are equal.

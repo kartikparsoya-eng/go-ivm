@@ -254,7 +254,7 @@ func (fj *FlippedJoin) Fetch(req FetchRequest) iter.Seq[Node] {
 				nodeOut := Node{
 					Row: minHead.Row,
 					Relationships: mergeRelationshipMaps(minHead.Relationships, Relationships{
-						fj.relationshipName: func() []Node { return captured },
+						fj.relationshipName: func() iter.Seq[Node] { return slices.Values(captured) },
 					}),
 				}
 				if !yield(nodeOut) {
@@ -308,16 +308,22 @@ func (fj *FlippedJoin) pushChildChange(change Change, exists bool) []Change {
 		fj.inprogressChildChange = &change
 		fj.inprogressChildChangePosition = parentNode.Row
 
-		childNodeStream := func() []Node {
-			c := BuildJoinConstraint(parentNode.Row, fj.parentKey, fj.childKey)
-			if c == nil {
-				return nil
+		childNodeStream := func() iter.Seq[Node] {
+			return func(yield func(Node) bool) {
+				c := BuildJoinConstraint(parentNode.Row, fj.parentKey, fj.childKey)
+				if c == nil {
+					return
+				}
+				for n := range fj.child.Fetch(FetchRequest{Constraint: c}) {
+					if !yield(n) {
+						return
+					}
+				}
 			}
-			return slices.Collect(fj.child.Fetch(FetchRequest{Constraint: c}))
 		}
 
 		if !exists {
-			for _, childNode := range childNodeStream() {
+			for childNode := range childNodeStream() {
 				if fj.child.GetSchema().CompareRows(childNode.Row, change.Node.Row) != 0 {
 					exists = true
 					break
@@ -341,7 +347,7 @@ func (fj *FlippedJoin) pushChildChange(change Change, exists bool) []Change {
 			outNode := Node{
 				Row: parentNode.Row,
 				Relationships: mergeRelationshipMaps(parentNode.Relationships, Relationships{
-					fj.relationshipName: func() []Node { return []Node{change.Node} },
+					fj.relationshipName: func() iter.Seq[Node] { return slices.Values([]Node{change.Node}) },
 				}),
 			}
 			var outChange Change
@@ -369,13 +375,19 @@ func (o *flippedJoinParentOutput) Push(change Change, _ InputBase) []Change {
 
 // pushParent — source: flipped-join.ts line 427-504
 func (fj *FlippedJoin) pushParent(change Change) []Change {
-	childNodeStream := func(node Node) func() []Node {
-		return func() []Node {
-			c := BuildJoinConstraint(node.Row, fj.parentKey, fj.childKey)
-			if c == nil {
-				return nil
+	childNodeStream := func(node Node) func() iter.Seq[Node] {
+		return func() iter.Seq[Node] {
+			return func(yield func(Node) bool) {
+				c := BuildJoinConstraint(node.Row, fj.parentKey, fj.childKey)
+				if c == nil {
+					return
+				}
+				for n := range fj.child.Fetch(FetchRequest{Constraint: c}) {
+					if !yield(n) {
+						return
+					}
+				}
 			}
-			return slices.Collect(fj.child.Fetch(FetchRequest{Constraint: c}))
 		}
 	}
 
@@ -389,8 +401,12 @@ func (fj *FlippedJoin) pushParent(change Change) []Change {
 	}
 
 	// If no related child, don't push (inner join)
-	children := childNodeStream(change.Node)()
-	if len(children) == 0 {
+	hasChildren := false
+	for range childNodeStream(change.Node)() {
+		hasChildren = true
+		break
+	}
+	if !hasChildren {
 		return nil
 	}
 

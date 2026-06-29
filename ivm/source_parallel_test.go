@@ -229,7 +229,7 @@ func benchFanOut(b *testing.B, parallel bool) {
 	// Seed data
 	for i := 0; i < 100; i++ {
 		source.Push(ivm.MakeSourceChangeAdd(ivm.Row{
-			"id":   string(rune('a' + i%26)) + string(rune('0'+i/26)),
+			"id":   string(rune('a'+i%26)) + string(rune('0'+i/26)),
 			"name": "user",
 			"age":  float64(i),
 		}))

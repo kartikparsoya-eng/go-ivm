@@ -125,7 +125,7 @@ func setupConversationsAndParticipants(t *testing.T, convSeed, partSeed []ivm.Ro
 
 	convSrc, err := tablesource.New(db, wdb, "conversations",
 		map[string]sqlite.ColumnSchema{
-			"conversationId":  {Type: "string"},
+			"conversationId": {Type: "string"},
 			"channelId":      {Type: "string"},
 			"createdAt":      {Type: "number"},
 			"lastActivityAt": {Type: "number"},
@@ -166,11 +166,12 @@ func setupConversationsAndParticipants(t *testing.T, convSeed, partSeed []ivm.Ro
 
 // userConversationsPaginatedAST builds the AST for a query mirroring
 // the production userConversationsPaginated:
-//   conversations
-//     .where('replyCount', '>', 0)
-//     .whereExists('participants', p => p.where('userId', userId))
-//     .orderBy('lastActivityAt', 'desc')
-//     .limit(limit)
+//
+//	conversations
+//	  .where('replyCount', '>', 0)
+//	  .whereExists('participants', p => p.where('userId', userId))
+//	  .orderBy('lastActivityAt', 'desc')
+//	  .limit(limit)
 //
 // scalar controls whether the correlatedSubquery is marked Scalar=true.
 // The production query does NOT use {scalar: true}, so scalar=false
@@ -182,14 +183,14 @@ func userConversationsPaginatedAST(userID string, limit int, scalar bool) builde
 			Type: "and",
 			Conditions: []builder.Condition{
 				{
-					Type: "simple",
-					Op:   ">",
+					Type:  "simple",
+					Op:    ">",
 					Left:  &builder.ValuePos{Type: "column", Name: "replyCount"},
 					Right: &builder.ValuePos{Type: "literal", Value: float64(0)},
 				},
 				{
-					Type: "correlatedSubquery",
-					Op:   "EXISTS",
+					Type:   "correlatedSubquery",
+					Op:     "EXISTS",
 					Scalar: scalar,
 					Related: &builder.CorrelatedSubquery{
 						System: "client",
@@ -201,8 +202,8 @@ func userConversationsPaginatedAST(userID string, limit int, scalar bool) builde
 							Table: "channel_participants",
 							Alias: "zsubq_participants",
 							Where: &builder.Condition{
-								Type: "simple",
-								Op:   "=",
+								Type:  "simple",
+								Op:    "=",
 								Left:  &builder.ValuePos{Type: "column", Name: "userId"},
 								Right: &builder.ValuePos{Type: "literal", Value: userID},
 							},
@@ -225,7 +226,7 @@ func seedConversations(numConversations int) []ivm.Row {
 	convSeed := make([]ivm.Row, numConversations)
 	for i := 0; i < numConversations; i++ {
 		convSeed[i] = ivm.Row{
-			"conversationId":  fmt.Sprintf("conv-%d", i),
+			"conversationId": fmt.Sprintf("conv-%d", i),
 			"channelId":      "ch1",
 			"createdAt":      float64(1000 + i),
 			"lastActivityAt": float64(2000 + i),
@@ -363,7 +364,7 @@ func TestMismatch1_ParentEditNoChildReEmission(t *testing.T) {
 			Table: "conversations",
 			PrevValues: []ivm.Row{
 				{
-					"conversationId":  "conv-0",
+					"conversationId": "conv-0",
 					"channelId":      "ch1",
 					"createdAt":      float64(1000),
 					"lastActivityAt": float64(2000),
@@ -371,7 +372,7 @@ func TestMismatch1_ParentEditNoChildReEmission(t *testing.T) {
 				},
 			},
 			NextValue: ivm.Row{
-				"conversationId":  "conv-0",
+				"conversationId": "conv-0",
 				"channelId":      "ch1",
 				"createdAt":      float64(1000),
 				"lastActivityAt": float64(3000),
@@ -540,7 +541,7 @@ func setupChannelUserStatus(t *testing.T, seed []ivm.Row) (*Engine, *tablesource
 	src, err := tablesource.New(db, wdb, "channel_user_status",
 		map[string]sqlite.ColumnSchema{
 			"id":           {Type: "string"},
-			"channelId":   {Type: "string"},
+			"channelId":    {Type: "string"},
 			"userId":       {Type: "string"},
 			"isDeleted":    {Type: "number"},
 			"unreadCount":  {Type: "number"},
@@ -565,11 +566,12 @@ func setupChannelUserStatus(t *testing.T, seed []ivm.Row) (*Engine, *tablesource
 }
 
 // channelUserStatusAST builds the AST for getChannelUserStatus:
-//   channel_user_status
-//     .where('channelId', channelId)
-//     .where('userId', userId)
-//     .where('isDeleted', false)
-//     .one()
+//
+//	channel_user_status
+//	  .where('channelId', channelId)
+//	  .where('userId', userId)
+//	  .where('isDeleted', false)
+//	  .one()
 func channelUserStatusAST(channelID, userID string) builder.AST {
 	return builder.AST{
 		Table: "channel_user_status",
@@ -606,7 +608,7 @@ func TestMismatch2_EditEmittedInAdvance(t *testing.T) {
 	seed := []ivm.Row{
 		{
 			"id":           "ae0f0bc7-6a1a-4d64-8124-48e7c472eb5f",
-			"channelId":   "cmi39e2jj00fex66cheedyjc8",
+			"channelId":    "cmi39e2jj00fex66cheedyjc8",
 			"userId":       "h32jgo10qc6r8e1mh0crc3qs",
 			"isDeleted":    float64(0),
 			"unreadCount":  float64(5),
@@ -636,7 +638,7 @@ func TestMismatch2_EditEmittedInAdvance(t *testing.T) {
 			PrevValues: []ivm.Row{
 				{
 					"id":           "ae0f0bc7-6a1a-4d64-8124-48e7c472eb5f",
-					"channelId":   "cmi39e2jj00fex66cheedyjc8",
+					"channelId":    "cmi39e2jj00fex66cheedyjc8",
 					"userId":       "h32jgo10qc6r8e1mh0crc3qs",
 					"isDeleted":    float64(0),
 					"unreadCount":  float64(5),
@@ -646,7 +648,7 @@ func TestMismatch2_EditEmittedInAdvance(t *testing.T) {
 			},
 			NextValue: ivm.Row{
 				"id":           "ae0f0bc7-6a1a-4d64-8124-48e7c472eb5f",
-				"channelId":   "cmi39e2jj00fex66cheedyjc8",
+				"channelId":    "cmi39e2jj00fex66cheedyjc8",
 				"userId":       "h32jgo10qc6r8e1mh0crc3qs",
 				"isDeleted":    float64(0),
 				"unreadCount":  float64(0),
@@ -692,7 +694,7 @@ func TestMismatch2_EditEmittedAcrossMultipleQueries(t *testing.T) {
 	seed := []ivm.Row{
 		{
 			"id":           "ae0f0bc7-6a1a-4d64-8124-48e7c472eb5f",
-			"channelId":   "cmi39e2jj00fex66cheedyjc8",
+			"channelId":    "cmi39e2jj00fex66cheedyjc8",
 			"userId":       "h32jgo10qc6r8e1mh0crc3qs",
 			"isDeleted":    float64(0),
 			"unreadCount":  float64(5),
@@ -722,7 +724,7 @@ func TestMismatch2_EditEmittedAcrossMultipleQueries(t *testing.T) {
 			PrevValues: []ivm.Row{
 				{
 					"id":           "ae0f0bc7-6a1a-4d64-8124-48e7c472eb5f",
-					"channelId":   "cmi39e2jj00fex66cheedyjc8",
+					"channelId":    "cmi39e2jj00fex66cheedyjc8",
 					"userId":       "h32jgo10qc6r8e1mh0crc3qs",
 					"isDeleted":    float64(0),
 					"unreadCount":  float64(5),
@@ -732,7 +734,7 @@ func TestMismatch2_EditEmittedAcrossMultipleQueries(t *testing.T) {
 			},
 			NextValue: ivm.Row{
 				"id":           "ae0f0bc7-6a1a-4d64-8124-48e7c472eb5f",
-				"channelId":   "cmi39e2jj00fex66cheedyjc8",
+				"channelId":    "cmi39e2jj00fex66cheedyjc8",
 				"userId":       "h32jgo10qc6r8e1mh0crc3qs",
 				"isDeleted":    float64(0),
 				"unreadCount":  float64(0),
@@ -769,7 +771,7 @@ func TestMismatch2_SequentialEdits(t *testing.T) {
 	seed := []ivm.Row{
 		{
 			"id":           "ae0f0bc7-6a1a-4d64-8124-48e7c472eb5f",
-			"channelId":   "cmi39e2jj00fex66cheedyjc8",
+			"channelId":    "cmi39e2jj00fex66cheedyjc8",
 			"userId":       "h32jgo10qc6r8e1mh0crc3qs",
 			"isDeleted":    float64(0),
 			"unreadCount":  float64(5),

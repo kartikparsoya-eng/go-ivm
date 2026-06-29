@@ -62,10 +62,10 @@ func TestSnapshotRoundTrip(t *testing.T) {
 
 	// 3. Re-hydrate from the captured .db.
 	got, err := RunTestCaseFromSnapshot(SnapshotTestCase{
-		Schema:             itemsSchema,
-		AST:                itemsAST,
-		SnapshotFile:       snapshotFile,
-		ExpectedHydration:  ref.Hydration,
+		Schema:            itemsSchema,
+		AST:               itemsAST,
+		SnapshotFile:      snapshotFile,
+		ExpectedHydration: ref.Hydration,
 	})
 	if err != nil {
 		t.Fatalf("RunTestCaseFromSnapshot: %v", err)
@@ -101,10 +101,10 @@ func TestSnapshotRoundTripFilter(t *testing.T) {
 	ref := mustRunTestCase(t, itemsSchema, itemsRows, ast)
 
 	got, err := RunTestCaseFromSnapshot(SnapshotTestCase{
-		Schema:             itemsSchema,
-		AST:                ast,
-		SnapshotFile:       snapshotFile,
-		ExpectedHydration:  ref.Hydration,
+		Schema:            itemsSchema,
+		AST:               ast,
+		SnapshotFile:      snapshotFile,
+		ExpectedHydration: ref.Hydration,
 	})
 	if err != nil {
 		t.Fatalf("RunTestCaseFromSnapshot: %v", err)
@@ -132,10 +132,10 @@ func TestSnapshotDivergenceDetected(t *testing.T) {
 	}
 
 	got, err := RunTestCaseFromSnapshot(SnapshotTestCase{
-		Schema:             itemsSchema,
-		AST:                itemsAST,
-		SnapshotFile:       snapshotFile,
-		ExpectedHydration:  wrongExpected,
+		Schema:            itemsSchema,
+		AST:               itemsAST,
+		SnapshotFile:      snapshotFile,
+		ExpectedHydration: wrongExpected,
 	})
 	if err != nil {
 		t.Fatalf("RunTestCaseFromSnapshot: %v", err)
@@ -159,10 +159,10 @@ func TestSnapshotFromJSON(t *testing.T) {
 	// Marshal the case to JSON (the format an offline replay tool would read),
 	// then run it through the JSON entry point.
 	tc := SnapshotTestCase{
-		Schema:             itemsSchema,
-		AST:                itemsAST,
-		SnapshotFile:       snapshotFile,
-		ExpectedHydration:  ref.Hydration,
+		Schema:            itemsSchema,
+		AST:               itemsAST,
+		SnapshotFile:      snapshotFile,
+		ExpectedHydration: ref.Hydration,
 	}
 	// Round-trip through JSON to mimic a capture file on disk.
 	payload, err := json.Marshal(tc)

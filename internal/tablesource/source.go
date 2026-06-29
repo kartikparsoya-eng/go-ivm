@@ -1036,6 +1036,9 @@ func (i *sourceInput) Destroy() {
 }
 
 func (i *sourceInput) Fetch(req ivm.FetchRequest) iter.Seq[ivm.Node] {
+	if pool := i.src.readerPool.Load(); pool != nil {
+		return i.src.fetchViaPoolStream(req, i.conn, pool)
+	}
 	return slices.Values(i.src.fetchForConn(req, i.conn))
 }
 
@@ -1073,6 +1076,10 @@ func (s *Source) fetchForConn(req ivm.FetchRequest, conn *connection) []ivm.Node
 	// path — it just runs concurrently with sibling queries' fetches. The pool
 	// is bound only during the advance-free hydrate window, so there is no
 	// in-flight Push (s.overlay is nil) and no prev-tx writeChange to observe.
+	// When a reader pool is bound, sourceInput.Fetch dispatches directly to
+	// fetchViaPoolStream (lazy, row-at-a-time) before reaching here. This
+	// pool check remains as a defensive fallback for any direct fetchForConn
+	// caller that might execute with a pool still bound.
 	if pool := s.readerPool.Load(); pool != nil {
 		return s.fetchViaPool(req, conn, pool)
 	}
@@ -1262,6 +1269,97 @@ func (s *Source) scanRows(
 // borrowed reader is exclusive to this call. The overlay path is intentionally
 // absent: the pool is bound only in the advance-free window, so no Push is in
 // flight (invariant asserted by the engine's bind/unbind discipline).
+// fetchViaPoolStream is the LAZY hydrate read: it borrows a frame-pinned
+// reader from the bound pool, runs the SELECT, and yields each row one at a
+// time via iter.Seq — the reader and sql.Rows stay open across the entire
+// iteration, so a parent Join can hold this cursor while fetching a child.
+// This is the actual memory win: no []Node is materialised. The pool is
+// sized K = P × Cmax to guarantee enough readers for every lane's concurrent
+// cursors (§3d).
+//
+// No s.mu is taken — every field touched is immutable for the lifetime of
+// the bound pool (same invariant as fetchViaPool). The overlay path is
+// intentionally absent: the pool is bound only in the advance-free window.
+func (s *Source) fetchViaPoolStream(req ivm.FetchRequest, conn *connection, pool *ReaderPool) iter.Seq[ivm.Node] {
+	return func(yield func(ivm.Node) bool) {
+		order := conn.sort
+		if order == nil {
+			order = make(ivm.Ordering, len(s.primaryKey))
+			for i, k := range s.primaryKey {
+				order[i] = [2]string{k, "asc"}
+			}
+		}
+		q := sqlite.BuildSelectQuery(
+			s.tableName,
+			s.columns,
+			req.Constraint,
+			conn.filterCondition,
+			order,
+			req.Reverse,
+			req.Start,
+		)
+		r, err := pool.acquire(s.ctx)
+		if err != nil {
+			panic(fmt.Sprintf("tablesource.Source.Fetch %s: pool acquire: %v", s.tableName, err))
+		}
+		defer pool.release(r)
+		stmt, err := r.prepared(s.ctx, q.SQL)
+		if err != nil {
+			panic(fmt.Sprintf("tablesource.Source.Fetch %s: pool prepare: %v\nSQL: %s",
+				s.tableName, err, q.SQL))
+		}
+		rows, err := stmt.QueryContext(s.ctx, q.Params...)
+		if err != nil {
+			panic(fmt.Sprintf("tablesource.Source.Fetch %s: pool query: %v\nSQL: %s",
+				s.tableName, err, q.SQL))
+		}
+		defer rows.Close()
+		colNames, err := rows.Columns()
+		if err != nil {
+			panic(fmt.Sprintf("tablesource.Source.Fetch %s: pool columns: %v", s.tableName, err))
+		}
+		raw := make([]any, len(colNames))
+		ptrs := make([]any, len(colNames))
+		for i := range raw {
+			ptrs[i] = &raw[i]
+		}
+		count := 0
+		for rows.Next() {
+			if err := rows.Scan(ptrs...); err != nil {
+				panic(fmt.Sprintf("tablesource.Source.Fetch %s: scan: %v",
+					s.tableName, err))
+			}
+			row := make(ivm.Row, len(colNames))
+			for i, c := range colNames {
+				cs, ok := s.columns[c]
+				if !ok {
+					continue
+				}
+				row[c] = sqlite.FromSQLiteType(raw[i], cs.Type)
+			}
+			if conn.filterPredicate != nil && !conn.filterPredicate(row) {
+				continue
+			}
+			if !yield(ivm.Node{Row: row}) {
+				return
+			}
+			count++
+			if req.Limit > 0 && count >= req.Limit {
+				return
+			}
+		}
+		if err := rows.Err(); err != nil {
+			panic(fmt.Sprintf("tablesource.Source.Fetch %s: rows: %v",
+				s.tableName, err))
+		}
+	}
+}
+
+// fetchViaPool is the EAGER pool read (returns []ivm.Node). It is the
+// defensive fallback for callers that invoke fetchForConn directly with a
+// pool still bound; sourceInput.Fetch normally takes the streaming
+// fetchViaPoolStream path instead. Kept for correctness — no caller should
+// reach it via sourceInput.Fetch, but a direct fetchForConn caller might.
 func (s *Source) fetchViaPool(req ivm.FetchRequest, conn *connection, pool *ReaderPool) []ivm.Node {
 	order := conn.sort
 	if order == nil {

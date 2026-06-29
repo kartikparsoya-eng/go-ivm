@@ -1,5 +1,7 @@
 package ivm
 
+import "iter"
+
 // Pushes accumulated changes from fan-out/fan-in sub-graphs,
 // collapsing duplicates and enforcing invariants.
 
@@ -170,7 +172,7 @@ func MergeRelationships(left, right Change) Change {
 }
 
 // Relationships is a type alias for the relationship map in Node.
-type Relationships = map[string]func() []Node
+type Relationships = map[string]func() iter.Seq[Node]
 
 // mergeRelationshipMaps merges two relationship maps, left takes precedence.
 func mergeRelationshipMaps(left, right Relationships) Relationships {
@@ -234,7 +236,7 @@ func copyRelationships(rels Relationships) Relationships {
 func mergeEmpty(rels Relationships, schemaRels map[string]*SourceSchema) {
 	for relName := range schemaRels {
 		if _, ok := rels[relName]; !ok {
-			rels[relName] = func() []Node { return nil }
+			rels[relName] = func() iter.Seq[Node] { return func(yield func(Node) bool) {} }
 		}
 	}
 }

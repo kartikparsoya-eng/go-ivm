@@ -9,6 +9,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"iter"
 	"os"
 	"slices"
 	"strconv"
@@ -599,18 +600,22 @@ func (e *Engine) buildAndRegisterLocked(queryID string, ast builder.AST) *pipeli
 	executor := func(subqueryAST builder.AST, childField string) (interface{}, bool) {
 		subPipeline := builder.BuildPipeline(subqueryAST, delegate)
 		subSchema := subPipeline.Input.GetSchema()
-		nodes := slices.Collect(subPipeline.Input.Fetch(ivm.FetchRequest{}))
+		var firstNode ivm.Node
+		var matched bool
+		for node := range subPipeline.Input.Fetch(ivm.FetchRequest{}) {
+			firstNode = node
+			matched = true
+			break
+		}
 		ce := &companionEntry{
 			pipeline:   subPipeline,
 			schema:     subSchema,
 			childField: childField,
 		}
 		var value interface{}
-		var matched bool
-		if len(nodes) > 0 {
-			ce.matchedRow = nodes[0].Row
-			value = nodes[0].Row[childField]
-			matched = true
+		if matched {
+			ce.matchedRow = firstNode.Row
+			value = firstNode.Row[childField]
 		}
 		// Capture the resolved scalar value so the companion's advance-time
 		// output can detect a later change (port of TS CompanionPipeline's
@@ -673,8 +678,7 @@ func (e *Engine) wireCompanionOutputsLocked(entry *pipelineEntry) {
 // responsible for timing.
 func hydrateEntry(entry *pipelineEntry) []RowChange {
 	var hydration []RowChange
-	nodes := slices.Collect(entry.pipeline.Input.Fetch(ivm.FetchRequest{}))
-	for _, node := range nodes {
+	for node := range entry.pipeline.Input.Fetch(ivm.FetchRequest{}) {
 		hydration = append(hydration, streamNodes(entry.queryID, entry.schema, RowChangeAdd, node)...)
 	}
 	// Companion rows: emit each matched subquery row as an ADD so the
@@ -821,11 +825,10 @@ func (e *Engine) AddQueriesStream(
 	// Final=true. P bounds both goroutine count and connection demand (K =
 	// P × Cmax; see DESIGN-streaming-hydrate.md §3a/§3d).
 	//
-	// Chunking is a wire-level optimization: it reduces TS-side peak memory
-	// (decode + process + discard per chunk vs decode-whole-frame) and
-	// improves time-to-first-byte for large hydrations. Go-side memory is
-	// NOT bounded — pipeline.Input.Fetch still returns the full result
-	// slice up front; operator-level chunking would be a separate refactor.
+	// The consumer streams each node as Fetch yields it — no intermediate
+	// slices.Collect materialization. Go-side peak memory is bounded by the
+	// current chunk (hydrateChunkSize RowChanges), not the full result set.
+	// (True row-at-a-time DB streaming also requires a lazy leaf — Step 4.)
 	mrv := e.minRowVersions
 	// C1: capture per-lane panics (see AddQueries) so a nil-PK panic in one
 	// query's hydrate becomes a returned error instead of a process abort.
@@ -863,8 +866,6 @@ func (e *Engine) AddQueriesStream(
 					}()
 					entry := job.entry
 					start := time.Now()
-					nodes := slices.Collect(entry.pipeline.Input.Fetch(ivm.FetchRequest{}))
-
 					var chunk []RowChange
 					chunkBytes := 0
 					chunkIndex := 0
@@ -893,7 +894,7 @@ func (e *Engine) AddQueriesStream(
 						chunkIndex++
 					}
 
-					for _, node := range nodes {
+					for node := range entry.pipeline.Input.Fetch(ivm.FetchRequest{}) {
 						nodeChanges := streamNodes(entry.queryID, entry.schema, RowChangeAdd, node)
 						chunk = append(chunk, nodeChanges...)
 						chunkBytes += estimateRowChangesBytes(nodeChanges)
@@ -1525,10 +1526,13 @@ func materializeChange(change ivm.Change) ivm.Change {
 func materializeNode(node ivm.Node) ivm.Node {
 	result := ivm.Node{Row: node.Row}
 	if node.Relationships != nil {
-		result.Relationships = make(map[string]func() []ivm.Node, len(node.Relationships))
+		result.Relationships = make(map[string]func() iter.Seq[ivm.Node], len(node.Relationships))
 		for relName, fn := range node.Relationships {
 			// Evaluate the closure NOW (while overlay is active)
-			children := fn()
+			var children []ivm.Node
+			if seq := fn(); seq != nil {
+				children = slices.Collect(seq)
+			}
 			// Recursively materialize children
 			materialized := make([]ivm.Node, len(children))
 			for i, child := range children {
@@ -1536,7 +1540,7 @@ func materializeNode(node ivm.Node) ivm.Node {
 			}
 			// Capture in a non-lazy closure
 			captured := materialized
-			result.Relationships[relName] = func() []ivm.Node { return captured }
+			result.Relationships[relName] = func() iter.Seq[ivm.Node] { return slices.Values(captured) }
 		}
 	}
 	return result

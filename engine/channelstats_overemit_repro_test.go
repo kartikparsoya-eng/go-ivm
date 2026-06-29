@@ -38,9 +38,9 @@ func TestChannelStats_DoesNotOverEmitNestedExistsRow(t *testing.T) {
 	// Three MemorySource leaves matching the production schema.
 	channelStats := ivm.NewMemorySource("channel_stats",
 		map[string]string{
-			"channelId":   "string",
-			"messages":    "number",
-			"unread":      "number",
+			"channelId": "string",
+			"messages":  "number",
+			"unread":    "number",
 		},
 		[]string{"channelId"},
 	)

@@ -71,9 +71,9 @@ func setupConversationsEngine(t *testing.T, seed []ivm.Row) (*Engine, *tablesour
 
 	src, err := tablesource.New(db, wdb, "conversations",
 		map[string]sqlite.ColumnSchema{
-			"conversationId":    {Type: "string"},
-			"channelId":         {Type: "string"},
-			"createdAt":         {Type: "number"},
+			"conversationId":     {Type: "string"},
+			"channelId":          {Type: "string"},
+			"createdAt":          {Type: "number"},
 			"doNotPostToChannel": {Type: "number"},
 		},
 		[]string{"conversationId"},
@@ -100,8 +100,8 @@ func latestConversationAST(channelID string) builder.AST {
 	return builder.AST{
 		Table: "conversations",
 		Where: &builder.Condition{
-			Type: "simple",
-			Op:   "=",
+			Type:  "simple",
+			Op:    "=",
 			Left:  &builder.ValuePos{Type: "column", Name: "channelId"},
 			Right: &builder.ValuePos{Type: "literal", Value: channelID},
 		},
@@ -157,7 +157,7 @@ func TestAdvanceDrift_PureAddNewConversation(t *testing.T) {
 		{
 			Table: "conversations",
 			NextValue: ivm.Row{
-				"conversationId":    "a383a3b1",
+				"conversationId":     "a383a3b1",
 				"channelId":          "ch1",
 				"createdAt":          int64(2000),
 				"doNotPostToChannel": int64(0),
@@ -197,13 +197,13 @@ func TestAdvanceDrift_EditNonSortKeyThenAdd(t *testing.T) {
 		{
 			Table: "conversations",
 			PrevValues: []ivm.Row{{
-				"conversationId":    "9d3f1b99",
+				"conversationId":     "9d3f1b99",
 				"channelId":          "ch1",
 				"createdAt":          int64(1000),
 				"doNotPostToChannel": int64(0),
 			}},
 			NextValue: ivm.Row{
-				"conversationId":    "9d3f1b99",
+				"conversationId":     "9d3f1b99",
 				"channelId":          "ch1",
 				"createdAt":          int64(1000),
 				"doNotPostToChannel": int64(1),
@@ -212,7 +212,7 @@ func TestAdvanceDrift_EditNonSortKeyThenAdd(t *testing.T) {
 		{
 			Table: "conversations",
 			NextValue: ivm.Row{
-				"conversationId":    "a383a3b1",
+				"conversationId":     "a383a3b1",
 				"channelId":          "ch1",
 				"createdAt":          int64(2000),
 				"doNotPostToChannel": int64(0),
@@ -253,13 +253,13 @@ func TestAdvanceDrift_EditSortKeyThenAdd(t *testing.T) {
 		{
 			Table: "conversations",
 			PrevValues: []ivm.Row{{
-				"conversationId":    "9d3f1b99",
+				"conversationId":     "9d3f1b99",
 				"channelId":          "ch1",
 				"createdAt":          int64(1000),
 				"doNotPostToChannel": int64(0),
 			}},
 			NextValue: ivm.Row{
-				"conversationId":    "9d3f1b99",
+				"conversationId":     "9d3f1b99",
 				"channelId":          "ch1",
 				"createdAt":          int64(500),
 				"doNotPostToChannel": int64(0),
@@ -268,7 +268,7 @@ func TestAdvanceDrift_EditSortKeyThenAdd(t *testing.T) {
 		{
 			Table: "conversations",
 			NextValue: ivm.Row{
-				"conversationId":    "a383a3b1",
+				"conversationId":     "a383a3b1",
 				"channelId":          "ch1",
 				"createdAt":          int64(2000),
 				"doNotPostToChannel": int64(0),
@@ -307,13 +307,13 @@ func TestAdvanceDrift_PrevValuesWithAdd(t *testing.T) {
 		{
 			Table: "conversations",
 			PrevValues: []ivm.Row{{
-				"conversationId":    "9d3f1b99",
+				"conversationId":     "9d3f1b99",
 				"channelId":          "ch1",
 				"createdAt":          int64(1000),
 				"doNotPostToChannel": int64(0),
 			}},
 			NextValue: ivm.Row{
-				"conversationId":    "a383a3b1",
+				"conversationId":     "a383a3b1",
 				"channelId":          "ch1",
 				"createdAt":          int64(2000),
 				"doNotPostToChannel": int64(0),
@@ -350,13 +350,13 @@ func TestAdvanceDrift_EditSortKeyRaiseThenAdd(t *testing.T) {
 		{
 			Table: "conversations",
 			PrevValues: []ivm.Row{{
-				"conversationId":    "9d3f1b99",
+				"conversationId":     "9d3f1b99",
 				"channelId":          "ch1",
 				"createdAt":          int64(1000),
 				"doNotPostToChannel": int64(0),
 			}},
 			NextValue: ivm.Row{
-				"conversationId":    "9d3f1b99",
+				"conversationId":     "9d3f1b99",
 				"channelId":          "ch1",
 				"createdAt":          int64(1500),
 				"doNotPostToChannel": int64(0),
@@ -365,7 +365,7 @@ func TestAdvanceDrift_EditSortKeyRaiseThenAdd(t *testing.T) {
 		{
 			Table: "conversations",
 			NextValue: ivm.Row{
-				"conversationId":    "a383a3b1",
+				"conversationId":     "a383a3b1",
 				"channelId":          "ch1",
 				"createdAt":          int64(2000),
 				"doNotPostToChannel": int64(0),
@@ -447,13 +447,13 @@ func TestAdvanceDrift_EditSameSortThenAdd(t *testing.T) {
 		{
 			Table: "conversations",
 			PrevValues: []ivm.Row{{
-				"conversationId":    "9d3f1b99",
+				"conversationId":     "9d3f1b99",
 				"channelId":          "ch1",
 				"createdAt":          int64(1000),
 				"doNotPostToChannel": int64(0),
 			}},
 			NextValue: ivm.Row{
-				"conversationId":    "9d3f1b99",
+				"conversationId":     "9d3f1b99",
 				"channelId":          "ch1",
 				"createdAt":          int64(2000),
 				"doNotPostToChannel": int64(0),
@@ -462,7 +462,7 @@ func TestAdvanceDrift_EditSameSortThenAdd(t *testing.T) {
 		{
 			Table: "conversations",
 			NextValue: ivm.Row{
-				"conversationId":    "a383a3b1",
+				"conversationId":     "a383a3b1",
 				"channelId":          "ch1",
 				"createdAt":          int64(2000),
 				"doNotPostToChannel": int64(0),
@@ -497,7 +497,7 @@ func TestAdvanceDrift_AddWithSameSortTie(t *testing.T) {
 		{
 			Table: "conversations",
 			NextValue: ivm.Row{
-				"conversationId":    "a383a3b1",
+				"conversationId":     "a383a3b1",
 				"channelId":          "ch1",
 				"createdAt":          int64(1000),
 				"doNotPostToChannel": int64(0),
@@ -537,7 +537,7 @@ func TestAdvanceDrift_AddFromDifferentChannel(t *testing.T) {
 		{
 			Table: "conversations",
 			NextValue: ivm.Row{
-				"conversationId":    "other-conv",
+				"conversationId":     "other-conv",
 				"channelId":          "ch2",
 				"createdAt":          int64(5000),
 				"doNotPostToChannel": int64(0),

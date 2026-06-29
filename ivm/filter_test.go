@@ -8,8 +8,8 @@ type mockFilterInput struct {
 	output FilterOutput
 }
 
-func (m *mockFilterInput) GetSchema() *SourceSchema   { return m.schema }
-func (m *mockFilterInput) Destroy()                   {}
+func (m *mockFilterInput) GetSchema() *SourceSchema       { return m.schema }
+func (m *mockFilterInput) Destroy()                       {}
 func (m *mockFilterInput) SetFilterOutput(o FilterOutput) { m.output = o }
 
 // mockOutput collects pushed changes for assertions.
@@ -22,8 +22,8 @@ func (m *mockOutput) Push(change Change, pusher InputBase) []Change {
 	return []Change{change}
 }
 
-func (m *mockOutput) BeginFilter() {}
-func (m *mockOutput) EndFilter()   {}
+func (m *mockOutput) BeginFilter()          {}
+func (m *mockOutput) EndFilter()            {}
 func (m *mockOutput) Filter(node Node) bool { return true }
 
 func TestFilter_Push_Add_PassesPredicate(t *testing.T) {
