@@ -2,7 +2,6 @@ package ivm
 
 import (
 	"iter"
-	"slices"
 )
 
 // UnionFanIn merges results from multiple OR-condition branches back together,
@@ -84,13 +83,70 @@ func (ufi *UnionFanIn) Destroy() {
 	}
 }
 
-// Fetch merges sorted fetches from all inputs, deduplicating by row identity.
+// Fetch lazily merges sorted streams from all inputs, deduplicating by row
+// identity. Uses iter.Pull to convert each branch's iter.Seq to a pull
+// iterator, then performs a streaming k-way merge by comparing heads. All k
+// branch cursors are held open concurrently (C_q = Σ C_branch_i) — this is
+// the most cursor-hungry operator. On early stop (yield→false), defer calls
+// stop() on all pull iterators, releasing upstream cursors.
 func (ufi *UnionFanIn) Fetch(req FetchRequest) iter.Seq[Node] {
-	fetches := make([][]Node, len(ufi.inputs))
-	for i, input := range ufi.inputs {
-		fetches[i] = slices.Collect(input.Fetch(req))
+	if len(ufi.inputs) == 0 {
+		return emptyNodeSeq
 	}
-	return slices.Values(MergeFetches(fetches, ufi.schema.CompareRows))
+
+	return func(yield func(Node) bool) {
+		type pullIter struct {
+			next func() (Node, bool)
+			stop func()
+			head Node
+			ok   bool
+		}
+		iters := make([]pullIter, len(ufi.inputs))
+
+		for i, input := range ufi.inputs {
+			next, stop := iter.Pull(input.Fetch(req))
+			iters[i].next = next
+			iters[i].stop = stop
+			iters[i].head, iters[i].ok = next()
+		}
+
+		defer func() {
+			for i := range iters {
+				iters[i].stop()
+			}
+		}()
+
+		comparator := ufi.schema.CompareRows
+		var lastRow Row
+
+		for {
+			minIdx := -1
+			for i := range iters {
+				if !iters[i].ok {
+					continue
+				}
+				if minIdx == -1 || comparator(iters[i].head.Row, iters[minIdx].head.Row) < 0 {
+					minIdx = i
+				}
+			}
+
+			if minIdx == -1 {
+				return
+			}
+
+			node := iters[minIdx].head
+			iters[minIdx].head, iters[minIdx].ok = iters[minIdx].next()
+
+			if lastRow != nil && comparator(lastRow, node.Row) == 0 {
+				continue
+			}
+
+			lastRow = node.Row
+			if !yield(node) {
+				return
+			}
+		}
+	}
 }
 
 func (ufi *UnionFanIn) GetSchema() *SourceSchema {
@@ -128,9 +184,12 @@ func (ufi *UnionFanIn) pushInternalChange(change Change, pusher InputBase) []Cha
 		for _, key := range ufi.schema.PrimaryKey {
 			constraint[key] = change.Node.Row[key]
 		}
-		fetchResult := slices.Collect(input.Fetch(FetchRequest{Constraint: &constraint}))
-		if len(fetchResult) > 0 {
-			// Another branch has the row
+		found := false
+		for range input.Fetch(FetchRequest{Constraint: &constraint}) {
+			found = true
+			break
+		}
+		if found {
 			return nil
 		}
 	}
@@ -180,44 +239,4 @@ func (ufi *UnionFanIn) FanOutDonePushing(fanOutChangeType ChangeType) []Change {
 
 func (ufi *UnionFanIn) SetOutput(output Output) {
 	ufi.output = output
-}
-
-// MergeFetches merges multiple sorted node slices, deduplicating equal rows.
-func MergeFetches(fetches [][]Node, comparator Comparator) []Node {
-	// Initialize positions
-	positions := make([]int, len(fetches))
-	var result []Node
-	var lastNode *Node
-
-	for {
-		var minNode *Node
-		minIdx := -1
-
-		for i, pos := range positions {
-			if pos >= len(fetches[i]) {
-				continue
-			}
-			node := &fetches[i][pos]
-			if minNode == nil || comparator(node.Row, minNode.Row) < 0 {
-				minNode = node
-				minIdx = i
-			}
-		}
-
-		if minNode == nil {
-			break
-		}
-
-		positions[minIdx]++
-
-		// Deduplicate
-		if lastNode != nil && comparator(lastNode.Row, minNode.Row) == 0 {
-			continue
-		}
-
-		result = append(result, *minNode)
-		lastNode = minNode
-	}
-
-	return result
 }
