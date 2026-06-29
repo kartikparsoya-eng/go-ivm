@@ -103,18 +103,20 @@ func (ufi *UnionFanIn) Fetch(req FetchRequest) iter.Seq[Node] {
 		}
 		iters := make([]pullIter, len(ufi.inputs))
 
+		defer func() {
+			for i := range iters {
+				if iters[i].stop != nil {
+					iters[i].stop()
+				}
+			}
+		}()
+
 		for i, input := range ufi.inputs {
 			next, stop := iter.Pull(input.Fetch(req))
 			iters[i].next = next
 			iters[i].stop = stop
 			iters[i].head, iters[i].ok = next()
 		}
-
-		defer func() {
-			for i := range iters {
-				iters[i].stop()
-			}
-		}()
 
 		comparator := ufi.schema.CompareRows
 		var lastRow Row

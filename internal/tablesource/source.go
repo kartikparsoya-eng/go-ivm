@@ -318,6 +318,7 @@ func NewWithContext(parent context.Context, db *sql.DB, writableDB *sql.DB, tabl
 // context so any in-flight SQLite calls unblock.
 func (s *Source) Close() error {
 	s.cancel()
+	s.UnbindReaderPool()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.closeAllCachedStmtsLocked()

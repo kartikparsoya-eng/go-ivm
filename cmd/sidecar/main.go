@@ -2511,6 +2511,9 @@ func main() {
 	// adds (existing-pipeline CGs). Co-read-only, pinned to curr's current frame.
 	// Off by default; needs HYDRATE_READERS>1 + ADVANCE_DRIVE to do anything.
 	server.warmHydratePoolEnabled = os.Getenv("GO_IVM_WARM_HYDRATE_POOL") == "true"
+	fmt.Fprintf(os.Stderr,
+		"[GO-IVM] hydrate config: readers=%d lanes=%d warmPool=%v advanceDrive=%v\n",
+		server.hydrateReaders, server.hydrateLanes, server.warmHydratePoolEnabled, server.advanceDriveEnabled)
 	if server.advanceToHeadEnabled {
 		if sourceMode != tablesource.ModeTable {
 			fmt.Fprintln(os.Stderr,

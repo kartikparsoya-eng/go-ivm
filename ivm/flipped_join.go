@@ -97,12 +97,13 @@ func (fj *FlippedJoin) GetSchema() *SourceSchema {
 	return fj.schema
 }
 
-// Fetch fetches child nodes first (eager — small filtered set), then lazily
-// streams related parents via iter.Pull, merging by parent order and grouping
-// children per parent. Parent cursors are held open concurrently (one per
-// child); on early stop, defer calls stop() on all pull iterators. Children
-// stay materialized because the remove-overlay logic splices into the slice
-// and the overlay logic reads related children by index.
+// Fetch fetches child nodes first (eager — small filtered set), then fetches
+// matching parents for each child sequentially (one reader at a time, no
+// iter.Pull goroutines), collects all (parent, child) pairs, sorts by parent
+// row, groups by parent (deduplicating), and yields each unique parent with
+// its related children. This avoids the pool deadlock that iter.Pull caused
+// (N children × iter.Pull = N concurrent readers > pool size K) and eliminates
+// the goroutine leak (no iter.Pull coroutines to leak).
 func (fj *FlippedJoin) Fetch(req FetchRequest) iter.Seq[Node] {
 	// Translate constraints for the parent on parts of the join key to constraints for the child.
 	var childConstraint Constraint
@@ -138,31 +139,6 @@ func (fj *FlippedJoin) Fetch(req FetchRequest) iter.Seq[Node] {
 		childNodes[insertPos] = removedNode
 	}
 
-	// For each child, create a lazy parent pull iterator
-	type parentPull struct {
-		next func() (Node, bool)
-		stop func()
-		head Node
-		ok   bool
-	}
-	pulls := make([]parentPull, len(childNodes))
-	for i, childNode := range childNodes {
-		constraintFromChild := BuildJoinConstraint(childNode.Row, fj.childKey, fj.parentKey)
-		if constraintFromChild == nil || (req.Constraint != nil && !constraintsAreCompatible(*constraintFromChild, *req.Constraint)) {
-			continue
-		}
-		merged := mergeConstraints(req.Constraint, constraintFromChild)
-		parentReq := FetchRequest{
-			Constraint: merged,
-			Start:      req.Start,
-			Reverse:    req.Reverse,
-		}
-		next, stop := iter.Pull(fj.parent.Fetch(parentReq))
-		pulls[i].next = next
-		pulls[i].stop = stop
-		pulls[i].head, pulls[i].ok = next()
-	}
-
 	compare := func(a, b Node) int {
 		cmp := fj.schema.CompareRows(a.Row, b.Row)
 		if req.Reverse {
@@ -172,51 +148,45 @@ func (fj *FlippedJoin) Fetch(req FetchRequest) iter.Seq[Node] {
 	}
 
 	return func(yield func(Node) bool) {
-		defer func() {
-			for i := range pulls {
-				if pulls[i].stop != nil {
-					pulls[i].stop()
-				}
+		type parentChild struct {
+			parent   Node
+			childIdx int
+		}
+		var pairs []parentChild
+		for i, childNode := range childNodes {
+			constraintFromChild := BuildJoinConstraint(childNode.Row, fj.childKey, fj.parentKey)
+			if constraintFromChild == nil || (req.Constraint != nil && !constraintsAreCompatible(*constraintFromChild, *req.Constraint)) {
+				continue
 			}
-		}()
-
-		for {
-			// Find minimum parent node across all pull iterators
-			minIdx := -1
-			for i := range pulls {
-				if !pulls[i].ok {
-					continue
-				}
-				if minIdx == -1 || compare(pulls[i].head, pulls[minIdx].head) < 0 {
-					minIdx = i
-				}
+			merged := mergeConstraints(req.Constraint, constraintFromChild)
+			parentReq := FetchRequest{
+				Constraint: merged,
+				Start:      req.Start,
+				Reverse:    req.Reverse,
 			}
-
-			if minIdx == -1 {
-				return
+			for pn := range fj.parent.Fetch(parentReq) {
+				pairs = append(pairs, parentChild{parent: pn, childIdx: i})
 			}
+		}
 
-			minHead := pulls[minIdx].head
+		sort.SliceStable(pairs, func(i, j int) bool {
+			return compare(pairs[i].parent, pairs[j].parent) < 0
+		})
 
-			// Find all iterators with head equal to minHead
-			var minChildIndexes []int
-			for i := range pulls {
-				if !pulls[i].ok {
-					continue
-				}
-				if compare(pulls[i].head, minHead) == 0 {
-					minChildIndexes = append(minChildIndexes, i)
-				}
+		i := 0
+		for i < len(pairs) {
+			j := i + 1
+			for j < len(pairs) && compare(pairs[j].parent, pairs[i].parent) == 0 {
+				j++
 			}
 
-			// Collect related children for this parent and advance iterators
-			relatedChildNodes := make([]Node, 0, len(minChildIndexes))
-			for _, idx := range minChildIndexes {
-				relatedChildNodes = append(relatedChildNodes, childNodes[idx])
-				pulls[idx].head, pulls[idx].ok = pulls[idx].next()
+			relatedChildNodes := make([]Node, 0, j-i)
+			for k := i; k < j; k++ {
+				relatedChildNodes = append(relatedChildNodes, childNodes[pairs[k].childIdx])
 			}
 
-			// Apply overlay
+			minHead := pairs[i].parent
+
 			overlaidRelatedChildNodes := relatedChildNodes
 			if fj.inprogressChildChange != nil && fj.inprogressChildChangePosition != nil &&
 				IsJoinMatch(fj.inprogressChildChange.Node.Row, fj.childKey, minHead.Row, fj.parentKey) {
@@ -225,16 +195,6 @@ func (fj *FlippedJoin) Fetch(req FetchRequest) iter.Seq[Node] {
 
 				if fj.inprogressChildChange.Type == ChangeTypeRemove {
 					if hasBeenPushed {
-						// Filter out the removed node. TS filters by reference
-						// identity (flipped-join.ts:271-272: `n !== change.node`)
-						// because the removed node was spliced into childNodes by
-						// reference. Go copies nodes through slices, so identity
-						// is unavailable — we match by the child schema's full
-						// comparator instead. Equivalent ONLY because the child
-						// sort is total (Zero always appends the PK to the
-						// ordering), so CompareRows==0 ⟺ same row. If a non-total
-						// child sort is ever introduced, this could filter a
-						// DIFFERENT child that ties with the removed one.
 						filtered := make([]Node, 0, len(relatedChildNodes))
 						for _, n := range relatedChildNodes {
 							if fj.child.GetSchema().CompareRows(n.Row, fj.inprogressChildChange.Node.Row) != 0 {
@@ -248,7 +208,6 @@ func (fj *FlippedJoin) Fetch(req FetchRequest) iter.Seq[Node] {
 				}
 			}
 
-			// Only yield if there are related children (inner join)
 			if len(overlaidRelatedChildNodes) > 0 {
 				captured := overlaidRelatedChildNodes
 				nodeOut := Node{
@@ -261,6 +220,8 @@ func (fj *FlippedJoin) Fetch(req FetchRequest) iter.Seq[Node] {
 					return
 				}
 			}
+
+			i = j
 		}
 	}
 }
