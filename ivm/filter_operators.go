@@ -2,7 +2,6 @@ package ivm
 
 import (
 	"iter"
-	"slices"
 )
 
 // The FilterOperator abstraction enables efficient fetch for WHERE clauses
@@ -85,22 +84,26 @@ func (fs *FilterStart) Push(change Change, pusher InputBase) []Change {
 // lazy-generator behavior where Take's break propagates through Filter,
 // stopping the EXISTS predicate from running on the entire upstream result.
 func (fs *FilterStart) Fetch(req FetchRequest) iter.Seq[Node] {
-	fs.output.BeginFilter()
-	defer fs.output.EndFilter()
-
 	upstreamReq := req
 	upstreamReq.Limit = 0
 
-	var result []Node
-	for node := range fs.input.Fetch(upstreamReq) {
-		if fs.output.Filter(node) {
-			result = append(result, node)
-			if req.Limit > 0 && len(result) >= req.Limit {
-				break
+	return func(yield func(Node) bool) {
+		fs.output.BeginFilter()
+		defer fs.output.EndFilter()
+
+		count := 0
+		for node := range fs.input.Fetch(upstreamReq) {
+			if fs.output.Filter(node) {
+				if !yield(node) {
+					return
+				}
+				count++
+				if req.Limit > 0 && count >= req.Limit {
+					return
+				}
 			}
 		}
 	}
-	return slices.Values(result)
 }
 
 // FilterEnd adapts from FilterOperator FilterOutput back to normal Input.

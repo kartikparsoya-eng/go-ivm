@@ -2,7 +2,6 @@ package ivm
 
 import (
 	"iter"
-	"slices"
 )
 
 // Skip sets the start position for the pipeline. No rows before the bound
@@ -103,7 +102,7 @@ func (s *Skip) Fetch(req FetchRequest) iter.Seq[Node] {
 
 	newReq := FetchRequest{
 		Constraint: req.Constraint,
-		Start:      start, // may be nil (undefined) for reverse — means no start override
+		Start:      start,
 		Reverse:    req.Reverse,
 	}
 	// Forward Limit in the forward case only. In reverse, Skip's
@@ -113,21 +112,21 @@ func (s *Skip) Fetch(req FetchRequest) iter.Seq[Node] {
 	if !req.Reverse {
 		newReq.Limit = req.Limit
 	}
-	nodes := slices.Collect(s.input.Fetch(newReq))
 
 	if !req.Reverse {
-		return slices.Values(nodes)
+		return s.input.Fetch(newReq)
 	}
 
-	// For reverse, filter out nodes before bound
-	var result []Node
-	for _, node := range nodes {
-		if !s.shouldBePresent(node.Row) {
-			break
+	return func(yield func(Node) bool) {
+		for node := range s.input.Fetch(newReq) {
+			if !s.shouldBePresent(node.Row) {
+				return
+			}
+			if !yield(node) {
+				return
+			}
 		}
-		result = append(result, node)
 	}
-	return slices.Values(result)
 }
 
 // Push — handles incremental changes respecting the bound.

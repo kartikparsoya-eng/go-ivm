@@ -11,7 +11,6 @@ import (
 	"fmt"
 	"iter"
 	"os"
-	"slices"
 )
 
 const maxBoundKey = "maxBound"
@@ -113,18 +112,20 @@ func (t *Take) Fetch(req FetchRequest) iter.Seq[Node] {
 		if takeState.Bound == nil {
 			return emptyNodeSeq
 		}
-		var result []Node
-		for inputNode := range t.input.Fetch(req) {
-			if t.GetSchema().CompareRows(takeState.Bound, inputNode.Row) < 0 {
-				break
+		return func(yield func(Node) bool) {
+			for inputNode := range t.input.Fetch(req) {
+				if t.GetSchema().CompareRows(takeState.Bound, inputNode.Row) < 0 {
+					return
+				}
+				if t.rowHiddenFromFetch != nil &&
+					t.GetSchema().CompareRows(t.rowHiddenFromFetch, inputNode.Row) == 0 {
+					continue
+				}
+				if !yield(inputNode) {
+					return
+				}
 			}
-			if t.rowHiddenFromFetch != nil &&
-				t.GetSchema().CompareRows(t.rowHiddenFromFetch, inputNode.Row) == 0 {
-				continue
-			}
-			result = append(result, inputNode)
 		}
-		return slices.Values(result)
 	}
 
 	// Partition key exists but fetch not constrained on it
@@ -132,19 +133,21 @@ func (t *Take) Fetch(req FetchRequest) iter.Seq[Node] {
 	if maxBound == nil {
 		return emptyNodeSeq
 	}
-	var result []Node
-	for inputNode := range t.input.Fetch(req) {
-		if t.GetSchema().CompareRows(inputNode.Row, maxBound) > 0 {
-			break
-		}
-		takeStateKey := GetTakeStateKey(t.partitionKey, inputNode.Row)
-		takeState := t.storage.GetTakeState(takeStateKey)
-		if takeState != nil && takeState.Bound != nil &&
-			t.GetSchema().CompareRows(takeState.Bound, inputNode.Row) >= 0 {
-			result = append(result, inputNode)
+	return func(yield func(Node) bool) {
+		for inputNode := range t.input.Fetch(req) {
+			if t.GetSchema().CompareRows(inputNode.Row, maxBound) > 0 {
+				return
+			}
+			takeStateKey := GetTakeStateKey(t.partitionKey, inputNode.Row)
+			takeState := t.storage.GetTakeState(takeStateKey)
+			if takeState != nil && takeState.Bound != nil &&
+				t.GetSchema().CompareRows(takeState.Bound, inputNode.Row) >= 0 {
+				if !yield(inputNode) {
+					return
+				}
+			}
 		}
 	}
-	return slices.Values(result)
 }
 
 // initialFetch — Source: take.ts line 158-216
@@ -157,20 +160,23 @@ func (t *Take) initialFetch(req FetchRequest) iter.Seq[Node] {
 
 	req.Limit = t.limit
 
-	var result []Node
-	var size int
-	var bound Row
-	for inputNode := range t.input.Fetch(req) {
-		result = append(result, inputNode)
-		bound = inputNode.Row
-		size++
-		if size == t.limit {
-			break
+	return func(yield func(Node) bool) {
+		var size int
+		var bound Row
+		defer func() {
+			t.setTakeState(takeStateKey, size, bound, t.storage.GetMaxBound())
+		}()
+		for inputNode := range t.input.Fetch(req) {
+			bound = inputNode.Row
+			size++
+			if !yield(inputNode) {
+				return
+			}
+			if size == t.limit {
+				return
+			}
 		}
 	}
-
-	t.setTakeState(takeStateKey, size, bound, t.storage.GetMaxBound())
-	return slices.Values(result)
 }
 
 // Push — Source: take.ts line 247-430
