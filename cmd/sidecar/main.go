@@ -637,7 +637,7 @@ type ClientGroup struct {
 	// shutdownGroup / re-init. Nil when the feature is off or the pool couldn't
 	// pin (replica advanced past curr) — both fall back to the single-conn path.
 	readerPool *tablesource.ReaderPool
-	coread    *tablesource.CoRead
+	coread     *tablesource.CoRead
 }
 
 type clientGroupReq struct {
@@ -721,6 +721,13 @@ type Server struct {
 	// goroutines read in parallel; torn down at the first advance.
 	hydrateReaders int
 
+	// hydrateLanes is GO_IVM_HYDRATE_LANES — the number of worker lanes (P)
+	// that hydrate queries in parallel. Replaces the unbounded per-query
+	// goroutine spawn with P workers. The reader pool is sized to at least P
+	// (K = P × Cmax; Cmax=1 while operators are eager → K=P) so every lane
+	// can always acquire a reader. Default 4. 1 = serial (legacy).
+	hydrateLanes int
+
 	// warmHydratePoolEnabled extends the parallel-hydrate reader pool to WARM
 	// hydrates (addQueriesStream on a CG that already has live pipelines), not
 	// just the first cold one. From GO_IVM_WARM_HYDRATE_POOL=true; default OFF so
@@ -739,6 +746,7 @@ func NewServer(mode tablesource.Mode, replicaPath string) *Server {
 		sourceMode:     mode,
 		replicaPath:    replicaPath,
 		hydrateReaders: 1,
+		hydrateLanes:   4,
 	}
 }
 
@@ -2496,6 +2504,14 @@ func main() {
 	if v := os.Getenv("GO_IVM_HYDRATE_READERS"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 1 {
 			server.hydrateReaders = n
+		}
+	}
+	// GO_IVM_HYDRATE_LANES sets P (worker lane count for bounded parallel
+	// hydrate). The reader pool is sized to max(hydrateReaders, hydrateLanes)
+	// so every lane can acquire a reader (deadlock-freedom: §3d).
+	if v := os.Getenv("GO_IVM_HYDRATE_LANES"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			server.hydrateLanes = n
 		}
 	}
 	// GO_IVM_WARM_HYDRATE_POOL=true extends the parallel-hydrate pool to warm

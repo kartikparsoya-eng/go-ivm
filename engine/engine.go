@@ -711,39 +711,59 @@ func (e *Engine) AddQueries(queries []QuerySpec) ([]QueryResult, error) {
 		built = append(built, e.buildAndRegisterLocked(q.QueryID, q.AST))
 	}
 
-	// Phase 2: Hydrate all pipelines in parallel (read-only fetches).
+	// Phase 2: Hydrate all pipelines via P worker lanes (bounded parallelism).
+	// P bounds both the goroutine count and — with K = P × Cmax reader-pool
+	// connections — the concurrent-cursor demand. See
+	// DESIGN-streaming-hydrate.md §3a/§3d.
 	results := make([]QueryResult, len(built))
-	// Snapshot minRowVersions under the held e.mu so the parallel hydrate
-	// goroutines read a stable map (K: minRowVersion bump).
 	mrv := e.minRowVersions
 	// C1: a panic inside a hydrate goroutine (e.g. pkValue on a nil-PK row)
 	// cannot be caught by the RPC handler's recover — panics don't cross
 	// goroutine boundaries, so an uncaught one aborts the WHOLE multi-CG
-	// process. Capture per-goroutine and surface as an error (mirrors the
+	// process. Capture per-lane and surface as an error (mirrors the
 	// per-goroutine recover in ivm/parallel.go's push fan-out).
 	hydratePanics := make([]any, len(built))
-	var wg sync.WaitGroup
-	wg.Add(len(built))
+	p := hydrateLanes
+	if p > len(built) {
+		p = len(built)
+	}
+	if p < 1 {
+		p = 1
+	}
+	type hydrateJob struct {
+		idx   int
+		entry *pipelineEntry
+	}
+	jobs := make(chan hydrateJob, len(built))
 	for i, entry := range built {
-		go func(idx int, entry *pipelineEntry) {
+		jobs <- hydrateJob{i, entry}
+	}
+	close(jobs)
+	var wg sync.WaitGroup
+	for w := 0; w < p; w++ {
+		wg.Add(1)
+		go func() {
 			defer wg.Done()
-			defer func() {
-				if r := recover(); r != nil {
-					hydratePanics[idx] = r
-				}
-			}()
-			start := time.Now()
-			hydration := bumpRowVersions(hydrateEntry(entry), mrv)
-			timingMs := float64(time.Since(start).Microseconds()) / 1000.0
-			// Non-streaming path: result is the single (final) chunk.
-			results[idx] = QueryResult{
-				QueryID:    entry.queryID,
-				Changes:    hydration,
-				ChunkIndex: 0,
-				Final:      true,
-				TimingMs:   timingMs,
+			for job := range jobs {
+				func() {
+					defer func() {
+						if r := recover(); r != nil {
+							hydratePanics[job.idx] = r
+						}
+					}()
+					start := time.Now()
+					hydration := bumpRowVersions(hydrateEntry(job.entry), mrv)
+					timingMs := float64(time.Since(start).Microseconds()) / 1000.0
+					results[job.idx] = QueryResult{
+						QueryID:    job.entry.queryID,
+						Changes:    hydration,
+						ChunkIndex: 0,
+						Final:      true,
+						TimingMs:   timingMs,
+					}
+				}()
 			}
-		}(i, entry)
+		}()
 	}
 	wg.Wait()
 	if err := firstHydratePanic(built, hydratePanics); err != nil {
@@ -795,99 +815,120 @@ func (e *Engine) AddQueriesStream(
 		built = append(built, e.buildAndRegisterLocked(q.QueryID, q.AST))
 	}
 
-	// Phase 2: Hydrate in parallel, stream per-query results in chunks as
-	// each query's fetch progresses. Each query may emit multiple chunks
-	// (one per hydrateChunkSize RowChanges); the last chunk has Final=true.
+	// Phase 2: Hydrate via P worker lanes, streaming per-query results in
+	// chunks as each query's fetch progresses. Each query may emit multiple
+	// chunks (one per hydrateChunkSize RowChanges); the last chunk has
+	// Final=true. P bounds both goroutine count and connection demand (K =
+	// P × Cmax; see DESIGN-streaming-hydrate.md §3a/§3d).
 	//
 	// Chunking is a wire-level optimization: it reduces TS-side peak memory
 	// (decode + process + discard per chunk vs decode-whole-frame) and
 	// improves time-to-first-byte for large hydrations. Go-side memory is
 	// NOT bounded — pipeline.Input.Fetch still returns the full result
 	// slice up front; operator-level chunking would be a separate refactor.
-	// Snapshot minRowVersions under the held e.mu so the parallel hydrate
-	// goroutines read a stable map (K: minRowVersion bump).
 	mrv := e.minRowVersions
-	// C1: capture per-goroutine panics (see AddQueries) so a nil-PK panic in
-	// one query's hydrate becomes a returned error instead of a process abort.
+	// C1: capture per-lane panics (see AddQueries) so a nil-PK panic in one
+	// query's hydrate becomes a returned error instead of a process abort.
 	// The query may have already emitted partial (Final=false) frames; the
 	// handler turns the returned error into an rpcError, which rejects the
 	// whole addQueriesStream call on the TS side — a clean failure, not a crash.
 	hydratePanics := make([]any, len(built))
+	p := hydrateLanes
+	if p > len(built) {
+		p = len(built)
+	}
+	if p < 1 {
+		p = 1
+	}
+	type hydrateJob struct {
+		idx   int
+		entry *pipelineEntry
+	}
+	jobs := make(chan hydrateJob, len(built))
+	for i, entry := range built {
+		jobs <- hydrateJob{i, entry}
+	}
+	close(jobs)
 	var wg sync.WaitGroup
-	wg.Add(len(built))
-	for bi, b := range built {
-		go func(idx int, entry *pipelineEntry) {
+	for w := 0; w < p; w++ {
+		wg.Add(1)
+		go func() {
 			defer wg.Done()
-			defer func() {
-				if r := recover(); r != nil {
-					hydratePanics[idx] = r
-				}
-			}()
-			start := time.Now()
-			nodes := slices.Collect(entry.pipeline.Input.Fetch(ivm.FetchRequest{}))
+			for job := range jobs {
+				func() {
+					defer func() {
+						if r := recover(); r != nil {
+							hydratePanics[job.idx] = r
+						}
+					}()
+					entry := job.entry
+					start := time.Now()
+					nodes := slices.Collect(entry.pipeline.Input.Fetch(ivm.FetchRequest{}))
 
-			var chunk []RowChange
-			chunkBytes := 0
-			chunkIndex := 0
-			flush := func(final bool) {
-				// TimingMs only on the final chunk (TS accumulator uses it
-				// for per-query attribution). Avoids leaking incremental
-				// fetch-time noise into the histogram.
-				var timingMs float64
-				if final {
-					timingMs = float64(time.Since(start).Microseconds()) / 1000.0
-				}
-				onResult(QueryResult{
-					QueryID:    entry.queryID,
-					Changes:    bumpRowVersions(chunk, mrv),
-					ChunkIndex: chunkIndex,
-					Final:      final,
-					TimingMs:   timingMs,
-				})
-				// T1-5: reuse the backing array (see the matching note in
-				// AdvanceStream's flush). onResult encodes Changes
-				// synchronously via the sidecar's streamW before returning, so
-				// the array is free to reuse. Revert to `chunk = nil` if any
-				// caller retains Changes asynchronously.
-				chunk = chunk[:0]
-				chunkBytes = 0
-				chunkIndex++
-			}
+					var chunk []RowChange
+					chunkBytes := 0
+					chunkIndex := 0
+					flush := func(final bool) {
+						// TimingMs only on the final chunk (TS accumulator uses it
+						// for per-query attribution). Avoids leaking incremental
+						// fetch-time noise into the histogram.
+						var timingMs float64
+						if final {
+							timingMs = float64(time.Since(start).Microseconds()) / 1000.0
+						}
+						onResult(QueryResult{
+							QueryID:    entry.queryID,
+							Changes:    bumpRowVersions(chunk, mrv),
+							ChunkIndex: chunkIndex,
+							Final:      final,
+							TimingMs:   timingMs,
+						})
+						// T1-5: reuse the backing array (see the matching note in
+						// AdvanceStream's flush). onResult encodes Changes
+						// synchronously via the sidecar's streamW before returning, so
+						// the array is free to reuse. Revert to `chunk = nil` if any
+						// caller retains Changes asynchronously.
+						chunk = chunk[:0]
+						chunkBytes = 0
+						chunkIndex++
+					}
 
-			for _, node := range nodes {
-				nodeChanges := streamNodes(entry.queryID, entry.schema, RowChangeAdd, node)
-				chunk = append(chunk, nodeChanges...)
-				chunkBytes += estimateRowChangesBytes(nodeChanges)
-				if len(chunk) >= hydrateChunkSize || chunkBytes >= softChunkBytes {
-					flush(false)
-				}
+					for _, node := range nodes {
+						nodeChanges := streamNodes(entry.queryID, entry.schema, RowChangeAdd, node)
+						chunk = append(chunk, nodeChanges...)
+						chunkBytes += estimateRowChangesBytes(nodeChanges)
+						if len(chunk) >= hydrateChunkSize || chunkBytes >= softChunkBytes {
+							flush(false)
+						}
+					}
+					// Emit companion rows after the main pipeline's nodes so the
+					// client receives all rows for one queryID in one logical run.
+					// They're tagged with the same queryID + each companion's own
+					// schema (table name), so the streamer/client demultiplex
+					// correctly. Chunk-bounded so a query with many companions
+					// still respects hydrateChunkSize.
+					for _, ce := range entry.companions {
+						if ce.matchedRow == nil {
+							continue
+						}
+						node := ivm.Node{Row: ce.matchedRow}
+						nodeChanges := streamNodes(entry.queryID, ce.schema, RowChangeAdd, node)
+						chunk = append(chunk, nodeChanges...)
+						chunkBytes += estimateRowChangesBytes(nodeChanges)
+						if len(chunk) >= hydrateChunkSize || chunkBytes >= softChunkBytes {
+							flush(false)
+						}
+					}
+					// Always emit a terminal frame with Final=true, even if empty —
+					// the TS accumulator uses it as the per-query completion signal.
+					// For queries whose total RowChanges hit an exact multiple of
+					// hydrateChunkSize, the terminal frame carries zero rows; one
+					// extra small frame per such query is the tradeoff for a simple
+					// invariant ("every query ends with Final=true").
+					flush(true)
+				}()
 			}
-			// Emit companion rows after the main pipeline's nodes so the
-			// client receives all rows for one queryID in one logical run.
-			// They're tagged with the same queryID + each companion's own
-			// schema (table name), so the streamer/client demultiplex
-			// correctly. Chunk-bounded so a query with many companions
-			// still respects hydrateChunkSize.
-			for _, ce := range entry.companions {
-				if ce.matchedRow == nil {
-					continue
-				}
-				node := ivm.Node{Row: ce.matchedRow}
-				nodeChanges := streamNodes(entry.queryID, ce.schema, RowChangeAdd, node)
-				chunk = append(chunk, nodeChanges...)
-				chunkBytes += estimateRowChangesBytes(nodeChanges)
-				if len(chunk) >= hydrateChunkSize || chunkBytes >= softChunkBytes {
-					flush(false)
-				}
-			}
-			// Always emit a terminal frame with Final=true, even if empty —
-			// the TS accumulator uses it as the per-query completion signal.
-			// For queries whose total RowChanges hit an exact multiple of
-			// hydrateChunkSize, the terminal frame carries zero rows; one
-			// extra small frame per such query is the tradeoff for a simple
-			// invariant ("every query ends with Final=true").
-			flush(true)
-		}(bi, b)
+		}()
 	}
 	wg.Wait()
 	if err := firstHydratePanic(built, hydratePanics); err != nil {
@@ -955,6 +996,17 @@ type QueryResult struct {
 // Declared as var (not const) so tests can shrink it to exercise chunk
 // boundaries without allocating 10k-row payloads per case.
 var hydrateChunkSize = envChunkSize("GO_IVM_HYDRATE_CHUNK_SIZE", 10000)
+
+// hydrateLanes is the number of worker lanes (P) that hydrate queries in
+// parallel. Replaces the unbounded per-query goroutine spawn with P workers
+// draining a job channel, bounding both goroutine count and — with K = P ×
+// Cmax reader-pool connections — concurrent-cursor demand. See
+// DESIGN-streaming-hydrate.md §3a/§3d.
+//
+// Default 4. GO_IVM_HYDRATE_LANES overrides. The pool must be sized to at
+// least P (K = P × Cmax; Cmax=1 while operators are eager → K=P) so every
+// lane can always acquire a reader (deadlock-freedom: §3d).
+var hydrateLanes = envChunkSize("GO_IVM_HYDRATE_LANES", 4)
 
 // softChunkBytes is the estimated-payload budget per streamed partial frame.
 // The row-count caps (hydrateChunkSize / advanceChunkSize) bound COUNT but

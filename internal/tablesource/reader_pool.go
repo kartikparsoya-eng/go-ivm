@@ -65,9 +65,13 @@ func (r *poolReader) close(ctx context.Context) {
 // Cold-start hydrate routes its per-query fetches across the pool so they run
 // in parallel while staying on one consistent frame. Borrow with acquire,
 // return with release; each borrow is exclusive, so the SQL read runs lock-free.
-// Because hydrate fetch is eager (read all rows, then return), a single goroutine
-// holds at most one reader at a time, so pool size = #concurrent hydrate
-// goroutines is deadlock-free.
+//
+// Deadlock-freedom: the pool is sized K = P × Cmax where P is the number of
+// worker lanes and Cmax is the max concurrent-cursor demand per query. In the
+// eager model (Phase 0/1, compat shims), Cmax=1 → K=P. In the lazy model
+// (Phase 2+), Cmax = join depth + union breadth + EXISTS probes. Worst case:
+// P lanes each hold Cmax−1 readers → P×(Cmax−1) held, P free → all acquire.
+// See DESIGN-streaming-hydrate.md §3d.
 type ReaderPool struct {
 	free    chan *poolReader
 	all     []*poolReader

@@ -135,7 +135,15 @@ func (s *Server) buildSnapshotterLocked(group *ClientGroup, p *initParams) error
 // pool.Version() matches the Snapshotter's curr and retry if not. MUST hold
 // group.mu.
 func (s *Server) buildReaderPoolLocked(cur *snapshotter.Snapshot) (*tablesource.ReaderPool, *tablesource.CoRead, error) {
-	if s.hydrateReaders <= 1 {
+	// Pool size K = max(hydrateReaders, hydrateLanes). hydrateLanes (P worker
+	// lanes) needs at least P readers so every lane can acquire one
+	// (deadlock-freedom: K = P × Cmax, Cmax=1 while eager → K=P). When both
+	// are ≤1, the feature is off: serial by design.
+	k := s.hydrateReaders
+	if s.hydrateLanes > k {
+		k = s.hydrateLanes
+	}
+	if k <= 1 {
 		return nil, nil, nil // feature off: serial by design, not a failure
 	}
 	rdb, derr := s.getReplicaDB()
@@ -148,7 +156,7 @@ func (s *Server) buildReaderPoolLocked(cur *snapshotter.Snapshot) (*tablesource.
 	// (not wal2 mode, SQLITE_ERROR, etc.).
 	if cur != nil {
 		if cr, cerr := tablesource.CaptureCoReadFromConn(cur.Conn()); cerr == nil {
-			pool, perr := tablesource.NewCoReadReaderPool(context.Background(), rdb, cr, s.hydrateReaders)
+			pool, perr := tablesource.NewCoReadReaderPool(context.Background(), rdb, cr, k)
 			if perr == nil {
 				return pool, cr, nil
 			}
@@ -158,7 +166,7 @@ func (s *Server) buildReaderPoolLocked(cur *snapshotter.Snapshot) (*tablesource.
 	}
 
 	// Converge-fallback path (shipped pool: K readers converge-upward).
-	pool, err := tablesource.NewReaderPool(context.Background(), rdb, "", s.hydrateReaders)
+	pool, err := tablesource.NewReaderPool(context.Background(), rdb, "", k)
 	return pool, nil, err
 }
 
@@ -200,7 +208,11 @@ func (s *Server) tearDownReaderPool(group *ClientGroup) {
 // stored on the group (it is per-call); group.readerPool is the cold pool's
 // slot and is left untouched. MUST hold group.mu.
 func (s *Server) buildWarmReaderPoolLocked(group *ClientGroup) (*tablesource.ReaderPool, *tablesource.CoRead) {
-	if !s.warmHydratePoolEnabled || !s.advanceDriveEnabled || s.hydrateReaders <= 1 {
+	k := s.hydrateReaders
+	if s.hydrateLanes > k {
+		k = s.hydrateLanes
+	}
+	if !s.warmHydratePoolEnabled || !s.advanceDriveEnabled || k <= 1 {
 		return nil, nil
 	}
 	if group.snap == nil || group.eng == nil {
@@ -235,7 +247,7 @@ func (s *Server) buildWarmReaderPoolLocked(group *ClientGroup) (*tablesource.Rea
 		metrics.recordWarmReaderPoolBind(false) // non-wal2 or capture error → serial
 		return nil, nil
 	}
-	pool, perr := tablesource.NewCoReadReaderPool(context.Background(), rdb, cr, s.hydrateReaders)
+	pool, perr := tablesource.NewCoReadReaderPool(context.Background(), rdb, cr, k)
 	if perr != nil {
 		cr.Free()
 		metrics.recordWarmReaderPoolBind(false)

@@ -4,8 +4,8 @@ import (
 	"testing"
 
 	"github.com/kartikparsoya-eng/go-ivm/builder"
-	"github.com/kartikparsoya-eng/go-ivm/ivm"
 	"github.com/kartikparsoya-eng/go-ivm/internal/tablesource"
+	"github.com/kartikparsoya-eng/go-ivm/ivm"
 	"github.com/kartikparsoya-eng/go-ivm/sqlite"
 )
 
@@ -124,10 +124,11 @@ func TestBuildWarmReaderPool_Guards(t *testing.T) {
 		assertWarmNoop(t, srv, group)
 	})
 
-	t.Run("readers<=1", func(t *testing.T) {
+	t.Run("pool size <=1", func(t *testing.T) {
 		srv, group := warmTestServer(t)
 		srv.tearDownReaderPool(group)
 		srv.hydrateReaders = 1
+		srv.hydrateLanes = 1
 		assertWarmNoop(t, srv, group)
 	})
 
