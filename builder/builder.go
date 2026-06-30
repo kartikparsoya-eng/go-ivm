@@ -98,7 +98,7 @@ func buildPipelineInternal(ast AST, delegate Delegate, p *Pipeline, partitionKey
 	// Step 1: Connect to source
 	source := delegate.GetSource(ast.Table)
 	if source == nil {
-		panic(fmt.Sprintf("no source for table %q", ast.Table))
+		panic(ivm.NewDataError("no source for table %q", ast.Table))
 	}
 
 	// Build filter condition (strip correlatedSubquery conditions for source-level filter)
@@ -431,7 +431,7 @@ func applyFilter(input ivm.FilterInput, cond *Condition, p *Pipeline) ivm.Filter
 	case "simple":
 		return applySimpleFilter(input, cond, p)
 	}
-	panic(fmt.Sprintf("applyFilter: unknown condition type %q", cond.Type))
+	panic(ivm.NewDataError("applyFilter: unknown condition type %q", cond.Type))
 }
 
 func applyAnd(input ivm.FilterInput, cond *Condition, p *Pipeline) ivm.FilterInput {
@@ -638,7 +638,7 @@ func applyFilterWithFlips(input ivm.Input, cond *Condition, delegate Delegate, p
 		p.Edges = append(p.Edges, [2]ivm.InputBase{childInput, flippedJoin})
 		return flippedJoin
 	}
-	panic(fmt.Sprintf("applyFilterWithFlips: unknown condition type %q", cond.Type))
+	panic(ivm.NewDataError("applyFilterWithFlips: unknown condition type %q", cond.Type))
 }
 
 // conditionIncludesFlippedSubquery reports whether the condition tree

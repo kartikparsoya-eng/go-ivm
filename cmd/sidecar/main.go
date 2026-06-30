@@ -1166,6 +1166,23 @@ func (s *Server) closeAll() {
 	}
 }
 
+// rpcCodeDataError marks a recovered panic as a DETERMINISTIC, NON-RETRYABLE
+// data/schema error (ivm.DataError — bad replica value, e.g. non-JSON in a
+// json column, int beyond MAX_SAFE_INTEGER, cross-type compare). The TS
+// view-syncer (RPC_CODE_DATA_ERROR in go-ivm-client.ts) tears down the CG
+// instead of escalating to a pipeline reset, which would re-read the same bad
+// row and loop forever. Generic panics keep -32000 (transient → reset).
+const rpcCodeDataError = -32102
+
+// panicErrorCode returns the RPC error code for a recovered panic value:
+// rpcCodeDataError for an *ivm.DataError, -32000 otherwise.
+func panicErrorCode(r any) int {
+	if _, ok := r.(*ivm.DataError); ok {
+		return rpcCodeDataError
+	}
+	return -32000
+}
+
 // handleStreamWithRecover runs a streaming handler with a panic recover (C1).
 // The streaming handlers dispatch directly from the worker goroutine, bypassing
 // handleRequest's recover; AdvanceStream also re-raises non-drift panics onto
@@ -1184,7 +1201,7 @@ func (s *Server) handleStreamWithRecover(
 			fmt.Fprintf(os.Stderr, "[GO-IVM] PANIC in %s (stream): %v\n%s\n", req.Method, r, stack[:n])
 			resp = RPCResponse{
 				JSONRPC: "2.0",
-				Error:   &RPCError{Code: -32000, Message: fmt.Sprintf("panic: %v", r)},
+				Error:   &RPCError{Code: panicErrorCode(r), Message: fmt.Sprintf("panic: %v", r)},
 				ID:      req.ID,
 			}
 		}
@@ -1200,7 +1217,7 @@ func (s *Server) handleRequest(req RPCRequest) (resp RPCResponse) {
 			fmt.Fprintf(os.Stderr, "[GO-IVM] PANIC in %s: %v\n%s\n", req.Method, r, stack[:n])
 			resp = RPCResponse{
 				JSONRPC: "2.0",
-				Error:   &RPCError{Code: -32000, Message: fmt.Sprintf("panic: %v", r)},
+				Error:   &RPCError{Code: panicErrorCode(r), Message: fmt.Sprintf("panic: %v", r)},
 				ID:      req.ID,
 			}
 		}

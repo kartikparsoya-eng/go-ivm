@@ -61,7 +61,7 @@ func conditionToPredicate(cond *Condition) Predicate {
 		// Return true (passthrough) — the builder constructs operators for these.
 		return func(ivm.Row) bool { return true }
 	default:
-		panic(fmt.Sprintf("unknown condition type: %s", cond.Type))
+		panic(ivm.NewDataError("unknown condition type: %s", cond.Type))
 	}
 }
 
@@ -148,7 +148,7 @@ func evalOp(op string, left, right ivm.Value) bool {
 	case "NOT IN":
 		return !valueIn(left, right)
 	default:
-		panic(fmt.Sprintf("unknown operator: %s", op))
+		panic(ivm.NewDataError("unknown operator: %s", op))
 	}
 }
 

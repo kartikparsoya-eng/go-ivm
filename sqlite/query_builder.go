@@ -455,12 +455,12 @@ func FromSQLiteType(v interface{}, colType string) ivm.Value {
 			// UnsupportedValueError on the same input; panic to match (the
 			// engine's recover surfaces it instead of corrupting silently).
 			if val > maxSafeInteger || val < -maxSafeInteger {
-				panic(fmt.Sprintf("FromSQLiteType(number): int64 %d exceeds JS MAX_SAFE_INTEGER (±2^53-1); float64 coercion loses precision", val))
+				panic(ivm.NewDataError("FromSQLiteType(number): int64 %d exceeds JS MAX_SAFE_INTEGER (±2^53-1); float64 coercion loses precision", val))
 			}
 			return boxFloat64(float64(val))
 		case uint64:
 			if val > uint64(maxSafeInteger) {
-				panic(fmt.Sprintf("FromSQLiteType(number): uint64 %d exceeds JS MAX_SAFE_INTEGER (2^53-1); float64 coercion loses precision", val))
+				panic(ivm.NewDataError("FromSQLiteType(number): uint64 %d exceeds JS MAX_SAFE_INTEGER (2^53-1); float64 coercion loses precision", val))
 			}
 			return boxFloat64(float64(val))
 		case float64:
@@ -498,13 +498,13 @@ func FromSQLiteType(v interface{}, colType string) ivm.Value {
 		case string:
 			var parsed interface{}
 			if err := json.Unmarshal([]byte(val), &parsed); err != nil {
-				panic(fmt.Sprintf("FromSQLiteType(json): parse failed for %q: %v", val, err))
+				panic(ivm.NewDataError("FromSQLiteType(json): parse failed for %q: %v", val, err))
 			}
 			return parsed
 		case []byte:
 			var parsed interface{}
 			if err := json.Unmarshal(val, &parsed); err != nil {
-				panic(fmt.Sprintf("FromSQLiteType(json): parse failed for %q: %v", string(val), err))
+				panic(ivm.NewDataError("FromSQLiteType(json): parse failed for %q: %v", string(val), err))
 			}
 			return parsed
 		default:
@@ -531,11 +531,11 @@ func FromSQLiteType(v interface{}, colType string) ivm.Value {
 		switch val := v.(type) {
 		case int64:
 			if val > maxSafeInteger || val < -maxSafeInteger {
-				panic(fmt.Sprintf("FromSQLiteType(null): int64 %d exceeds JS MAX_SAFE_INTEGER (±2^53-1)", val))
+				panic(ivm.NewDataError("FromSQLiteType(null): int64 %d exceeds JS MAX_SAFE_INTEGER (±2^53-1)", val))
 			}
 		case uint64:
 			if val > uint64(maxSafeInteger) {
-				panic(fmt.Sprintf("FromSQLiteType(null): uint64 %d exceeds JS MAX_SAFE_INTEGER (2^53-1)", val))
+				panic(ivm.NewDataError("FromSQLiteType(null): uint64 %d exceeds JS MAX_SAFE_INTEGER (2^53-1)", val))
 			}
 		}
 		return v
