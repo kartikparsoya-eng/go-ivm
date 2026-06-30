@@ -129,3 +129,49 @@ func TestPositionalWireFixture(t *testing.T) {
 			"TS test's GO_WIRE_FIXTURE_B64 with the new value.", b64, goldenHydrateFrameB64)
 	}
 }
+
+// TestPositionalWire_JSONScalarRoundTrip pins that a json-column SCALAR STRING
+// value — the bug class ("Payment Failures") — survives the REAL wire codec
+// (mpMarshal → mpUnmarshal → fromPositional) unchanged, alongside the other
+// top-level scalar shapes a row carries. The encode side (toPositional) just
+// copies row values, so json CONTAINER fidelity is pinned at the SQLite
+// write/read boundary (sqlite.TestJSONWriteReadRoundTrip_AllShapes); here we
+// guard that the framing/codec doesn't mangle the bytes carrying a parsed-json
+// scalar. (Production decodes the wire in TS via msgpackr; the Go decode here is
+// test-only, which is why this stays to unambiguous top-level scalars.)
+func TestPositionalWire_JSONScalarRoundTrip(t *testing.T) {
+	in := []engine.RowChange{{
+		Type: engine.RowChangeAdd, QueryID: "q1", Table: "docs",
+		RowKey: map[string]interface{}{"id": "1"},
+		Row: ivm.Row{
+			"id":      "1",
+			"payload": "Payment Failures", // parsed json scalar string (bug class)
+			"count":   float64(42),
+			"ok":      true,
+			"missing": nil,
+		},
+	}}
+
+	pc := toPositional(in)
+	wire, err := mpMarshal(addQueriesStreamPartial{
+		QueryID: "q1",
+		Dict:    pc.Dict,
+		Rows:    pc.Rows,
+		Final:   true,
+	})
+	if err != nil {
+		t.Fatalf("mpMarshal: %v", err)
+	}
+
+	var decoded addQueriesStreamPartial
+	if err := mpUnmarshal(wire, &decoded); err != nil {
+		t.Fatalf("mpUnmarshal: %v", err)
+	}
+	got := fromPositional(positionalChanges{Dict: decoded.Dict, Rows: decoded.Rows})
+	if len(got) != 1 {
+		t.Fatalf("round-trip length: got %d want 1", len(got))
+	}
+	if !reflect.DeepEqual(got[0].Row, in[0].Row) {
+		t.Fatalf("row mangled through wire:\n got  %#v\n want %#v", got[0].Row, in[0].Row)
+	}
+}

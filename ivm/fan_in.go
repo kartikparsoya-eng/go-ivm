@@ -19,6 +19,9 @@ func NewFanIn(fanOut *FanOut, inputs []FilterInput) *FanIn {
 	}
 	for _, input := range inputs {
 		input.SetFilterOutput(fi)
+		if fi.schema != input.GetSchema() {
+			panic("Schema mismatch in fan-in")
+		}
 	}
 	return fi
 }

@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/kartikparsoya-eng/go-ivm/ivm"
+	"github.com/kartikparsoya-eng/go-ivm/sqlite"
 )
 
 func tempStoragePath(t *testing.T) string {
@@ -90,6 +91,36 @@ func TestSnapshotToSourceChanges(t *testing.T) {
 	}
 	if changes[1].Type != ivm.ChangeTypeAdd {
 		t.Fatalf("expected second=ADD, got %d", changes[1].Type)
+	}
+}
+
+// TestSnapshotToSourceChanges_JSONColumnNoReparse is the wire-decode regression
+// at the engine boundary. snapshotToSourceChanges runs every wire-delivered row
+// through source.NormalizeRow. A json scalar string ("Payment Failures") arrives
+// over the wire ALREADY parsed — TS ships it post-fromSQLiteTypes (snapshotter)
+// and the push path never re-coerces — so it is a bare Go string here, not JSON
+// text. Re-parsing it used to panic. This wires a converter-backed MemorySource
+// exactly as memory mode does (main.go injects sqlite.FromSQLiteType as the
+// column converter) and asserts the value flows through unchanged, no panic.
+func TestSnapshotToSourceChanges_JSONColumnNoReparse(t *testing.T) {
+	ms := ivm.NewMemorySourceWithConverter(
+		"docs",
+		map[string]string{"id": "string", "payload": "json"},
+		[]string{"id"},
+		sqlite.FromSQLiteType,
+	)
+	source := &memorySourceAdapter{ms: ms}
+
+	changes := snapshotToSourceChanges(SnapshotChange{
+		Table:     "docs",
+		NextValue: ivm.Row{"id": "1", "payload": "Payment Failures"},
+	}, source)
+
+	if len(changes) != 1 || changes[0].Type != ivm.ChangeTypeAdd {
+		t.Fatalf("expected 1 ADD change, got %+v", changes)
+	}
+	if got := changes[0].Row["payload"]; got != "Payment Failures" {
+		t.Fatalf("payload = %#v, want \"Payment Failures\" (passed through unchanged)", got)
 	}
 }
 

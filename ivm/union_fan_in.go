@@ -2,6 +2,7 @@ package ivm
 
 import (
 	"iter"
+	"reflect"
 )
 
 // UnionFanIn merges results from multiple OR-condition branches back together,
@@ -35,11 +36,18 @@ func NewUnionFanIn(fanOut *UnionFanOut, inputs []Input) *UnionFanIn {
 		if fanOutSchema.TableName != inputSchema.TableName {
 			panic("Table name mismatch in union fan-in")
 		}
-		if len(fanOutSchema.PrimaryKey) != len(inputSchema.PrimaryKey) {
+		if !reflect.DeepEqual(fanOutSchema.PrimaryKey, inputSchema.PrimaryKey) {
 			panic("Primary key mismatch in union fan-in")
 		}
 		if fanOutSchema.System != inputSchema.System {
 			panic("System mismatch in union fan-in")
+		}
+		if (fanOutSchema.CompareRows == nil) != (inputSchema.CompareRows == nil) ||
+			(fanOutSchema.CompareRows != nil && reflect.ValueOf(fanOutSchema.CompareRows).Pointer() != reflect.ValueOf(inputSchema.CompareRows).Pointer()) {
+			panic("compareRows mismatch in union fan-in")
+		}
+		if !reflect.DeepEqual(fanOutSchema.Sort, inputSchema.Sort) {
+			panic("Sort mismatch in union fan-in")
 		}
 
 		for relName, relSchema := range inputSchema.Relationships {

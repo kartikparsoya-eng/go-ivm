@@ -195,6 +195,16 @@ func (fj *FlippedJoin) Fetch(req FetchRequest) iter.Seq[Node] {
 
 				if fj.inprogressChildChange.Type == ChangeTypeRemove {
 					if hasBeenPushed {
+						// Filter out the removed node. TS filters by reference
+						// identity (flipped-join.ts:271-272: `n !== change.node`)
+						// because the removed node was spliced into childNodes by
+						// reference. Go copies nodes through slices, so identity
+						// is unavailable — we match by the child schema's full
+						// comparator instead. Equivalent ONLY because the child
+						// sort is total (Zero always appends the PK to the
+						// ordering), so CompareRows==0 ⟺ same row. If a non-total
+						// child sort is ever introduced, this could filter a
+						// DIFFERENT child that ties with the removed one.
 						filtered := make([]Node, 0, len(relatedChildNodes))
 						for _, n := range relatedChildNodes {
 							if fj.child.GetSchema().CompareRows(n.Row, fj.inprogressChildChange.Node.Row) != 0 {
@@ -210,11 +220,14 @@ func (fj *FlippedJoin) Fetch(req FetchRequest) iter.Seq[Node] {
 
 			if len(overlaidRelatedChildNodes) > 0 {
 				captured := overlaidRelatedChildNodes
+				// New relationship wins over any same-named parent relationship,
+				// matching TS's spread order ({...parent, [relName]: ...}) at
+				// flipped-join.ts:291-292 and the FlippedJoin schema (new key last).
 				nodeOut := Node{
 					Row: minHead.Row,
-					Relationships: mergeRelationshipMaps(minHead.Relationships, Relationships{
+					Relationships: mergeRelationshipMaps(Relationships{
 						fj.relationshipName: func() iter.Seq[Node] { return slices.Values(captured) },
-					}),
+					}, minHead.Relationships),
 				}
 				if !yield(nodeOut) {
 					return
@@ -295,9 +308,9 @@ func (fj *FlippedJoin) pushChildChange(change Change, exists bool) []Change {
 		if exists {
 			outNode := Node{
 				Row: parentNode.Row,
-				Relationships: mergeRelationshipMaps(parentNode.Relationships, Relationships{
+				Relationships: mergeRelationshipMaps(Relationships{
 					fj.relationshipName: childNodeStream,
-				}),
+				}, parentNode.Relationships),
 			}
 			outChange := MakeChildChange(outNode, ChildData{
 				RelationshipName: fj.relationshipName,
@@ -307,9 +320,9 @@ func (fj *FlippedJoin) pushChildChange(change Change, exists bool) []Change {
 		} else {
 			outNode := Node{
 				Row: parentNode.Row,
-				Relationships: mergeRelationshipMaps(parentNode.Relationships, Relationships{
+				Relationships: mergeRelationshipMaps(Relationships{
 					fj.relationshipName: func() iter.Seq[Node] { return slices.Values([]Node{change.Node}) },
-				}),
+				}, parentNode.Relationships),
 			}
 			var outChange Change
 			if change.Type == ChangeTypeAdd {
@@ -355,9 +368,9 @@ func (fj *FlippedJoin) pushParent(change Change) []Change {
 	flip := func(node Node) Node {
 		return Node{
 			Row: node.Row,
-			Relationships: mergeRelationshipMaps(node.Relationships, Relationships{
+			Relationships: mergeRelationshipMaps(Relationships{
 				fj.relationshipName: childNodeStream(node),
-			}),
+			}, node.Relationships),
 		}
 	}
 

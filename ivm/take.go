@@ -163,19 +163,48 @@ func (t *Take) initialFetch(req FetchRequest) iter.Seq[Node] {
 	return func(yield func(Node) bool) {
 		var size int
 		var bound Row
+		// Source: take.ts:177-215 (try/catch/finally).
+		//   - downstreamEarlyReturn mirrors the TS flag: it stays true until the
+		//     input is fully consumed (exhausted or limit reached). A downstream
+		//     consumer that breaks early leaves it true.
+		//   - On a panic during iteration (source error or a downstream panic),
+		//     TS's exceptionThrown branch skips setTakeState so a partial state
+		//     is never persisted, then re-raises. The recover()/re-panic below
+		//     does the same.
+		downstreamEarlyReturn := true
 		defer func() {
+			if r := recover(); r != nil {
+				// take.ts exceptionThrown branch: do not persist a partial
+				// takeState when iteration aborted via panic; re-raise as-is so
+				// a *DriftError still reaches engine.Advance's recover.
+				panic(r)
+			}
 			t.setTakeState(takeStateKey, size, bound, t.storage.GetMaxBound())
+			// take.ts:206-213: takeState must be fully hydrated. A downstream
+			// early return would leave it partial (wrong bound → corrupt
+			// pushes). If early return ever becomes necessary, remove this
+			// panic and instead drain the input up to limit before
+			// setTakeState. Today no consumer early-returns (engine, Join, and
+			// Exists all fully drain), so this is the same safety net TS keeps.
+			if downstreamEarlyReturn {
+				panic("Take.initialFetch: unexpected early return prevented full hydration")
+			}
 		}()
+		// Match TS ordering exactly: yield BEFORE recording bound/size, so a
+		// downstream break (yield→false) leaves bound/size untouched — identical
+		// to TS where .return() at `yield inputNode` skips the following
+		// `bound = ...; size++`.
 		for inputNode := range t.input.Fetch(req) {
-			bound = inputNode.Row
-			size++
 			if !yield(inputNode) {
 				return
 			}
+			bound = inputNode.Row
+			size++
 			if size == t.limit {
-				return
+				break
 			}
 		}
+		downstreamEarlyReturn = false
 	}
 }
 
