@@ -225,7 +225,10 @@ func CompareValues(a, b Value) int {
 		return 1
 	}
 
-	panic(fmt.Sprintf("cannot compare values of different types: %T(%v) and %T(%v)\n%s", a, a, b, b, string(debug.Stack())))
+	// Cross-type comparison = deterministic data/schema mismatch (non-retryable):
+	// tag as DataError so the sidecar maps it to RPC_CODE_DATA_ERROR (teardown,
+	// not reset-retry — a reset re-reads the same rows and re-panics forever).
+	panic(NewDataError("cannot compare values of different types: %T(%v) and %T(%v)\n%s", a, a, b, b, string(debug.Stack())))
 }
 
 // ValuesEqual checks if two values are equal — matches TS valuesEqual.
