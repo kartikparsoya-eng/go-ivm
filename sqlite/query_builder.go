@@ -379,14 +379,23 @@ func ToSQLiteType(v ivm.Value, colType string) interface{} {
 		}
 		return v
 	case "json":
-		// JSON stored as text
-		if s, ok := v.(string); ok {
-			return s
-		}
-		// Marshal non-string values to JSON
+		// ALWAYS marshal — never passthrough. TS's toSQLiteType ALWAYS
+		// JSON.stringify's (query-builder.ts:192), even for a string, so a JSON
+		// string value is stored as "\"x\"" not bare x. A bare-string passthrough
+		// here is what made FromSQLiteType panic on the next read ("Payment
+		// Failures" → invalid JSON).
 		b, err := json.Marshal(v)
 		if err != nil {
-			return fmt.Sprintf("%v", v)
+			// json.Marshal rejects NaN/±Inf; JSON.stringify encodes them as the
+			// literal "null" rather than throwing. Match TS exactly: return "null"
+			// (valid JSON, round-trips to nil) — NOT the old fmt.Sprintf("%v", v),
+			// which wrote bare "NaN"/"+Inf" that FromSQLiteType then panicked on
+			// (the same corruption class as the string-passthrough bug), and NOT a
+			// panic: the codebase's invariant is that Go fails ONLY where TS fails,
+			// and TS does not fail here. Unreachable for real json-column values
+			// (they originate from json.Unmarshal and never hold NaN/Inf), but kept
+			// symmetric so a stray non-finite float can't desync Go from TS.
+			return "null"
 		}
 		return string(b)
 	default:
@@ -575,7 +584,40 @@ func SelfCheckCoercion() error {
 				c.colType, c.rawShape, c.rawShape, a, c.jsShape, c.jsShape, b)
 		}
 	}
+	// JSON write/read symmetry — the string-passthrough bug class. A json column
+	// value MUST survive ToSQLiteType→FromSQLiteType unchanged; the original bug
+	// passed a Go string through ToSQLiteType un-quoted, so the next read panicked
+	// ("Payment Failures" → invalid JSON). TestToSQLiteType_JSONRoundTrip guards
+	// this in CI, but the bug reached PRODUCTION, so re-assert it on the live
+	// build/driver before serving. Scalar payloads only: they exercise the
+	// stringify/parse symmetry and stay !=-comparable after parse.
+	for _, jv := range []interface{}{"Payment Failures", "PROD", float64(42), true} {
+		rt, err := jsonRoundTrip(jv)
+		if err != nil {
+			return fmt.Errorf("coercion self-check FAILED: json round-trip of %T(%v) errored: %w "+
+				"— ToSQLiteType/FromSQLiteType asymmetric for json (string-passthrough bug class)",
+				jv, jv, err)
+		}
+		if rt != jv {
+			return fmt.Errorf("coercion self-check FAILED: json round-trip of %T(%v) produced %T(%v) "+
+				"— ToSQLiteType/FromSQLiteType asymmetric for json (string-passthrough bug class)",
+				jv, jv, rt, rt)
+		}
+	}
 	return nil
+}
+
+// jsonRoundTrip runs v through ToSQLiteType then FromSQLiteType for a json
+// column, recovering any panic into an error so SelfCheckCoercion keeps a
+// uniform error contract (return, not crash) if a future change reintroduces
+// an asymmetry that makes the re-read panic.
+func jsonRoundTrip(v interface{}) (out interface{}, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("panic on re-read: %v", r)
+		}
+	}()
+	return FromSQLiteType(ToSQLiteType(v, "json"), "json"), nil
 }
 
 // --- Helpers ---

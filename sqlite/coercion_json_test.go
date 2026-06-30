@@ -14,6 +14,9 @@ package sqlite
 // via decimal string conversion (no float64 coercion).
 
 import (
+	"encoding/json"
+	"fmt"
+	"math"
 	"testing"
 )
 
@@ -165,6 +168,125 @@ func TestFromSQLiteType_NullHigh9Panics(t *testing.T) {
 		}
 	}()
 	FromSQLiteType(maxSafeInteger+1, "null")
+}
+
+// TestToSQLiteType_JSONRoundTrip verifies that ToSQLiteType always
+// produces valid JSON for json-typed columns, matching TS's
+// JSON.stringify behavior (query-builder.ts:192). The Go side
+// previously had a string passthrough (query_builder.go:383-384)
+// that returned Go strings as-is without JSON-quoting, causing
+// FromSQLiteType to panic on the next read:
+//
+//	SQLite: "Payment Failures" (valid JSON string)
+//	FromSQLiteType → "Payment Failures" (Go string, quotes stripped)
+//	ToSQLiteType (bug) → "Payment Failures" (no quotes — NOT valid JSON)
+//	FromSQLiteType → panic: invalid character 'P'
+//
+// After the fix, ToSQLiteType always json.Marshal's, producing
+// "\"Payment Failures\"" which round-trips correctly.
+func TestToSQLiteType_JSONRoundTrip(t *testing.T) {
+	panicValues := []string{
+		"Payment Failures",
+		"Others",
+		"PROD",
+		"Details about txn/refund",
+		"NA",
+		"done",
+		"Yes",
+		"GENERATED",
+		"REVIEWED",
+		"Dashboard",
+		"Call with gateway",
+		"hello",
+		"",
+	}
+	for _, val := range panicValues {
+		t.Run(val, func(t *testing.T) {
+			// Simulate what the SQLite replica stores: a JSON-encoded string
+			jsonInSQLite, _ := json.Marshal(val) // e.g. "\"Payment Failures\""
+
+			// Step 1: FromSQLiteType reads valid JSON → returns Go string
+			goVal := FromSQLiteType(string(jsonInSQLite), "json")
+			goStr, ok := goVal.(string)
+			if !ok {
+				t.Fatalf("FromSQLiteType(%q, json) = %T, want string", jsonInSQLite, goVal)
+			}
+
+			// Step 2: ToSQLiteType must produce valid JSON that can round-trip
+			sqliteOut := ToSQLiteType(goStr, "json")
+			sqliteStr, ok := sqliteOut.(string)
+			if !ok {
+				t.Fatalf("ToSQLiteType(%q, json) = %T, want string", goStr, sqliteOut)
+			}
+
+			// Step 3: FromSQLiteType must be able to re-read the output
+			// This would panic before the fix if sqliteStr was not valid JSON
+			roundTripped := FromSQLiteType(sqliteStr, "json")
+			if roundTripped != goStr {
+				t.Fatalf("round-trip failed: FromSQLiteType(ToSQLiteType(%q)) = %#v, want %q",
+					goStr, roundTripped, goStr)
+			}
+		})
+	}
+}
+
+// TestToSQLiteType_JSONNonStringValues verifies that non-string JSON
+// values (objects, arrays, numbers, booleans) are correctly marshalled.
+func TestToSQLiteType_JSONNonStringValues(t *testing.T) {
+	cases := []struct {
+		name string
+		in   interface{}
+		want string
+	}{
+		{"object", map[string]interface{}{"a": float64(1)}, `{"a":1}`},
+		{"array", []interface{}{float64(1), float64(2)}, `[1,2]`},
+		{"number", float64(42), `42`},
+		{"bool", true, `true`},
+		{"null", nil, ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := ToSQLiteType(c.in, "json")
+			if c.in == nil {
+				if got != nil {
+					t.Fatalf("ToSQLiteType(nil, json) = %#v, want nil", got)
+				}
+				return
+			}
+			gotStr, ok := got.(string)
+			if !ok {
+				t.Fatalf("ToSQLiteType(%v, json) = %T, want string", c.in, got)
+			}
+			if gotStr != c.want {
+				t.Fatalf("ToSQLiteType(%v, json) = %q, want %q", c.in, gotStr, c.want)
+			}
+		})
+	}
+}
+
+// TestToSQLiteType_JSONMarshalFailureMatchesTS verifies the json-column
+// marshal-failure path. json.Marshal rejects NaN/±Inf, but JS JSON.stringify
+// (query-builder.ts:192) encodes them as the literal "null" rather than
+// throwing. Go must match: return "null" (valid JSON that round-trips to nil),
+// NOT the old fmt.Sprintf("%v", v) fallback which wrote bare "NaN"/"+Inf" that
+// FromSQLiteType then panicked on — the same corruption class as the original
+// string-passthrough bug. Panicking here would be wrong too: it would be the
+// first place Go fails where TS succeeds, violating the Go-fails-iff-TS-fails
+// invariant. (Unreachable for real json-column values, which come from
+// json.Unmarshal and never hold non-finite floats, but kept symmetric.)
+func TestToSQLiteType_JSONMarshalFailureMatchesTS(t *testing.T) {
+	for _, v := range []interface{}{math.NaN(), math.Inf(1), math.Inf(-1)} {
+		t.Run(fmt.Sprintf("%v", v), func(t *testing.T) {
+			out := ToSQLiteType(v, "json")
+			if out != "null" {
+				t.Fatalf("ToSQLiteType(%v, json) = %#v, want \"null\" (matching JSON.stringify(NaN/Inf))", v, out)
+			}
+			// Must re-read without panicking (the old "NaN" fallback panicked here).
+			if got := FromSQLiteType(out, "json"); got != nil {
+				t.Fatalf("FromSQLiteType(%#v, json) = %#v, want nil", out, got)
+			}
+		})
+	}
 }
 
 // deepEqual is a minimal deep-equality check for interface{} values
