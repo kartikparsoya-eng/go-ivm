@@ -570,6 +570,19 @@ func (s *Source) PrimaryKey() []string { return s.primaryKey }
 // arriving from msgpack (numbers as float64, no type fidelity) ends up
 // shaped the same as a row read from this Source's Fetch. Unknown
 // columns are left as-is — TS MemorySource has the same behavior.
+//
+// json columns are deliberately skipped. This mirrors TS's coerce-once model:
+// fromSQLiteType (the strict JSON.parse) runs ONLY at the SQLite-read boundary
+// (table-source.ts #fetch/#pull → fromSQLiteTypes), and the snapshotter runs it
+// before shipping over the wire (snapshotter.ts:577-581). TS's push path then
+// consumes the incoming change row AS-IS — genPush/#writeChange never re-coerce
+// with fromSQLiteType. So by the time a json value reaches this Go wire-normalize
+// path it is ALREADY parsed: a json scalar string like "Payment Failures" arrives
+// as a bare Go string, not as JSON text. Re-running FromSQLiteType's strict parse
+// on it would panic (W1). Passing it through unchanged is both panic-free and
+// behavior-identical to the old code for every other json shape (objects, arrays,
+// numbers, bools, null already hit FromSQLiteType's json default: return v). The
+// strict parse stays where it belongs — the SQLite-read boundary in scanRows.
 func (s *Source) NormalizeRow(row ivm.Row) {
 	if row == nil {
 		return
@@ -577,6 +590,9 @@ func (s *Source) NormalizeRow(row ivm.Row) {
 	for col, val := range row {
 		cs, ok := s.columns[col]
 		if !ok {
+			continue
+		}
+		if cs.Type == "json" {
 			continue
 		}
 		row[col] = sqlite.FromSQLiteType(val, cs.Type)

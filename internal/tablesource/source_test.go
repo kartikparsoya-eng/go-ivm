@@ -83,6 +83,43 @@ func newUserSource(t *testing.T) (*Source, *sql.DB) {
 	return src, db
 }
 
+// newJSONSource builds a Source over a docs(id, payload) table whose payload is
+// a json column, for exercising the json-coercion boundary in NormalizeRow.
+func newJSONSource(t *testing.T) (*Source, *sql.DB) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "replica.sqlite")
+	w, err := sql.Open("sqlite3", path)
+	if err != nil {
+		t.Fatalf("seed open: %v", err)
+	}
+	for _, stmt := range []string{
+		"PRAGMA journal_mode=WAL",
+		`CREATE TABLE docs (id INTEGER PRIMARY KEY, payload TEXT)`,
+	} {
+		if _, err := w.Exec(stmt); err != nil {
+			w.Close()
+			t.Fatalf("seed exec %q: %v", stmt, err)
+		}
+	}
+	w.Close()
+
+	db, err := Open(path, OpenOptions{})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	wdb := openWritableForTest(t, path)
+	t.Cleanup(func() { wdb.Close() })
+	src, err := New(db, wdb, "docs", map[string]sqlite.ColumnSchema{
+		"id":      {Type: "number"},
+		"payload": {Type: "json"},
+	}, []string{"id"})
+	if err != nil {
+		db.Close()
+		t.Fatalf("New: %v", err)
+	}
+	return src, db
+}
+
 func TestNewRejectsUnknownTable(t *testing.T) {
 	path := seedTypedReplica(t)
 	db, err := Open(path, OpenOptions{})
@@ -163,6 +200,48 @@ func TestNormalizeRow(t *testing.T) {
 	}
 	if row["junk"] != "ignored" {
 		t.Errorf("junk = %#v, want ignored (untouched)", row["junk"])
+	}
+}
+
+// TestNormalizeRow_JSONAlreadyParsedNoReparse is the W1 regression. json values
+// arrive over the wire ALREADY parsed: TS's snapshotter runs fromSQLiteTypes
+// before shipping (snapshotter.ts:577-581) and TS's push path consumes the
+// change row AS-IS without re-coercing (table-source.ts genPush/#writeChange
+// never call fromSQLiteType). So a json scalar string like "Payment Failures"
+// reaches Go as a bare string, NOT as JSON text. NormalizeRow must pass it
+// through unchanged — re-running FromSQLiteType's strict JSON.parse on it would
+// panic. Every other json shape must also pass through, and non-json columns
+// must still be re-boxed (int64 → float64).
+func TestNormalizeRow_JSONAlreadyParsedNoReparse(t *testing.T) {
+	src, db := newJSONSource(t)
+	defer db.Close()
+
+	cases := []struct {
+		name    string
+		payload any
+	}{
+		{"scalar string", "Payment Failures"}, // the W1 panic case
+		{"scalar string that looks quoted", `"quoted"`},
+		{"object", map[string]any{"k": "v"}},
+		{"array", []any{float64(1), float64(2)}},
+		{"number", float64(42)},
+		{"bool", true},
+		{"null", nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			row := ivm.Row{"id": int64(1), "payload": tc.payload}
+			// Must not panic.
+			src.NormalizeRow(row)
+			if !reflect.DeepEqual(row["payload"], tc.payload) {
+				t.Errorf("payload = %#v, want %#v (passed through unchanged)",
+					row["payload"], tc.payload)
+			}
+			// Non-json column is still normalized: int64 → float64.
+			if row["id"] != float64(1) {
+				t.Errorf("id = %#v, want float64(1)", row["id"])
+			}
+		})
 	}
 }
 
