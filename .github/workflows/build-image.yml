@@ -2,7 +2,7 @@ name: Build & publish sidecar image
 
 on:
   push:
-    branches: [main, feat/snapshotter-in-go]
+    branches: [main, feat/snapshotter-in-go, feat/streaming-hydrate]
     tags: ['v*']
   pull_request:
     branches: [main]
