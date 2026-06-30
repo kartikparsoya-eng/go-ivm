@@ -289,6 +289,52 @@ func TestToSQLiteType_JSONMarshalFailureMatchesTS(t *testing.T) {
 	}
 }
 
+// TestJSONWriteReadRoundTrip_AllShapes is the cross-boundary fidelity guard for
+// the SQLite write↔read boundary: for EVERY json value shape, the value must
+// survive ToSQLiteType (write) → FromSQLiteType (read) byte-for-byte unchanged.
+// The original string-passthrough bug was ONE shape (a scalar string) silently
+// diverging; this asserts the whole shape space round-trips, so a future change
+// to either half that breaks any shape fails loudly here. Mirrors TS, where
+// toSQLiteType (JSON.stringify, query-builder.ts:192) and fromSQLiteType
+// (JSON.parse, table-source.ts:633) are exact inverses. The stored form must
+// ALWAYS be JSON text (a Go string) — never a bare passthrough value, which is
+// exactly the invariant the bug violated.
+func TestJSONWriteReadRoundTrip_AllShapes(t *testing.T) {
+	shapes := []struct {
+		name string
+		v    interface{}
+	}{
+		{"scalar string (the bug class)", "Payment Failures"},
+		{"scalar string with embedded quotes", `he said "hi"`},
+		{"empty string", ""},
+		{"scalar number", float64(42)},
+		{"scalar bool true", true},
+		{"scalar bool false", false},
+		{"object", map[string]interface{}{"a": float64(1), "b": "x"}},
+		{"array", []interface{}{float64(1), "two", true}},
+		{"nested", map[string]interface{}{"o": map[string]interface{}{"k": []interface{}{float64(1), float64(2)}}}},
+		{"empty object", map[string]interface{}{}},
+		{"empty array", []interface{}{}},
+	}
+	for _, s := range shapes {
+		t.Run(s.name, func(t *testing.T) {
+			stored := ToSQLiteType(s.v, "json")
+			if _, ok := stored.(string); !ok {
+				t.Fatalf("ToSQLiteType(%#v, json) = %T, want string (JSON text — never a bare passthrough)", s.v, stored)
+			}
+			got := FromSQLiteType(stored, "json")
+			if !deepEqual(got, s.v) {
+				t.Fatalf("round-trip mismatch for %s: FromSQLiteType(ToSQLiteType(%#v)) = %#v", s.name, s.v, got)
+			}
+		})
+	}
+	// nil short-circuits in ToSQLiteType (stored as SQL NULL), so it never
+	// reaches the json marshal path; assert that explicitly.
+	if got := ToSQLiteType(nil, "json"); got != nil {
+		t.Fatalf("ToSQLiteType(nil, json) = %#v, want nil", got)
+	}
+}
+
 // deepEqual is a minimal deep-equality check for interface{} values
 // covering maps, slices, and scalars. We avoid reflect.DeepEqual because
 // msgpack-decoded maps have type map[string]interface{} which

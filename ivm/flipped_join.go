@@ -246,9 +246,9 @@ func (fj *FlippedJoin) Fetch(req FetchRequest) []Node {
 			captured := overlaidRelatedChildNodes
 			nodeOut := Node{
 				Row: minParentNode.Row,
-				Relationships: mergeRelationshipMaps(minParentNode.Relationships, Relationships{
+				Relationships: mergeRelationshipMaps(Relationships{
 					fj.relationshipName: func() []Node { return captured },
-				}),
+				}, minParentNode.Relationships),
 			}
 			result = append(result, nodeOut)
 		}
@@ -320,9 +320,9 @@ func (fj *FlippedJoin) pushChildChange(change Change, exists bool) []Change {
 		if exists {
 			outNode := Node{
 				Row: parentNode.Row,
-				Relationships: mergeRelationshipMaps(parentNode.Relationships, Relationships{
+				Relationships: mergeRelationshipMaps(Relationships{
 					fj.relationshipName: childNodeStream,
-				}),
+				}, parentNode.Relationships),
 			}
 			outChange := MakeChildChange(outNode, ChildData{
 				RelationshipName: fj.relationshipName,
@@ -332,9 +332,9 @@ func (fj *FlippedJoin) pushChildChange(change Change, exists bool) []Change {
 		} else {
 			outNode := Node{
 				Row: parentNode.Row,
-				Relationships: mergeRelationshipMaps(parentNode.Relationships, Relationships{
+				Relationships: mergeRelationshipMaps(Relationships{
 					fj.relationshipName: func() []Node { return []Node{change.Node} },
-				}),
+				}, parentNode.Relationships),
 			}
 			var outChange Change
 			if change.Type == ChangeTypeAdd {
@@ -374,9 +374,9 @@ func (fj *FlippedJoin) pushParent(change Change) []Change {
 	flip := func(node Node) Node {
 		return Node{
 			Row: node.Row,
-			Relationships: mergeRelationshipMaps(node.Relationships, Relationships{
+			Relationships: mergeRelationshipMaps(Relationships{
 				fj.relationshipName: childNodeStream(node),
-			}),
+			}, node.Relationships),
 		}
 	}
 

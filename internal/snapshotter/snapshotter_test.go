@@ -583,3 +583,29 @@ func TestCoerceRow_MatchesFromSQLiteType(t *testing.T) {
 		}
 	}
 }
+
+// TestParseRowKey_RawScalarsNoCoercion guards the rowKey boundary's DELIBERATE
+// divergence from the row boundary. The change-log rowKey is emitted by TS
+// verbatim (raw JSON), NOT through fromSQLiteTypes (see jsonRow's doc: "the
+// rowKey carries raw JSON-decoded scalars"). So Go must parse it as plain JSON
+// and must NOT run the values through FromSQLiteType: a string PK stays a
+// string, a numeric PK stays a JSON number (float64), a bool stays a bool.
+// Coercing here (e.g. boolean→!!v, or json re-parse) would desync Go's rowKey
+// from TS's and break change-log key matching. Invalid JSON must error, not panic.
+func TestParseRowKey_RawScalarsNoCoercion(t *testing.T) {
+	m, err := parseRowKey(`{"id":"abc","seq":42,"flag":true}`)
+	if err != nil {
+		t.Fatalf("parseRowKey: %v", err)
+	}
+	row := jsonRow(m)
+	want := ivm.Row{"id": "abc", "seq": float64(42), "flag": true}
+	for k, wv := range want {
+		if row[k] != wv {
+			t.Errorf("rowKey[%s] = %#v (%T), want %#v (%T) — rowKey must be raw, not coerced",
+				k, row[k], row[k], wv, wv)
+		}
+	}
+	if _, err := parseRowKey(`{not valid json`); err == nil {
+		t.Fatalf("parseRowKey on invalid JSON should return an error, not panic or succeed")
+	}
+}

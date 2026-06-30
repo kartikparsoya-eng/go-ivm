@@ -1,5 +1,7 @@
 package ivm
 
+import "fmt"
+
 // Pushes accumulated changes from fan-out/fan-in sub-graphs,
 // collapsing duplicates and enforcing invariants.
 
@@ -25,6 +27,14 @@ func PushAccumulatedChanges(
 	// Collapse down to a single change per type
 	candidatesToPush := make(map[ChangeType]Change)
 	for _, change := range accumulatedPushes {
+		// Source: push-accumulated.ts:104-113 — when the fan-out change was a
+		// CHILD, any non-child result type must be unique (at most one add / one
+		// remove). A second occurrence signals a fan-in invariant breach.
+		if fanOutChangeType == ChangeTypeChild && change.Type != ChangeTypeChild {
+			if _, has := candidatesToPush[change.Type]; has {
+				panic(fmt.Sprintf("Fan-in:child expected at most one %v when fan-out is of type child", change.Type))
+			}
+		}
 		existing, exists := candidatesToPush[change.Type]
 		mergedChange := change
 		if exists {
@@ -35,20 +45,31 @@ func PushAccumulatedChanges(
 
 	switch fanOutChangeType {
 	case ChangeTypeRemove:
+		// Source: push-accumulated.ts:139-142 — a REMOVE fan-out must yield only
+		// removes (types.length === 1 && types[0] === REMOVE).
 		c, ok := candidatesToPush[ChangeTypeRemove]
-		if !ok {
-			panic("pushAccumulatedChanges: REMOVE expected but not found in candidates")
+		if len(candidatesToPush) != 1 || !ok {
+			panic("Fan-in:remove expected all removes")
 		}
 		return output.Push(addEmptyRelationships(c), pusher)
 
 	case ChangeTypeAdd:
+		// Source: push-accumulated.ts:149-152 — an ADD fan-out must yield only
+		// adds (types.length === 1 && types[0] === ADD).
 		c, ok := candidatesToPush[ChangeTypeAdd]
-		if !ok {
-			panic("pushAccumulatedChanges: ADD expected but not found in candidates")
+		if len(candidatesToPush) != 1 || !ok {
+			panic("Fan-in:add expected all adds")
 		}
 		return output.Push(addEmptyRelationships(c), pusher)
 
 	case ChangeTypeEdit:
+		// Source: push-accumulated.ts:159-167 — an EDIT fan-out may only yield
+		// adds, removes, or edits.
+		for ct := range candidatesToPush {
+			if ct != ChangeTypeAdd && ct != ChangeTypeRemove && ct != ChangeTypeEdit {
+				panic("Fan-in:edit expected all adds, removes, or edits")
+			}
+		}
 		addChange, hasAdd := candidatesToPush[ChangeTypeAdd]
 		removeChange, hasRemove := candidatesToPush[ChangeTypeRemove]
 		editChange, hasEdit := candidatesToPush[ChangeTypeEdit]
@@ -84,6 +105,16 @@ func PushAccumulatedChanges(
 		panic("PushAccumulated EDIT: expected hasEdit||hasAdd||hasRemove, got none")
 
 	case ChangeTypeChild:
+		// Source: push-accumulated.ts:222-234 — a CHILD fan-out may only yield
+		// adds, removes, or children, and at most two distinct types.
+		for ct := range candidatesToPush {
+			if ct != ChangeTypeAdd && ct != ChangeTypeRemove && ct != ChangeTypeChild {
+				panic("Fan-in:child expected all adds, removes, or children")
+			}
+		}
+		if len(candidatesToPush) > 2 {
+			panic("Fan-in:child expected at most 2 types on a child change from fan-out")
+		}
 		// Child takes precedence
 		childChange, hasChild := candidatesToPush[ChangeTypeChild]
 		if hasChild {
@@ -125,6 +156,10 @@ func MergeRelationships(left, right Change) Change {
 				Relationships: mergeRelationshipMaps(left.Node.Relationships, right.Node.Relationships),
 			})
 		case ChangeTypeEdit:
+			// Source: push-accumulated.ts:290-294.
+			if right.Type != ChangeTypeEdit {
+				panic("mergeRelationships: when left.type is edit and types match, right.type must be edit")
+			}
 			return MakeEditChange(
 				Node{
 					Row:           left.Node.Row,
@@ -136,6 +171,10 @@ func MergeRelationships(left, right Change) Change {
 				},
 			)
 		case ChangeTypeChild:
+			// Source: push-accumulated.ts:317-321.
+			if right.Type != ChangeTypeChild {
+				panic("mergeRelationships: when left.type is child and types match, right.type must be child")
+			}
 			return MakeChildChange(
 				Node{
 					Row:           left.Node.Row,
@@ -146,7 +185,11 @@ func MergeRelationships(left, right Change) Change {
 		}
 	}
 
-	// Types differ — left must be edit
+	// Types differ — left must be edit.
+	// Source: push-accumulated.ts:337-341.
+	if left.Type != ChangeTypeEdit {
+		panic(fmt.Sprintf("mergeRelationships: when types differ, left.type must be edit, got left.type=%v right.type=%v", left.Type, right.Type))
+	}
 	switch right.Type {
 	case ChangeTypeAdd:
 		return MakeEditChange(

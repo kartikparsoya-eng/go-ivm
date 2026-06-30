@@ -119,6 +119,46 @@ func newJSONSource(t *testing.T) (*Source, *sql.DB) {
 	return src, db
 }
 
+// newAllTypesSource builds a Source over a table exercising every Zero value
+// type (number, boolean, string, json) so NormalizeRow can be checked across
+// the full type space in one fixture.
+func newAllTypesSource(t *testing.T) (*Source, *sql.DB) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "replica.sqlite")
+	w, err := sql.Open("sqlite3", path)
+	if err != nil {
+		t.Fatalf("seed open: %v", err)
+	}
+	for _, stmt := range []string{
+		"PRAGMA journal_mode=WAL",
+		`CREATE TABLE allt (id INTEGER PRIMARY KEY, flag INTEGER, name TEXT, payload TEXT)`,
+	} {
+		if _, err := w.Exec(stmt); err != nil {
+			w.Close()
+			t.Fatalf("seed exec %q: %v", stmt, err)
+		}
+	}
+	w.Close()
+
+	db, err := Open(path, OpenOptions{})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	wdb := openWritableForTest(t, path)
+	t.Cleanup(func() { wdb.Close() })
+	src, err := New(db, wdb, "allt", map[string]sqlite.ColumnSchema{
+		"id":      {Type: "number"},
+		"flag":    {Type: "boolean"},
+		"name":    {Type: "string"},
+		"payload": {Type: "json"},
+	}, []string{"id"})
+	if err != nil {
+		db.Close()
+		t.Fatalf("New: %v", err)
+	}
+	return src, db
+}
+
 func TestNewRejectsUnknownTable(t *testing.T) {
 	path := seedTypedReplica(t)
 	db, err := Open(path, OpenOptions{})
@@ -239,6 +279,53 @@ func TestNormalizeRow_JSONAlreadyParsedNoReparse(t *testing.T) {
 			// Non-json column is still normalized: int64 → float64.
 			if row["id"] != float64(1) {
 				t.Errorf("id = %#v, want float64(1)", row["id"])
+			}
+		})
+	}
+}
+
+// TestNormalizeRow_IdempotentOnCanonicalRows is the master guard against the
+// whole bug class — a value's shape silently diverging between the init/read
+// path and the wire/advance path. The invariant: NormalizeRow is a NO-OP on an
+// already-canonical row (every value is exactly what FromSQLiteType — the
+// SQLite-read boundary and the snapshotter's emit — produces). TS reaches the
+// same property structurally via coerce-once: fromSQLiteType runs only at read,
+// and the push path consumes rows as-is. If normalization ever re-mangles a
+// canonical value for ANY type, init and advance rows would carry mismatched
+// per-column shapes and dedup/compare would silently corrupt — this fails loud
+// instead. The canonical values are DERIVED by running FromSQLiteType, so the
+// test tracks the real coercion rather than a hand-copied guess that could drift.
+func TestNormalizeRow_IdempotentOnCanonicalRows(t *testing.T) {
+	src, db := newAllTypesSource(t)
+	defer db.Close()
+
+	jsonShapes := []struct {
+		name string
+		raw  string // JSON text as stored in the SQLite json column
+	}{
+		{"json scalar string (the bug class)", `"Payment Failures"`},
+		{"json object", `{"k":"v","n":3}`},
+		{"json array", `[1,"two",true]`},
+		{"json number", `42`},
+		{"json bool", `true`},
+		{"json null", `null`},
+	}
+	for _, js := range jsonShapes {
+		t.Run(js.name, func(t *testing.T) {
+			canonical := ivm.Row{
+				"id":      sqlite.FromSQLiteType(int64(7), "number"),
+				"flag":    sqlite.FromSQLiteType(int64(1), "boolean"),
+				"name":    sqlite.FromSQLiteType("dave", "string"),
+				"payload": sqlite.FromSQLiteType(js.raw, "json"),
+			}
+			// NormalizeRow mutates in place, so normalize a clone and compare.
+			got := make(ivm.Row, len(canonical))
+			for k, v := range canonical {
+				got[k] = v
+			}
+			src.NormalizeRow(got) // must not panic, must not change anything
+			if !reflect.DeepEqual(got, canonical) {
+				t.Fatalf("NormalizeRow mutated a canonical row:\n got  %#v\n want %#v", got, canonical)
 			}
 		})
 	}

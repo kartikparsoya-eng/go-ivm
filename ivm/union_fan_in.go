@@ -1,16 +1,18 @@
 package ivm
 
+import "reflect"
+
 // UnionFanIn merges results from multiple OR-condition branches back together,
 // deduplicating rows that appear in multiple branches.
 
 // UnionFanIn implements Operator. It receives pushes from multiple branches
 // that share a UnionFanOut, and merges/deduplicates them.
 type UnionFanIn struct {
-	inputs             []Input
-	schema             *SourceSchema
-	fanOutPushStarted  bool
-	output             Output
-	accumulatedPushes  []Change
+	inputs            []Input
+	schema            *SourceSchema
+	fanOutPushStarted bool
+	output            Output
+	accumulatedPushes []Change
 }
 
 func NewUnionFanIn(fanOut *UnionFanOut, inputs []Input) *UnionFanIn {
@@ -31,11 +33,18 @@ func NewUnionFanIn(fanOut *UnionFanOut, inputs []Input) *UnionFanIn {
 		if fanOutSchema.TableName != inputSchema.TableName {
 			panic("Table name mismatch in union fan-in")
 		}
-		if len(fanOutSchema.PrimaryKey) != len(inputSchema.PrimaryKey) {
+		if !reflect.DeepEqual(fanOutSchema.PrimaryKey, inputSchema.PrimaryKey) {
 			panic("Primary key mismatch in union fan-in")
 		}
 		if fanOutSchema.System != inputSchema.System {
 			panic("System mismatch in union fan-in")
+		}
+		if (fanOutSchema.CompareRows == nil) != (inputSchema.CompareRows == nil) ||
+			(fanOutSchema.CompareRows != nil && reflect.ValueOf(fanOutSchema.CompareRows).Pointer() != reflect.ValueOf(inputSchema.CompareRows).Pointer()) {
+			panic("compareRows mismatch in union fan-in")
+		}
+		if !reflect.DeepEqual(fanOutSchema.Sort, inputSchema.Sort) {
+			panic("Sort mismatch in union fan-in")
 		}
 
 		for relName, relSchema := range inputSchema.Relationships {

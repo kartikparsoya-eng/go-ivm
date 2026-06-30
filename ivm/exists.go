@@ -243,6 +243,12 @@ func (e *Exists) pushWithFilter(change Change, exists *bool) []Change {
 }
 
 // fetchExists — checks if relationship has any nodes.
+//
+// Mirrors exists.ts:241-246. While it seems like this should be able to
+// fetch just 1 node to check for exists, we can't because Take does not
+// support early return during initial fetch — so we drain the full
+// relationship via fetchSize (a counting loop, no slice allocation) rather
+// than pulling one element.
 func (e *Exists) fetchExists(node Node) bool {
 	return e.fetchSize(node) > 0
 }
