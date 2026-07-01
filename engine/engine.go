@@ -9,9 +9,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"iter"
 	"os"
-	"slices"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -1439,10 +1437,12 @@ type pipelineOutput struct {
 }
 
 func (po *pipelineOutput) Push(change ivm.Change, pusher ivm.InputBase) []ivm.Change {
-	// Materialize relationships eagerly (like TS Catch.expandNode does during push).
-	// This captures the relationship state while the overlay is still active.
-	materialized := materializeChange(change)
-	po.engine.streamer.Accumulate(po.queryID, po.schema, []ivm.Change{materialized})
+	// Flatten-in-push (DESIGN-streaming-advance.md): Accumulate flattens the
+	// change tree to RowChanges NOW, while Output.Push is on the stack and the
+	// mutation overlay + join in-progress child state are still live (§3). No
+	// eager materializeChange deep-copy — streamNodesInto walks the lazy
+	// relationship closures directly, matching TS's #streamNodes generator.
+	po.engine.streamer.Accumulate(po.queryID, po.schema, []ivm.Change{change})
 	return nil
 }
 
@@ -1506,44 +1506,6 @@ func scalarValuesEqual(a, b ivm.Value) (eq bool) {
 		}
 	}()
 	return a == b
-}
-
-// materializeChange eagerly evaluates all lazy relationship closures in a change.
-func materializeChange(change ivm.Change) ivm.Change {
-	result := ivm.Change{
-		Type:  change.Type,
-		Child: change.Child,
-	}
-	result.Node = materializeNode(change.Node)
-	if change.OldNode != nil {
-		old := materializeNode(*change.OldNode)
-		result.OldNode = &old
-	}
-	return result
-}
-
-// materializeNode evaluates lazy relationship closures and returns a node with concrete data.
-func materializeNode(node ivm.Node) ivm.Node {
-	result := ivm.Node{Row: node.Row}
-	if node.Relationships != nil {
-		result.Relationships = make(map[string]func() iter.Seq[ivm.Node], len(node.Relationships))
-		for relName, fn := range node.Relationships {
-			// Evaluate the closure NOW (while overlay is active)
-			var children []ivm.Node
-			if seq := fn(); seq != nil {
-				children = slices.Collect(seq)
-			}
-			// Recursively materialize children
-			materialized := make([]ivm.Node, len(children))
-			for i, child := range children {
-				materialized[i] = materializeNode(child)
-			}
-			// Capture in a non-lazy closure
-			captured := materialized
-			result.Relationships[relName] = func() iter.Seq[ivm.Node] { return slices.Values(captured) }
-		}
-	}
-	return result
 }
 
 // --- engineDelegate implements builder.Delegate ---

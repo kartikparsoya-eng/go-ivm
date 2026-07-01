@@ -47,6 +47,13 @@ type RowChange struct {
 // Streamer accumulates IVM changes and flattens them to RowChanges.
 // Thread-safe: Accumulate may be called concurrently from parallel pipelines.
 //
+// Flatten-in-push (DESIGN-streaming-advance.md): Accumulate flattens each
+// change tree to RowChanges SYNCHRONOUSLY, while the caller's Output.Push is
+// still on the stack and the mutation overlay + join in-progress state are
+// live (§3). This deletes the eager materializeChange deep-copy and the
+// Nodes-then-RowChanges double-hold, matching TS's #streamNodes generator
+// (pipeline-driver.ts:6022-6024) which flattens inside the push loop.
+//
 // Ordering contract (D8):
 //   - Changes within a single Accumulate call preserve their input slice
 //     order in the Stream() output.
@@ -59,14 +66,8 @@ type RowChange struct {
 //     comparators) MUST sort by a stable key (queryID, table, rowKey, type
 //     in TS's #shadowCompare).
 type Streamer struct {
-	mu          sync.Mutex
-	accumulated []accEntry
-}
-
-type accEntry struct {
-	queryID string
-	schema  *ivm.SourceSchema
-	changes []ivm.Change
+	mu   sync.Mutex
+	rows []RowChange
 }
 
 // NewStreamer creates a new Streamer.
@@ -74,32 +75,29 @@ func NewStreamer() *Streamer {
 	return &Streamer{}
 }
 
-// Accumulate stores IVM changes for later flattening.
-// Called by each pipeline's output handler during push.
+// Accumulate flattens IVM changes to RowChanges immediately — while the
+// overlay and join push-scoped state are still live (DESIGN-streaming-advance
+// §3). Called by each pipeline's output handler during push; the flatten
+// runs on the caller's goroutine, parallelizing across push pipelines.
 func (s *Streamer) Accumulate(queryID string, schema *ivm.SourceSchema, changes []ivm.Change) {
+	flat := streamChanges(queryID, schema, changes)
+	if len(flat) == 0 {
+		return
+	}
 	s.mu.Lock()
-	s.accumulated = append(s.accumulated, accEntry{
-		queryID: queryID,
-		schema:  schema,
-		changes: changes,
-	})
+	s.rows = append(s.rows, flat...)
 	s.mu.Unlock()
 }
 
-// Stream flattens all accumulated changes into RowChanges.
+// Stream drains all accumulated RowChanges. After this call the Streamer
+// is empty; the next Accumulate re-allocates. Hand-off: ownership of the
+// backing slice transfers to the caller.
 func (s *Streamer) Stream() []RowChange {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
-	var result []RowChange
-	for _, entry := range s.accumulated {
-		result = append(result, streamChanges(entry.queryID, entry.schema, entry.changes)...)
-	}
-	// Parallelism review LOW-3: drop the backing array so a one-time large
-	// advance doesn't permanently retain memory. The next Accumulate will
-	// allocate a fresh small slice.
-	s.accumulated = nil
-	return result
+	out := s.rows
+	s.rows = nil
+	return out
 }
 
 // streamChanges recursively flattens IVM changes.
