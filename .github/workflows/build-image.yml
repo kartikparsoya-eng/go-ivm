@@ -98,12 +98,17 @@ jobs:
   # so the workflow stays green during initial setup.
   notify-downstream:
     needs: build
-    # Only a feat/snapshotter-in-go publish should rebuild the mono
-    # feat/snapshotter-in-go image — that's the branch whose tablesrc
-    # image bundles THIS branch's binary. main/tag pushes publish
-    # go-ivm:latest for other lineages and must not retag the feat image
-    # with a mismatched binary. PRs and forks never carry the secret.
-    if: github.event_name == 'push' && github.ref == 'refs/heads/feat/snapshotter-in-go'
+    # A publish from EITHER Go-primary feature branch should rebuild the
+    # mono feat/snapshotter-in-go image — its build matrix bundles a
+    # different go-ivm binary per variant: feat/snapshotter-in-go feeds
+    # tablesrc + shadow-tablesrc, feat/streaming-hydrate feeds
+    # streaming-tablesrc. main/tag pushes publish go-ivm:latest for other
+    # lineages and must not retag the feat images with a mismatched
+    # binary. PRs and forks never carry the secret.
+    if: >-
+      github.event_name == 'push' &&
+      (github.ref == 'refs/heads/feat/snapshotter-in-go' ||
+      github.ref == 'refs/heads/feat/streaming-hydrate')
     runs-on: ubuntu-latest
     steps:
       - name: Trigger mono-better build on feat/snapshotter-in-go (workflow_dispatch)
