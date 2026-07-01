@@ -13,6 +13,7 @@ import (
 	"sort"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/kartikparsoya-eng/go-ivm/builder"
 	"github.com/kartikparsoya-eng/go-ivm/ivm"
@@ -362,5 +363,182 @@ func TestAddQueriesStream_TotalRowsMatchNonStreaming(t *testing.T) {
 	}
 	if streamRows != totalN {
 		t.Fatalf("expected %d rows, got %d", totalN, streamRows)
+	}
+}
+
+// TestStreamingChunkSizeComparison measures the Go-side effect of chunk size
+// on streaming granularity: frame count, time-to-first-chunk, and total time.
+// Uses 1000 rows so chunk=100 produces 10+ frames while chunk=10000 produces
+// 1 (the terminal frame). This isolates the Go emit side; it does NOT reflect
+// client-visible latency, which is gated downstream by CURSOR_PAGE_SIZE in
+// view-syncer.ts (the consumer batches every 10000 deduped rows before poking
+// the WebSocket).
+func TestStreamingChunkSizeComparison(t *testing.T) {
+	const rowCount = 1000
+
+	for _, size := range []int{100, 10000} {
+		t.Run(fmt.Sprintf("chunk=%d", size), func(t *testing.T) {
+			withChunkSize(t, size)
+			eng, _ := newStreamingTestEngine(t, rowCount)
+
+			var mu sync.Mutex
+			var chunks []QueryResult
+			var firstChunkAt time.Time
+			start := time.Now()
+
+			err := eng.AddQueriesStream([]QuerySpec{simpleQuery("q1")}, func(r QueryResult) {
+				mu.Lock()
+				if firstChunkAt.IsZero() {
+					firstChunkAt = time.Now()
+				}
+				cp := make([]RowChange, len(r.Changes))
+				copy(cp, r.Changes)
+				r.Changes = cp
+				chunks = append(chunks, r)
+				mu.Unlock()
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			elapsed := time.Since(start)
+			ttc := firstChunkAt.Sub(start)
+
+			t.Logf("chunk=%-6d  frames=%-4d  rows=%-4d  time-to-first=%-12v  total=%v",
+				size, len(chunks), totalRows(chunks), ttc, elapsed)
+
+			if totalRows(chunks) != rowCount {
+				t.Fatalf("row count mismatch: got %d, want %d", totalRows(chunks), rowCount)
+			}
+			if size == 100 && len(chunks) < 10 {
+				t.Fatalf("chunk=100 expected >=10 frames for 1000 rows, got %d", len(chunks))
+			}
+			if size == 10000 && len(chunks) != 1 {
+				t.Fatalf("chunk=10000 expected 1 frame for 1000 rows, got %d", len(chunks))
+			}
+		})
+	}
+}
+
+// simulateHydratePipeline models the TWO-stage streaming pipeline end-to-end so
+// we can predict client-visible latency without touching the live container.
+//
+// Stage 1 — Go sidecar (engine.go AddQueriesStream): fetches rowCount rows and
+// emits a partial frame every goChunk rows (engine.go:901 `len(chunk) >=
+// hydrateChunkSize`), plus a terminal frame for the remainder. Each row costs
+// perRowFetchCost — this models the SQLite-cursor read + msgpack serialize that
+// the in-memory MemorySource does NOT incur but dominates real hydrate. The
+// cost is applied per-chunk (n*perRowFetchCost before the chunk is delivered),
+// which is when that chunk becomes visible to TS.
+//
+// Stage 2 — TS view-syncer (#processChanges): accumulates rows in a dedup map
+// and pokes the client via processBatch() every CURSOR_PAGE_SIZE NEW rows
+// (view-syncer.ts:2324 `rows.size % CURSOR_PAGE_SIZE === 0`, where processBatch
+// calls rows.clear() at :2281 so the counter resets each flush), plus a final
+// flush at end-of-stream (:2328 `if (rows.size) processBatch()`). All rows are
+// unique ADDs during hydrate, so the dedup map grows by exactly 1 per row.
+//
+// Returns time-to-first-client-poke and total wall time. The first poke is the
+// real perceived-latency metric (progressive render); the per-poke work is
+// modeled as instant, so the FIRST-flush comparison is the faithful signal and
+// total slightly understates production (ignores updater.received + poke cost).
+func simulateHydratePipeline(rowCount, goChunk, cursorPage int, perRowFetchCost time.Duration) (firstFlush, total time.Duration) {
+	start := time.Now()
+	chunks := make(chan int, 1024) // each value = row count in that delivered chunk
+
+	// Stage 1: Go sidecar producer.
+	go func() {
+		defer close(chunks)
+		remaining := rowCount
+		for remaining > 0 {
+			n := goChunk
+			if n > remaining {
+				n = remaining // terminal partial chunk
+			}
+			time.Sleep(time.Duration(n) * perRowFetchCost) // fetch+serialize n rows
+			chunks <- n
+			remaining -= n
+		}
+	}()
+
+	// Stage 2: TS #processChanges consumer with CURSOR_PAGE_SIZE batching.
+	var firstFlushAt time.Time
+	pending := 0
+	flush := func() {
+		if firstFlushAt.IsZero() {
+			firstFlushAt = time.Now()
+		}
+		pending = 0 // mirrors rows.clear() at view-syncer.ts:2281
+	}
+	for nRows := range chunks {
+		for k := 0; k < nRows; k++ {
+			pending++
+			if pending%cursorPage == 0 { // view-syncer.ts:2324
+				flush()
+			}
+		}
+	}
+	if pending > 0 {
+		flush() // final flush, view-syncer.ts:2328
+	}
+
+	total = time.Since(start)
+	firstFlush = firstFlushAt.Sub(start)
+	return firstFlush, total
+}
+
+// TestClientFlushSimulation_BothLeversRequired proves the key finding: a
+// client-visible streaming win (early first poke) needs BOTH the Go chunk size
+// AND ZERO_CURSOR_PAGE_SIZE lowered. Lowering only one keeps time-to-first-row
+// pinned at full-hydrate time. Models a 1000-row query at 50µs/row (~50ms
+// hydrate — a realistic mid-size result).
+func TestClientFlushSimulation_BothLeversRequired(t *testing.T) {
+	const (
+		rowCount        = 1000
+		perRowFetchCost = 50 * time.Microsecond
+	)
+
+	type combo struct {
+		name             string
+		goChunk          int
+		cursorPage       int
+		expectEarlyFlush bool
+	}
+	combos := []combo{
+		{"go=100   cursor=100  (both low)", 100, 100, true},
+		{"go=100   cursor=10000 (TS coarse)", 100, 10000, false},
+		{"go=10000 cursor=100  (Go coarse)", 10000, 100, false},
+		{"go=10000 cursor=10000 (both high)", 10000, 10000, false},
+	}
+
+	t.Logf("rowCount=%d perRowFetchCost=%v (ideal full hydrate ~%v)",
+		rowCount, perRowFetchCost, time.Duration(rowCount)*perRowFetchCost)
+
+	var bothLowFirst time.Duration
+	for _, c := range combos {
+		firstFlush, total := simulateHydratePipeline(rowCount, c.goChunk, c.cursorPage, perRowFetchCost)
+		pct := float64(firstFlush) / float64(total) * 100
+		t.Logf("%-34s  first-client-poke=%-10v  total=%-10v  (first=%.0f%% of total)",
+			c.name, firstFlush.Round(time.Millisecond), total.Round(time.Millisecond), pct)
+
+		if c.expectEarlyFlush {
+			bothLowFirst = firstFlush
+			// First poke should land near the first Go chunk (~10% of total),
+			// well before the halfway point. Generous bound to absorb sleep jitter.
+			if firstFlush > total/2 {
+				t.Errorf("%s: expected early first poke (<50%% of total), got %.0f%%", c.name, pct)
+			}
+		} else {
+			// First poke pinned at end-of-hydrate: must be in the final 20%.
+			if firstFlush < total*4/5 {
+				t.Errorf("%s: expected late first poke (>80%% of total), got %.0f%%", c.name, pct)
+			}
+		}
+	}
+
+	// The both-low first poke must be dramatically earlier than full hydrate —
+	// this is the entire perceived-latency case for fine-grained streaming.
+	if bothLowFirst > time.Duration(rowCount)*perRowFetchCost/3 {
+		t.Errorf("both-low first poke %v not meaningfully earlier than full hydrate %v",
+			bothLowFirst, time.Duration(rowCount)*perRowFetchCost)
 	}
 }
