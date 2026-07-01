@@ -68,6 +68,16 @@ type RowChange struct {
 type Streamer struct {
 	mu   sync.Mutex
 	rows []RowChange
+	// chunkSink, when non-nil, switches Accumulate into operator-level streaming:
+	// full chunkRows/chunkBytes chunks of a single source-change's fan-out are
+	// handed off DURING the flatten (a 50k-child ADD ships as N frames, not one),
+	// and only the sub-threshold residual coalesces into `rows`. Set by
+	// AdvanceStream for the advance window; nil elsewhere so hydrate/companion
+	// keep slice mode. chunkSink MUST consume its argument synchronously (the
+	// AdvanceStream sink encodes it into a wire frame before returning).
+	chunkSink  func([]RowChange)
+	chunkRows  int
+	chunkBytes int
 }
 
 // NewStreamer creates a new Streamer.
@@ -75,18 +85,68 @@ func NewStreamer() *Streamer {
 	return &Streamer{}
 }
 
+// SetChunkSink switches Accumulate into operator-level streaming mode for the
+// advance window: full chunks (rowLimit rows OR byteLimit estimated bytes) flush
+// via sink mid-flatten. Pass (nil,0,0) to restore slice mode. Call only while the
+// engine lock is held and no push is active (AdvanceStream setup/teardown), so it
+// never races an in-flight Accumulate.
+func (s *Streamer) SetChunkSink(sink func([]RowChange), rowLimit, byteLimit int) {
+	s.mu.Lock()
+	s.chunkSink = sink
+	s.chunkRows = rowLimit
+	s.chunkBytes = byteLimit
+	s.mu.Unlock()
+}
+
 // Accumulate flattens IVM changes to RowChanges immediately — while the
 // overlay and join push-scoped state are still live (DESIGN-streaming-advance
 // §3). Called by each pipeline's output handler during push; the flatten
 // runs on the caller's goroutine, parallelizing across push pipelines.
 func (s *Streamer) Accumulate(queryID string, schema *ivm.SourceSchema, changes []ivm.Change) {
-	flat := streamChanges(queryID, schema, changes)
-	if len(flat) == 0 {
+	s.mu.Lock()
+	sink := s.chunkSink
+	rowLimit := s.chunkRows
+	byteLimit := s.chunkBytes
+	s.mu.Unlock()
+
+	if sink == nil {
+		// Slice mode (hydrate/companion): flatten lock-free, append once.
+		flat := streamChanges(queryID, schema, changes)
+		if len(flat) == 0 {
+			return
+		}
+		s.mu.Lock()
+		s.rows = append(s.rows, flat...)
+		s.mu.Unlock()
 		return
 	}
-	s.mu.Lock()
-	s.rows = append(s.rows, flat...)
-	s.mu.Unlock()
+
+	// Streaming mode (advance): flatten lock-free into a per-goroutine local
+	// buffer; hand full chunks to sink mid-walk so a single source-change's huge
+	// fan-out streams incrementally (peak buffer bounded to a chunk, matching TS
+	// #streamNodes' yield* + poke-every-CURSOR_PAGE_SIZE). The sub-threshold
+	// residual coalesces into rows, drained per source-change by Stream().
+	cap0 := rowLimit
+	if cap0 > 1024 {
+		cap0 = 1024
+	}
+	local := make([]RowChange, 0, cap0)
+	localBytes := 0
+	emit := func(rc RowChange) {
+		local = append(local, rc)
+		localBytes += estimateRowChangeBytes(rc)
+		if len(local) >= rowLimit || localBytes >= byteLimit {
+			sink(local) // consumed synchronously (encoded to a wire frame)
+			local = make([]RowChange, 0, cap0)
+			localBytes = 0
+		}
+	}
+	streamChangesInto(emit, queryID, schema, changes)
+	if len(local) > 0 {
+		s.mu.Lock()
+		s.rows = append(s.rows, local...)
+		s.mu.Unlock()
+	}
 }
 
 // Stream drains all accumulated RowChanges. After this call the Streamer
@@ -100,9 +160,22 @@ func (s *Streamer) Stream() []RowChange {
 	return out
 }
 
-// streamChanges recursively flattens IVM changes.
+// streamChanges recursively flattens IVM changes into a slice. Compat wrapper
+// over streamChangesInto (emit = append) for callers that want the whole result
+// in memory (hydrate, the streamer's residual path).
 func streamChanges(queryID string, schema *ivm.SourceSchema, changes []ivm.Change) []RowChange {
 	var result []RowChange
+	streamChangesInto(func(rc RowChange) { result = append(result, rc) }, queryID, schema, changes)
+	return result
+}
+
+// streamChangesInto recursively flattens IVM changes, emitting each RowChange to
+// `emit` the moment it is produced instead of accumulating a slice. This is the
+// streaming core: callers wanting a slice pass emit = append (streamChanges);
+// the advance path passes an emit that flushes a partial frame at a row/byte
+// threshold, so a single source-change's huge relationship fan-out streams out
+// incrementally — matching TS #streamNodes' yield* (never holds the whole delta).
+func streamChangesInto(emit func(RowChange), queryID string, schema *ivm.SourceSchema, changes []ivm.Change) {
 	for _, change := range changes {
 		// Skip permissions system schemas
 		if schema.System == "permissions" {
@@ -111,9 +184,9 @@ func streamChanges(queryID string, schema *ivm.SourceSchema, changes []ivm.Chang
 
 		switch change.Type {
 		case ivm.ChangeTypeAdd:
-			streamNodesInto(&result, queryID, schema, RowChangeAdd, change.Node)
+			streamNodesInto(emit, queryID, schema, RowChangeAdd, change.Node)
 		case ivm.ChangeTypeRemove:
-			streamNodesInto(&result, queryID, schema, RowChangeRemove, change.Node)
+			streamNodesInto(emit, queryID, schema, RowChangeRemove, change.Node)
 		case ivm.ChangeTypeEdit:
 			// IsScalar guard — mirrors streamNodesInto's check (:180). Without
 			// this, an Edit on a pre-resolved scalar CSQ row is emitted while
@@ -126,7 +199,7 @@ func streamChanges(queryID string, schema *ivm.SourceSchema, changes []ivm.Chang
 			for _, pk := range schema.PrimaryKey {
 				rowKey[pk] = pkValue(change.Node.Row, pk, schema.TableName)
 			}
-			result = append(result, RowChange{
+			emit(RowChange{
 				Type:    RowChangeEdit,
 				QueryID: queryID,
 				Table:   schema.TableName,
@@ -138,12 +211,11 @@ func streamChanges(queryID string, schema *ivm.SourceSchema, changes []ivm.Chang
 			if change.Child != nil && schema.Relationships != nil {
 				childSchema := schema.Relationships[change.Child.RelationshipName]
 				if childSchema != nil {
-					result = append(result, streamChanges(queryID, childSchema, []ivm.Change{change.Child.Change})...)
+					streamChangesInto(emit, queryID, childSchema, []ivm.Change{change.Child.Change})
 				}
 			}
 		}
 	}
-	return result
 }
 
 // streamNodes produces RowChanges for a node and its relationships.
@@ -158,13 +230,13 @@ func streamNodes(queryID string, schema *ivm.SourceSchema, op int, node ivm.Node
 	// relationship values are closures that materialise child nodes, so a
 	// counting pre-walk would fetch every relationship twice.
 	out := make([]RowChange, 0, 1+len(node.Relationships))
-	streamNodesInto(&out, queryID, schema, op, node)
+	streamNodesInto(func(rc RowChange) { out = append(out, rc) }, queryID, schema, op, node)
 	return out
 }
 
 // streamNodesInto appends the RowChanges for a node and its relationships into
 // *out, recursing in place so the entire subtree shares one backing slice.
-func streamNodesInto(out *[]RowChange, queryID string, schema *ivm.SourceSchema, op int, node ivm.Node) {
+func streamNodesInto(emit func(RowChange), queryID string, schema *ivm.SourceSchema, op int, node ivm.Node) {
 	// Skip permission-system rows — mirrors TS pipeline-driver.ts:2101.
 	// streamChanges already guards permissions for top-level Add/Remove, but
 	// the recursive descent into child relationships re-enters here with the
@@ -199,7 +271,7 @@ func streamNodesInto(out *[]RowChange, queryID string, schema *ivm.SourceSchema,
 	if op != RowChangeRemove {
 		rc.Row = node.Row
 	}
-	*out = append(*out, rc)
+	emit(rc)
 
 	if node.Relationships != nil && schema.Relationships != nil {
 		// Iterate relationships in a STABLE order. TS streams them in
@@ -224,7 +296,7 @@ func streamNodesInto(out *[]RowChange, queryID string, schema *ivm.SourceSchema,
 			}
 			if seq := node.Relationships[relName](); seq != nil {
 				for childNode := range seq {
-					streamNodesInto(out, queryID, childSchema, op, childNode)
+					streamNodesInto(emit, queryID, childSchema, op, childNode)
 				}
 			}
 		}

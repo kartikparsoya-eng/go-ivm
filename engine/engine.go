@@ -1246,30 +1246,49 @@ func (e *Engine) AdvanceStream(
 	var timings []TableTiming
 	chunkIndex := 0
 	var drift *ivm.DriftError
+	var flushMu sync.Mutex
 
-	flush := func(final bool) {
+	// sendFrame emits ONE partial/final frame under flushMu so chunkIndex stays
+	// monotonic and frame SEND order matches it — even when parallel push-fanout
+	// goroutines flush mid-flatten chunks (via the streamer's chunkSink)
+	// concurrently. Timings ride the final frame only; drift is set only on the
+	// terminal drift frame (drift is validated pre-fanout, so chunkSink never
+	// fires on a drift path). `changes` is consumed synchronously — the sidecar's
+	// streamW → mpMarshal encodes it into a separate byte buffer before onResult
+	// returns, so callers may reuse the backing array after (T1-5 invariant).
+	sendFrame := func(changes []RowChange, final bool) {
 		var t []TableTiming
 		if final {
 			t = timings
 		}
+		flushMu.Lock()
 		onResult(AdvanceStreamPartial{
-			Changes:    bumpRowVersions(pending, e.minRowVersions),
+			Changes:    bumpRowVersions(changes, e.minRowVersions),
 			ChunkIndex: chunkIndex,
 			Final:      final,
 			Timings:    t,
 			Drift:      drift, // nil unless this is the terminal drift signal
 		})
-		// T1-5: reuse the backing array instead of `pending = nil`. SAFE only
-		// because onResult consumes `Changes` SYNCHRONOUSLY — the sidecar's
-		// streamW → writeFrameLocked → mpMarshal encodes the slice into a
-		// separate byte buffer before this call returns (cmd/sidecar/main.go
-		// streamW). By here the array is no longer referenced downstream.
-		// INVARIANT: if a caller's onResult ever retains Changes past return
-		// (async encode/buffer), revert this to `pending = nil`.
+		chunkIndex++
+		flushMu.Unlock()
+	}
+
+	flush := func(final bool) {
+		sendFrame(pending, final)
 		pending = pending[:0]
 		pendingBytes = 0
-		chunkIndex++
 	}
+
+	// Operator-level streaming (DESIGN-streaming-advance §Win-2): a single
+	// source-change's fan-out flushes full chunks DURING the flatten via the
+	// streamer's chunkSink, so peak buffer is bounded to one chunk instead of the
+	// whole delta (a 50k-child ADD ships as N frames, not one 50k frame — matching
+	// TS #streamNodes yield* + processChanges poke-every-CURSOR_PAGE_SIZE). The
+	// <chunkSize residual coalesces into the streamer's rows and is drained per
+	// source-change below. Cleared on return (under e.mu, before Unlock) so
+	// hydrate/companion Accumulate stay in slice mode.
+	e.streamer.SetChunkSink(func(chunk []RowChange) { sendFrame(chunk, false) }, advanceChunkSize, softChunkBytes)
+	defer e.streamer.SetChunkSink(nil, 0, 0)
 
 	// Non-Drift panic capture: pre-fix this re-raised inline (panic(r)
 	// in the deferred recover), skipping the terminal flush(true) below
