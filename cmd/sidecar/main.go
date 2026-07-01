@@ -2509,8 +2509,10 @@ func main() {
 	if server.advanceDriveEnabled {
 		server.advanceToHeadEnabled = true
 	}
-	// GO_IVM_HYDRATE_READERS>1 enables the cold-start parallel-hydrate reader
-	// pool (drive mode only). Default 1 = legacy single-conn serial hydrate.
+	// GO_IVM_HYDRATE_READERS RAISES the cold-hydrate reader-pool floor above the
+	// default K = hydrateLanes × Cmax. Streaming-by-default (this branch): the
+	// pool is built unconditionally under drive mode, so this env no longer
+	// enables/disables streaming — it only sets a higher K floor.
 	if v := os.Getenv("GO_IVM_HYDRATE_READERS"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 1 {
 			server.hydrateReaders = n
@@ -2524,13 +2526,13 @@ func main() {
 			server.hydrateLanes = n
 		}
 	}
-	// GO_IVM_WARM_HYDRATE_POOL=true extends the parallel-hydrate pool to warm
-	// adds (existing-pipeline CGs). Co-read-only, pinned to curr's current frame.
-	// Off by default; needs HYDRATE_READERS>1 + ADVANCE_DRIVE to do anything.
+	// Warm hydrate (adds on existing-pipeline CGs) now ALSO streams via the
+	// co-read pool by default under drive mode — no GO_IVM_WARM_HYDRATE_POOL gate.
+	// The env is still read for the boot log but no longer gates anything.
 	server.warmHydratePoolEnabled = os.Getenv("GO_IVM_WARM_HYDRATE_POOL") == "true"
 	fmt.Fprintf(os.Stderr,
-		"[GO-IVM] hydrate config: readers=%d lanes=%d warmPool=%v advanceDrive=%v\n",
-		server.hydrateReaders, server.hydrateLanes, server.warmHydratePoolEnabled, server.advanceDriveEnabled)
+		"[GO-IVM] hydrate config: streaming=%v (default-on under drive) readers=%d(floor) lanes=%d advanceDrive=%v\n",
+		server.advanceDriveEnabled, server.hydrateReaders, server.hydrateLanes, server.advanceDriveEnabled)
 	if server.advanceToHeadEnabled {
 		if sourceMode != tablesource.ModeTable {
 			fmt.Fprintln(os.Stderr,

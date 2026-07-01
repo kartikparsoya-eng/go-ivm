@@ -220,7 +220,11 @@ func (s *Server) buildWarmReaderPoolLocked(group *ClientGroup, cmax int) (*table
 	if lanesCmax := s.hydrateLanes * cmax; lanesCmax > k {
 		k = lanesCmax
 	}
-	if !s.warmHydratePoolEnabled || !s.advanceDriveEnabled || k <= 1 {
+	// Streaming-by-default (this branch): warm hydrate also always streams via the
+	// co-read pool — no GO_IVM_WARM_HYDRATE_POOL gate. advanceDrive is still
+	// required (the pool pins to curr's drive-mode frame); k<=1 is unreachable
+	// with the default lanes but kept as a defensive floor.
+	if !s.advanceDriveEnabled || k <= 1 {
 		return nil, nil
 	}
 	if group.snap == nil || group.eng == nil {
@@ -371,9 +375,16 @@ func (s *Server) refreshSnapForInitialHydrateLocked(cgID string, group *ClientGr
 	// itself) reads the init-time frame.
 	group.eng.BindTableSourcesToConn(cur.Conn())
 
-	if s.hydrateReaders <= 1 {
-		return // feature off: serial by design
-	}
+	// Streaming-by-default (this branch): ALWAYS build the frame-pinned reader
+	// pool for cold hydrate so every leaf streams row-at-a-time via
+	// fetchViaPoolStream instead of materializing through fetchForConn. K = P ×
+	// Cmax (buildReaderPoolLocked) sizes it for parallel streaming; with the
+	// default hydrateLanes=4, K ≥ 4 even when GO_IVM_HYDRATE_READERS is unset, so
+	// there is NO readers<=1 eager fallback on the hydrate path. The only eager
+	// (materializing) reader left is fetchForConn on the ADVANCE/overlay path,
+	// where the pool is deliberately torn down (tearDownReaderPool) — it must stay
+	// eager there to splice in-flight pushes (s.overlay). GO_IVM_HYDRATE_READERS
+	// now only RAISES K above P×Cmax; it can no longer disable streaming.
 
 	// Build pool at curr's current (init-time) frame. The coread-fast path
 	// latches K readers to this frame; the converge-fallback path would
