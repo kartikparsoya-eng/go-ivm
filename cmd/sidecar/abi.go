@@ -157,6 +157,15 @@ type abiHost struct {
 	// leak — the whole reason abi.go reuses Server but not main()).
 	reaperCancel context.CancelFunc
 
+	// hcWg tracks the handleConnection goroutine so Shutdown can JOIN it.
+	// Without this, Shutdown returned while handleConnection's deferred
+	// cleanup (writerWg.Wait → close(flushCh) → flusher drain) was still
+	// running — harmless in production (process exit reclaims; the pump
+	// reader that touches the TSFN has already exited via <-h.done) but a
+	// brief goroutine escape that tests observing "host fully torn down"
+	// could race against (full-scale review 2026-07-03).
+	hcWg sync.WaitGroup
+
 	// pprofServer is the in-process pprof endpoint (nil unless
 	// GO_IVM_PPROF_ADDR is set). Same O1 rationale as the reaper: pprof and
 	// the PERF reporter lived only in main(), leaving napi mode blind.
@@ -220,8 +229,14 @@ func startABIHostWithServer(server *Server, deliver func(kind int32, payload []b
 
 	// The production connection handler, verbatim. When either pipe end
 	// closes, its read loop errors out and it tears down exactly as it
-	// would on a socket disconnect.
-	go handleConnection(serverEnd, server)
+	// would on a socket disconnect. Tracked by hcWg so Shutdown can join
+	// its deferred cleanup (which completes only after closeAll unblocks
+	// the workers' respCh sends — hence the wait is AFTER closeAll).
+	h.hcWg.Add(1)
+	go func() {
+		defer h.hcWg.Done()
+		handleConnection(serverEnd, server)
+	}()
 
 	// Send-queue writer: drains sendQ → clientEnd. net.Pipe writes are
 	// synchronous (block until handleConnection's reader consumes), which
@@ -316,4 +331,9 @@ func (h *abiHost) Shutdown() {
 	h.markClosed()
 	<-h.done
 	h.server.closeAll()
+	// Join handleConnection LAST: its deferred cleanup blocks on
+	// writerWg.Wait(), whose writer goroutines unblock only after closeAll
+	// drains the workers' respCh sends. Waiting before closeAll would
+	// deadlock; waiting after guarantees no goroutine outlives Shutdown.
+	h.hcWg.Wait()
 }

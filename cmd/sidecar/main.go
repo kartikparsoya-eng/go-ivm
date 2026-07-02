@@ -739,6 +739,19 @@ type ClientGroup struct {
 	// reaper doesn't need mu.
 	lastUsedNs atomic.Int64
 
+	// sendMu closes the orphaned-respCh race between trySendReq and the
+	// worker's post-done drain (full-scale review 2026-07-03). trySendReq
+	// holds RLock across its done pre-check AND the reqC send; the exiting
+	// worker takes Lock ONCE (a barrier) after its drain grace expires —
+	// waiting out any sender still mid-send — then does a final
+	// non-blocking sweep of reqC. Pre-fix, a sender preempted >50ms between
+	// the pre-check and the select commit could land a request in reqC
+	// AFTER the worker exited: its respCh never got a reader, the
+	// connection's writer goroutine blocked forever, and handleConnection's
+	// writerWg.Wait() hung the teardown. Senders acquiring RLock after the
+	// barrier see done closed at the pre-check and bail deterministically.
+	sendMu sync.RWMutex
+
 	// snap is this group's Snapshotter — the Go-side leapfrog that derives
 	// its own snapshot diff from the replica's changeLog2 (internal/snapshotter).
 	// Non-nil only when GO_IVM_ADVANCE_TO_HEAD=true AND sourceMode==table; the
@@ -1174,15 +1187,14 @@ func (g *ClientGroup) worker(s *Server) {
 			// fall through to handle
 		case <-g.done:
 			// Drain buffered requests with an error so respCh readers
-			// unblock. The grace deadline absorbs a small race window:
+			// unblock. The grace deadline absorbs the common race window:
 			// a trySendReq whose select observed done-not-closed AND
 			// reqC-has-space can commit to the reqC send case AFTER we
-			// noticed done was closed. Without the grace period we'd
-			// exit on `default` and orphan that send (respCh hangs
-			// forever). 50ms is far longer than the goroutine commits
-			// involved, so any racy sender lands in time.
+			// noticed done was closed. 50ms covers any normally-scheduled
+			// sender; the sendMu barrier below covers the pathological one.
 			deadline := time.NewTimer(50 * time.Millisecond)
 			defer deadline.Stop()
+		drain:
 			for {
 				select {
 				case r := <-g.reqC:
@@ -1192,6 +1204,26 @@ func (g *ClientGroup) worker(s *Server) {
 						ID:      r.req.ID,
 					}
 				case <-deadline.C:
+					break drain
+				}
+			}
+			// Barrier: wait out any trySendReq still holding RLock (it will
+			// either commit to reqC or bail via done), then sweep whatever
+			// landed. After this Lock, every future sender's done pre-check
+			// runs strictly after close(done) — deterministically bails — so
+			// nothing can enter reqC once the sweep finishes. Closes the
+			// >50ms-preempted-sender orphan (see ClientGroup.sendMu).
+			g.sendMu.Lock()
+			g.sendMu.Unlock() //nolint:staticcheck // empty critical section IS the barrier
+			for {
+				select {
+				case r := <-g.reqC:
+					r.respCh <- RPCResponse{
+						JSONRPC: "2.0",
+						Error:   &RPCError{Code: -32000, Message: "client group destroyed"},
+						ID:      r.req.ID,
+					}
+				default:
 					return
 				}
 			}
@@ -1289,6 +1321,14 @@ func (g *ClientGroup) worker(s *Server) {
 // the reaper's double-check (under s.mu in reapIdleGroups) sees the
 // fresh timestamp and skips eviction.
 func (g *ClientGroup) trySendReq(req clientGroupReq) bool {
+	// RLock brackets the pre-check + send so the exiting worker's sendMu
+	// barrier can wait out an in-flight send before its final reqC sweep
+	// (see ClientGroup.sendMu). Uncontended RLock is nanoseconds — noise
+	// against the msgpack decode already on this path. Holding it across
+	// the blocking send is safe: the worker never takes sendMu while
+	// serving, so backpressure drains normally.
+	g.sendMu.RLock()
+	defer g.sendMu.RUnlock()
 	select {
 	case <-g.done:
 		return false

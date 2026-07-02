@@ -417,12 +417,32 @@ func (e *Engine) RegisterSource(source Source) {
 // replica writer, rather than against a snapshot pinned by the last
 // Push (which would show transient set differences during sustained
 // writes).
+//
+// NON-BLOCKING against the engine: TryLock, skip when busy (full-scale
+// review 2026-07-03). The audit RPC deliberately bypasses the per-CG worker
+// FIFO and used to run this fully concurrently with an in-flight advance.
+// That was DESTRUCTIVE: between two pushes of one batch the source's
+// overlay is nil, so RefreshSnapshot→OnAdvanceEnd would ROLLBACK the prev
+// tx — discarding the batch's earlier uncommitted writeChange rows — and
+// eagerly re-pin at the current WAL head, which (in shadow mode) already
+// contains the batch's committed rows. The next push's driftCheck then saw
+// post-batch state and false-drifted every Add (the exact pathology the
+// OnAdvanceEnd comment describes for lazy re-pins). Drive mode was shielded
+// by externalConn; shadow-mode advanceStream was exposed. Holding e.mu for
+// the (fast: ROLLBACK+BEGIN per source) refresh excludes advances entirely;
+// TryLock preserves the FIFO-bypass's real goal — the audit must never
+// BLOCK behind a multi-second advance — by skipping instead. A skipped
+// refresh degrades the audit to the pinned frame for one cycle (cosmetic
+// transient diffs at worst), vs. corrupting the in-flight advance.
 func (e *Engine) RefreshAllSources() {
-	// Lock-free read of the sources snapshot — this is the load-bearing part
-	// of the refreshSnapshot FIFO-bypass. See the type Engine doc comment for
-	// the full rationale. Per-source RefreshSnapshot is independently safe
-	// to invoke concurrently with the source's Push (see source.go's
-	// "No-op while a Push is in progress" guard).
+	if !e.mu.TryLock() {
+		// Advance/hydrate in flight — refreshing now would destroy its
+		// prev-tx state. Skip; the next audit cycle retries.
+		fmt.Fprintln(os.Stderr,
+			"[GO-IVM] refreshSnapshot skipped: engine busy (advance/hydrate in flight)")
+		return
+	}
+	defer e.mu.Unlock()
 	for _, src := range e.sourcesView() {
 		if r, ok := src.(interface{ RefreshSnapshot() }); ok {
 			r.RefreshSnapshot()

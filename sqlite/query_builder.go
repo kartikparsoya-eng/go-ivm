@@ -533,19 +533,26 @@ func FromSQLiteType(v interface{}, colType string) ivm.Value {
 			return fmt.Sprintf("%v", v)
 		}
 	case "null":
-		// CRIT-6: TS folds 'null' with 'number'|'string' (table-source.ts:619-630)
-		// — pass the value through unchanged, but reject int64/uint64 beyond
-		// ±2^53 that cannot round-trip as a JS number (same bound as HIGH-9).
-		// Previously 'null' silently hit the default below with no bounds check.
+		// TS folds 'null' with 'number'|'string' into ONE branch
+		// (table-source.ts fromSQLiteType): `typeof v === 'bigint'` →
+		// bounds-check → `return Number(v)`. So an INTEGER-stored value in a
+		// 'null'-typed column comes back a JS NUMBER, not a bigint. The Go
+		// port must therefore CONVERT int64/uint64 to float64 after the
+		// bounds check — the previous passthrough (return raw int64) was a
+		// porting divergence (full-scale review 2026-07-03): within Go it
+		// left int64 vs float64 mixing in comparators/equality for the same
+		// logical value, and it diverged from what TS's engine holds.
 		switch val := v.(type) {
 		case int64:
 			if val > maxSafeInteger || val < -maxSafeInteger {
 				panic(ivm.NewDataError("FromSQLiteType(null): int64 %d exceeds JS MAX_SAFE_INTEGER (±2^53-1)", val))
 			}
+			return float64(val)
 		case uint64:
 			if val > uint64(maxSafeInteger) {
 				panic(ivm.NewDataError("FromSQLiteType(null): uint64 %d exceeds JS MAX_SAFE_INTEGER (2^53-1)", val))
 			}
+			return float64(val)
 		}
 		return v
 	default:
@@ -572,6 +579,10 @@ func SelfCheckCoercion() error {
 		{"boolean", int64(0), false},
 		{"number", int64(42), float64(42)},
 		{"string", int64(7), "7"},
+		// 'null' type: TS's shared 'number|string|null' branch converts
+		// bigint→Number, so an int64 from the replica and a float64 from an
+		// advance row must converge on the same float64.
+		{"null", int64(42), float64(42)},
 	}
 	for _, c := range checks {
 		a := FromSQLiteType(c.rawShape, c.colType)

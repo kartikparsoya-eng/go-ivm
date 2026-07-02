@@ -367,3 +367,34 @@ func deepEqual(a, b interface{}) bool {
 		return a == b
 	}
 }
+
+// TestFromSQLiteType_NullTypeConvertsIntsToFloat64 pins the TS-parity fix
+// from the full-scale porting review (2026-07-03): TS's fromSQLiteType folds
+// 'number'|'string'|'null' into ONE branch that converts bigint → Number, so
+// an INTEGER-stored value in a 'null'-typed column must come back float64 —
+// NOT the raw int64 the previous passthrough returned (which left int64 vs
+// float64 mixing inside Go comparators for the same logical value).
+func TestFromSQLiteType_NullTypeConvertsIntsToFloat64(t *testing.T) {
+	if got := FromSQLiteType(int64(42), "null"); got != float64(42) {
+		t.Fatalf("FromSQLiteType(int64(42), null) = %T(%v), want float64(42)", got, got)
+	}
+	if got := FromSQLiteType(uint64(7), "null"); got != float64(7) {
+		t.Fatalf("FromSQLiteType(uint64(7), null) = %T(%v), want float64(7)", got, got)
+	}
+	// Non-integer values still pass through unchanged (TS `return v`).
+	if got := FromSQLiteType("s", "null"); got != "s" {
+		t.Fatalf("string passthrough broken: %v", got)
+	}
+	if got := FromSQLiteType(float64(1.5), "null"); got != float64(1.5) {
+		t.Fatalf("float passthrough broken: %v", got)
+	}
+	// Bounds check preserved: beyond ±2^53 still panics DataError.
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("expected DataError panic for out-of-range int64 in null-typed column")
+			}
+		}()
+		FromSQLiteType(int64(maxSafeInteger+1), "null")
+	}()
+}

@@ -37,12 +37,15 @@ func (b *blockingSource) RefreshSnapshot() {
 	b.refreshCount.Add(1)
 }
 
-// TestRefreshAllSources_NotBlockedByLongAdvance is the H9 regression. Pre-fix,
-// RefreshAllSources took e.mu and serialized behind any in-flight Advance —
-// so a slow advance would block the drift-audit's refresh call for seconds.
-// Post-fix, sources access is via atomic.Pointer + COW and RefreshAllSources
-// takes no engine lock, so it proceeds immediately regardless of what other
-// handlers are doing.
+// TestRefreshAllSources_NotBlockedByLongAdvance is the H9 regression, updated
+// for the mid-batch refresh fix (full-scale review 2026-07-03). The invariant
+// H9 protects is NON-BLOCKING: the drift audit's refresh must never serialize
+// behind a slow in-flight Advance. Originally that was achieved by running the
+// refresh fully concurrently — which turned out DESTRUCTIVE (between two
+// pushes of a batch it ROLLBACKed the prev tx, discarding the batch's earlier
+// writeChange rows; see the RefreshAllSources doc). The contract is now:
+// while the engine is busy, RefreshAllSources returns immediately WITHOUT
+// refreshing (TryLock skip); once free, it refreshes normally.
 func TestRefreshAllSources_NotBlockedByLongAdvance(t *testing.T) {
 	storagePath := t.TempDir() + "/storage.db"
 	eng, err := NewEngine(EngineConfig{StoragePath: storagePath})
@@ -74,22 +77,33 @@ func TestRefreshAllSources_NotBlockedByLongAdvance(t *testing.T) {
 	// Give the advance goroutine a moment to enter Push and pin e.mu.
 	time.Sleep(20 * time.Millisecond)
 
-	// RefreshAllSources must return immediately (no e.mu contention).
+	// RefreshAllSources must return immediately (TryLock — no e.mu wait).
 	refreshStart := time.Now()
 	eng.RefreshAllSources()
 	refreshElapsed := time.Since(refreshStart)
-	if refreshElapsed > 100*time.Millisecond {
-		t.Fatalf("RefreshAllSources serialized behind Advance: took %v (expected ~immediate)", refreshElapsed)
-	}
-	if got := bs.refreshCount.Load(); got != 1 {
-		t.Fatalf("RefreshAllSources didn't invoke per-source RefreshSnapshot: count=%d", got)
-	}
+	busyCount := bs.refreshCount.Load()
 
-	// Release the advance so the test cleans up.
+	// Release the advance BEFORE asserting: a t.Fatal with the gate still
+	// closed would leave the advance goroutine holding e.mu forever and
+	// deadlock the deferred eng.Close (this hung the whole package pre-fix).
 	close(gate)
 	select {
 	case <-advanceDone:
 	case <-time.After(2 * time.Second):
 		t.Fatal("Advance didn't complete after gate released")
+	}
+
+	if refreshElapsed > 100*time.Millisecond {
+		t.Fatalf("RefreshAllSources serialized behind Advance: took %v (expected ~immediate skip)", refreshElapsed)
+	}
+	if busyCount != 0 {
+		t.Fatalf("RefreshAllSources refreshed %d source(s) WHILE an advance was in flight — "+
+			"the destructive mid-batch refresh the TryLock guard exists to prevent", busyCount)
+	}
+
+	// Engine free again → refresh must actually run now.
+	eng.RefreshAllSources()
+	if got := bs.refreshCount.Load(); got != 1 {
+		t.Fatalf("RefreshAllSources on a free engine didn't refresh: count=%d, want 1", got)
 	}
 }
