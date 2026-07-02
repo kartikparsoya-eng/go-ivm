@@ -85,4 +85,17 @@ func TestFirstHydratePanic(t *testing.T) {
 	if !errors.As(got, &de) {
 		t.Fatalf("DriftError panic should be returned unwrapped, got %T (%v)", got, got)
 	}
+
+	// A *ivm.DataError must survive the %w wrap so the sidecar maps it to
+	// rpcCodeDataError — parity with the advance path (panicErrorCode). Before
+	// this the DataError was stringified and the code degraded to -32000.
+	dataErr := ivm.NewDataError("FromSQLiteType(number): int64 %d exceeds MAX_SAFE_INTEGER", 9007199254740993)
+	gotData := firstHydratePanic(built, []any{nil, dataErr})
+	var recoveredData *ivm.DataError
+	if !errors.As(gotData, &recoveredData) {
+		t.Fatalf("DataError panic must survive as *ivm.DataError, got %T (%v)", gotData, gotData)
+	}
+	if !strings.Contains(gotData.Error(), "qB") {
+		t.Fatalf("wrapped DataError should still name the query, got %v", gotData)
+	}
 }

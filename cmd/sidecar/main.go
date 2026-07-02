@@ -10,6 +10,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -1373,6 +1374,22 @@ func panicErrorCode(r any) int {
 	return -32000
 }
 
+// hydrateErrorResponse maps a RETURNED hydrate error to the right RPC code —
+// the returned-error twin of panicErrorCode. A hydrate lane's panic is
+// recovered per-lane (panics can't cross goroutines) and surfaced as an error
+// by firstHydratePanic, so a *ivm.DataError read during the hydrate scan
+// arrives here wrapped, not as a live panic. errors.As unwraps it → the SAME
+// rpcCodeDataError the advance path emits via panicErrorCode, so TS classifies
+// a bad replica value identically whether it surfaces in hydrate or advance.
+// Everything else keeps -32000 (transient → TS reset).
+func hydrateErrorResponse(reqID interface{}, prefix string, err error) RPCResponse {
+	var de *ivm.DataError
+	if errors.As(err, &de) {
+		return rpcError(reqID, rpcCodeDataError, prefix+err.Error())
+	}
+	return rpcError(reqID, -32000, prefix+err.Error())
+}
+
 // handleStreamWithRecover runs a streaming handler with a panic recover (C1).
 // The streaming handlers dispatch directly from the worker goroutine, bypassing
 // handleRequest's recover; AdvanceStream also re-raises non-drift panics onto
@@ -1782,7 +1799,7 @@ func (s *Server) handleAddQuery(req RPCRequest) RPCResponse {
 	changes, timingMs, err := group.eng.AddQuery(p.QueryID, p.AST)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[GO-IVM] addQuery ERROR cg=%s query=%s: %v\n", cgID, p.QueryID, err)
-		return rpcError(req.ID, -32000, "addQuery: "+err.Error())
+		return hydrateErrorResponse(req.ID, "addQuery: ", err)
 	}
 
 	return RPCResponse{JSONRPC: "2.0", Result: addQueryResult{Changes: changes, TimingMs: timingMs}, ID: req.ID}
@@ -1867,7 +1884,7 @@ func (s *Server) handleAddQueries(req RPCRequest) RPCResponse {
 	results, err := group.eng.AddQueries(specs)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[GO-IVM] addQueries ERROR cg=%s: %v\n", cgID, err)
-		return rpcError(req.ID, -32000, "addQueries: "+err.Error())
+		return hydrateErrorResponse(req.ID, "addQueries: ", err)
 	}
 
 	resultList := make([]addQueryResult, len(results))
@@ -1960,7 +1977,7 @@ func (s *Server) handleAddQueriesStream(req RPCRequest, streamW streamWriter) RP
 		})
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "[GO-IVM] addQueriesStream(rowMode) ERROR cg=%s: %v\n", cgID, err)
-			return rpcError(req.ID, -32000, "addQueriesStream: "+err.Error())
+			return hydrateErrorResponse(req.ID, "addQueriesStream: ", err)
 		}
 		return RPCResponse{JSONRPC: "2.0", Result: "done", ID: req.ID}
 	}
@@ -1980,7 +1997,7 @@ func (s *Server) handleAddQueriesStream(req RPCRequest, streamW streamWriter) RP
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[GO-IVM] addQueriesStream ERROR cg=%s: %v\n", cgID, err)
-		return rpcError(req.ID, -32000, "addQueriesStream: "+err.Error())
+		return hydrateErrorResponse(req.ID, "addQueriesStream: ", err)
 	}
 
 	// "done" sentinel — TS client uses this to resolve the call promise.

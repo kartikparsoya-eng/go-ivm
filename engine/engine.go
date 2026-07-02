@@ -1009,6 +1009,16 @@ func firstHydratePanic(built []*pipelineEntry, panics []any) error {
 		if i < len(built) && built[i] != nil {
 			qid = built[i].queryID
 		}
+		// Preserve a typed *ivm.DataError (unsafe int / bad JSON surfaced by
+		// FromSQLiteType during the hydrate scan) through the %w chain, so the
+		// sidecar handler maps it to rpcCodeDataError — IDENTICAL to how the
+		// advance path surfaces the same panic via panicErrorCode. Before this,
+		// the SAME DataError produced -32102 in advance but a generic -32000 in
+		// hydrate, so TS re-initialized cleanly on an advance-time bad value but
+		// took the generic-failure path on a hydrate-time one (parity gap).
+		if err, ok := p.(error); ok {
+			return fmt.Errorf("hydrate panic (query %s): %w", qid, err)
+		}
 		return fmt.Errorf("hydrate panic (query %s): %v", qid, p)
 	}
 	return nil
