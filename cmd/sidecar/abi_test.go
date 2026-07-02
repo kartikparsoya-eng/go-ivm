@@ -10,6 +10,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/kartikparsoya-eng/go-ivm/sqlite"
 )
 
 // sinkCollector is a deliver callback that copies every payload (honoring
@@ -334,4 +336,56 @@ func TestNewServerFromEnv_ParallelismKnob(t *testing.T) {
 			t.Error("GO_IVM_WARM_HYDRATE_POOL=false must disable the warm pool")
 		}
 	})
+}
+
+// TestABIHostReapsIdleGroups is the regression guard for the napi-only
+// half of the ART memory leak: the in-process host must run the same
+// idle-group reaper main() does, or abandoned CGs (missed TS teardown)
+// accumulate engines + prev-tx conns for the worker's whole life. Drives
+// the host end-to-end with a fast reaper (env-tuned to sub-second) and
+// asserts an idle memory-mode group is collected.
+func TestABIHostReapsIdleGroups(t *testing.T) {
+	t.Setenv("GO_IVM_REAPER_INTERVAL_SEC", "1")
+	t.Setenv("GO_IVM_REAPER_IDLE_SEC", "1")
+
+	col := newSinkCollector()
+	h := startABIHostWithServer(NewServer(0, ""), col.sink, nil)
+	defer h.Shutdown()
+
+	// Create a group via a real init RPC so it has an engine + worker.
+	if err := h.Send(encodeReq(t, "init", 1, initParams{
+		ClientGroupID: "cg-idle",
+		Storage:       t.TempDir() + "/s.db",
+		Tables: map[string]tableSchemaParams{
+			"t": {
+				Columns:    map[string]sqlite.ColumnSchema{"id": {Type: "string"}},
+				PrimaryKey: []string{"id"},
+			},
+		},
+	})); err != nil {
+		t.Fatalf("send init: %v", err)
+	}
+	col.waitFrames(t, 1, 5*time.Second)
+
+	if g := h.server.getGroup("cg-idle", false); g == nil {
+		t.Fatal("group not created by init")
+	}
+
+	// Backdate lastUsed so the 1s idle threshold trips on the next tick.
+	h.server.mu.RLock()
+	g := h.server.groups["cg-idle"]
+	h.server.mu.RUnlock()
+	if g == nil {
+		t.Fatal("group missing before reap")
+	}
+	g.lastUsedNs.Store(time.Now().Add(-1 * time.Hour).UnixNano())
+
+	deadline := time.Now().Add(6 * time.Second)
+	for time.Now().Before(deadline) {
+		if h.server.getGroup("cg-idle", false) == nil {
+			return // reaped
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatal("idle group was NOT reaped by the ABI host — napi transport leaks CGs")
 }

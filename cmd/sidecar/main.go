@@ -545,6 +545,27 @@ func envPositiveInt(name string, def int) int {
 	return n
 }
 
+// connMaxIdleFromEnv resolves GO_IVM_CONN_MAX_IDLE_SEC into the tablesource
+// pool's idle-conn deadline. Unset → 0 (package default, 90s). A value of 0
+// or a negative sentinel disables the deadline (conns park until closed) —
+// use only for A/B against the pre-fix behavior. Invalid → default.
+func connMaxIdleFromEnv() time.Duration {
+	v := os.Getenv("GO_IVM_CONN_MAX_IDLE_SEC")
+	if v == "" {
+		return 0 // tablesource applies its default
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		fmt.Fprintf(os.Stderr,
+			"[GO-IVM] invalid GO_IVM_CONN_MAX_IDLE_SEC=%q, using default\n", v)
+		return 0
+	}
+	if n <= 0 {
+		return -1 * time.Second // sentinel: disable the idle deadline
+	}
+	return time.Duration(n) * time.Second
+}
+
 // maxDiffChanges caps how many change-log entries advanceToHead[Stream] will
 // materialize via diff.Collect (full row values per entry — see the guards at
 // the Collect call sites). Above the cap the RPC returns an error and the TS
@@ -829,6 +850,11 @@ func (s *Server) getReplicaDB() (*sql.DB, error) {
 		MaxOpenConns: envPositiveInt("GO_IVM_MAX_OPEN_CONNS", 0),
 		MaxIdleConns: envPositiveInt("GO_IVM_MAX_IDLE_CONNS", 0),
 		CacheSizeKB:  envPositiveInt("GO_IVM_CONN_CACHE_KB", 0),
+		// Idle-conn reclaim: after a churn burst subsides, the pool cleaner
+		// closes conns idle longer than this, returning their fd + C-side
+		// page cache to the OS (the ART memory-growth fix). Env-tunable;
+		// 0 → package default (90s). A dedicated -1 sentinel disables it.
+		ConnMaxIdle: connMaxIdleFromEnv(),
 	}
 	if poolOpts.MaxOpenConns > 0 {
 		fmt.Fprintf(os.Stderr, "[GO-IVM] replica pool: max open conns %d (GO_IVM_MAX_OPEN_CONNS)\n",
@@ -945,6 +971,53 @@ func (s *Server) getGroup(id string, createIfMissing bool) *ClientGroup {
 // reaping. Picked to be longer than typical client churn (>30 min) but
 // short enough to bound memory after a wave of disconnects.
 const groupIdleTimeout = 30 * time.Minute
+
+// reaperInterval is how often runReaper scans for idle groups. Env-tunable
+// (GO_IVM_REAPER_INTERVAL_SEC) so the memory-leak soak can force fast
+// reaping; default 5 min.
+func reaperInterval() time.Duration {
+	if v := os.Getenv("GO_IVM_REAPER_INTERVAL_SEC"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return time.Duration(n) * time.Second
+		}
+	}
+	return 5 * time.Minute
+}
+
+// reaperIdleTimeout is the age threshold for reaping. Env-tunable
+// (GO_IVM_REAPER_IDLE_SEC) alongside the interval; default groupIdleTimeout.
+func reaperIdleTimeout() time.Duration {
+	if v := os.Getenv("GO_IVM_REAPER_IDLE_SEC"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return time.Duration(n) * time.Second
+		}
+	}
+	return groupIdleTimeout
+}
+
+// runReaper periodically reaps idle client groups until ctx is cancelled.
+// Started by BOTH transports — main() for the socket sidecar AND the NAPI
+// ABI host (abi.go). Before the ABI host wired this, in-process (napi) mode
+// had NO reaper at all: abandoned CGs (missed TS teardown, network
+// partition) accumulated engines + prev-tx conns for the life of the worker
+// — a napi-only leak on top of the shared idle-conn one. Blocking call; run
+// in its own goroutine.
+func (s *Server) runReaper(ctx context.Context) {
+	ticker := time.NewTicker(reaperInterval())
+	defer ticker.Stop()
+	idle := reaperIdleTimeout()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-ticker.C:
+			n := s.reapIdleGroups(now.Add(-idle))
+			if n > 0 {
+				fmt.Fprintf(os.Stderr, "[GO-IVM] reaped %d idle client groups\n", n)
+			}
+		}
+	}
+}
 
 // reapIdleGroups scans the group map and destroys any group whose lastUsedNs
 // is older than `cutoff`. Returns the number of groups reaped.
@@ -2566,21 +2639,7 @@ func main() {
 	// teardown) accumulate indefinitely, with their engine state + worker
 	// goroutine + MemorySource data resident. Reaps groups untouched for
 	// groupIdleTimeout. REVIEW-final HIGH-CROSS-2 / HIGH-CROSS-3.
-	go func() {
-		ticker := time.NewTicker(5 * time.Minute)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-shutdownCtx.Done():
-				return
-			case now := <-ticker.C:
-				n := server.reapIdleGroups(now.Add(-groupIdleTimeout))
-				if n > 0 {
-					fmt.Fprintf(os.Stderr, "[GO-IVM] reaped %d idle client groups\n", n)
-				}
-			}
-		}
-	}()
+	go server.runReaper(shutdownCtx)
 
 	// Graceful shutdown
 	sig := make(chan os.Signal, 1)

@@ -30,6 +30,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -148,6 +149,12 @@ type abiHost struct {
 	closed bool
 	done   chan struct{} // closed when both pump goroutines have exited
 	wg     sync.WaitGroup
+
+	// reaperCancel stops the idle-group reaper goroutine on Shutdown. The
+	// socket transport runs this reaper from main(); the in-process host
+	// must run its own or abandoned CGs never get collected (napi-only
+	// leak — the whole reason abi.go reuses Server but not main()).
+	reaperCancel context.CancelFunc
 }
 
 // errHostClosed is returned by Send after Shutdown (or pipe teardown).
@@ -190,6 +197,13 @@ func startABIHostWithServer(server *Server, deliver func(kind int32, payload []b
 	// (bypassing the pipe — see rowplane.go's ordering invariant). Set
 	// before handleConnection starts; never mutated after.
 	server.abiDeliver = deliver
+
+	// Idle-group reaper: the socket transport starts this from main(); the
+	// in-process host must start its own (same Server, same leak otherwise).
+	// Cancelled on Shutdown.
+	reaperCtx, reaperCancel := context.WithCancel(context.Background())
+	h.reaperCancel = reaperCancel
+	go server.runReaper(reaperCtx)
 
 	// The production connection handler, verbatim. When either pipe end
 	// closes, its read loop errors out and it tears down exactly as it
@@ -279,6 +293,9 @@ func (h *abiHost) markClosed() {
 // deferred flusher drain runs) and waits for the pump goroutines, then
 // closes all client groups. Idempotent.
 func (h *abiHost) Shutdown() {
+	if h.reaperCancel != nil {
+		h.reaperCancel()
+	}
 	h.markClosed()
 	<-h.done
 	h.server.closeAll()

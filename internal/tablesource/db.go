@@ -22,6 +22,7 @@ import (
 	"database/sql"
 	"fmt"
 	"strconv"
+	"time"
 
 	_ "github.com/mattn/go-sqlite3"
 )
@@ -40,6 +41,18 @@ const (
 	// side). 256 supports ~36 concurrent CGs comfortably.
 	defaultMaxOpenConns = 256
 	defaultMaxIdleConns = 32
+
+	// How long a conn may sit in the pool's idle list before database/sql's
+	// cleaner closes it. THE memory-release valve for the replica pools:
+	// every open SQLite conn pins its page cache (CacheSizeKB of C-side
+	// malloc — invisible to the Go heap, GOMEMLIMIT, and pprof) plus fds
+	// and lookaside. Without an idle deadline, a churn burst that fans the
+	// pool out to MaxOpenConns parks up to MaxIdleConns of them FOREVER —
+	// RSS ratchets up run after run and never comes back (the ART chaos
+	// finding: ~500MB growth in 147s, Go heap flat, heap diff empty).
+	// Checked-out conns (Source prevConns, snapshotter frame conns, reader
+	// pools) are never touched — database/sql only reaps the idle list.
+	defaultConnMaxIdle = 90 * time.Second
 )
 
 // OpenOptions configures the read-side pool. Zero-valued fields fall back
@@ -60,6 +73,11 @@ type OpenOptions struct {
 	// shrinking the per-conn cache trades a little repeat-read locality
 	// for a hard cap on invisible memory.
 	CacheSizeKB int
+	// ConnMaxIdle is how long an idle pooled conn survives before the
+	// pool cleaner closes it (releasing its fd + page cache — see
+	// defaultConnMaxIdle). 0 → defaultConnMaxIdle; negative → no idle
+	// deadline (pre-2026-07 behavior, conns park forever).
+	ConnMaxIdle time.Duration
 }
 
 // Open returns a *sql.DB pool aimed at the SQLite file at path, configured
@@ -103,12 +121,26 @@ func Open(path string, opts OpenOptions) (*sql.DB, error) {
 	}
 	db.SetMaxOpenConns(maxOpen)
 	db.SetMaxIdleConns(maxIdle)
+	applyConnMaxIdle(db, opts.ConnMaxIdle)
 
 	if err := assertWAL(db); err != nil {
 		db.Close()
 		return nil, err
 	}
 	return db, nil
+}
+
+// applyConnMaxIdle applies the idle-conn deadline policy (see
+// OpenOptions.ConnMaxIdle) to a pool. Extracted so Open and OpenWritable
+// stay in lockstep.
+func applyConnMaxIdle(db *sql.DB, d time.Duration) {
+	switch {
+	case d == 0:
+		db.SetConnMaxIdleTime(defaultConnMaxIdle)
+	case d > 0:
+		db.SetConnMaxIdleTime(d)
+		// d < 0: caller opted out of the idle deadline.
+	}
 }
 
 // assertWAL fails-closed if the database is not in a multi-reader-capable
@@ -184,6 +216,7 @@ func OpenWritable(path string, opts OpenOptions) (*sql.DB, error) {
 	}
 	db.SetMaxOpenConns(maxOpen)
 	db.SetMaxIdleConns(maxIdle)
+	applyConnMaxIdle(db, opts.ConnMaxIdle)
 
 	if err := assertWAL(db); err != nil {
 		db.Close()
