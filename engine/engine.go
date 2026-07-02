@@ -653,6 +653,41 @@ func (e *Engine) buildAndRegisterLocked(queryID string, ast builder.AST) *pipeli
 	return entry
 }
 
+// buildBatchLocked builds+registers a batch of query pipelines sequentially
+// (Phase 1 of AddQueries / AddQueriesStream). Must be called with e.mu held.
+//
+// Unwind-on-panic: BuildPipeline panics on bad input (*ivm.DataError for an
+// unknown table / unknown condition type). Without the recover below, a panic
+// on query k would leave queries 0..k-1 REGISTERED with wired outputs but
+// never hydrated — orphan pipelines the TS side doesn't know about (the whole
+// batch RPC rejects). Their operators (e.g. Take, whose bound is only set by
+// the hydrate fetch) would then receive advance pushes in an un-hydrated
+// state and panic, turning one bad query in a batch into an advance-time
+// reset loop. Unwind everything this call registered, then re-raise so the
+// RPC handler's recover classifies the original panic (*ivm.DataError keeps
+// its -32102 teardown code).
+//
+// Note: the panicking query's own partially-built operators may have
+// connected to sources before the panic (connections with nil output —
+// skipped by push fan-out). Those are a bounded memory leak until the CG is
+// destroyed, not a correctness hazard, and are not unwound here.
+func (e *Engine) buildBatchLocked(queries []QuerySpec) []*pipelineEntry {
+	built := make([]*pipelineEntry, 0, len(queries))
+	defer func() {
+		if r := recover(); r != nil {
+			for _, entry := range built {
+				e.removeQueryLocked(entry.queryID)
+			}
+			panic(r)
+		}
+	}()
+	for _, q := range queries {
+		e.removeQueryLocked(q.QueryID)
+		built = append(built, e.buildAndRegisterLocked(q.QueryID, q.AST))
+	}
+	return built
+}
+
 // wireCompanionOutputsLocked attaches each companion sub-pipeline's output to
 // the streamer (tagged with the MAIN queryID) and the scalar-value-changed
 // reset check. Called by the AddQuery* paths AFTER hydrateEntry, so a companion
@@ -707,11 +742,7 @@ func (e *Engine) AddQueries(queries []QuerySpec) ([]QueryResult, error) {
 
 	// Phase 1: Build all pipelines sequentially (mutates shared state).
 	// Scalar-subquery resolution runs here too — see buildAndRegisterLocked.
-	built := make([]*pipelineEntry, 0, len(queries))
-	for _, q := range queries {
-		e.removeQueryLocked(q.QueryID)
-		built = append(built, e.buildAndRegisterLocked(q.QueryID, q.AST))
-	}
+	built := e.buildBatchLocked(queries)
 
 	// Phase 2: Hydrate all pipelines via P worker lanes (bounded parallelism).
 	// P bounds both the goroutine count and — with K = P × Cmax reader-pool
@@ -811,11 +842,7 @@ func (e *Engine) AddQueriesStream(
 	// Phase 1: Build all pipelines sequentially (mutates shared state).
 	// Scalar-subquery resolution + companion wiring happens here too —
 	// see buildAndRegisterLocked.
-	built := make([]*pipelineEntry, 0, len(queries))
-	for _, q := range queries {
-		e.removeQueryLocked(q.QueryID)
-		built = append(built, e.buildAndRegisterLocked(q.QueryID, q.AST))
-	}
+	built := e.buildBatchLocked(queries)
 
 	// Phase 2: Hydrate via P worker lanes, streaming per-query results in
 	// chunks as each query's fetch progresses. Each query may emit multiple
@@ -1262,6 +1289,12 @@ func (e *Engine) AdvanceStream(
 			t = timings
 		}
 		flushMu.Lock()
+		// Deferred unlock: onResult is caller-supplied and may panic (e.g. a
+		// wire-write failure surfacing as panic). A bare Unlock after the call
+		// would leave flushMu held on that panic, and the guaranteed terminal
+		// flush(true) below would then deadlock on flushMu.Lock() — wedging the
+		// engine with e.mu held, i.e. every CG sharing this engine.
+		defer flushMu.Unlock()
 		onResult(AdvanceStreamPartial{
 			Changes:    bumpRowVersions(changes, e.minRowVersions),
 			ChunkIndex: chunkIndex,
@@ -1270,7 +1303,6 @@ func (e *Engine) AdvanceStream(
 			Drift:      drift, // nil unless this is the terminal drift signal
 		})
 		chunkIndex++
-		flushMu.Unlock()
 	}
 
 	flush := func(final bool) {
