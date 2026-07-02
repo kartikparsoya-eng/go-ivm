@@ -32,6 +32,7 @@ import (
 	"database/sql"
 	"fmt"
 	"iter"
+	"os"
 	"slices"
 	"strings"
 	"sync"
@@ -42,6 +43,18 @@ import (
 	"github.com/kartikparsoya-eng/go-ivm/ivm"
 	"github.com/kartikparsoya-eng/go-ivm/sqlite"
 )
+
+// LazyAdvance gates the streaming advance-time leaf fetch
+// (fetchDuringPushStream): when true, a Fetch issued while a Push is fanning
+// out yields rows from a live SQLite cursor on the prev-tx conn instead of
+// materializing the whole result set first — matching TS's lazy
+// statement.iterate() leaf (zqlite table-source.ts #fetch), whose cursor
+// nesting semantics SQLite natively supports on one connection (verified:
+// nested cursors on a single conn holding an uncommitted write interleave
+// correctly). Default off: the eager fetchForConn path stays byte-identical.
+// Exported as a var (not re-read from env per call) so engine-level tests
+// can toggle it. GO_IVM_LAZY_ADVANCE=true enables.
+var LazyAdvance = os.Getenv("GO_IVM_LAZY_ADVANCE") == "true"
 
 // Source is the read-only TableSource leaf. One instance per (CG, table).
 type Source struct {
@@ -151,7 +164,9 @@ type Source struct {
 	// mid-life — so cardinality stays at a few entries and a cached stmt stays
 	// valid across advances (a prepare_v2 stmt is frame-independent and SQLite
 	// auto-recompiles it on the rare replica-schema change). Invalidated
-	// whenever a conn is torn down. Guarded by s.mu (held across the fetch).
+	// whenever a conn is torn down. Guarded by s.mu. Entries are CHECKED OUT
+	// (removed from the map) while their cursor is open and handed back after —
+	// see checkoutSelectLocked for why sharing a live stmt corrupts.
 	stmtCache map[*sql.Conn]map[string]*sql.Stmt
 
 	// readerPool, when non-nil, is a CG-shared pool of read connections ALL
@@ -363,14 +378,29 @@ func (s *Source) activeConn() *sql.Conn {
 	return s.prevConn
 }
 
-// preparedSelectLocked returns a prepared statement for query bound to conn,
-// preparing and caching it on first use. MUST be called with s.mu held. The
-// returned *sql.Stmt executes on conn's current transaction (the pinned frame
-// plus any in-flight writeChange writes), so it observes read-your-own-writes
-// exactly like the previous one-shot QueryContext did. The caller resolved
-// conn from activeConn() under the same lock, and the cache is invalidated
-// whenever a conn is torn down, so a stale entry can never be executed.
-func (s *Source) preparedSelectLocked(conn *sql.Conn, query string) (*sql.Stmt, error) {
+// checkoutSelectLocked returns a prepared statement for query bound to conn,
+// preparing and caching it on first use. The returned *sql.Stmt executes on
+// conn's current transaction (the pinned frame plus any in-flight writeChange
+// writes), so it observes read-your-own-writes exactly like a one-shot
+// QueryContext would. The caller resolved conn from activeConn() under the
+// same lock, and the cache is invalidated whenever a conn is torn down, so a
+// stale entry can never be executed.
+//
+// CHECKOUT semantics (mirrors TS zqlite's StatementCache, whose `get`
+// removes the stmt from the cache until `return`): the stmt is REMOVED from
+// the cache while checked out and MUST be handed back via
+// returnSelectStmt(Locked) once its rows are fully consumed. A *sql.Stmt
+// wraps a single sqlite3_stmt — re-running Query on it while a previous
+// *sql.Rows is still open silently RESETS the live cursor, which then
+// iterates the second query's result set (verified experimentally: silent
+// row corruption, no error). The eager fetch drains its cursor before any
+// same-SQL re-entry could run, so a shared map was safe there; the lazy
+// advance fetch (fetchDuringPushStream) holds cursors open across nested
+// child fetches, where a same-SQL sibling (e.g. a self-join's two legs)
+// would corrupt. A concurrent checkout of the same (conn, SQL) simply
+// prepares a fresh transient stmt; whichever returns second is closed.
+// MUST be called with s.mu held.
+func (s *Source) checkoutSelectLocked(conn *sql.Conn, query string) (*sql.Stmt, error) {
 	bySQL := s.stmtCache[conn]
 	if bySQL == nil {
 		if s.stmtCache == nil {
@@ -380,14 +410,44 @@ func (s *Source) preparedSelectLocked(conn *sql.Conn, query string) (*sql.Stmt, 
 		s.stmtCache[conn] = bySQL
 	}
 	if st, ok := bySQL[query]; ok {
+		delete(bySQL, query)
 		return st, nil
 	}
 	st, err := conn.PrepareContext(context.Background(), query)
 	if err != nil {
 		return nil, err
 	}
-	bySQL[query] = st
 	return st, nil
+}
+
+// returnSelectStmtLocked hands a checked-out stmt back to the cache. The stmt
+// is CLOSED instead of cached when (a) the conn's cache bucket vanished while
+// it was out — the conn was torn down via closeCachedStmtsForConnLocked /
+// closeAllCachedStmtsLocked, so the stmt is dead weight — or (b) another
+// checkout of the same (conn, SQL) returned first — at most one stmt is
+// cached per key. In practice a checkout never straddles conn teardown (lazy
+// cursors live only inside a push fanout, during which OnAdvanceEnd's
+// overlay guard blocks the rollback path); the close is defensive.
+// MUST be called with s.mu held.
+func (s *Source) returnSelectStmtLocked(conn *sql.Conn, query string, st *sql.Stmt) {
+	bySQL := s.stmtCache[conn]
+	if bySQL == nil {
+		_ = st.Close()
+		return
+	}
+	if _, occupied := bySQL[query]; occupied {
+		_ = st.Close()
+		return
+	}
+	bySQL[query] = st
+}
+
+// returnSelectStmt is returnSelectStmtLocked for callers not holding s.mu
+// (the lazy fetch returns its stmt after releasing the lock).
+func (s *Source) returnSelectStmt(conn *sql.Conn, query string, st *sql.Stmt) {
+	s.mu.Lock()
+	s.returnSelectStmtLocked(conn, query, st)
+	s.mu.Unlock()
 }
 
 // closeCachedStmtsForConnLocked finalizes and drops every prepared statement
@@ -1056,6 +1116,9 @@ func (i *sourceInput) Fetch(req ivm.FetchRequest) iter.Seq[ivm.Node] {
 	if pool := i.src.readerPool.Load(); pool != nil {
 		return i.src.fetchViaPoolStream(req, i.conn, pool)
 	}
+	if LazyAdvance {
+		return i.src.fetchDuringPushStream(req, i.conn)
+	}
 	return slices.Values(i.src.fetchForConn(req, i.conn))
 }
 
@@ -1134,11 +1197,15 @@ func (s *Source) fetchForConn(req ivm.FetchRequest, conn *connection) []ivm.Node
 	// frame conn bound via BindConn), so the cached Conn-bound stmt stays valid
 	// across advances and re-reads the new frame after each leapfrog.
 	dbConn := s.activeConn()
-	stmt, err := s.preparedSelectLocked(dbConn, q.SQL)
+	stmt, err := s.checkoutSelectLocked(dbConn, q.SQL)
 	if err != nil {
 		panic(fmt.Sprintf("tablesource.Source.Fetch %s: prepare: %v\nSQL: %s",
 			s.tableName, err, q.SQL))
 	}
+	// Hand the stmt back before s.mu releases (defers run LIFO; the Unlock
+	// defer above runs after this). The eager scan below fully drains the
+	// cursor under the lock, so the stmt is idle again by then.
+	defer s.returnSelectStmtLocked(dbConn, q.SQL, stmt)
 	rows, err := stmt.QueryContext(ctx, q.Params...)
 	if err != nil {
 		panic(fmt.Sprintf("tablesource.Source.Fetch %s: query: %v\nSQL: %s",
@@ -1211,6 +1278,168 @@ func (s *Source) fetchForConn(req ivm.FetchRequest, conn *connection) []ivm.Node
 		}
 	}
 	return out
+}
+
+// fetchDuringPushStream is the LAZY advance-time leaf read (LazyAdvance /
+// GO_IVM_LAZY_ADVANCE): it yields rows one at a time from a live SQLite
+// cursor on the prev-tx conn, splicing the in-flight overlay per row, instead
+// of materializing the whole result set the way fetchForConn does. This is
+// the Go analog of TS's leaf during push processing — statement.iterate()
+// wrapped by generateWithOverlay (zqlite table-source.ts #fetch) — and the
+// advance-side counterpart of fetchViaPoolStream: a parent Join can hold this
+// cursor open while it fetches a child, so a large fan-out streams cursor →
+// operator → flatten → wire chunk with nothing fully co-resident.
+//
+// The yielded sequence is element-for-element identical to
+// slices.Values(fetchForConn(req, conn)) — fetchForConn is the oracle the
+// parity tests compare against. Behavioral mirrors, in order:
+//   - overlay nil ⇒ delegate to the eager path (hydrate-without-pool etc.);
+//   - epoch gate (lastPushedEpoch >= overlay.Epoch) decides splicing, with
+//     the same PartialBoundComparator;
+//   - the overlay-add row passes conn.filterPredicate or is dropped
+//     (fetchForConn refilters the spliced slice; SQL rows are refiltered
+//     idempotently there, so predicate-gating just the add is equivalent);
+//   - NO limit-pushdown early stop — fetchForConn disables the break
+//     whenever an overlay is live (scanRows overlayActive), because a
+//     spliced row may land inside the top-N. Consumers (Take) stop pulling
+//     when satisfied, which is the real limit.
+//
+// Locking: setup (prev tx, SQL build, stmt checkout, overlay snapshot) runs
+// under s.mu; the cursor is then iterated WITHOUT the lock so nested child
+// fetches on this or sibling sources can run mid-iteration (they re-take
+// s.mu per-fetch; SQLite interleaves cursors on one conn natively — the
+// single-threaded-JS-equivalent discipline TS gets for free). Releasing the
+// lock is safe because every field the iteration touches is stable for the
+// cursor's lifetime: the cursor exists only inside a push fanout, during
+// which s.overlay is set exactly once (genPushAndWrite sets it before any
+// Output.Push and clears it only after the fanout returns), writeChangeLocked
+// runs strictly after fanout, OnAdvanceEnd/RefreshSnapshot refuse to roll
+// back while overlay is non-nil, and conn.lastPushedEpoch for THIS conn was
+// bumped before its filterPush. The checked-out stmt makes the cursor
+// private (see checkoutSelectLocked).
+//
+// Uses s.ctx (CG lifetime) per the Source ctx contract — a teardown mid-
+// cursor surfaces as a panic that the engine's advance recovery converts to
+// a clean terminal frame.
+func (s *Source) fetchDuringPushStream(req ivm.FetchRequest, conn *connection) iter.Seq[ivm.Node] {
+	return func(yield func(ivm.Node) bool) {
+		s.mu.Lock()
+		if s.overlay == nil {
+			// Not inside a push fanout (e.g. hydrate without a reader pool,
+			// or a companion re-check between batches). The eager path is
+			// the reference behavior there; it re-takes s.mu itself.
+			s.mu.Unlock()
+			for _, n := range s.fetchForConn(req, conn) {
+				if !yield(n) {
+					return
+				}
+			}
+			return
+		}
+
+		if err := s.ensurePrevTxLocked(); err != nil {
+			s.mu.Unlock()
+			panic(fmt.Sprintf("tablesource.Source.Fetch %s: ensurePrevTx: %v", s.tableName, err))
+		}
+		order := conn.sort
+		if order == nil {
+			order = make(ivm.Ordering, len(s.primaryKey))
+			for i, k := range s.primaryKey {
+				order[i] = [2]string{k, "asc"}
+			}
+		}
+		q := sqlite.BuildSelectQuery(
+			s.tableName,
+			s.columns,
+			req.Constraint,
+			conn.filterCondition,
+			order,
+			req.Reverse,
+			req.Start,
+		)
+		dbConn := s.activeConn()
+		stmt, err := s.checkoutSelectLocked(dbConn, q.SQL)
+		if err != nil {
+			s.mu.Unlock()
+			panic(fmt.Sprintf("tablesource.Source.Fetch %s: prepare: %v\nSQL: %s",
+				s.tableName, err, q.SQL))
+		}
+		// Snapshot the splice plan under the lock. Same comparator + gate as
+		// fetchForConn's applyOverlay block; see overlaySplicePlan for the
+		// positional contract that makes the per-row merge equivalent to
+		// insertSorted + removeByPK on the materialized slice.
+		effCmp := ivm.MakePartialBoundComparator(order, req.Reverse)
+		var pendingAdd, pendingRemove ivm.Row
+		if conn.lastPushedEpoch >= s.overlay.Epoch {
+			pendingAdd, pendingRemove = overlaySplicePlan(s.overlay.Change, effCmp, req.Constraint, req.Start)
+			if pendingAdd != nil && conn.filterPredicate != nil && !conn.filterPredicate(pendingAdd) {
+				pendingAdd = nil
+			}
+		}
+		s.mu.Unlock()
+
+		defer s.returnSelectStmt(dbConn, q.SQL, stmt)
+		rows, err := stmt.QueryContext(s.ctx, q.Params...)
+		if err != nil {
+			panic(fmt.Sprintf("tablesource.Source.Fetch %s: query: %v\nSQL: %s",
+				s.tableName, err, q.SQL))
+		}
+		defer rows.Close()
+		colNames, err := rows.Columns()
+		if err != nil {
+			panic(fmt.Sprintf("tablesource.Source.Fetch %s: columns: %v",
+				s.tableName, err))
+		}
+
+		// Per-row scan mirrors scanRows (reused buffers; each row's values are
+		// copied into its own map, so buffer reuse never aliases yielded rows).
+		raw := make([]any, len(colNames))
+		ptrs := make([]any, len(colNames))
+		for i := range raw {
+			ptrs[i] = &raw[i]
+		}
+		for rows.Next() {
+			if err := rows.Scan(ptrs...); err != nil {
+				panic(fmt.Sprintf("tablesource.Source.Fetch %s: scan: %v",
+					s.tableName, err))
+			}
+			row := make(ivm.Row, len(colNames))
+			for i, c := range colNames {
+				cs, ok := s.columns[c]
+				if !ok {
+					continue
+				}
+				row[c] = sqlite.FromSQLiteType(raw[i], cs.Type)
+			}
+			if conn.filterPredicate != nil && !conn.filterPredicate(row) {
+				continue
+			}
+			if pendingRemove != nil && pkRowsEqual(row, pendingRemove, s.primaryKey) {
+				pendingRemove = nil
+				continue
+			}
+			if pendingAdd != nil && effCmp(pendingAdd, row) <= 0 {
+				add := pendingAdd
+				pendingAdd = nil
+				if !yield(ivm.Node{Row: add}) {
+					return
+				}
+			}
+			if !yield(ivm.Node{Row: row}) {
+				return
+			}
+		}
+		if err := rows.Err(); err != nil {
+			panic(fmt.Sprintf("tablesource.Source.Fetch %s: rows: %v",
+				s.tableName, err))
+		}
+		// Overlay add that sorts after every SQL row (or empty result).
+		if pendingAdd != nil {
+			if !yield(ivm.Node{Row: pendingAdd}) {
+				return
+			}
+		}
+	}
 }
 
 // scanRows materialises rows into Nodes, applying the connection's residual

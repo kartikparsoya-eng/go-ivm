@@ -129,6 +129,72 @@ func overlayRowAtOrAfterStart(row ivm.Row, start *ivm.Start, comparator ivm.Comp
 	return true
 }
 
+// overlaySplicePlan reduces the in-flight overlay change to its streaming
+// splice ingredients: at most one row to inject (add) and one row to
+// suppress (remove), pre-gated by the fetch's constraint + start cursor.
+// It is the per-row merge equivalent of applyOverlay — the branch
+// structure mirrors it case for case; keep the two in lockstep.
+//
+// Contract for the caller (fetchDuringPushStream):
+//   - inject `add` immediately BEFORE the first streamed row R with
+//     comparator(add, R) <= 0, or after the last row if none — the
+//     leftmost position insertSorted picks (streamed rows arrive already
+//     sorted by the same comparator, so first-match == leftmost index);
+//   - drop the first streamed row whose primary key equals `remove`
+//     (removeByPK removes exactly one; PKs are unique).
+//
+// Equivalence with applyOverlay's remove-then-insert sequencing holds
+// regardless of per-row check order: the add lands before the first
+// SURVIVING row that sorts >= it either way (total order + transitivity),
+// which is exactly where insertSorted places it post-removal.
+func overlaySplicePlan(
+	change ivm.SourceChange,
+	comparator ivm.Comparator,
+	constraint *ivm.Constraint,
+	start *ivm.Start,
+) (add, remove ivm.Row) {
+	addAllowed := func(row ivm.Row) bool {
+		if constraint != nil && !constraintMatchesRow(*constraint, row) {
+			return false
+		}
+		return overlayRowAtOrAfterStart(row, start, comparator)
+	}
+	switch change.Type {
+	case ivm.ChangeTypeAdd:
+		if addAllowed(change.Row) {
+			add = change.Row
+		}
+	case ivm.ChangeTypeRemove:
+		remove = change.Row
+	case ivm.ChangeTypeEdit:
+		if constraint != nil && !constraintMatchesRow(*constraint, change.OldRow) {
+			// Old row outside the constraint window — nothing of it is in
+			// the streamed set; the edit degrades to a pure add (mirrors
+			// applyOverlay's Edit early branch).
+			if addAllowed(change.Row) {
+				add = change.Row
+			}
+			return
+		}
+		remove = change.OldRow
+		if addAllowed(change.Row) {
+			add = change.Row
+		}
+	}
+	return
+}
+
+// pkRowsEqual reports whether two rows agree on every primary-key column,
+// using the same CompareValues convention as removeByPK.
+func pkRowsEqual(a, b ivm.Row, primaryKey []string) bool {
+	for _, pk := range primaryKey {
+		if ivm.CompareValues(a[pk], b[pk]) != 0 {
+			return false
+		}
+	}
+	return true
+}
+
 // constraintMatchesRow — TS uses valuesEqual (constraint.ts:21), which treats
 // null/null as UNEQUAL (data.ts:112-118). CompareValues treats nil/nil as equal
 // (returns 0), which would over-include an overlay row whose constraint column
