@@ -20,9 +20,17 @@ package main
 //     is safe because it is enqueued only after the handler returns, i.e.
 //     after every abiDeliver above (TSFN FIFO puts it last).
 //
-// Fallback contract: a change that can't be row-encoded (non-homogeneous
-// column set, remove-first group taking a later add — see encodeRow) ships
-// inside a positional msgpack partial instead. Correct over fast; the TS
+// Fallback contract (ALL-OR-NOTHING per partial — REVIEW-napi-transport
+// B2): if ANY change in a partial can't be row-encoded (non-homogeneous
+// column set, remove-first group taking a later add — see encodeRow), the
+// ENTIRE partial ships inside one positional msgpack partial and ZERO of
+// its rows go out as records. Mixing planes within a partial would reorder
+// its changes — encodable rows left immediately as records while fallback
+// rows waited for the trailing frame, so [add X (fallback), remove X
+// (record)] arrived at the client as remove-then-add: net phantom row →
+// drift. chunkSize=1 partials mostly dodge this, but remove-first groups
+// fall back forever and the residual-drain path produces multi-change
+// partials, so the interleave was reachable. Correct over fast; the TS
 // row-mode accumulator accepts both planes.
 
 import (
@@ -69,11 +77,26 @@ func newRowPlane(s *Server, reqID interface{}, want bool) *rowPlane {
 	return &rowPlane{enc: newRowRecordEncoder(rid), deliver: s.abiDeliver, reqID: reqID}
 }
 
-// emitChanges routes one partial's changes: records for the encodable rows,
-// and returns the changes that must fall back to a msgpack frame (nil when
-// everything was row-encoded).
+// emitChanges routes one partial's changes. ALL-OR-NOTHING: row records
+// are buffered and delivered only if EVERY change in the partial
+// row-encodes; on the first unencodable change it returns the ENTIRE
+// partial for frame delivery with zero records delivered (see the file
+// header for the reorder this prevents).
+//
+// Group defs still deliver EAGERLY (before the whole partial's
+// encodability is known): defs are metadata-only — the JS registry just
+// interns them and no row references a def until a record actually
+// delivers — so a def whose partial ends up framed is harmless. Deferring
+// defs on an aborted partial would be WORSE: the group stays interned on
+// the Go side, so a later partial's record for it would reference a def
+// the JS side never received ("row record references unknown group").
 func (rp *rowPlane) emitChanges(changes []engine.RowChange) []engine.RowChange {
-	var fallback []engine.RowChange
+	if len(changes) == 0 {
+		return nil
+	}
+	// Phase 1: encode every row into a COPY (encodeRow's return aliases the
+	// encoder's scratch buffer, so buffered records must not share it).
+	recs := make([][]byte, 0, len(changes))
 	for i := range changes {
 		c := &changes[i]
 		g, def := rp.enc.groupFor(c)
@@ -82,12 +105,15 @@ func (rp *rowPlane) emitChanges(changes []engine.RowChange) []engine.RowChange {
 		}
 		rec, ok := rp.enc.encodeRow(g, c)
 		if !ok {
-			fallback = append(fallback, *c)
-			continue
+			return changes // whole partial → one frame; no records delivered
 		}
+		recs = append(recs, append([]byte(nil), rec...))
+	}
+	// Phase 2: every change encoded — deliver in order.
+	for _, rec := range recs {
 		rp.deliver(abiKindRow, rec)
 	}
-	return fallback
+	return nil
 }
 
 // deliverFrame msgpack-encodes a partial as a full RPCResponse and delivers

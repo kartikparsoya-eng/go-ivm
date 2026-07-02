@@ -500,3 +500,84 @@ func TestABIHost_RowModeAdvanceEndToEnd(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 }
+
+// TestRowRecord_IntWidthValueTags (REVIEW-napi-transport pass-2 minor): every
+// integer width the engine could conceivably carry must cross as the i64 tag
+// (symmetric with ivm's toFloat64 matrix), EXCEPT uint64/uint above MaxInt64 —
+// the wire tag is signed (JS reads BigInt64), so those ship as msgpack blobs
+// to avoid decoding negative.
+func TestRowRecord_IntWidthValueTags(t *testing.T) {
+	enc := newRowRecordEncoder(1)
+	row := ivm.Row{
+		"id":     "k1",
+		"i8":     int8(-5),
+		"i16":    int16(-1234),
+		"u8":     uint8(200),
+		"u16":    uint16(60000),
+		"u32":    uint32(4000000000),
+		"u64ok":  uint64(9223372036854775807),
+		"u64big": uint64(9223372036854775808), // MaxInt64+1 → blob
+	}
+	c := &engine.RowChange{
+		Type: engine.RowChangeAdd, QueryID: "q", Table: "t",
+		RowKey: map[string]interface{}{"id": "k1"}, Row: row,
+	}
+	g, def := enc.groupFor(c)
+	if def == nil {
+		t.Fatal("expected a groupDef")
+	}
+	gd := decodeGroupDef(t, append([]byte(nil), def...))
+	rec, ok := enc.encodeRow(g, c)
+	if !ok {
+		t.Fatal("encodeRow failed")
+	}
+	dr := decodeRowRecord(t, append([]byte(nil), rec...), len(gd.cols))
+	byCol := map[string]interface{}{}
+	for i, col := range gd.cols {
+		byCol[col] = dr.values[i]
+	}
+	for col, want := range map[string]float64{
+		"i8": -5, "i16": -1234, "u8": 200, "u16": 60000,
+		"u32": 4000000000, "u64ok": 9223372036854775807, "u64big": 9223372036854775808,
+	} {
+		if got := toF64(t, byCol[col]); got != want {
+			t.Errorf("%s = %v (%T), want %v", col, byCol[col], byCol[col], want)
+		}
+	}
+}
+
+// TestRowRecord_OversizedIdentifierFailsLoud: an identifier beyond the u16
+// length space must pin the group to the frame plane (NO def delivered, every
+// record rejected — removes included), not silently truncate. A truncated def
+// would mismatch every record's column order at the client.
+func TestRowRecord_OversizedIdentifierFailsLoud(t *testing.T) {
+	enc := newRowRecordEncoder(2)
+	giant := string(make([]byte, 70000))
+	c := &engine.RowChange{
+		Type: engine.RowChangeAdd, QueryID: giant, Table: "t",
+		RowKey: map[string]interface{}{"id": "a"}, Row: ivm.Row{"id": "a"},
+	}
+	g, def := enc.groupFor(c)
+	if def != nil {
+		t.Fatal("oversized identifier must NOT produce a def")
+	}
+	if !g.frameOnly {
+		t.Fatal("group must be pinned frameOnly")
+	}
+	if _, ok := enc.encodeRow(g, c); ok {
+		t.Fatal("frameOnly group must reject add records")
+	}
+	// Removes too: the def was never delivered, so a remove record would
+	// reference an unknown group on the JS side.
+	rc := &engine.RowChange{
+		Type: engine.RowChangeRemove, QueryID: giant, Table: "t",
+		RowKey: map[string]interface{}{"id": "a"},
+	}
+	g2, def2 := enc.groupFor(rc)
+	if def2 != nil || g2 != g {
+		t.Fatal("interned frameOnly group must be reused, still defless")
+	}
+	if _, ok := enc.encodeRow(g2, rc); ok {
+		t.Fatal("remove against a frameOnly group must fall back to frames")
+	}
+}

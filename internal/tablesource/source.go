@@ -1330,12 +1330,82 @@ func (s *Source) fetchForConn(req ivm.FetchRequest, conn *connection) []ivm.Node
 // a clean terminal frame.
 func (s *Source) fetchDuringPushStream(req ivm.FetchRequest, conn *connection) iter.Seq[ivm.Node] {
 	return func(yield func(ivm.Node) bool) {
-		s.mu.Lock()
-		if s.overlay == nil {
-			// Not inside a push fanout (e.g. hydrate without a reader pool,
-			// or a companion re-check between batches). The eager path is
-			// the reference behavior there; it re-takes s.mu itself.
-			s.mu.Unlock()
+		// Locked setup, PANIC-SAFE (REVIEW-napi-transport F7): the splice
+		// plan runs user-value-sensitive code inside the lock —
+		// overlaySplicePlan invokes the effective comparator against
+		// req.Start (CompareValues panics with a DataError on non-scalar /
+		// mismatched sort keys) and the connection's filterPredicate
+		// (ported TS closures; type asserts). The previous manual
+		// Lock/Unlock pairs let such a panic escape WITH s.mu held: every
+		// later Push/Fetch on this source blocked forever — a silent CG
+		// wedge with no error frame and no restart trigger, strictly worse
+		// than the panic itself (which the engine recovers into a DataError
+		// teardown). The closure's deferred unlock guarantees release on
+		// every exit; the stmt checkout runs LAST so no panic can fire
+		// while a stmt is checked out of the cache (an orphaned checkout
+		// would leak until conn teardown).
+		var (
+			eager                     bool
+			dbConn                    *sql.Conn
+			stmt                      *sql.Stmt
+			qSQL                      string
+			qParams                   []any
+			effCmp                    ivm.Comparator
+			pendingAdd, pendingRemove ivm.Row
+		)
+		func() {
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			if s.overlay == nil {
+				// Not inside a push fanout (e.g. hydrate without a reader pool,
+				// or a companion re-check between batches). The eager path is
+				// the reference behavior there; it re-takes s.mu itself (after
+				// this closure's deferred unlock).
+				eager = true
+				return
+			}
+
+			if err := s.ensurePrevTxLocked(); err != nil {
+				panic(fmt.Sprintf("tablesource.Source.Fetch %s: ensurePrevTx: %v", s.tableName, err))
+			}
+			order := conn.sort
+			if order == nil {
+				order = make(ivm.Ordering, len(s.primaryKey))
+				for i, k := range s.primaryKey {
+					order[i] = [2]string{k, "asc"}
+				}
+			}
+			q := sqlite.BuildSelectQuery(
+				s.tableName,
+				s.columns,
+				req.Constraint,
+				conn.filterCondition,
+				order,
+				req.Reverse,
+				req.Start,
+			)
+			qSQL, qParams = q.SQL, q.Params
+			// Snapshot the splice plan under the lock. Same comparator + gate as
+			// fetchForConn's applyOverlay block; see overlaySplicePlan for the
+			// positional contract that makes the per-row merge equivalent to
+			// insertSorted + removeByPK on the materialized slice. CAN PANIC on
+			// poison values — deliberately placed BEFORE the stmt checkout.
+			effCmp = ivm.MakePartialBoundComparator(order, req.Reverse)
+			if conn.lastPushedEpoch >= s.overlay.Epoch {
+				pendingAdd, pendingRemove = overlaySplicePlan(s.overlay.Change, effCmp, req.Constraint, req.Start)
+				if pendingAdd != nil && conn.filterPredicate != nil && !conn.filterPredicate(pendingAdd) {
+					pendingAdd = nil
+				}
+			}
+			dbConn = s.activeConn()
+			var err error
+			stmt, err = s.checkoutSelectLocked(dbConn, qSQL)
+			if err != nil {
+				panic(fmt.Sprintf("tablesource.Source.Fetch %s: prepare: %v\nSQL: %s",
+					s.tableName, err, qSQL))
+			}
+		}()
+		if eager {
 			for _, n := range s.fetchForConn(req, conn) {
 				if !yield(n) {
 					return
@@ -1344,52 +1414,11 @@ func (s *Source) fetchDuringPushStream(req ivm.FetchRequest, conn *connection) i
 			return
 		}
 
-		if err := s.ensurePrevTxLocked(); err != nil {
-			s.mu.Unlock()
-			panic(fmt.Sprintf("tablesource.Source.Fetch %s: ensurePrevTx: %v", s.tableName, err))
-		}
-		order := conn.sort
-		if order == nil {
-			order = make(ivm.Ordering, len(s.primaryKey))
-			for i, k := range s.primaryKey {
-				order[i] = [2]string{k, "asc"}
-			}
-		}
-		q := sqlite.BuildSelectQuery(
-			s.tableName,
-			s.columns,
-			req.Constraint,
-			conn.filterCondition,
-			order,
-			req.Reverse,
-			req.Start,
-		)
-		dbConn := s.activeConn()
-		stmt, err := s.checkoutSelectLocked(dbConn, q.SQL)
-		if err != nil {
-			s.mu.Unlock()
-			panic(fmt.Sprintf("tablesource.Source.Fetch %s: prepare: %v\nSQL: %s",
-				s.tableName, err, q.SQL))
-		}
-		// Snapshot the splice plan under the lock. Same comparator + gate as
-		// fetchForConn's applyOverlay block; see overlaySplicePlan for the
-		// positional contract that makes the per-row merge equivalent to
-		// insertSorted + removeByPK on the materialized slice.
-		effCmp := ivm.MakePartialBoundComparator(order, req.Reverse)
-		var pendingAdd, pendingRemove ivm.Row
-		if conn.lastPushedEpoch >= s.overlay.Epoch {
-			pendingAdd, pendingRemove = overlaySplicePlan(s.overlay.Change, effCmp, req.Constraint, req.Start)
-			if pendingAdd != nil && conn.filterPredicate != nil && !conn.filterPredicate(pendingAdd) {
-				pendingAdd = nil
-			}
-		}
-		s.mu.Unlock()
-
-		defer s.returnSelectStmt(dbConn, q.SQL, stmt)
-		rows, err := stmt.QueryContext(s.ctx, q.Params...)
+		defer s.returnSelectStmt(dbConn, qSQL, stmt)
+		rows, err := stmt.QueryContext(s.ctx, qParams...)
 		if err != nil {
 			panic(fmt.Sprintf("tablesource.Source.Fetch %s: query: %v\nSQL: %s",
-				s.tableName, err, q.SQL))
+				s.tableName, err, qSQL))
 		}
 		defer rows.Close()
 		colNames, err := rows.Columns()

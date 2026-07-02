@@ -228,11 +228,16 @@ func (s *Server) buildWarmReaderPoolLocked(group *ClientGroup, cmax int) (*table
 	if lanesCmax := s.hydrateLanes * cmax; lanesCmax > k {
 		k = lanesCmax
 	}
-	// Streaming-by-default (this branch): warm hydrate also always streams via the
-	// co-read pool — no GO_IVM_WARM_HYDRATE_POOL gate. advanceDrive is still
-	// required (the pool pins to curr's drive-mode frame); k<=1 is unreachable
-	// with the default lanes but kept as a defensive floor.
-	if !s.advanceDriveEnabled || k <= 1 {
+	// GO_IVM_WARM_HYDRATE_POOL=false is the operator KILL SWITCH for this
+	// production default. The gate must stay wired even though the default
+	// is ON: 0df0f63 dropped this check when streaming went default-on, and
+	// the 2026-07-02 flag consolidation then documented the env knob while
+	// it was consumed nowhere — a dead kill switch (REVIEW-napi-transport
+	// B1; TestBuildWarmReaderPool_Guards/feature_off pins it now).
+	// advanceDrive is still required (the pool pins to curr's drive-mode
+	// frame); k<=1 is unreachable with the default lanes but kept as a
+	// defensive floor.
+	if !s.warmHydratePoolEnabled || !s.advanceDriveEnabled || k <= 1 {
 		return nil, nil
 	}
 	if group.snap == nil || group.eng == nil {

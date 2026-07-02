@@ -83,6 +83,11 @@ type rowGroup struct {
 	id   uint32
 	cols []string
 	pk   []string
+	// frameOnly pins the group to the msgpack frame plane forever: set when
+	// the groupDef could not be encoded (identifier over 64KB — see
+	// putShortStr). The def was never delivered, so NO record may reference
+	// this group (removes included) or the JS side throws "unknown group".
+	frameOnly bool
 }
 
 func newRowRecordEncoder(reqID float64) *rowRecordEncoder {
@@ -132,12 +137,19 @@ func (e *rowRecordEncoder) putF64(v float64) {
 	e.buf = binary.LittleEndian.AppendUint64(e.buf, math.Float64bits(v))
 }
 
-func (e *rowRecordEncoder) putShortStr(s string) {
+// putShortStr appends a u16-length identifier. Returns false when the
+// identifier exceeds the u16 length space — FAIL LOUD (the caller pins the
+// group to the frame plane) instead of silently truncating: a truncated
+// def would mismatch every subsequent record's column order, delivering
+// wrong values under wrong keys at the client (REVIEW-napi-transport
+// pass-2 minor).
+func (e *rowRecordEncoder) putShortStr(s string) bool {
 	if len(s) > math.MaxUint16 {
-		s = s[:math.MaxUint16] // identifiers; never legitimately this long
+		return false // identifiers are never legitimately this long
 	}
 	e.putU16(uint16(len(s)))
 	e.buf = append(e.buf, s...)
+	return true
 }
 
 // groupFor interns the (queryID,table) group, encoding a groupDef record
@@ -169,11 +181,11 @@ func (e *rowRecordEncoder) groupFor(c *engine.RowChange) (*rowGroup, []byte) {
 	e.buf = e.buf[:0]
 	e.putF64(e.reqID)
 	e.putU32(g.id)
-	e.putShortStr(c.QueryID)
-	e.putShortStr(c.Table)
+	ok := e.putShortStr(c.QueryID)
+	ok = e.putShortStr(c.Table) && ok
 	e.putU16(uint16(len(g.cols)))
 	for _, col := range g.cols {
-		e.putShortStr(col)
+		ok = e.putShortStr(col) && ok
 	}
 	e.putU16(uint16(len(g.pk)))
 	for _, pkCol := range g.pk {
@@ -191,7 +203,14 @@ func (e *rowRecordEncoder) groupFor(c *engine.RowChange) (*rowGroup, []byte) {
 		} else {
 			e.putU16(uint16(idx))
 		}
-		e.putShortStr(pkCol)
+		ok = e.putShortStr(pkCol) && ok
+	}
+	if !ok {
+		// Oversized identifier — the def cannot be represented. Pin the
+		// group to the frame plane (encodeRow rejects everything for it)
+		// and deliver NO def; the partially-encoded buf is discarded.
+		g.frameOnly = true
+		return g, nil
 	}
 	return g, e.buf
 }
@@ -203,6 +222,11 @@ func (e *rowRecordEncoder) groupFor(c *engine.RowChange) (*rowGroup, []byte) {
 // caller must fall back to the msgpack frame path for this change.
 // The returned slice aliases e.buf; consume before the next encode.
 func (e *rowRecordEncoder) encodeRow(g *rowGroup, c *engine.RowChange) ([]byte, bool) {
+	if g.frameOnly {
+		// Def was never delivered (oversized identifier) — no record may
+		// reference this group, removes included.
+		return nil, false
+	}
 	if c.Type != engine.RowChangeRemove {
 		if c.Row == nil {
 			return nil, false
@@ -267,21 +291,57 @@ func (e *rowRecordEncoder) putValue(v interface{}) bool {
 	case int32:
 		e.buf = append(e.buf, rowValI64)
 		e.buf = binary.LittleEndian.AppendUint64(e.buf, uint64(int64(x)))
+	case int8:
+		e.buf = append(e.buf, rowValI64)
+		e.buf = binary.LittleEndian.AppendUint64(e.buf, uint64(int64(x)))
+	case int16:
+		e.buf = append(e.buf, rowValI64)
+		e.buf = binary.LittleEndian.AppendUint64(e.buf, uint64(int64(x)))
+	case uint8:
+		e.buf = append(e.buf, rowValI64)
+		e.buf = binary.LittleEndian.AppendUint64(e.buf, uint64(int64(x)))
+	case uint16:
+		e.buf = append(e.buf, rowValI64)
+		e.buf = binary.LittleEndian.AppendUint64(e.buf, uint64(int64(x)))
+	case uint32:
+		e.buf = append(e.buf, rowValI64)
+		e.buf = binary.LittleEndian.AppendUint64(e.buf, uint64(int64(x)))
+	case uint64:
+		// i64 tag is SIGNED on the wire (JS reads BigInt64): a value above
+		// MaxInt64 would decode negative — ship it as a blob instead.
+		if x <= math.MaxInt64 {
+			e.buf = append(e.buf, rowValI64)
+			e.buf = binary.LittleEndian.AppendUint64(e.buf, x)
+		} else {
+			return e.putBlobValue(v)
+		}
+	case uint:
+		if uint64(x) <= math.MaxInt64 {
+			e.buf = append(e.buf, rowValI64)
+			e.buf = binary.LittleEndian.AppendUint64(e.buf, uint64(x))
+		} else {
+			return e.putBlobValue(v)
+		}
 	case string:
 		e.buf = append(e.buf, rowValStr)
 		e.putU32(uint32(len(x)))
 		e.buf = append(e.buf, x...)
 	default:
-		// Nested JSON (maps/slices), []byte, and any exotic value ride as
-		// a msgpack blob; TS decodes those rare values with msgpackr.
-		blob, err := mpMarshal(v)
-		if err != nil {
-			return false
-		}
-		e.buf = append(e.buf, rowValBlob)
-		e.putU32(uint32(len(blob)))
-		e.buf = append(e.buf, blob...)
+		return e.putBlobValue(v)
 	}
+	return true
+}
+
+// putBlobValue appends a msgpack-blob-tagged value (nested JSON maps/slices,
+// []byte, over-range uint64, and any exotic value). TS decodes with msgpackr.
+func (e *rowRecordEncoder) putBlobValue(v interface{}) bool {
+	blob, err := mpMarshal(v)
+	if err != nil {
+		return false
+	}
+	e.buf = append(e.buf, rowValBlob)
+	e.putU32(uint32(len(blob)))
+	e.buf = append(e.buf, blob...)
 	return true
 }
 
