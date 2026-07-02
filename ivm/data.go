@@ -150,6 +150,9 @@ type Comparator func(r1, r2 Row) int
 // toFloat64 converts any numeric Value into a float64.
 // Mirrors JS's single-Number-type model so values that arrived as int64/uint64
 // (e.g., msgpack-decoded AST literals) compare equal to float64 row values.
+// The matrix is complete over every width msgpack's DecodeInterface can
+// produce (small ints decode as int8/int16 on the wire) — a missing case
+// would make an equal pair look cross-type and panic instead of comparing.
 func toFloat64(v Value) (float64, bool) {
 	switch n := v.(type) {
 	case float64:
@@ -166,6 +169,16 @@ func toFloat64(v Value) (float64, bool) {
 		return float64(n), true
 	case float32:
 		return float64(n), true
+	case int8:
+		return float64(n), true
+	case int16:
+		return float64(n), true
+	case uint8:
+		return float64(n), true
+	case uint16:
+		return float64(n), true
+	case uint:
+		return float64(n), true
 	}
 	return 0, false
 }
@@ -174,12 +187,17 @@ func toFloat64(v Value) (float64, bool) {
 // type, but numeric values are compared in a unified float64 space (matching
 // TS's single JS Number type). nil compares equal to nil here (unlike SQL).
 // Join code handles null separately via ValuesEqual.
+//
+// Structure note: there is deliberately NO leading `if a == b` fast path.
+// Interface == panics with an opaque runtime error ("comparing uncomparable
+// type") when both operands hold the same non-comparable dynamic type — a
+// JSON column's map[string]interface{}, a JSON array, or a blob's []byte.
+// TS compareValues (zql data.ts:75) throws a clean `Unsupported type` Error
+// for non-scalar operands instead; we match that by letting non-scalars fall
+// through every scalar branch into the DataError below. Scalar equality is
+// handled inside each typed branch, so dropping the fast path costs nothing.
 func CompareValues(a, b Value) int {
-	if a == b {
-		return 0
-	}
-
-	// Numeric cross-type: int64/uint64/int/float64 all compare as float64.
+	// Numeric cross-type: every integer width + float compare as float64.
 	if af, ok := toFloat64(a); ok {
 		if bf, ok := toFloat64(b); ok {
 			if af < bf {
@@ -194,41 +212,43 @@ func CompareValues(a, b Value) int {
 
 	switch av := a.(type) {
 	case string:
-		bv, ok := b.(string)
-		if !ok {
-			break
+		if bv, ok := b.(string); ok {
+			// Byte-wise compare == UTF-8 code-point order — the SAME order TS
+			// chose on purpose (compareUTF8, data.ts:40-49) to match SQLite's
+			// BINARY collation. Do not switch to a locale/UTF-16 comparison.
+			return strings.Compare(av, bv)
 		}
-		return strings.Compare(av, bv)
 	case bool:
-		bv, ok := b.(bool)
-		if !ok {
-			break
+		if bv, ok := b.(bool); ok {
+			if av == bv {
+				return 0
+			}
+			if av {
+				return 1
+			}
+			return -1
 		}
-		if av == bv {
-			return 0
-		}
-		if av {
-			return 1
-		}
-		return -1
-	case nil:
+	}
+
+	// Null orders before ANY value — including non-scalar ones. TS runs its
+	// null checks (data.ts:62-67) before the unsupported-type throw, so
+	// nil-vs-object is ordered, not an error. Same here.
+	if a == nil {
 		if b == nil {
 			return 0
 		}
-		return -1
-	}
-
-	if a == nil {
 		return -1
 	}
 	if b == nil {
 		return 1
 	}
 
-	// Cross-type comparison = deterministic data/schema mismatch (non-retryable):
-	// tag as DataError so the sidecar maps it to RPC_CODE_DATA_ERROR (teardown,
-	// not reset-retry — a reset re-reads the same rows and re-panics forever).
-	panic(NewDataError("cannot compare values of different types: %T(%v) and %T(%v)\n%s", a, a, b, b, string(debug.Stack())))
+	// Cross-type or non-scalar (JSON object/array column, blob) comparison =
+	// deterministic data/schema mismatch (non-retryable): tag as DataError so
+	// the sidecar maps it to RPC_CODE_DATA_ERROR (teardown, not reset-retry —
+	// a reset re-reads the same rows and re-panics forever). Mirrors both TS
+	// throws (`Cannot compare values of different types` / `Unsupported type`).
+	panic(NewDataError("cannot compare values: unsupported or mismatched types %T(%v) and %T(%v)\n%s", a, a, b, b, string(debug.Stack())))
 }
 
 // ValuesEqual checks if two values are equal — matches TS valuesEqual.
@@ -244,15 +264,28 @@ func ValuesEqual(a, b Value) bool {
 	if a == nil || b == nil {
 		return false
 	}
-	if a == b {
-		return true
-	}
 	// Numeric cross-type
 	if af, ok := toFloat64(a); ok {
-		if bf, ok := toFloat64(b); ok {
-			return af == bf
-		}
+		bf, ok := toFloat64(b)
+		return ok && af == bf
 	}
+	switch av := a.(type) {
+	case string:
+		bv, ok := b.(string)
+		return ok && av == bv
+	case bool:
+		bv, ok := b.(bool)
+		return ok && av == bv
+	}
+	// Non-scalar (JSON object/array column, blob): TS valuesEqual is `a === b`
+	// — REFERENCE equality (data.ts:117). Two independently-decoded objects
+	// are always distinct references, so they compare UNEQUAL in TS even with
+	// identical content. Return false to match (a bare interface == here would
+	// instead panic "comparing uncomparable type" on same-typed maps/slices).
+	// Known micro-divergence: TS would return true for the literally-same
+	// object reference on both sides; that cannot occur on our push paths
+	// (Row and OldRow are decoded separately) and checking map identity would
+	// need reflection on a hot path.
 	return false
 }
 

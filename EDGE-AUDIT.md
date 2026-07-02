@@ -162,3 +162,84 @@ engine/advance_stream_drift_after_chunks_test.go F4 mid-stream drift
 engine/stream_byte_flush_test.go                F5 byte lever ×3 surfaces
 cmd/sidecar/panic_classification_test.go        F3 RPC classification
 ```
+
+---
+
+# Pass 2 — lifecycle, boundary types, porting + parallelization (TableSource)
+
+Scope per request: TS↔Go lifecycle, boundary type-conversion correctness,
+porting + parallelization correctness — **TableSource only** (prod path;
+MemorySource is shadow/test-only).
+
+## 6. Findings (fixed + pinned)
+
+### F6 — comparator crash on non-scalar values (FIXED, ivm/data.go)
+`CompareValues`/`ValuesEqual` opened with an interface `a == b` fast path.
+When both operands hold the same non-comparable dynamic type — a JSON
+column's `map[string]interface{}`, a JSON array, a blob's `[]byte` — Go
+panics with a raw `runtime error: comparing uncomparable type` (repro'd).
+That classifies as -32000 → deterministic reset loop until the breaker
+trips. TS is different on BOTH functions (zql data.ts):
+  - `compareValues` throws a clean `Unsupported type` Error for non-scalars;
+  - `valuesEqual` is `a === b` — REFERENCE equality, so two decoded objects
+    are simply unequal, never a crash (reachable via editChangesSplitKeys
+    when a JSON column is a sort key).
+Faithful port applied: scalar branches first (no leading `==`), then
+`CompareValues` → `*DataError` (-32102 teardown — consistent with its
+cross-type policy), `ValuesEqual` → `false`. Nil-vs-object stays ORDERED
+(TS runs null checks before the throw). Known micro-divergence documented:
+TS returns true for the literally-same reference; unreachable on our push
+paths.
+
+### F7 — `toFloat64` width matrix incomplete (FIXED, ivm/data.go)
+Missing `int8/int16/uint8/uint16/uint` — widths msgpack's DecodeInterface
+produces for small wire integers. An equal pair like `int16(5)` vs
+`float64(5)` looked cross-type → spurious DataError panic. Matrix completed;
+pinned by an all-pairs width test.
+
+### F8 — string collation parity CONFIRMED (pinned, no bug)
+TS deliberately compares strings with `compareUTF8` (data.ts:40-49) to match
+SQLite BINARY collation; Go's byte-wise `strings.Compare` is the same order.
+Pinned with the discriminating pair (U+E000 vs U+10000) so a future
+"optimization" to UTF-16-style comparison can't silently desync Take bounds
+from SQLite ORDER BY.
+
+## 7. Contracts pinned by new tests (pass 2)
+
+- **Wire decode** (`ivm/data_boundary_test.go`): every integer width → float64
+  at every nesting depth (JSON columns), scalar passthrough, nil row → nil
+  map, 2^53 boundary; decoded values usable by comparators end-to-end.
+- **Positional rev-9 sparse rows** (`cmd/sidecar/positional_sparse_test.go`):
+  Cols = union across the group; absent column → explicit nil (safe:
+  undefined≈null in TS, and FromSQLiteType rows are schema-complete);
+  group PK taken from a Remove-first change; nested JSON values survive.
+- **TableSource lifecycle** (`engine/tablesource_lifecycle_test.go`):
+  - add → advance → remove → advance (0 output, no panic) → re-add →
+    advance (output re-wired). Repeat-Add across batches is clean — pins
+    the OnAdvanceEnd ROLLBACK semantics (writeChange is prev-tx-only; the
+    replica FILE is ground truth, mirroring TS Snapshotter.resetToHead).
+  - rotation visibility BOTH ways: an external (replicator) commit is
+    INVISIBLE to hydrates before the next rotation (pinned frame — no
+    mid-frame tearing) and VISIBLE after it (re-pin at head).
+  - remove-unknown / double-remove are no-ops.
+- **TableSource parallelization** (same file + -race):
+  - 8 queries × 4 lanes streaming hydrate over 4 TableSource leaves:
+    per-query chunkIndex contiguous, exactly one Final per query, per-query
+    row totals exact, race-clean.
+  - concurrent advance loop vs remove/re-add churn loop: e.mu serialization
+    race-clean, zero drift, no prev-tx leak across batch boundaries.
+
+## 8. Pass-2 notes / accepted
+
+- Prod parallel-advance reality re-confirmed: `tablesource.Source.Push` fans
+  out serially; hydrate lanes + reader pool are the parallel surfaces. The
+  MemorySource parallel-push matrix is shadow-only.
+- Under mattn (test builds, plain BEGIN) an external commit between pins
+  makes the next writeChange hit SQLITE_BUSY_SNAPSHOT — this is precisely
+  why prod requires the wal2 BEGIN CONCURRENT build; tests model the
+  replicator by committing before the pin or across a rotation.
+- NaN ordering micro-divergence (TS `a-b` → NaN propagates; Go returns 0):
+  unreachable — SQLite REAL and JSON cannot carry NaN; msgpack could, but
+  nothing TS-side produces it. Documented, not fixed.
+- Absent-vs-null conflation in positional sparse rows: accepted (TS
+  normalizeUndefined makes them equivalent; engine rows are schema-complete).
