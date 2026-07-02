@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"sort"
 	"sync"
+	"sync/atomic"
 
 	"github.com/kartikparsoya-eng/go-ivm/ivm"
 )
@@ -68,16 +69,30 @@ type RowChange struct {
 type Streamer struct {
 	mu   sync.Mutex
 	rows []RowChange
-	// chunkSink, when non-nil, switches Accumulate into operator-level streaming:
-	// full chunkRows/chunkBytes chunks of a single source-change's fan-out are
-	// handed off DURING the flatten (a 50k-child ADD ships as N frames, not one),
-	// and only the sub-threshold residual coalesces into `rows`. Set by
-	// AdvanceStream for the advance window; nil elsewhere so hydrate/companion
-	// keep slice mode. chunkSink MUST consume its argument synchronously (the
-	// AdvanceStream sink encodes it into a wire frame before returning).
-	chunkSink  func([]RowChange)
-	chunkRows  int
-	chunkBytes int
+	// chunk is the operator-level streaming config (sink + thresholds) as ONE
+	// atomic snapshot: nil = slice mode (hydrate/companion); non-nil switches
+	// Accumulate into streaming mode, where full chunkConfig-sized chunks of a
+	// single source-change's fan-out are handed off DURING the flatten (a
+	// 50k-child ADD ships as N frames, not one) and only the sub-threshold
+	// residual coalesces into `rows`.
+	//
+	// Read LOCK-FREE on the Accumulate hot path (see Accumulate). It is stable
+	// for the whole advance/hydrate window — swapped only by SetChunkSink at
+	// advance setup/teardown, when no Accumulate is in flight — so the parallel
+	// hydrate lanes and parallel-fanout goroutines that all call Accumulate no
+	// longer contend s.mu just to READ this config. The atomic gives a
+	// consistent (sink, rowLimit, byteLimit) snapshot with no torn read even if
+	// the no-in-flight contract were ever violated.
+	chunk atomic.Pointer[chunkConfig]
+}
+
+// chunkConfig is the immutable streaming config SetChunkSink swaps in. The
+// three fields are bundled so Accumulate reads them from ONE atomic load —
+// three separate atomics could interleave a new sink with an old limit.
+type chunkConfig struct {
+	sink      func([]RowChange)
+	rowLimit  int
+	byteLimit int
 }
 
 // NewStreamer creates a new Streamer.
@@ -88,14 +103,16 @@ func NewStreamer() *Streamer {
 // SetChunkSink switches Accumulate into operator-level streaming mode for the
 // advance window: full chunks (rowLimit rows OR byteLimit estimated bytes) flush
 // via sink mid-flatten. Pass (nil,0,0) to restore slice mode. Call only while the
-// engine lock is held and no push is active (AdvanceStream setup/teardown), so it
-// never races an in-flight Accumulate.
+// engine lock is held and no push is active (AdvanceStream setup/teardown): the
+// atomic swap makes the READ race-free regardless, but selecting slice-vs-stream
+// mode consistently for a whole advance still relies on the swap happening
+// outside the push window (no Accumulate mid-flight).
 func (s *Streamer) SetChunkSink(sink func([]RowChange), rowLimit, byteLimit int) {
-	s.mu.Lock()
-	s.chunkSink = sink
-	s.chunkRows = rowLimit
-	s.chunkBytes = byteLimit
-	s.mu.Unlock()
+	if sink == nil {
+		s.chunk.Store(nil)
+		return
+	}
+	s.chunk.Store(&chunkConfig{sink: sink, rowLimit: rowLimit, byteLimit: byteLimit})
 }
 
 // Accumulate flattens IVM changes to RowChanges immediately — while the
@@ -103,13 +120,12 @@ func (s *Streamer) SetChunkSink(sink func([]RowChange), rowLimit, byteLimit int)
 // §3). Called by each pipeline's output handler during push; the flatten
 // runs on the caller's goroutine, parallelizing across push pipelines.
 func (s *Streamer) Accumulate(queryID string, schema *ivm.SourceSchema, changes []ivm.Change) {
-	s.mu.Lock()
-	sink := s.chunkSink
-	rowLimit := s.chunkRows
-	byteLimit := s.chunkBytes
-	s.mu.Unlock()
+	// Lock-free config read — the whole point of the atomic (see the chunk
+	// field doc): parallel hydrate lanes / fanout goroutines no longer serialize
+	// on s.mu just to learn which mode they're in.
+	cfg := s.chunk.Load()
 
-	if sink == nil {
+	if cfg == nil {
 		// Slice mode (hydrate/companion): flatten lock-free, append once.
 		flat := streamChanges(queryID, schema, changes)
 		if len(flat) == 0 {
@@ -126,6 +142,9 @@ func (s *Streamer) Accumulate(queryID string, schema *ivm.SourceSchema, changes 
 	// fan-out streams incrementally (peak buffer bounded to a chunk, matching TS
 	// #streamNodes' yield* + poke-every-CURSOR_PAGE_SIZE). The sub-threshold
 	// residual coalesces into rows, drained per source-change by Stream().
+	sink := cfg.sink
+	rowLimit := cfg.rowLimit
+	byteLimit := cfg.byteLimit
 	cap0 := rowLimit
 	if cap0 > 1024 {
 		cap0 = 1024
