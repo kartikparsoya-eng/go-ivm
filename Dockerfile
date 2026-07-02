@@ -70,6 +70,45 @@ RUN CGO_ENABLED=1 GOOS=linux go build \
     -o /go-ivm-sidecar \
     ./cmd/sidecar
 
+# Stage: libgoivm.so — the c-shared library for the in-process (NAPI)
+# transport (feat/napi-transport). Built on BOOKWORM (glibc), NOT alpine:
+# the consumer is the zero-cache image (node:22-slim, Debian/glibc) whose
+# goivm_napi addon dlopen()s this .so — a musl-linked shared object will
+# not load there. c-shared also cannot be fully static (-extldflags
+# '-static' conflicts with -buildmode=c-shared), so glibc-matching the
+# consumer is the whole game. Same wal2 sqlite amalgamation + tags as the
+# binary above, plus `napilib` to compile the cgo //export shims
+# (cmd/sidecar/napi_lib.go). Recipe smoke-tested 2026-07-02 against the
+# exact node:22-slim runtime (dlopen + goivm_start + ping round-trip).
+FROM golang:1.25-bookworm AS libgoivm-builder
+
+WORKDIR /src
+
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+
+RUN gcc -O2 -fPIC -c c/sqlite3/sqlite3.c -o /tmp/sqlite3.o \
+        -DSQLITE_THREADSAFE=2 \
+        -DSQLITE_ENABLE_FTS5 \
+        -DSQLITE_ENABLE_JSON1 \
+        -DSQLITE_ENABLE_RTREE \
+        -DSQLITE_OMIT_LOAD_EXTENSION \
+        -DSQLITE_ENABLE_SNAPSHOT \
+        -DSQLITE_ENABLE_WAL2_COREAD \
+    && ar rcs /usr/lib/libsqlite3.a /tmp/sqlite3.o \
+    && cp c/sqlite3/sqlite3.h /usr/include/sqlite3.h \
+    && cp c/sqlite3/sqlite3ext.h /usr/include/sqlite3ext.h
+
+RUN CGO_ENABLED=1 GOOS=linux go build \
+    -tags "libsqlite3 sqlite_omit_load_extension osusergo netgo napilib" \
+    -ldflags="-s -w" \
+    -trimpath \
+    -buildmode=c-shared \
+    -o /libgoivm.so \
+    ./cmd/sidecar
+
 # Minimal runtime image. alpine gives us a shell + apk for debugging
 # and ca-certificates for OTLP/HTTPS when tracing is enabled.
 FROM alpine:3.20
@@ -77,5 +116,10 @@ FROM alpine:3.20
 RUN apk add --no-cache ca-certificates
 
 COPY --from=builder /go-ivm-sidecar /usr/local/bin/go-ivm-sidecar
+
+# libgoivm.so rides along as an ARTIFACT (this alpine image never dlopens
+# it — it's glibc-linked for the node:22-slim consumer, which pulls it via
+# COPY --from=go-ivm in mono's Dockerfile.go-ivm napi variant).
+COPY --from=libgoivm-builder /libgoivm.so /usr/local/lib/libgoivm.so
 
 ENTRYPOINT ["/usr/local/bin/go-ivm-sidecar"]

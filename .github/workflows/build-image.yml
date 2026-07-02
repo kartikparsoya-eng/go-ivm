@@ -2,7 +2,7 @@ name: Build & publish sidecar image
 
 on:
   push:
-    branches: [main, feat/snapshotter-in-go, feat/streaming-hydrate]
+    branches: [main, feat/snapshotter-in-go, feat/streaming-hydrate, feat/napi-transport]
     tags: ['v*']
   pull_request:
     branches: [main]
@@ -98,25 +98,40 @@ jobs:
   # so the workflow stays green during initial setup.
   notify-downstream:
     needs: build
-    # A publish from EITHER Go-primary feature branch should rebuild the
-    # mono feat/snapshotter-in-go image — its build matrix bundles a
-    # different go-ivm binary per variant: feat/snapshotter-in-go feeds
+    # A publish from ANY Go-primary feature branch should rebuild the mono
+    # image whose build matrix bundles it: feat/snapshotter-in-go feeds
     # tablesrc + shadow-tablesrc, feat/streaming-hydrate feeds
-    # streaming-tablesrc. main/tag pushes publish go-ivm:latest for other
-    # lineages and must not retag the feat images with a mismatched
-    # binary. PRs and forks never carry the secret.
+    # streaming-tablesrc (both live on mono's feat/snapshotter-in-go
+    # workflow), and feat/napi-transport feeds napi-tablesrc (which lives
+    # on mono's feat/napi-transport workflow — that branch's matrix also
+    # includes the libgoivm.so consumer wiring). main/tag pushes publish
+    # go-ivm:latest for other lineages and must not retag the feat images
+    # with a mismatched binary. PRs and forks never carry the secret.
     if: >-
       github.event_name == 'push' &&
       (github.ref == 'refs/heads/feat/snapshotter-in-go' ||
-      github.ref == 'refs/heads/feat/streaming-hydrate')
+      github.ref == 'refs/heads/feat/streaming-hydrate' ||
+      github.ref == 'refs/heads/feat/napi-transport')
     runs-on: ubuntu-latest
     steps:
-      - name: Trigger mono-better build on feat/snapshotter-in-go (workflow_dispatch)
+      - name: Compute downstream target ref
+        id: target
+        # Which mono-better BRANCH gets rebuilt. napi publishes are consumed
+        # by mono's feat/napi-transport (its matrix has the napi-tablesrc
+        # variant + Dockerfile that bakes libgoivm.so + the addon); the two
+        # older branches keep feeding mono's feat/snapshotter-in-go exactly
+        # as before.
+        run: |
+          case "${GITHUB_REF#refs/heads/}" in
+            feat/napi-transport) echo "ref=feat/napi-transport" >> "$GITHUB_OUTPUT" ;;
+            *)                   echo "ref=feat/snapshotter-in-go" >> "$GITHUB_OUTPUT" ;;
+          esac
+      - name: Trigger mono-better build (workflow_dispatch)
         env:
           MONO_DISPATCH_TOKEN: ${{ secrets.MONO_DISPATCH_TOKEN }}
           # The mono-better branch whose workflow file + zero-cache source
           # is (re)built against the freshly published sidecar binary.
-          MONO_TARGET_REF: feat/snapshotter-in-go
+          MONO_TARGET_REF: ${{ steps.target.outputs.ref }}
           MONO_WORKFLOW_FILE: build-zero-cache-go.yml
         run: |
           if [ -z "${MONO_DISPATCH_TOKEN}" ]; then
