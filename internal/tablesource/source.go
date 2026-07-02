@@ -51,10 +51,13 @@ import (
 // statement.iterate() leaf (zqlite table-source.ts #fetch), whose cursor
 // nesting semantics SQLite natively supports on one connection (verified:
 // nested cursors on a single conn holding an uncommitted write interleave
-// correctly). Default off: the eager fetchForConn path stays byte-identical.
+// correctly). Production default ON — the streaming leaf fetch is the
+// deployed path (parity with the eager fetch proven by
+// TestLazyAdvanceFetchParity + engine/lazy_advance_parity_test.go).
 // Exported as a var (not re-read from env per call) so engine-level tests
-// can toggle it. GO_IVM_LAZY_ADVANCE=true enables.
-var LazyAdvance = os.Getenv("GO_IVM_LAZY_ADVANCE") == "true"
+// can toggle it. GO_IVM_LAZY_ADVANCE=false reverts to the eager
+// materialized fetchForConn path.
+var LazyAdvance = os.Getenv("GO_IVM_LAZY_ADVANCE") != "false"
 
 // Source is the read-only TableSource leaf. One instance per (CG, table).
 type Source struct {

@@ -74,6 +74,20 @@ func newServerFromEnv() (*Server, error) {
 	if server.advanceDriveEnabled {
 		server.advanceToHeadEnabled = true
 	}
+	// ONE parallelism knob: GO_IVM_PARALLELISM (default 4) sets the hydrate
+	// lane count (P — the engine package reads the SAME env for its lane
+	// workers, so the two stay in lockstep) and the reader-pool floor
+	// (K = 2×P; default 4 lanes / 8 readers is the prod-validated shape from
+	// the Dockerfile rollout). GO_IVM_HYDRATE_LANES / GO_IVM_HYDRATE_READERS
+	// override the facets individually for A/B work.
+	parallelism := 4
+	if v := os.Getenv("GO_IVM_PARALLELISM"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			parallelism = n
+		}
+	}
+	server.hydrateLanes = parallelism
+	server.hydrateReaders = 2 * parallelism
 	if v := os.Getenv("GO_IVM_HYDRATE_READERS"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 1 {
 			server.hydrateReaders = n
@@ -84,7 +98,11 @@ func newServerFromEnv() (*Server, error) {
 			server.hydrateLanes = n
 		}
 	}
-	server.warmHydratePoolEnabled = os.Getenv("GO_IVM_WARM_HYDRATE_POOL") == "true"
+	// Warm-hydrate reader pool: production default ON — co-read-only (never
+	// converges the pool to head), so it cannot desync live pipelines;
+	// validated in the rust-test soak (pin-rate 100%, serial fallback 0).
+	// GO_IVM_WARM_HYDRATE_POOL=false disables.
+	server.warmHydratePoolEnabled = os.Getenv("GO_IVM_WARM_HYDRATE_POOL") != "false"
 	fmt.Fprintf(os.Stderr,
 		"[GO-IVM] hydrate config: streaming=%v (default-on under drive) readers=%d(floor) lanes=%d advanceDrive=%v\n",
 		server.advanceDriveEnabled, server.hydrateReaders, server.hydrateLanes, server.advanceDriveEnabled)

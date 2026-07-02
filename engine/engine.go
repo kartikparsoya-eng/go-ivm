@@ -1038,6 +1038,14 @@ type QueryResult struct {
 	TimingMs   float64 // wall-time millis for this query's fetch+stream (final chunk only)
 }
 
+// defaultChunkSize is the ONE production knob for streamed-frame
+// granularity: GO_IVM_CHUNK_SIZE sets BOTH hydrateChunkSize and
+// advanceChunkSize. Default 100 — the production path streams by default
+// (the validated streaming-tablesrc setting; aligns with the TS
+// view-syncer's cursor page size). The per-facet vars below remain as
+// fine-grained overrides for A/B work; deployments should set only this.
+var defaultChunkSize = envChunkSize("GO_IVM_CHUNK_SIZE", 100)
+
 // hydrateChunkSize is the max number of RowChanges per partial frame in
 // AddQueriesStream. Matches the TS view-syncer's CURSOR_PAGE_SIZE so chunks
 // align with the downstream poke-batching boundary (no point chunking
@@ -1045,7 +1053,7 @@ type QueryResult struct {
 //
 // Declared as var (not const) so tests can shrink it to exercise chunk
 // boundaries without allocating 10k-row payloads per case.
-var hydrateChunkSize = envChunkSize("GO_IVM_HYDRATE_CHUNK_SIZE", 10000)
+var hydrateChunkSize = envChunkSize("GO_IVM_HYDRATE_CHUNK_SIZE", defaultChunkSize)
 
 // hydrateLanes is the number of worker lanes (P) that hydrate queries in
 // parallel. Replaces the unbounded per-query goroutine spawn with P workers
@@ -1053,10 +1061,12 @@ var hydrateChunkSize = envChunkSize("GO_IVM_HYDRATE_CHUNK_SIZE", 10000)
 // Cmax reader-pool connections — concurrent-cursor demand. See
 // DESIGN-streaming-hydrate.md §3a/§3d.
 //
-// Default 4. GO_IVM_HYDRATE_LANES overrides. The pool must be sized to at
-// least P (K = P × Cmax; Cmax=1 while operators are eager → K=P) so every
-// lane can always acquire a reader (deadlock-freedom: §3d).
-var hydrateLanes = envChunkSize("GO_IVM_HYDRATE_LANES", 4)
+// Default 4; GO_IVM_PARALLELISM is the ONE production parallelism knob (it
+// also sizes the sidecar's reader-pool floor at 2×P — see newServerFromEnv);
+// GO_IVM_HYDRATE_LANES overrides the lane count individually. The pool must
+// be sized to at least P (K = P × Cmax; Cmax=1 while operators are eager →
+// K=P) so every lane can always acquire a reader (deadlock-freedom: §3d).
+var hydrateLanes = envChunkSize("GO_IVM_HYDRATE_LANES", envChunkSize("GO_IVM_PARALLELISM", 4))
 
 // softChunkBytes is the estimated-payload budget per streamed partial frame.
 // The row-count caps (hydrateChunkSize / advanceChunkSize) bound COUNT but
@@ -1251,8 +1261,9 @@ type AdvanceStreamPartial struct {
 // advanceChunkSize is the max number of RowChanges per partial frame in
 // AdvanceStream. Matches hydrateChunkSize and the TS view-syncer's
 // CURSOR_PAGE_SIZE so chunks align with the downstream poke-batching
-// boundary. Var (not const) for test override.
-var advanceChunkSize = envChunkSize("GO_IVM_ADVANCE_CHUNK_SIZE", 10000)
+// boundary. Var (not const) for test override. Set GO_IVM_CHUNK_SIZE to
+// control both this and hydrateChunkSize together (the production knob).
+var advanceChunkSize = envChunkSize("GO_IVM_ADVANCE_CHUNK_SIZE", defaultChunkSize)
 
 // AdvanceStream is the streaming variant of Advance: same source-push +
 // streamer-drain loop, but flushes a partial frame every advanceChunkSize

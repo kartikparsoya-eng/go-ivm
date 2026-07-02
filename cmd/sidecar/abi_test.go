@@ -266,3 +266,72 @@ func TestABIHost_ShutdownSemantics(t *testing.T) {
 		t.Fatalf("Send after shutdown: got %v, want errHostClosed", err)
 	}
 }
+
+// TestNewServerFromEnv_ParallelismKnob covers the consolidated production
+// env contract (shared by BOTH entry points — socket main() and the NAPI
+// host): GO_IVM_PARALLELISM is the one parallelism knob (lanes=P,
+// readers=2×P), warm-hydrate pool defaults ON, and the per-facet legacy
+// vars still override individually.
+func TestNewServerFromEnv_ParallelismKnob(t *testing.T) {
+	clearEnv := func(t *testing.T) {
+		for _, k := range []string{
+			"GO_IVM_SOURCE_MODE", "GO_IVM_PARALLELISM",
+			"GO_IVM_HYDRATE_READERS", "GO_IVM_HYDRATE_LANES",
+			"GO_IVM_WARM_HYDRATE_POOL",
+		} {
+			t.Setenv(k, "")
+		}
+	}
+
+	t.Run("production defaults: lanes=4 readers=8 warm-pool ON", func(t *testing.T) {
+		clearEnv(t)
+		srv, err := newServerFromEnv()
+		if err != nil {
+			t.Fatalf("newServerFromEnv: %v", err)
+		}
+		if srv.hydrateLanes != 4 || srv.hydrateReaders != 8 {
+			t.Errorf("lanes=%d readers=%d, want 4/8", srv.hydrateLanes, srv.hydrateReaders)
+		}
+		if !srv.warmHydratePoolEnabled {
+			t.Error("warm hydrate pool must default ON")
+		}
+	})
+
+	t.Run("GO_IVM_PARALLELISM scales both facets", func(t *testing.T) {
+		clearEnv(t)
+		t.Setenv("GO_IVM_PARALLELISM", "6")
+		srv, err := newServerFromEnv()
+		if err != nil {
+			t.Fatalf("newServerFromEnv: %v", err)
+		}
+		if srv.hydrateLanes != 6 || srv.hydrateReaders != 12 {
+			t.Errorf("lanes=%d readers=%d, want 6/12", srv.hydrateLanes, srv.hydrateReaders)
+		}
+	})
+
+	t.Run("legacy per-facet vars override the knob", func(t *testing.T) {
+		clearEnv(t)
+		t.Setenv("GO_IVM_PARALLELISM", "6")
+		t.Setenv("GO_IVM_HYDRATE_READERS", "3")
+		t.Setenv("GO_IVM_HYDRATE_LANES", "2")
+		srv, err := newServerFromEnv()
+		if err != nil {
+			t.Fatalf("newServerFromEnv: %v", err)
+		}
+		if srv.hydrateLanes != 2 || srv.hydrateReaders != 3 {
+			t.Errorf("lanes=%d readers=%d, want 2/3 (facet overrides win)", srv.hydrateLanes, srv.hydrateReaders)
+		}
+	})
+
+	t.Run("warm pool opt-out", func(t *testing.T) {
+		clearEnv(t)
+		t.Setenv("GO_IVM_WARM_HYDRATE_POOL", "false")
+		srv, err := newServerFromEnv()
+		if err != nil {
+			t.Fatalf("newServerFromEnv: %v", err)
+		}
+		if srv.warmHydratePoolEnabled {
+			t.Error("GO_IVM_WARM_HYDRATE_POOL=false must disable the warm pool")
+		}
+	})
+}
