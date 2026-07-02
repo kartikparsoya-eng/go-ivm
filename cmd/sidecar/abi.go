@@ -277,18 +277,19 @@ func startABIHostWithServer(server *Server, deliver func(kind int32, payload []b
 	return h
 }
 
-// Send enqueues one request frame (payload WITHOUT length prefix; the
-// writer adds it). The buffer is copied before return, so the caller (the
-// cgo shim pointing at C-owned memory) may reuse/free it immediately.
+// Send enqueues one request frame (payload WITHOUT length prefix; the writer
+// adds it). TAKES OWNERSHIP of payload — the caller must not reuse or mutate
+// the slice after the call (REVIEW-napi-transport perf #2: goivm_send already
+// hands us a fresh C.GoBytes copy, so an internal make+copy here was a second
+// redundant allocation per request frame; every caller passes a freshly
+// built, never-retained slice — verified).
 func (h *abiHost) Send(payload []byte) error {
-	buf := make([]byte, len(payload))
-	copy(buf, payload)
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.closed {
 		return errHostClosed
 	}
-	h.sendQ = append(h.sendQ, buf)
+	h.sendQ = append(h.sendQ, payload)
 	h.cond.Signal()
 	return nil
 }

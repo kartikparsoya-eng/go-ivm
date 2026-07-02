@@ -427,3 +427,108 @@ Pass 3–5:
 Verified: full go-ivm suite green under `-race` (cmd/sidecar included — F1
 red is now green); 97/97 mono go-sidecar + pipeline-driver tests; 0 tsc
 errors in touched files.
+
+---
+
+# Pass 6 — independent post-fix verification (2026-07-02, late)
+
+Re-reviewed every fix commit on both branches (go-ivm 9afb725/413ccad/2c19699,
+mono bb6c1935b/626251970/8913dacaf/cf98dfdf9) with fresh eyes, plus ran the
+suites myself.
+
+## Verified by execution
+- go-ivm: **full suite green under -race** including cmd/sidecar (the F1 red
+  test now passes).
+- mono: rebuilt `/tmp/libgoivm.dylib` from go-ivm HEAD and ran the suites
+  against the CURRENT pair: **21/21 napi + 60/60 go-sidecar** pass.
+- mono working tree clean; the previously-uncommitted addon.c fixes landed
+  in 626251970.
+
+## Fix-quality notes (all fixes correct; these are observations)
+- **F2 fix**: all-or-nothing is implemented with a per-row record COPY
+  (`append([]byte(nil), rec...)`) to escape the encoder scratch — one alloc
+  per row on the happy path. Correct-over-fast; an arena/second scratch is a
+  later micro-optimization.
+- **F2 eager group-defs**: the rationale is right — a def for an all-framed
+  partial is inert JS-side, while deferring defs would orphan later records.
+- **R1 fix**: the oversize check runs AFTER the record is built, so the
+  encoder scratch briefly holds the fat payload and RETAINS that capacity for
+  the RPC's lifetime (bounded: one buffer per RPC). Fine; noting for memory
+  profiles.
+- **F3 fix**: `fatalExit` is correctly gated to POST-START napi failures and
+  injectable for tests — but the branch is currently DEFENSIVE-ONLY (the
+  commit says so): nothing detects a post-start napi failure today
+  (`napi.send` rc!=0 still only rejects per-call — the standing LOW note).
+  Today that's near-unreachable (send fails only after deliberate shutdown),
+  but any future failure-detection MUST route to #handleRestartTrigger or the
+  crash-not-degrade guarantee stays theoretical.
+- **F4 fix**: division respects absolute overrides (GO_IVM_GOMEMLIMIT /
+  GOMEMLIMIT), an explicit per-worker share, floors at 3%, and logs the
+  arithmetic. Correct.
+- **F5 fix**: the 8-byte reqID peek runs BEFORE any registry mutation and
+  also closes a leak beyond the original finding (late kind-2 def re-adding
+  a registry entry post-clear). Good catch.
+- **O1 fix**: `runPerfReporter` + `startPprofServer` shared by main() and the
+  ABI host; pprof keeps the loopback-default S3 guard and PID-spreads bare
+  ports across workers (`port + pid%1000` — small collision chance, discovery
+  via the stderr line; acceptable). BONUS: the reporter grew a replica-pool
+  pressure warning (WaitCount growth → "raise GO_IVM_MAX_OPEN_CONNS") — a
+  genuinely useful early-warning signal.
+- **Boot-blocker found by the team**: napi/package.json `"type": "module"` —
+  the ESM loader was invisible as CJS once baked into an image (masked by the
+  mounted-source rig). Exactly the class of thing T1(b) CI would have caught.
+
+## Perf micro-optimizations (post-Pass-6, code-level review)
+
+A code-level trace of both hot paths (no benchmark — mechanism/cost only)
+produced three safe micro-opts, now landed. They do NOT change the row-mode
+vs frame-mode tradeoff (that needs a real arm64-native measurement); they
+remove pure waste on the per-row path:
+
+- **perf #1 — emitChanges single-change fast path** (rowplane.go). Resolves
+  the Pass-6 F2-fix note ("one alloc per row … an arena/second scratch is a
+  later micro-optimization"). rowMode forces chunkSize=1, so the production
+  partial always has exactly ONE change and the all-or-nothing buffering has
+  nothing to protect. deliver copies synchronously (addon memcpy; test sink
+  copies too — verified), so the single record aliases the encoder scratch
+  and ships immediately: the `recs` slice + `append([]byte(nil), rec...)`
+  copy (2 allocs/row) are gone on the hot path. Multi-change partials keep
+  the buffered all-or-nothing path unchanged.
+- **perf #2 — abiHost.Send takes ownership** (abi.go). goivm_send already
+  hands a fresh `C.GoBytes` copy; the internal make+copy was a second
+  redundant alloc per REQUEST frame (low volume). Every caller passes a
+  fresh, never-retained slice (verified: goivm_send + tests), so Send now
+  appends it directly.
+- **perf #3 — Buffer.readDoubleLE for the reqID peek** (go-ivm-client.ts).
+  The late-record guard read the f64 reqID via `new DataView(...)` on EVERY
+  record; `payload.readDoubleLE(0)` reads it without the DataView allocation.
+  The RecordReader's own DataView (needed for the full multi-field decode) is
+  unchanged.
+
+Verified: full cmd/sidecar green under -race; 60/60 mono go-sidecar E2E
+against the rebuilt dylib (cross-plane byte-equality exercises #1 + #3);
+0 tsc errors. NOT done (bigger, needs measurement): the chunkSize=1 vs
+batched-row-delivery question, and the per-row C malloc/free freelist.
+
+## The v1.6.1 merge (8913dacaf) — biggest residual risk on the branch
+348 files / +21k lines of upstream landed mid-branch. Spot-checks pass: the
+Go-primary hooks survived (goHydrateBatchStream @view-syncer.ts:2143, the
+ResetPipelinesSignal keystone @:2518+, protocol already at v51 both sides),
+conflict resolutions are documented and reasoned (transform/push back-ports
+correctly superseded by upstream shapes), and 60/60 go-sidecar tests pass on
+the merged tree. NOT yet verified: the FULL zero-cache vitest suite on the
+merged tree, and live behavior — the merge's stated purpose is the sandbox
+diff-oracle against rocicorp/zero:1.6.1, so the next shadow soak doubles as
+its validation.
+
+## Remaining open (nothing red)
+1. **T1(b)**: mono CI job that builds .so+addon and RUNS the napi e2e suites
+   (image variant builds but doesn't test; the `describe.skipIf` suites stay
+   skipped in CI). The `"type": "module"` incident is the argument for it.
+2. **LOW**: wire `napi.send` rc!=0 → #handleRestartTrigger (arms F3's crash
+   path with a real trigger), or document unreachability at the call site.
+3. **LOW (cosmetic)**: boot log still prints `streaming=%v` from
+   advanceDriveEnabled (`hydrate config: streaming=false` on a memory-mode
+   host that IS streaming).
+4. Deferred from the wider plan: fuzz targets (#6), chaos soak with kills on
+   the napi build (#7), full zero-cache suite + shadow soak post-merge.

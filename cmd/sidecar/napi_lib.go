@@ -128,7 +128,9 @@ func goivm_send(data unsafe.Pointer, length C.int32_t) C.int32_t {
 	if length < 0 {
 		return 2
 	}
-	// C.GoBytes copies — the caller's buffer is free after return.
+	// C.GoBytes copies C→Go, so the caller's C buffer is free after return.
+	// The resulting slice is fresh and unshared, so h.Send takes ownership of
+	// it directly (no second copy — REVIEW-napi-transport perf #2).
 	payload := C.GoBytes(data, C.int(length))
 	if err := h.Send(payload); err != nil {
 		return 3

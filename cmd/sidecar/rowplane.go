@@ -94,8 +94,35 @@ func (rp *rowPlane) emitChanges(changes []engine.RowChange) []engine.RowChange {
 	if len(changes) == 0 {
 		return nil
 	}
-	// Phase 1: encode every row into a COPY (encodeRow's return aliases the
-	// encoder's scratch buffer, so buffered records must not share it).
+	// Fast path — the PRODUCTION case (REVIEW-napi-transport perf #1). rowMode
+	// forces chunkSize=1, so every partial carries exactly one change and the
+	// all-or-nothing buffering below has nothing to protect. deliver copies
+	// synchronously (the addon memcpy's the payload before returning; the test
+	// sink copies too — verified), so the record may alias the encoder's
+	// scratch buffer and go out immediately: no recs slice, no per-row
+	// defensive copy (2 allocations/row saved on the hottest path). The def
+	// (if any) is delivered — hence copied — before encodeRow overwrites the
+	// scratch buffer, and no later encode can clobber the row after its
+	// deliver returns.
+	if len(changes) == 1 {
+		c := &changes[0]
+		g, def := rp.enc.groupFor(c)
+		if def != nil {
+			rp.deliver(abiKindGroupDef, def)
+		}
+		rec, ok := rp.enc.encodeRow(g, c)
+		if !ok {
+			return changes // → one frame; no records delivered
+		}
+		rp.deliver(abiKindRow, rec)
+		return nil
+	}
+
+	// Multi-change partial (residual-drain, or a non-rowMode chunk size):
+	// Phase 1 encodes every row into a COPY (encodeRow's return aliases the
+	// encoder's scratch buffer, so buffered records must not share it) so a
+	// later unencodable change can abort the WHOLE partial with zero records
+	// already delivered (the F2 all-or-nothing rule).
 	recs := make([][]byte, 0, len(changes))
 	for i := range changes {
 		c := &changes[i]
