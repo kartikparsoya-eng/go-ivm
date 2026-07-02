@@ -668,6 +668,16 @@ type Server struct {
 	mu     sync.RWMutex
 	groups map[string]*ClientGroup // clientGroupID → ClientGroup
 
+	// abiDeliver, when non-nil, is the in-process (NAPI) transport's
+	// out-of-band delivery callback: (kind, payload) entries land on the
+	// addon's single ordered TSFN queue. Set ONCE by the ABI host before
+	// handleConnection starts (never mutated after) — handlers read it
+	// lock-free. nil on the socket transport, which disables row mode:
+	// rowMode requests then stream ordinary msgpack partials via streamW.
+	// Payload bytes are valid only for the duration of the call (the
+	// receiver copies), so encoders may reuse their buffers.
+	abiDeliver func(kind int32, payload []byte)
+
 	// Leaf-source mode for this sidecar process. ModeMemory uses the
 	// classic loadRows-populated MemorySource; ModeTable constructs a
 	// tablesource.Source per (cg, table) over replicaDB and treats
@@ -1616,6 +1626,8 @@ type addQueriesParams struct {
 		AST     builder.AST `json:"ast"`
 	} `json:"queries"`
 	InitEpoch uint64 `json:"initEpoch"`
+	// RowMode: see advanceParams.RowMode — same contract for hydrate.
+	RowMode bool `json:"rowMode,omitempty"`
 }
 
 type addQueriesResult struct {
@@ -1764,6 +1776,23 @@ func (s *Server) handleAddQueriesStream(req RPCRequest, streamW streamWriter) RP
 	if warmPool != nil {
 		defer s.tearDownWarmReaderPool(group, warmPool, warmCR)
 	}
+	// Row mode (NAPI transport only): per-row records via abiDeliver with
+	// chunkSize=1; each query's Final partial still ships as a kind-1 frame
+	// (per-query TimingMs + completion signal). onResult runs concurrently
+	// from hydrate lanes — rowPlane's mutex serializes the encoder.
+	if rp := newRowPlane(s, req.ID, p.RowMode); rp != nil {
+		err := group.eng.AddQueriesStreamChunked(specs, 1, func(r engine.QueryResult) {
+			rp.emitHydratePartial(r)
+			if r.Final {
+				metrics.recordHydrateChunks(r.ChunkIndex + 1)
+			}
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[GO-IVM] addQueriesStream(rowMode) ERROR cg=%s: %v\n", cgID, err)
+			return rpcError(req.ID, -32000, "addQueriesStream: "+err.Error())
+		}
+		return RPCResponse{JSONRPC: "2.0", Result: "done", ID: req.ID}
+	}
 	err := group.eng.AddQueriesStream(specs, func(r engine.QueryResult) {
 		pc := toPositional(r.Changes)
 		streamW(req.ID, addQueriesStreamPartial{
@@ -1830,6 +1859,12 @@ type advanceParams struct {
 	ClientGroupID string                  `json:"clientGroupID"`
 	Changes       []engine.SnapshotChange `json:"changes"`
 	InitEpoch     uint64                  `json:"initEpoch"`
+	// RowMode opts this call into the NAPI row plane: RowChanges cross the
+	// Go↔JS boundary as per-row flat records (kind 2/3 deliveries) instead
+	// of msgpack partial frames. Honored only when the in-process transport
+	// is active (Server.abiDeliver != nil) AND the request ID is numeric;
+	// otherwise silently degrades to the ordinary frame path.
+	RowMode bool `json:"rowMode,omitempty"`
 }
 
 // rpcCodeDrift is the JSON-RPC error code for source-drift detection.
@@ -1904,6 +1939,27 @@ func (s *Server) handleAdvanceStream(req RPCRequest, streamW streamWriter) RPCRe
 	}
 	if resp, stale := checkInitEpoch(group, req.ID, p.InitEpoch); stale {
 		return resp
+	}
+
+	// Row mode (NAPI transport only): per-row records via abiDeliver with
+	// chunkSize=1 so each RowChange crosses the boundary as the engine
+	// produces it. The engine partial's rows are re-routed; the terminal
+	// frame still ships (kind-1) carrying ChunkIndex/Final/Timings/Drift.
+	if rp := newRowPlane(s, req.ID, p.RowMode); rp != nil {
+		err := group.eng.AdvanceStreamChunked(p.Changes, 1, func(r engine.AdvanceStreamPartial) {
+			rp.emitAdvancePartial(r)
+			if r.Drift != nil {
+				fmt.Fprintf(os.Stderr, "[GO-IVM][drift] advanceStream(rowMode) cg=%s %s\n", cgID, r.Drift.Error())
+			}
+			if r.Final {
+				metrics.recordAdvanceChunks(r.ChunkIndex + 1)
+			}
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[GO-IVM] advanceStream(rowMode) ERROR cg=%s: %v\n", cgID, err)
+			return rpcError(req.ID, -32000, "advanceStream: "+err.Error())
+		}
+		return RPCResponse{JSONRPC: "2.0", Result: "done", ID: req.ID}
 	}
 
 	err := group.eng.AdvanceStream(p.Changes, func(r engine.AdvanceStreamPartial) {
@@ -2377,11 +2433,13 @@ func main() {
 			"[GO-IVM] take-state cache: UNBOUNDED (GO_IVM_TAKE_STATE_CACHE_MAX=0)\n")
 	}
 
-	// CRIT-6: fail loud at boot if the init/advance value-coercion contract is
-	// broken (a colType that doesn't map both raw and JS shapes to the same
-	// canonical value) — better a startup crash than silent client-data
-	// corruption once a CG is serving.
-	if err := sqlite.SelfCheckCoercion(); err != nil {
+	// CRIT-6 (coercion self-check), leaf-source mode resolution, replica-path
+	// validation, and all GO_IVM_* server config live in newServerFromEnv
+	// (abi.go) — shared verbatim with the in-process NAPI host so both
+	// transports construct an identical Server. Exit-on-error stays here:
+	// only the standalone binary may terminate the process.
+	server, err := newServerFromEnv()
+	if err != nil {
 		fmt.Fprintf(os.Stderr, "[GO-IVM] FATAL: %v\n", err)
 		os.Exit(1)
 	}
@@ -2457,97 +2515,15 @@ func main() {
 		otelShutdown = func(context.Context) error { return nil }
 	}
 
-	// Leaf-source selector (see DESIGN-tablesource-port.md). Unknown /
-	// empty values default to memory so misconfiguration cannot silently
-	// activate the read-from-replica path.
-	sourceMode := tablesource.ParseMode()
-
-	// When in table mode, open the TS replica file once for the whole
-	// process — pool is shared across CGs (per-CG read-tx isolation is
-	// the TxCache's job, not the pool's). Refuse to start if the path
-	// is missing or the file isn't in WAL — failing fast here beats a
-	// confusing per-CG init error later.
-	// In table mode, validate that the path is set but DO NOT open the
-	// replica synchronously. The TS replicator takes 5-30s to finish
-	// initializing replica.db in a cold-start container; blocking here
-	// would also block this process from servicing the TS ping that the
-	// view-syncer worker sends to verify the sidecar is alive. The
-	// listener wouldn't accept until the open returns, ping times out,
-	// TS falls back to TS-only path for the lifetime of the container.
-	//
-	// Instead, the path is stashed on the Server and the first init RPC
-	// for a table-mode CG triggers a synchronous (per-call) open with
-	// retry. By that time the replicator is definitely done.
-	var replicaPath string
-	if sourceMode == tablesource.ModeTable {
-		// Prefer the dedicated override so callers can point Go at a
-		// different replica than TS for testing. In normal deploys both
-		// processes share the same SQLite file, so fall back to the TS
-		// replica path — saves operators from setting the same value twice
-		// and from the silent-misconfigure trap when one is forgotten.
-		replicaPath = os.Getenv("GO_IVM_REPLICA_DB_PATH")
-		if replicaPath == "" {
-			replicaPath = os.Getenv("ZERO_REPLICA_FILE")
-		}
-		if replicaPath == "" {
-			fmt.Fprintln(os.Stderr,
-				"[GO-IVM] GO_IVM_SOURCE_MODE=table but neither GO_IVM_REPLICA_DB_PATH nor ZERO_REPLICA_FILE is set — refusing to start")
-			os.Exit(1)
-		}
-		fmt.Fprintf(os.Stderr,
-			"[GO-IVM] table mode armed; replica %s will open lazily on first init\n",
-			replicaPath)
-	}
+	// Server construction + all GO_IVM_* config happened in newServerFromEnv
+	// above (shared with the NAPI host). Only the listener banner remains
+	// transport-specific. NOTE on table mode: the replica is NOT opened
+	// synchronously here — the TS replicator takes 5-30s to initialize
+	// replica.db on a cold container, and blocking would starve the TS
+	// health ping. The path is stashed on the Server; the first init RPC
+	// opens it with retry (see newServerFromEnv / handleInit).
 	fmt.Printf("Go IVM sidecar listening on %s (multi-engine, source=%s)\n",
-		socketPath, sourceMode)
-
-	server := NewServer(sourceMode, replicaPath)
-	server.appID = os.Getenv("GO_IVM_APP_ID")
-	server.advanceToHeadEnabled = os.Getenv("GO_IVM_ADVANCE_TO_HEAD") == "true"
-	// GO_IVM_ADVANCE_DRIVE implies advanceToHead (P2 self-consistent advance).
-	server.advanceDriveEnabled = os.Getenv("GO_IVM_ADVANCE_DRIVE") == "true"
-	if server.advanceDriveEnabled {
-		server.advanceToHeadEnabled = true
-	}
-	// GO_IVM_HYDRATE_READERS RAISES the cold-hydrate reader-pool floor above the
-	// default K = hydrateLanes × Cmax. Streaming-by-default (this branch): the
-	// pool is built unconditionally under drive mode, so this env no longer
-	// enables/disables streaming — it only sets a higher K floor.
-	if v := os.Getenv("GO_IVM_HYDRATE_READERS"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 1 {
-			server.hydrateReaders = n
-		}
-	}
-	// GO_IVM_HYDRATE_LANES sets P (worker lane count for bounded parallel
-	// hydrate). The reader pool is sized to max(hydrateReaders, hydrateLanes×Cmax)
-	// so every lane can acquire all Cmax readers it needs (deadlock-freedom: §3d).
-	if v := os.Getenv("GO_IVM_HYDRATE_LANES"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			server.hydrateLanes = n
-		}
-	}
-	// Warm hydrate (adds on existing-pipeline CGs) now ALSO streams via the
-	// co-read pool by default under drive mode — no GO_IVM_WARM_HYDRATE_POOL gate.
-	// The env is still read for the boot log but no longer gates anything.
-	server.warmHydratePoolEnabled = os.Getenv("GO_IVM_WARM_HYDRATE_POOL") == "true"
-	fmt.Fprintf(os.Stderr,
-		"[GO-IVM] hydrate config: streaming=%v (default-on under drive) readers=%d(floor) lanes=%d advanceDrive=%v\n",
-		server.advanceDriveEnabled, server.hydrateReaders, server.hydrateLanes, server.advanceDriveEnabled)
-	if server.advanceToHeadEnabled {
-		if sourceMode != tablesource.ModeTable {
-			fmt.Fprintln(os.Stderr,
-				"[GO-IVM] GO_IVM_ADVANCE_TO_HEAD=true ignored: requires GO_IVM_SOURCE_MODE=table")
-			server.advanceToHeadEnabled = false
-			server.advanceDriveEnabled = false
-		} else {
-			mode := "derive-only (P1 shadow)"
-			if server.advanceDriveEnabled {
-				mode = "DRIVE (P2 frame-coordinated self-consistent advance)"
-			}
-			fmt.Fprintf(os.Stderr,
-				"[GO-IVM] advanceToHead ARMED [%s] (appID=%q)\n", mode, server.appID)
-		}
-	}
+		socketPath, server.sourceMode)
 
 	// Start periodic metrics reporter
 	go func() {

@@ -1,0 +1,502 @@
+package main
+
+// Row-record decode mirror + row-mode end-to-end tests.
+//
+// decodeGroupDef/decodeRowRecord mirror EXACTLY what the TS side's record
+// parser (napi-records.ts) does with a DataView — they exist to lock the
+// binary layout with an executable spec on the Go side and to back the
+// round-trip tests below. Any layout change must update both in lockstep.
+
+import (
+	"encoding/binary"
+	"fmt"
+	"math"
+	"testing"
+	"time"
+
+	"github.com/kartikparsoya-eng/go-ivm/engine"
+	"github.com/kartikparsoya-eng/go-ivm/ivm"
+	"github.com/kartikparsoya-eng/go-ivm/sqlite"
+)
+
+type decodedGroupDef struct {
+	reqID   float64
+	groupID uint32
+	queryID string
+	table   string
+	cols    []string
+	pk      []string
+}
+
+type decodedRow struct {
+	reqID      float64
+	groupID    uint32
+	changeType int
+	values     []interface{}
+}
+
+type recReader struct {
+	buf []byte
+	off int
+}
+
+func (r *recReader) u16() uint16 {
+	v := binary.LittleEndian.Uint16(r.buf[r.off:])
+	r.off += 2
+	return v
+}
+func (r *recReader) u32() uint32 {
+	v := binary.LittleEndian.Uint32(r.buf[r.off:])
+	r.off += 4
+	return v
+}
+func (r *recReader) f64() float64 {
+	v := math.Float64frombits(binary.LittleEndian.Uint64(r.buf[r.off:]))
+	r.off += 8
+	return v
+}
+func (r *recReader) u8() byte {
+	v := r.buf[r.off]
+	r.off++
+	return v
+}
+func (r *recReader) shortStr() string {
+	n := int(r.u16())
+	s := string(r.buf[r.off : r.off+n])
+	r.off += n
+	return s
+}
+func (r *recReader) longBytes() []byte {
+	n := int(r.u32())
+	b := r.buf[r.off : r.off+n]
+	r.off += n
+	return b
+}
+
+func decodeGroupDef(t *testing.T, rec []byte) decodedGroupDef {
+	t.Helper()
+	r := &recReader{buf: rec}
+	d := decodedGroupDef{reqID: r.f64(), groupID: r.u32()}
+	d.queryID = r.shortStr()
+	d.table = r.shortStr()
+	ncols := int(r.u16())
+	for i := 0; i < ncols; i++ {
+		d.cols = append(d.cols, r.shortStr())
+	}
+	npk := int(r.u16())
+	for i := 0; i < npk; i++ {
+		_ = r.u16() // pk column index (0xFFFF when not a column reference)
+		d.pk = append(d.pk, r.shortStr())
+	}
+	if r.off != len(rec) {
+		t.Fatalf("groupDef: %d trailing bytes", len(rec)-r.off)
+	}
+	return d
+}
+
+func decodeRowRecord(t *testing.T, rec []byte, nvalues int) decodedRow {
+	t.Helper()
+	r := &recReader{buf: rec}
+	d := decodedRow{reqID: r.f64(), groupID: r.u32(), changeType: int(r.u8())}
+	for i := 0; i < nvalues; i++ {
+		switch tag := r.u8(); tag {
+		case rowValNull:
+			d.values = append(d.values, nil)
+		case rowValFalse:
+			d.values = append(d.values, false)
+		case rowValTrue:
+			d.values = append(d.values, true)
+		case rowValF64:
+			d.values = append(d.values, r.f64())
+		case rowValI64:
+			d.values = append(d.values, int64(binary.LittleEndian.Uint64(r.buf[r.off:])))
+			r.off += 8
+		case rowValStr:
+			d.values = append(d.values, string(r.longBytes()))
+		case rowValBlob:
+			var v interface{}
+			if err := mpUnmarshal(r.longBytes(), &v); err != nil {
+				t.Fatalf("blob unmarshal: %v", err)
+			}
+			d.values = append(d.values, v)
+		default:
+			t.Fatalf("unknown value tag %d at offset %d", tag, r.off-1)
+		}
+	}
+	if r.off != len(rec) {
+		t.Fatalf("row: %d trailing bytes (decoded %d values)", len(rec)-r.off, nvalues)
+	}
+	return d
+}
+
+// TestRowRecordEncoder_RoundTrip locks the record layout: groupDef + rows
+// for add/remove/edit with every value tag, decoded by the TS-mirroring
+// reader above.
+func TestRowRecordEncoder_RoundTrip(t *testing.T) {
+	enc := newRowRecordEncoder(42)
+
+	add := engine.RowChange{
+		Type:    engine.RowChangeAdd,
+		QueryID: "q1",
+		Table:   "users",
+		RowKey:  map[string]interface{}{"id": "u1"},
+		Row: ivm.Row{
+			"id":       "u1",
+			"age":      float64(30),
+			"count":    int64(7),
+			"active":   true,
+			"disabled": false,
+			"note":     nil,
+			"meta":     map[string]interface{}{"k": "v"},
+		},
+	}
+	g, def := enc.groupFor(&add)
+	if def == nil {
+		t.Fatal("first sight must emit a groupDef")
+	}
+	dd := decodeGroupDef(t, def)
+	if dd.reqID != 42 || dd.groupID != 0 || dd.queryID != "q1" || dd.table != "users" {
+		t.Fatalf("groupDef header mismatch: %+v", dd)
+	}
+	wantCols := []string{"active", "age", "count", "disabled", "id", "meta", "note"}
+	if fmt.Sprint(dd.cols) != fmt.Sprint(wantCols) {
+		t.Fatalf("cols: got %v want %v (sorted first-row keys)", dd.cols, wantCols)
+	}
+	if fmt.Sprint(dd.pk) != fmt.Sprint([]string{"id"}) {
+		t.Fatalf("pk: got %v", dd.pk)
+	}
+
+	rec, ok := enc.encodeRow(g, &add)
+	if !ok {
+		t.Fatal("add row must encode")
+	}
+	dr := decodeRowRecord(t, rec, len(dd.cols))
+	if dr.changeType != engine.RowChangeAdd || dr.groupID != 0 || dr.reqID != 42 {
+		t.Fatalf("row header mismatch: %+v", dr)
+	}
+	// Values arrive in sorted column order: active,age,count,disabled,id,meta,note
+	if dr.values[0] != true || dr.values[3] != false || dr.values[6] != nil {
+		t.Fatalf("bool/null values wrong: %v", dr.values)
+	}
+	if dr.values[1] != float64(30) || dr.values[2] != int64(7) || dr.values[4] != "u1" {
+		t.Fatalf("scalar values wrong: %v", dr.values)
+	}
+	if m, ok := dr.values[5].(map[string]interface{}); !ok || m["k"] != "v" {
+		t.Fatalf("blob value wrong: %#v", dr.values[5])
+	}
+
+	// Second row, same group: NO def re-emitted.
+	if _, def2 := enc.groupFor(&add); def2 != nil {
+		t.Fatal("second sight re-emitted groupDef")
+	}
+
+	// Remove: PK values only.
+	rm := engine.RowChange{
+		Type:    engine.RowChangeRemove,
+		QueryID: "q1",
+		Table:   "users",
+		RowKey:  map[string]interface{}{"id": "u1"},
+	}
+	gRm, defRm := enc.groupFor(&rm)
+	if defRm != nil || gRm != g {
+		t.Fatal("remove must reuse the interned group")
+	}
+	recRm, ok := enc.encodeRow(gRm, &rm)
+	if !ok {
+		t.Fatal("remove must encode")
+	}
+	drm := decodeRowRecord(t, recRm, len(gRm.pk))
+	if drm.changeType != engine.RowChangeRemove || drm.values[0] != "u1" {
+		t.Fatalf("remove decode wrong: %+v", drm)
+	}
+
+	// Remove-FIRST group: def emitted with no cols; later add falls back.
+	rmFirst := engine.RowChange{
+		Type:    engine.RowChangeRemove,
+		QueryID: "q2",
+		Table:   "posts",
+		RowKey:  map[string]interface{}{"pid": int64(9)},
+	}
+	g2, def2 := enc.groupFor(&rmFirst)
+	if def2 == nil {
+		t.Fatal("new group must emit def")
+	}
+	d2 := decodeGroupDef(t, def2)
+	if len(d2.cols) != 0 || fmt.Sprint(d2.pk) != fmt.Sprint([]string{"pid"}) {
+		t.Fatalf("remove-first def wrong: %+v", d2)
+	}
+	if rec, ok := enc.encodeRow(g2, &rmFirst); !ok || len(rec) == 0 {
+		t.Fatal("remove-first row must encode")
+	}
+	addLater := engine.RowChange{
+		Type:    engine.RowChangeAdd,
+		QueryID: "q2",
+		Table:   "posts",
+		RowKey:  map[string]interface{}{"pid": int64(9)},
+		Row:     ivm.Row{"pid": int64(9), "title": "x"},
+	}
+	gL, _ := enc.groupFor(&addLater)
+	if _, ok := enc.encodeRow(gL, &addLater); ok {
+		t.Fatal("add against a remove-first (col-less) group MUST fall back")
+	}
+}
+
+// TestABIHost_RowModeHydrateEndToEnd drives the full stack in-process:
+// init (memory mode) → loadRows → addQueriesStream with rowMode → asserts
+// per-row records arrive (kind 2/3), the terminal frame arrives (kind 1,
+// final, timing), rows decode to the loaded content, and the ordering
+// invariant (defs before their rows, rows before the query's final frame,
+// final before done) holds on the single delivery queue.
+func TestABIHost_RowModeHydrateEndToEnd(t *testing.T) {
+	col := newSinkCollector()
+	h := startABIHostWithServer(NewServer(0, ""), col.sink, nil)
+	defer h.Shutdown()
+
+	send := func(id float64, method string, params interface{}) {
+		t.Helper()
+		if err := h.Send(encodeReq(t, method, id, params)); err != nil {
+			t.Fatalf("send %s: %v", method, err)
+		}
+	}
+
+	send(1, "init", initParams{
+		ClientGroupID: "cg-rows",
+		Storage:       t.TempDir() + "/storage.db",
+		Tables: map[string]tableSchemaParams{
+			"users": {
+				Columns: map[string]sqlite.ColumnSchema{
+					"id":   {Type: "string"},
+					"name": {Type: "string"},
+					"age":  {Type: "number"},
+				},
+				PrimaryKey: []string{"id"},
+			},
+		},
+	})
+	send(2, "loadRows", loadRowsParams{
+		ClientGroupID: "cg-rows",
+		Table:         "users",
+		InitEpoch:     1,
+		Rows: []ivm.Row{
+			{"id": "u1", "name": "alice", "age": float64(30)},
+			{"id": "u2", "name": "bob", "age": float64(25)},
+			{"id": "u3", "name": "carol", "age": float64(35)},
+		},
+	})
+	send(3, "addQueriesStream", map[string]interface{}{
+		"clientGroupID": "cg-rows",
+		"initEpoch":     1,
+		"rowMode":       true,
+		"queries": []map[string]interface{}{
+			{"queryID": "q-all", "ast": map[string]interface{}{
+				"table":   "users",
+				"orderBy": [][]string{{"id", "asc"}},
+			}},
+		},
+	})
+
+	// Expected deliveries for req id 3: 1 groupDef + 3 rows + 1 final frame,
+	// then the done frame. Plus the init/loadRows response frames (ids 1,2).
+	deadline := time.Now().Add(15 * time.Second)
+	var entries []sinkEntry
+	for {
+		col.mu.Lock()
+		entries = append(entries[:0], col.entries...)
+		col.mu.Unlock()
+		var defs, rows, frames3 int
+		for _, e := range entries {
+			switch e.kind {
+			case abiKindGroupDef:
+				defs++
+			case abiKindRow:
+				rows++
+			case abiKindFrame:
+				resp := decodeResp(t, e.payload)
+				if id, ok := toFloat(resp.ID); ok && id == 3 {
+					frames3++
+				}
+			}
+		}
+		if defs >= 1 && rows >= 3 && frames3 >= 2 { // final partial + done
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out: defs=%d rows=%d frames(id=3)=%d entries=%d",
+				defs, rows, frames3, len(entries))
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Decode + assert content and per-queue ordering.
+	var def *decodedGroupDef
+	var gotNames []string
+	sawFinalFrame := false
+	sawDone := false
+	for _, e := range entries {
+		switch e.kind {
+		case abiKindGroupDef:
+			d := decodeGroupDef(t, e.payload)
+			if d.reqID != 3 {
+				t.Fatalf("groupDef for wrong req: %v", d.reqID)
+			}
+			if def != nil {
+				t.Fatal("duplicate groupDef for single-group query")
+			}
+			def = &d
+			if d.queryID != "q-all" || d.table != "users" {
+				t.Fatalf("groupDef content: %+v", d)
+			}
+		case abiKindRow:
+			if def == nil {
+				t.Fatal("ORDERING VIOLATION: row record before its groupDef")
+			}
+			if sawFinalFrame {
+				t.Fatal("ORDERING VIOLATION: row record after final frame")
+			}
+			dr := decodeRowRecord(t, e.payload, len(def.cols))
+			if dr.reqID != 3 || dr.changeType != engine.RowChangeAdd {
+				t.Fatalf("row header: %+v", dr)
+			}
+			for i, c := range def.cols {
+				if c == "name" {
+					gotNames = append(gotNames, dr.values[i].(string))
+				}
+			}
+		case abiKindFrame:
+			resp := decodeResp(t, e.payload)
+			id, _ := toFloat(resp.ID)
+			if id != 3 {
+				continue
+			}
+			if s, ok := resp.Result.(string); ok && s == "done" {
+				if !sawFinalFrame {
+					t.Fatal("ORDERING VIOLATION: done before final partial")
+				}
+				sawDone = true
+				continue
+			}
+			// The final partial (msgpack map). Assert final=true + timing.
+			m, ok := resp.Result.(map[string]interface{})
+			if !ok {
+				t.Fatalf("unexpected id-3 frame result: %#v", resp.Result)
+			}
+			if fin, _ := m["final"].(bool); !fin {
+				t.Fatalf("non-final id-3 frame in row mode (fallback unexpected here): %#v", m)
+			}
+			sawFinalFrame = true
+		}
+	}
+	if !sawDone {
+		t.Fatal("done sentinel missing")
+	}
+	if fmt.Sprint(gotNames) != fmt.Sprint([]string{"alice", "bob", "carol"}) {
+		t.Fatalf("row content/order wrong: %v", gotNames)
+	}
+}
+
+// TestABIHost_RowModeAdvanceEndToEnd: advanceStream with rowMode ships each
+// RowChange as a record and the terminal frame as kind-1, in order.
+func TestABIHost_RowModeAdvanceEndToEnd(t *testing.T) {
+	col := newSinkCollector()
+	h := startABIHostWithServer(NewServer(0, ""), col.sink, nil)
+	defer h.Shutdown()
+
+	send := func(id float64, method string, params interface{}) {
+		t.Helper()
+		if err := h.Send(encodeReq(t, method, id, params)); err != nil {
+			t.Fatalf("send %s: %v", method, err)
+		}
+	}
+	send(1, "init", initParams{
+		ClientGroupID: "cg-adv",
+		Storage:       t.TempDir() + "/storage.db",
+		Tables: map[string]tableSchemaParams{
+			"users": {
+				Columns: map[string]sqlite.ColumnSchema{
+					"id":   {Type: "string"},
+					"name": {Type: "string"},
+				},
+				PrimaryKey: []string{"id"},
+			},
+		},
+	})
+	send(2, "addQueriesStream", map[string]interface{}{
+		"clientGroupID": "cg-adv",
+		"initEpoch":     1,
+		"queries": []map[string]interface{}{
+			{"queryID": "q-adv", "ast": map[string]interface{}{
+				"table":   "users",
+				"orderBy": [][]string{{"id", "asc"}},
+			}},
+		},
+	})
+	// Advance in row mode: one insert → one Add RowChange.
+	send(3, "advanceStream", map[string]interface{}{
+		"clientGroupID": "cg-adv",
+		"initEpoch":     1,
+		"rowMode":       true,
+		"changes": []map[string]interface{}{
+			{"table": "users", "nextValue": map[string]interface{}{"id": "u9", "name": "zed"}, "rowKey": map[string]interface{}{"id": "u9"}},
+		},
+	})
+
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		col.mu.Lock()
+		var defs, rows int
+		doneSeen := false
+		for _, e := range col.entries {
+			switch e.kind {
+			case abiKindGroupDef:
+				defs++
+			case abiKindRow:
+				rows++
+			case abiKindFrame:
+				resp := decodeResp(t, e.payload)
+				if id, ok := toFloat(resp.ID); ok && id == 3 {
+					if s, ok := resp.Result.(string); ok && s == "done" {
+						doneSeen = true
+					}
+				}
+			}
+		}
+		entriesCopy := append([]sinkEntry(nil), col.entries...)
+		col.mu.Unlock()
+		if doneSeen {
+			if defs != 1 || rows != 1 {
+				t.Fatalf("advance row mode: defs=%d rows=%d (want 1/1)", defs, rows)
+			}
+			// Verify the row record decodes to the pushed change.
+			for _, e := range entriesCopy {
+				if e.kind == abiKindGroupDef {
+					d := decodeGroupDef(t, e.payload)
+					if d.queryID != "q-adv" || d.table != "users" {
+						t.Fatalf("advance groupDef: %+v", d)
+					}
+				}
+				if e.kind == abiKindRow {
+					// cols = sorted keys of the emitted row (incl. _0_version).
+					var def decodedGroupDef
+					for _, e2 := range entriesCopy {
+						if e2.kind == abiKindGroupDef {
+							def = decodeGroupDef(t, e2.payload)
+						}
+					}
+					dr := decodeRowRecord(t, e.payload, len(def.cols))
+					vals := map[string]interface{}{}
+					for i, c := range def.cols {
+						vals[c] = dr.values[i]
+					}
+					if vals["id"] != "u9" || vals["name"] != "zed" {
+						t.Fatalf("advance row content: %v", vals)
+					}
+				}
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for advance done")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}

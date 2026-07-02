@@ -828,6 +828,30 @@ func (e *Engine) AddQueriesStream(
 	queries []QuerySpec,
 	onResult func(QueryResult),
 ) error {
+	return e.addQueriesStreamChunked(queries, hydrateChunkSize, onResult)
+}
+
+// AddQueriesStreamChunked is AddQueriesStream with a per-call chunk-size
+// override. chunkSize=1 yields one QueryResult per RowChange — the NAPI
+// row plane uses this so each row crosses the Go↔JS boundary the moment
+// the (lazy) fetch produces it, instead of being re-batched into
+// hydrateChunkSize frames. chunkSize<=0 falls back to hydrateChunkSize.
+func (e *Engine) AddQueriesStreamChunked(
+	queries []QuerySpec,
+	chunkSize int,
+	onResult func(QueryResult),
+) error {
+	if chunkSize <= 0 {
+		chunkSize = hydrateChunkSize
+	}
+	return e.addQueriesStreamChunked(queries, chunkSize, onResult)
+}
+
+func (e *Engine) addQueriesStreamChunked(
+	queries []QuerySpec,
+	chunkSize int,
+	onResult func(QueryResult),
+) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
@@ -923,7 +947,7 @@ func (e *Engine) AddQueriesStream(
 						nodeChanges := streamNodes(entry.queryID, entry.schema, RowChangeAdd, node)
 						chunk = append(chunk, nodeChanges...)
 						chunkBytes += estimateRowChangesBytes(nodeChanges)
-						if len(chunk) >= hydrateChunkSize || chunkBytes >= softChunkBytes {
+						if len(chunk) >= chunkSize || chunkBytes >= softChunkBytes {
 							flush(false)
 						}
 					}
@@ -941,7 +965,7 @@ func (e *Engine) AddQueriesStream(
 						nodeChanges := streamNodes(entry.queryID, ce.schema, RowChangeAdd, node)
 						chunk = append(chunk, nodeChanges...)
 						chunkBytes += estimateRowChangesBytes(nodeChanges)
-						if len(chunk) >= hydrateChunkSize || chunkBytes >= softChunkBytes {
+						if len(chunk) >= chunkSize || chunkBytes >= softChunkBytes {
 							flush(false)
 						}
 					}
@@ -1258,6 +1282,31 @@ func (e *Engine) AdvanceStream(
 	changes []SnapshotChange,
 	onResult func(AdvanceStreamPartial),
 ) error {
+	return e.advanceStreamChunked(changes, advanceChunkSize, onResult)
+}
+
+// AdvanceStreamChunked is AdvanceStream with a per-call chunk-size override.
+// chunkSize=1 yields one partial per RowChange — the NAPI row plane uses
+// this so each row crosses the Go↔JS boundary the moment the push's flatten
+// produces it (with GO_IVM_LAZY_ADVANCE, straight off the SQLite cursor),
+// instead of being re-batched into advanceChunkSize frames. chunkSize<=0
+// falls back to advanceChunkSize.
+func (e *Engine) AdvanceStreamChunked(
+	changes []SnapshotChange,
+	chunkSize int,
+	onResult func(AdvanceStreamPartial),
+) error {
+	if chunkSize <= 0 {
+		chunkSize = advanceChunkSize
+	}
+	return e.advanceStreamChunked(changes, chunkSize, onResult)
+}
+
+func (e *Engine) advanceStreamChunked(
+	changes []SnapshotChange,
+	chunkSize int,
+	onResult func(AdvanceStreamPartial),
+) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
@@ -1319,7 +1368,7 @@ func (e *Engine) AdvanceStream(
 	// <chunkSize residual coalesces into the streamer's rows and is drained per
 	// source-change below. Cleared on return (under e.mu, before Unlock) so
 	// hydrate/companion Accumulate stay in slice mode.
-	e.streamer.SetChunkSink(func(chunk []RowChange) { sendFrame(chunk, false) }, advanceChunkSize, softChunkBytes)
+	e.streamer.SetChunkSink(func(chunk []RowChange) { sendFrame(chunk, false) }, chunkSize, softChunkBytes)
 	defer e.streamer.SetChunkSink(nil, 0, 0)
 
 	// Non-Drift panic capture: pre-fix this re-raised inline (panic(r)
@@ -1393,7 +1442,7 @@ func (e *Engine) AdvanceStream(
 				// produces >chunkSize rows still ships in one frame (we
 				// don't split an individual source-change's RowChange list
 				// — that would require operator-level chunking).
-				if len(pending) >= advanceChunkSize || pendingBytes >= softChunkBytes {
+				if len(pending) >= chunkSize || pendingBytes >= softChunkBytes {
 					flush(false)
 				}
 			}
