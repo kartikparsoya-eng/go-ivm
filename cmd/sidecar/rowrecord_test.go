@@ -581,3 +581,35 @@ func TestRowRecord_OversizedIdentifierFailsLoud(t *testing.T) {
 		t.Fatal("remove against a frameOnly group must fall back to frames")
 	}
 }
+
+// TestRowRecord_OversizedRecordFallsBackToFrame is the R1 regression guard:
+// kind-3 records carry u32 value lengths with no cap of their own, so a value
+// pushing the record past the 64MB frame cap must make encodeRow reject it
+// (the caller then falls back to the capped frame path) rather than emit an
+// unbounded record that malloc+memcpy's into the addon.
+func TestRowRecord_OversizedRecordFallsBackToFrame(t *testing.T) {
+	enc := newRowRecordEncoder(1)
+	big := string(make([]byte, maxFrameSize+16)) // one value over the frame cap
+	c := &engine.RowChange{
+		Type: engine.RowChangeAdd, QueryID: "q", Table: "t",
+		RowKey: map[string]interface{}{"id": "a"},
+		Row:    ivm.Row{"id": "a", "blob": big},
+	}
+	g, def := enc.groupFor(c)
+	if def == nil {
+		t.Fatal("expected a groupDef")
+	}
+	if _, ok := enc.encodeRow(g, c); ok {
+		t.Fatal("oversized record must be rejected so the caller falls back to the frame path")
+	}
+	// A normal row for the same group still encodes (the reject didn't
+	// wedge the encoder / group state).
+	small := &engine.RowChange{
+		Type: engine.RowChangeAdd, QueryID: "q", Table: "t",
+		RowKey: map[string]interface{}{"id": "b"},
+		Row:    ivm.Row{"id": "b", "blob": "ok"},
+	}
+	if _, ok := enc.encodeRow(g, small); !ok {
+		t.Fatal("a normal row after an oversized one must still encode")
+	}
+}

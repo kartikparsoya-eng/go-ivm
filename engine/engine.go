@@ -1044,6 +1044,17 @@ type QueryResult struct {
 // (the validated streaming-tablesrc setting; aligns with the TS
 // view-syncer's cursor page size). The per-facet vars below remain as
 // fine-grained overrides for A/B work; deployments should set only this.
+//
+// TRANSPORT-AGNOSTIC (REVIEW-napi-transport O2): this default is engine-
+// level, so it applies to the SOCKET transport too, not just napi. A
+// socket deployment on this binary emits ~100× more (smaller) frames per
+// large hydrate/advance than the old 10000 default — each frame pays a
+// length-prefix + write() syscall + TS-side decode dispatch. This is
+// intended (streaming-by-default is a deliberate product decision) and is
+// the exact config the streaming-tablesrc image variant already ships and
+// soaked over a socket. A socket deployment that wants the old
+// coarse-frame behavior sets GO_IVM_CHUNK_SIZE=10000 (or the per-facet
+// GO_IVM_HYDRATE_CHUNK_SIZE / GO_IVM_ADVANCE_CHUNK_SIZE).
 var defaultChunkSize = envChunkSize("GO_IVM_CHUNK_SIZE", 100)
 
 // hydrateChunkSize is the max number of RowChanges per partial frame in

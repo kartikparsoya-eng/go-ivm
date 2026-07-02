@@ -33,6 +33,18 @@ jobs:
       - name: go vet
         run: go vet ./...
 
+      # NAPI ABI build guard (REVIEW-napi-transport T1): the in-process
+      # transport shims in napi_lib.go compile ONLY under -tags napilib, so
+      # neither `go vet ./...` nor `go test ./...` ever builds them — a
+      # regression there would otherwise surface only at Docker c-shared
+      # stage time. Build the c-shared library here to catch it in CI.
+      # Bundled sqlite (no libsqlite3 tag) so no system lib is needed.
+      - name: go build (napilib c-shared ABI)
+        run: |
+          CGO_ENABLED=1 go build -tags napilib -buildmode=c-shared \
+            -o /tmp/libgoivm-ci.so ./cmd/sidecar
+          test -f /tmp/libgoivm-ci.so
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 

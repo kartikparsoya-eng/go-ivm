@@ -271,6 +271,12 @@ type perfMetrics struct {
 	// values mean the payload crossed advanceChunkSize / hydrateChunkSize.
 	hydrateChunkCounts []int
 	advanceChunkCounts []int
+	// Row-mode advance delivers one record PER ROW (chunkSize=1), so its
+	// "chunk count" is really a ROW count. Tracked separately so the
+	// advance-chunks histogram stays comparable across transports — socket
+	// (frames of ~100) vs napi rowMode (rows) — which an A/B rollout dashboard
+	// would otherwise read apples-vs-oranges (REVIEW-napi-transport P2).
+	advanceRowCounts []int
 
 	// Cold-start reader-pool bind outcomes (last 10s window). Lets us
 	// correlate bind-success-rate with replicator commit frequency: under fast
@@ -326,6 +332,92 @@ func (m *perfMetrics) recordAdvanceChunks(n int) {
 	m.mu.Unlock()
 }
 
+// recordAdvanceRows logs the per-row delivery count for ONE rowMode advance
+// call (chunkSize=1). Separate from recordAdvanceChunks because a "chunk" is
+// a row in that mode; see advanceRowCounts (REVIEW-napi-transport P2).
+func (m *perfMetrics) recordAdvanceRows(n int) {
+	m.mu.Lock()
+	m.advanceRowCounts = append(m.advanceRowCounts, n)
+	m.mu.Unlock()
+}
+
+// startPprofServer opens the pprof + block/mutex profiling endpoint when
+// GO_IVM_PPROF_ADDR is set (nil when unset — off by default). Shared by the
+// socket main() and the in-process NAPI host: napi mode was previously BLIND
+// — pprof + the PERF reporter lived only in main(), which the host never runs
+// (REVIEW-napi-transport O1). pprof pinned the EXISTS N+1, the pin race, and
+// the GC ceiling on this project, so it must exist in-process too.
+//
+// napiMode derives a per-WORKER port from the PID for a bare ":port" addr:
+// napi syncer workers are separate PROCESSES that would otherwise all bind
+// the same fixed port and all but one would fail. A fully-qualified
+// host:port is honored verbatim (operator owns per-worker uniqueness). S3
+// bind guard preserved: a hostless addr defaults to loopback — pprof is an
+// RCE-grade surface (reads heap, dumps goroutines, can trigger GC).
+func startPprofServer(napiMode bool) *http.Server {
+	addr := os.Getenv("GO_IVM_PPROF_ADDR")
+	if addr == "" {
+		return nil
+	}
+	if strings.HasPrefix(addr, ":") {
+		if napiMode {
+			if p, err := strconv.Atoi(strings.TrimPrefix(addr, ":")); err == nil {
+				// Spread workers across a small band off the base port.
+				addr = fmt.Sprintf(":%d", p+os.Getpid()%1000)
+			}
+		}
+		addr = "127.0.0.1" + addr
+	}
+	runtime.SetBlockProfileRate(1)
+	runtime.SetMutexProfileFraction(1)
+	srv := &http.Server{Addr: addr, Handler: http.DefaultServeMux}
+	go func() {
+		fmt.Fprintf(os.Stderr, "[GO-IVM] pprof listening on %s\n", addr)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			fmt.Fprintf(os.Stderr, "[GO-IVM] pprof server exited: %v\n", err)
+		}
+	}()
+	return srv
+}
+
+// runPerfReporter runs the 10-second [GO-IVM][PERF] window reporter plus the
+// replica-pool-pressure watch until ctx is cancelled. Shared by main() and
+// the NAPI host (REVIEW-napi-transport O1 — the PERF line is what every soak
+// greps). Blocking; run in a goroutine.
+func (s *Server) runPerfReporter(ctx context.Context) {
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+	var lastWait int64
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		metrics.reportAndReset()
+		// Replica-pool pressure: WaitCount growth means goroutines are
+		// blocking on conn acquisition — the precursor to TS-side RPC
+		// timeouts. Surface it BEFORE it becomes reset storms.
+		s.replicaMu.Lock()
+		rdb, wdb := s.replicaDB, s.replicaWritableDB
+		s.replicaMu.Unlock()
+		if rdb != nil && wdb != nil {
+			rs, ws := rdb.Stats(), wdb.Stats()
+			wait := rs.WaitCount + ws.WaitCount
+			if wait > lastWait {
+				fmt.Fprintf(os.Stderr,
+					"[GO-IVM] replica pool pressure: +%d conn waits in last 10s "+
+						"(read in-use %d/%d, writable in-use %d/%d, total wait %s) — "+
+						"consider raising GO_IVM_MAX_OPEN_CONNS\n",
+					wait-lastWait, rs.InUse, rs.MaxOpenConnections,
+					ws.InUse, ws.MaxOpenConnections,
+					(rs.WaitDuration + ws.WaitDuration).Round(time.Millisecond))
+			}
+			lastWait = wait
+		}
+	}
+}
+
 // poolBindOutcome is HOW a cold-start hydrate got its K-reader frame: latched
 // to the anchor frame via wal2 co-read (coread-fast), converged-upward across K
 // independent BEGINs (the shipped fallback), or neither — no pool bound, so the
@@ -373,10 +465,12 @@ func (m *perfMetrics) reportAndReset() {
 	hydLats := m.hydrateLatencies
 	hydChunks := m.hydrateChunkCounts
 	advChunks := m.advanceChunkCounts
+	advRows := m.advanceRowCounts
 	m.advanceLatencies = nil
 	m.hydrateLatencies = nil
 	m.hydrateChunkCounts = nil
 	m.advanceChunkCounts = nil
+	m.advanceRowCounts = nil
 	m.mu.Unlock()
 
 	advCount := m.advanceCount.Swap(0)
@@ -416,11 +510,15 @@ func (m *perfMetrics) reportAndReset() {
 	// of 1 means almost every call hits the single-frame fast path.
 	hydChunkP50, hydChunkP95, hydChunkMax := chunkStats(hydChunks)
 	advChunkP50, advChunkP95, advChunkMax := chunkStats(advChunks)
+	// Row-mode advance rows reported as a DISTINCT segment (not folded into
+	// advance chunks) so socket-vs-napi comparisons stay honest (P2).
+	advRowP50, advRowP95, advRowMax := chunkStats(advRows)
 
 	fmt.Fprintf(os.Stderr,
-		"[GO-IVM][PERF-CHUNKS] 10s window: hydrate chunks (p50=%d p95=%d max=%d n=%d) advance chunks (p50=%d p95=%d max=%d n=%d)\n",
+		"[GO-IVM][PERF-CHUNKS] 10s window: hydrate chunks (p50=%d p95=%d max=%d n=%d) advance chunks (p50=%d p95=%d max=%d n=%d) advance rows (p50=%d p95=%d max=%d n=%d)\n",
 		hydChunkP50, hydChunkP95, hydChunkMax, len(hydChunks),
-		advChunkP50, advChunkP95, advChunkMax, len(advChunks))
+		advChunkP50, advChunkP95, advChunkMax, len(advChunks),
+		advRowP50, advRowP95, advRowMax, len(advRows))
 
 	fmt.Fprintf(os.Stderr, "[GO-IVM][PERF] 10s window: advances=%d (p50=%v p95=%v max=%v peakConc=%d) hydrates=%d (p50=%v p95=%v max=%v peakConc=%d)\n",
 		advCount, advP50, advP95, advMax, peakAdv,
@@ -2403,6 +2501,14 @@ func handleConnection(conn net.Conn, server *Server) {
 // The standard GOGC env (already applied by the runtime) takes precedence when
 // GO_IVM_GOGC is unset, so existing deployments that tuned GOGC are unaffected.
 func tuneRuntime() {
+	// Crash forensics (REVIEW-napi-transport C1): a Go runtime FATAL (not a
+	// recovered panic — concurrent map write, stack overflow, etc.) prints its
+	// goroutine dump then kills the process. In napi mode that process is the
+	// syncer WORKER, and a K8s restart makes the trace easy to miss — so
+	// guarantee there IS a trace even if the environment set GOTRACEBACK=none.
+	// SetTraceback can only RAISE the level, so this is a floor, never an
+	// override of an operator who asked for more ("all"/"crash").
+	debug.SetTraceback("single")
 	if v := os.Getenv("GO_IVM_GOGC"); v != "" {
 		if v == "off" {
 			debug.SetGCPercent(-1)
@@ -2521,34 +2627,10 @@ func main() {
 	// Cancelled by the SIGINT/SIGTERM handler so goroutines exit cleanly.
 	shutdownCtx, shutdownCancel := context.WithCancel(context.Background())
 	defer shutdownCancel()
-	var pprofServer *http.Server
-
-	// Optional pprof endpoint. Off by default — opens only when
-	// GO_IVM_PPROF_ADDR is set (e.g., "127.0.0.1:6060" in a sandbox or
-	// "0.0.0.0:6060" when the container exposes the port). Enabling block
-	// + mutex profiling carries ~5% overhead at sample rate 1, which is
-	// acceptable during a profile run but should stay off in prod. The
-	// _ "net/http/pprof" import registers handlers on http.DefaultServeMux.
-	//
-	// S3: a bare port (":6060") with no host binds 0.0.0.0 and exposes pprof on
-	// every interface — pprof is an RCE-grade surface (read heap, fetch goroutine
-	// state, even trigger GC/allocs). Default a hostless addr to 127.0.0.1 so it
-	// stays loopback-only unless the operator EXPLICITLY asks for a bind (an
-	// addr already carrying a host, including "0.0.0.0:…", is honored verbatim).
-	if addr := os.Getenv("GO_IVM_PPROF_ADDR"); addr != "" {
-		if strings.HasPrefix(addr, ":") {
-			addr = "127.0.0.1" + addr
-		}
-		runtime.SetBlockProfileRate(1)
-		runtime.SetMutexProfileFraction(1)
-		pprofServer = &http.Server{Addr: addr, Handler: http.DefaultServeMux}
-		go func() {
-			fmt.Fprintf(os.Stderr, "[GO-IVM] pprof listening on %s\n", addr)
-			if err := pprofServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-				fmt.Fprintf(os.Stderr, "[GO-IVM] pprof server exited: %v\n", err)
-			}
-		}()
-	}
+	// pprof endpoint — off unless GO_IVM_PPROF_ADDR is set. Extracted to
+	// startPprofServer so the NAPI host shares it (O1). Socket mode: no
+	// per-worker port derivation (one process).
+	pprofServer := startPprofServer(false)
 
 	// Remove stale socket — but ONLY if the path is an actual leftover socket,
 	// not a live file or directory someone (or another process) placed there.
@@ -2598,41 +2680,9 @@ func main() {
 	fmt.Printf("Go IVM sidecar listening on %s (multi-engine, source=%s)\n",
 		socketPath, server.sourceMode)
 
-	// Start periodic metrics reporter
-	go func() {
-		ticker := time.NewTicker(10 * time.Second)
-		defer ticker.Stop()
-		var lastWait int64
-		for {
-			select {
-			case <-shutdownCtx.Done():
-				return
-			case <-ticker.C:
-			}
-			metrics.reportAndReset()
-			// Replica-pool pressure: WaitCount growth means goroutines are
-			// blocking on conn acquisition — the precursor to TS-side RPC
-			// timeouts. Surface it BEFORE it becomes reset storms so ops can
-			// raise GO_IVM_MAX_OPEN_CONNS (rule of thumb: ≥3× concurrent CGs).
-			server.replicaMu.Lock()
-			rdb, wdb := server.replicaDB, server.replicaWritableDB
-			server.replicaMu.Unlock()
-			if rdb != nil && wdb != nil {
-				rs, ws := rdb.Stats(), wdb.Stats()
-				wait := rs.WaitCount + ws.WaitCount
-				if wait > lastWait {
-					fmt.Fprintf(os.Stderr,
-						"[GO-IVM] replica pool pressure: +%d conn waits in last 10s "+
-							"(read in-use %d/%d, writable in-use %d/%d, total wait %s) — "+
-							"consider raising GO_IVM_MAX_OPEN_CONNS\n",
-						wait-lastWait, rs.InUse, rs.MaxOpenConnections,
-						ws.InUse, ws.MaxOpenConnections,
-						(rs.WaitDuration + ws.WaitDuration).Round(time.Millisecond))
-				}
-				lastWait = wait
-			}
-		}
-	}()
+	// Start the 10s PERF reporter + pool-pressure watch (shared with the
+	// NAPI host — see runPerfReporter, O1).
+	go server.runPerfReporter(shutdownCtx)
 
 	// Start idle-group reaper. Without this, ClientGroups that the TS side
 	// fails to explicitly destroy (network partition, process crash, missed

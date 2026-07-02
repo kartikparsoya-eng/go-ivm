@@ -489,6 +489,15 @@ func (s *Server) handleAdvanceToHead(req RPCRequest) RPCResponse {
 			group.eng.BindTableSourcesToConn(diff.Curr().Conn())
 		}
 	}
+	// P1 (REVIEW-napi-transport): rebind on EVERY exit, including a PANIC
+	// unwind. engine.Advance re-raises non-drift panics (DataError, bugs)
+	// after recovering drift; that unwind skips the success-path rebindCurr()
+	// below and leaves the sources bound to diff.Prev() — which the next
+	// leapfrog turns into the rolled-back frame, so any hydrate/drift-audit
+	// read in the window sees one frame behind head (silent staleness).
+	// Double-bind is idempotent (just a pointer set), so the explicit
+	// error-path calls below stay correct and keep their ordering.
+	defer rebindCurr()
 
 	// Memory guard: diff.Collect materializes the FULL catch-up diff —
 	// every change-log entry WITH row values — before the engine applies
@@ -676,6 +685,13 @@ func (s *Server) handleAdvanceToHeadStream(req RPCRequest, streamW streamWriter)
 	rebindCurr := func() {
 		group.eng.BindTableSourcesToConn(diff.Curr().Conn())
 	}
+	// P1 (REVIEW-napi-transport): rebind on EVERY exit including a panic
+	// unwind — AdvanceStream re-raises non-drift panics after its terminal
+	// flush, which would otherwise skip the success-path rebindCurr() and
+	// strand the sources on diff.Prev() (one-frame-behind staleness).
+	// Idempotent, so the explicit reset/error-path calls below keep their
+	// rebind-before-Final-frame ordering.
+	defer rebindCurr()
 
 	// Memory guard — same rationale as handleAdvanceToHead: Collect
 	// materializes the full diff with row values; refuse oversized diffs so
@@ -740,9 +756,10 @@ func (s *Server) handleAdvanceToHeadStream(req RPCRequest, streamW streamWriter)
 					cgID, r.Drift.Error())
 			}
 			if r.Final {
-				// One call → one record on the terminal frame; Final's
-				// ChunkIndex+1 is the total chunk count for this call.
-				metrics.recordAdvanceChunks(r.ChunkIndex + 1)
+				// rowMode: chunkSize=1, so ChunkIndex+1 is the per-row
+				// DELIVERY count, not a chunk count — record it as rows so the
+				// advance-chunks histogram isn't polluted (P2).
+				metrics.recordAdvanceRows(r.ChunkIndex + 1)
 			}
 		})
 		rebindCurr()

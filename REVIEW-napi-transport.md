@@ -385,3 +385,45 @@ prune `byQueryID` on final (one line) to close it.
 5. Run the mono napi vitest suites + a kill/chaos soak (review item #7 from
    the edge audit) against the napi build — the RESILIENCE gates were
    validated on the socket transport only.
+
+## Resolution log (2026-07-02)
+
+All findings across passes 1–5 are addressed. Pass 1–2 (F1–F7 + pass-2
+minors) were fixed earlier this session (go-ivm 413ccad / mono 626251970).
+Pass 3–5:
+
+- **O1 (napi blind)** — `startPprofServer(napiMode)` + `(*Server).runPerfReporter`
+  extracted from `main()` (main.go); the NAPI host now starts BOTH under the
+  reaper context (abi.go), and shuts pprof down on host teardown. Bare-port
+  pprof is PID-offset in napi mode (separate worker processes); S3 loopback
+  guard preserved.
+- **O2 (chunk default hits socket)** — DECISION: kept 100 (streaming-by-
+  default is a deliberate product choice, and the streaming-tablesrc image
+  already ships+soaked chunk=100 over a socket). Documented the transport-
+  agnostic implication + the `GO_IVM_CHUNK_SIZE=10000` opt-out at the
+  `defaultChunkSize` definition (engine.go).
+- **R1 (unbounded records)** — `encodeRow` now rejects a record exceeding the
+  64 MB frame cap → caller falls back to the frame path (capFrameBytes turns
+  a truly-oversized payload into a loud error, not an OOM).
+  `TestRowRecord_OversizedRecordFallsBackToFrame`.
+- **P1 (rebindCurr skipped on panic)** — `defer rebindCurr()` in BOTH drive
+  handlers; idempotent double-bind keeps the explicit reset/error-path
+  ordering (advance_to_head.go).
+- **P2 (advance-chunks counts rows in rowMode)** — new `recordAdvanceRows` +
+  distinct `advance rows (…)` segment on the `[GO-IVM][PERF-CHUNKS]` line;
+  the rowMode advanceToHeadStream path records rows, not chunks (main.go,
+  advance_to_head.go).
+- **P3 (hydrate retry double-yield)** — `byQueryID.delete(queryID)` on a
+  query's final chunk in `goHydrateBatchStream` (pipeline-driver.ts).
+- **C1 (GOTRACEBACK unset)** — `debug.SetTraceback("single")` floor in
+  `tuneRuntime` (called by both `main()` and `goivm_start`) so a Go fatal in
+  the worker always leaves a trace even under `GOTRACEBACK=none`.
+- **T1(a) (napilib not built in CI)** — `go build -tags napilib -buildmode=
+  c-shared` step added to go-ivm's workflow. T1(b) (a mono CI job that builds
+  the .so + addon and runs the napi e2e suites, which are `describe.skipIf`'d
+  without artifacts) remains a follow-up — it needs the artifact-build
+  pipeline in CI, a larger change than the code fixes here.
+
+Verified: full go-ivm suite green under `-race` (cmd/sidecar included — F1
+red is now green); 97/97 mono go-sidecar + pipeline-driver tests; 0 tsc
+errors in touched files.

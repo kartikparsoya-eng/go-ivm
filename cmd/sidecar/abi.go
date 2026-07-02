@@ -34,6 +34,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
 	"os"
 	"strconv"
 	"sync"
@@ -155,6 +156,11 @@ type abiHost struct {
 	// must run its own or abandoned CGs never get collected (napi-only
 	// leak — the whole reason abi.go reuses Server but not main()).
 	reaperCancel context.CancelFunc
+
+	// pprofServer is the in-process pprof endpoint (nil unless
+	// GO_IVM_PPROF_ADDR is set). Same O1 rationale as the reaper: pprof and
+	// the PERF reporter lived only in main(), leaving napi mode blind.
+	pprofServer *http.Server
 }
 
 // errHostClosed is returned by Send after Shutdown (or pipe teardown).
@@ -204,6 +210,13 @@ func startABIHostWithServer(server *Server, deliver func(kind int32, payload []b
 	reaperCtx, reaperCancel := context.WithCancel(context.Background())
 	h.reaperCancel = reaperCancel
 	go server.runReaper(reaperCtx)
+
+	// Observability parity with the socket path (REVIEW-napi-transport O1):
+	// the 10s [GO-IVM][PERF] reporter (what every soak greps) + the pprof
+	// endpoint. Both were main()-only; the host never runs main(). pprof is
+	// per-worker-port-derived (napi workers are separate processes).
+	go server.runPerfReporter(reaperCtx)
+	h.pprofServer = startPprofServer(true)
 
 	// The production connection handler, verbatim. When either pipe end
 	// closes, its read loop errors out and it tears down exactly as it
@@ -295,6 +308,9 @@ func (h *abiHost) markClosed() {
 func (h *abiHost) Shutdown() {
 	if h.reaperCancel != nil {
 		h.reaperCancel()
+	}
+	if h.pprofServer != nil {
+		h.pprofServer.Shutdown(context.Background())
 	}
 	h.markClosed()
 	<-h.done

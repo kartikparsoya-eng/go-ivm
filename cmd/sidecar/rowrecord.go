@@ -253,12 +253,24 @@ func (e *rowRecordEncoder) encodeRow(g *rowGroup, c *engine.RowChange) ([]byte, 
 				return nil, false
 			}
 		}
+		if len(e.buf) > maxFrameSize {
+			return nil, false // oversize — fall back to the (capped) frame path
+		}
 		return e.buf, true
 	}
 	for _, col := range g.cols {
 		if !e.putValue(c.Row[col]) {
 			return nil, false
 		}
+	}
+	// R1 (REVIEW-napi-transport): kind-3 records carry u32 value lengths (up
+	// to 4GB) with NO cap of their own — unlike frames, which capFrameBytes
+	// guards. A single fat JSON/blob value would malloc+memcpy an unbounded
+	// buffer into the addon. Above the frame cap, fall back to the msgpack
+	// frame path, whose capFrameBytes turns a truly-oversized payload into a
+	// loud error frame instead of an OOM.
+	if len(e.buf) > maxFrameSize {
+		return nil, false
 	}
 	return e.buf, true
 }
