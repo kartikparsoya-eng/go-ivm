@@ -183,6 +183,12 @@ type Source struct {
 	// atomic so fetchForConn can read it without s.mu. Set/cleared via
 	// BindReaderPool / UnbindReaderPool (engine.BindTableSourcesToReaderPool).
 	readerPool atomic.Pointer[ReaderPool]
+
+	// nextConnectGroup is the pipeline-group tag the NEXT Connect call
+	// stamps on its connection (SetNextConnectGroup — the engine sets it to
+	// the owning queryID right before each Connect during a pipeline
+	// build). Guarded by s.mu. See parallel_fanout.go.
+	nextConnectGroup string
 }
 
 // connection is one downstream pipeline subscribed to this source.
@@ -196,6 +202,13 @@ type connection struct {
 	// Set by SetOutput once the operator above us wires its receiver.
 	output ivm.Output
 	input  ivm.Input
+
+	// group is the pipeline group this connection belongs to (the engine's
+	// queryID, via SetNextConnectGroup) — the parallel-advance
+	// serialization unit. Connections sharing a group push sequentially;
+	// distinct groups may push concurrently (see parallel_fanout.go).
+	// "" for non-engine callers → one shared serial group.
+	group string
 
 	// LastPushedEpoch is the most recent pushEpoch this connection has
 	// already observed via its Output.Push. Read during Fetch to gate
@@ -699,6 +712,10 @@ func (s *Source) Connect(
 	conn.input = in
 
 	s.mu.Lock()
+	// Consume the pending connect-group tag (engine sets it immediately
+	// before Connect; builds are serialized under Engine.mu so set→consume
+	// cannot interleave across queries).
+	conn.group = s.nextConnectGroup
 	s.connections = append(s.connections, conn)
 	s.mu.Unlock()
 	return in
@@ -805,23 +822,10 @@ func (s *Source) genPushAndWrite(change ivm.SourceChange, conns []*connection) [
 	s.overlay = &ivm.Overlay{Epoch: epoch, Change: change}
 	s.mu.Unlock()
 
-	var out []ivm.Change
-	for _, conn := range conns {
-		if conn.output == nil {
-			continue
-		}
-		// Bump lastPushedEpoch BEFORE filterPush so a downstream Fetch
-		// inside output.Push sees the gate match TS's genPush ordering
-		// (memory-source.ts:555). lastPushedEpoch is a single int field
-		// touched only from Push fanout + Fetch overlay-gate read; the
-		// engine serializes both per-source so no data race.
-		conn.lastPushedEpoch = epoch
-		outputChange := sourceChangeToChange(change)
-		if outputChange == nil {
-			continue
-		}
-		out = append(out, filterPush(*outputChange, conn)...)
-	}
+	// Fan out to every connection — in parallel across pipeline groups when
+	// enabled (see parallel_fanout.go), serially otherwise. Either way the
+	// returned Changes are in connection-registration order.
+	out := s.fanOut(change, epoch, conns)
 
 	// Re-acquire mu for writeChange + overlay clear.
 	s.mu.Lock()

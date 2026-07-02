@@ -1146,13 +1146,16 @@ func (e *Engine) removeQueryLocked(queryID string) {
 // Advance processes a batch of snapshot changes through all affected sources.
 // Returns flat RowChanges representing the effect on all registered pipelines.
 //
-// Drift recovery: if MemorySource's pre-Push validation detects an Edit/Remove
+// Drift recovery: if the source's pre-Push validation detects an Edit/Remove
 // against a missing row (or duplicate Add), it panics with *ivm.DriftError —
-// raised BEFORE any state mutation, so we can recover cleanly. On drift we
-// drop the entire advance: clear the streamer (it may hold valid output
-// from earlier source.Push calls in this loop, but TS will re-init from
-// fresh SQLite truth, so applying those would risk double-application),
-// and return a result with Drift set so the sidecar can signal TS.
+// raised BEFORE any state mutation, so we can recover cleanly. In prod table
+// mode that check is tablesource.Source.driftCheckLocked; the in-memory
+// MemorySource port has the equivalent asserts in genPush. On drift we stop
+// the advance and EMIT the partial output prior successful Pushes already
+// produced (draining the streamer), then return a result with Drift set so
+// the sidecar signals TS — matching TS's assert-and-throw path, which streams
+// its partial computation before the snapshot revert. Discarding the partial
+// output here would diverge from TS for the corrupt advance.
 func (e *Engine) Advance(changes []SnapshotChange) *AdvanceResult {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -1244,10 +1247,13 @@ func (e *Engine) Advance(changes []SnapshotChange) *AdvanceResult {
 // caller can record per-(table,op) histogram entries once, atomically with
 // the completion signal.
 //
-// Drift is non-nil only on the Final frame and only when MemorySource
-// raised *ivm.DriftError mid-advance. The TS client must discard ALL
-// partial frames received for this stream (their data is overlapping with
-// what the post-drift re-init will replay) and trigger sidecar re-init.
+// Drift is non-nil only on the Final frame and only when the source (or a
+// downstream operator, e.g. a companion scalar reset / Take stale-bound)
+// raised *ivm.DriftError mid-advance. The TS accumulator attaches the
+// partial frames it already received to the DriftError (partialChanges) and
+// re-throws; GoComputeBackend's recovery emits them to clients before the
+// re-init — the same partial-emit-then-rehydrate sequence TS's native
+// assert-and-throw path produces.
 //
 // See Engine.AdvanceStream for the chunking contract.
 type AdvanceStreamPartial struct {
@@ -1281,10 +1287,11 @@ var advanceChunkSize = envChunkSize("GO_IVM_ADVANCE_CHUNK_SIZE", defaultChunkSiz
 //
 // Like AddQueriesStream, this reduces Go-side memory pressure (each chunk
 // is encoded + flushed + freed before the next accumulates) and improves
-// time-to-first-byte for large advance batches. It does NOT bound Go-side
-// memory below the chunk size — single source-change outputs above
-// advanceChunkSize are still buffered intact (operator-level chunking
-// would be a separate refactor).
+// time-to-first-byte for large advance batches. Go-side peak buffer is
+// bounded to ~one chunk even for a single source-change whose fan-out
+// exceeds the chunk size: the streamer's chunkSink (SetChunkSink below)
+// flushes full chunks DURING the flatten, and only the sub-threshold
+// residual per pipeline coalesces into the streamer's slice.
 //
 // onResult may be called multiple times from this goroutine before the
 // function returns. Engine.mu is held throughout, matching Advance's
@@ -1448,11 +1455,11 @@ func (e *Engine) advanceStreamChunked(
 
 				// Flush mid-batch if we've crossed the chunk threshold —
 				// row count OR estimated bytes (fat rows blow the 64MB wire
-				// frame long before 10k rows; see softChunkBytes). We only
-				// check AFTER appending so a single source-change that
-				// produces >chunkSize rows still ships in one frame (we
-				// don't split an individual source-change's RowChange list
-				// — that would require operator-level chunking).
+				// frame long before 10k rows; see softChunkBytes). Note the
+				// residual drained above is what the chunkSink did NOT flush
+				// mid-flatten: up to one sub-threshold tail per pipeline, so
+				// `pending` can briefly exceed chunkSize with many pipelines
+				// — checked AFTER appending, flushed as one frame here.
 				if len(pending) >= chunkSize || pendingBytes >= softChunkBytes {
 					flush(false)
 				}
@@ -1631,12 +1638,20 @@ type engineDelegate struct {
 // build. Reads the engine's sources snapshot lock-free — the snapshot pointer
 // is COW-updated by RegisterSource so iteration is always against a consistent
 // post-Store view (see type Engine doc comment).
+//
+// The returned wrapper carries this delegate's queryID as the CONNECT GROUP:
+// every leaf connection the builder makes for this query (main pipeline
+// branches, EXISTS/related subquery legs, resolved-scalar companions — all
+// built under the same delegate) is tagged with it. tablesource.Source uses
+// the tag as the parallel-advance serialization unit: connections of one
+// query share spine operators and MUST push serially; connections of
+// different queries share nothing above the source and may push in parallel.
 func (d *engineDelegate) GetSource(tableName string) builder.Source {
 	source, ok := d.engine.sourcesView()[tableName]
 	if !ok {
 		return nil
 	}
-	return &engineSource{source: source}
+	return &engineSource{source: source, group: d.queryID}
 }
 
 func (d *engineDelegate) CreateStorage(name string) ivm.TakeStorage {
@@ -1650,9 +1665,25 @@ func (d *engineDelegate) CreateStorage(name string) ivm.TakeStorage {
 
 type engineSource struct {
 	source Source
+	// group is the owning query's ID — the parallel-advance serialization
+	// unit. Threaded to the source at Connect time via the optional
+	// connGroupTagger interface (tablesource implements it; MemorySource
+	// doesn't and keeps its own threshold-based parallel fanout).
+	group string
+}
+
+// connGroupTagger is implemented by sources whose next Connect call should
+// tag the new connection with a pipeline group. Set-then-Connect is atomic
+// here because pipeline builds run under Engine.mu and Connect is synchronous
+// inside builder.BuildPipeline.
+type connGroupTagger interface {
+	SetNextConnectGroup(string)
 }
 
 func (es *engineSource) Connect(opts builder.ConnectOptions) ivm.Input {
+	if t, ok := es.source.(connGroupTagger); ok {
+		t.SetNextConnectGroup(es.group)
+	}
 	return es.source.Connect(opts.Sort, opts.Filter, opts.FilterPredicate, opts.SplitEditKeys)
 }
 
