@@ -451,3 +451,46 @@ func TestAdvanceToHeadStream_RowModeTruncateResetViaStreamW(t *testing.T) {
 		}
 	}
 }
+
+// Stale initEpoch + rowMode: the epoch guard runs BEFORE the row plane is
+// created, so a torn-down caller's advance must produce ONE error frame and
+// ZERO row-plane records (a leaked record for a dead RPC would be dropped by
+// TS, but a leaked groupDef would poison the registry for a reused id).
+// Runs everywhere (rejected before any engine write).
+func TestAdvanceToHeadStream_RowModeStaleEpochNoRecords(t *testing.T) {
+	path, _ := makeReplica(t)
+
+	srv := NewServer(tablesource.ModeTable, path)
+	srv.appID = "myapp"
+	srv.advanceToHeadEnabled = true
+	srv.advanceDriveEnabled = true
+	t.Cleanup(srv.closeAll)
+
+	col := newSinkCollector()
+	srv.abiDeliver = col.sink
+
+	initReq := RPCRequest{Method: "init", ID: 1, Params: mustMarshal(t, issueInitParams("cg1"))}
+	if resp := srv.handleInit(initReq); resp.Error != nil {
+		t.Fatalf("init error: %+v", resp.Error)
+	}
+	group := srv.getGroup("cg1", false)
+
+	w, frames := collectAdvanceToHeadStreamFrames()
+	req := RPCRequest{Method: "advanceToHeadStream", ID: float64(2), Params: mustMarshal(t, advanceToHeadParams{
+		ClientGroupID: "cg1", InitEpoch: group.initEpoch + 99, RowMode: true,
+	})}
+	resp := srv.handleAdvanceToHeadStream(req, w)
+	if resp.Error == nil {
+		t.Fatalf("stale epoch must error, got %+v", resp.Result)
+	}
+	if len(*frames) != 0 {
+		t.Errorf("stale epoch must emit no partial frames, got %d", len(*frames))
+	}
+	col.mu.Lock()
+	defer col.mu.Unlock()
+	for _, e := range col.entries {
+		if e.kind == abiKindRow || e.kind == abiKindGroupDef {
+			t.Fatalf("stale epoch leaked a row-plane record (kind=%d)", e.kind)
+		}
+	}
+}
