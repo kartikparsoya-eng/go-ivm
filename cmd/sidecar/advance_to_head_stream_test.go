@@ -269,3 +269,185 @@ type engineRowChangeAlias struct {
 	Table   string
 	RowKey  map[string]interface{}
 }
+
+// Row-mode (NAPI) advanceToHeadStream: with abiDeliver set and rowMode=true,
+// the engine's RowChanges must cross as per-row records (kind 2/3 on the
+// delivery queue) with the terminal Final frame (kind 1) carrying
+// Version/NumChanges — and NOTHING on streamW (the ordering invariant: one
+// RPC's output on ONE queue). Skips without BEGIN CONCURRENT — same
+// constraint as TestAdvanceToHeadStream_DriveReassembles.
+func TestAdvanceToHeadStream_RowMode(t *testing.T) {
+	path, db := makeReplica(t)
+	if !beginConcurrentSupported(t, db) {
+		t.Skip("drive mode writes into a past-pinned snapshot — requires BEGIN CONCURRENT (wal2/libsqlite3 build); validated via the rust-test soak")
+	}
+
+	srv := NewServer(tablesource.ModeTable, path)
+	srv.appID = "myapp"
+	srv.advanceToHeadEnabled = true
+	srv.advanceDriveEnabled = true
+	t.Cleanup(srv.closeAll)
+
+	// Arm the row plane exactly as the NAPI host does (abi.go wires
+	// server.abiDeliver to the addon's delivery callback).
+	col := newSinkCollector()
+	srv.abiDeliver = col.sink
+
+	initReq := RPCRequest{Method: "init", ID: 1, Params: mustMarshal(t, issueInitParams("cg1"))}
+	if resp := srv.handleInit(initReq); resp.Error != nil {
+		t.Fatalf("init error: %+v", resp.Error)
+	}
+	group := srv.getGroup("cg1", false)
+
+	addReq := RPCRequest{Method: "addQuery", ID: 2, Params: mustMarshal(t, addQueryParams{
+		ClientGroupID: "cg1",
+		QueryID:       "q1",
+		AST:           builder.AST{Table: "issue", OrderBy: ivm.Ordering{{"id", "asc"}}},
+		InitEpoch:     group.initEpoch,
+	})}
+	if resp := srv.handleAddQuery(addReq); resp.Error != nil {
+		t.Fatalf("addQuery error: %+v", resp.Error)
+	}
+
+	// V2: add issue id=2.
+	mustExec(t, db, `INSERT INTO "issue" VALUES ('2','two',2,'0000000002')`)
+	mustExec(t, db, `INSERT OR REPLACE INTO "_zero.changeLog2" ("stateVersion","pos","table","rowKey","op") VALUES ('0000000002',0,'issue','{"id":"2"}','s')`)
+	mustExec(t, db, `INSERT OR REPLACE INTO "_zero.replicationState" (stateVersion, lock) VALUES ('0000000002', 1)`)
+
+	w, frames := collectAdvanceToHeadStreamFrames()
+	req := RPCRequest{Method: "advanceToHeadStream", ID: float64(3), Params: mustMarshal(t, advanceToHeadParams{
+		ClientGroupID: "cg1", InitEpoch: group.initEpoch, RowMode: true,
+	})}
+	resp := srv.handleAdvanceToHeadStream(req, w)
+	if resp.Error != nil {
+		t.Fatalf("advanceToHeadStream(rowMode) error: %+v", resp.Error)
+	}
+	if resp.Result != "done" {
+		t.Errorf("result = %v, want \"done\"", resp.Result)
+	}
+
+	// The ordering invariant: nothing rides streamW in row mode.
+	if len(*frames) != 0 {
+		t.Fatalf("row mode must not emit streamW frames, got %d: %+v", len(*frames), *frames)
+	}
+
+	// Handler calls deliver synchronously — no waiting needed.
+	col.mu.Lock()
+	entries := append([]sinkEntry(nil), col.entries...)
+	col.mu.Unlock()
+
+	var def *decodedGroupDef
+	var rowIDs []string
+	var finalSeen bool
+	for _, e := range entries {
+		switch e.kind {
+		case abiKindGroupDef:
+			d := decodeGroupDef(t, e.payload)
+			if d.reqID != 3 || d.queryID != "q1" || d.table != "issue" {
+				t.Fatalf("groupDef content: %+v", d)
+			}
+			def = &d
+		case abiKindRow:
+			if def == nil {
+				t.Fatal("ORDERING VIOLATION: row record before its groupDef")
+			}
+			if finalSeen {
+				t.Fatal("ORDERING VIOLATION: row record after final frame")
+			}
+			dr := decodeRowRecord(t, e.payload, len(def.cols))
+			if dr.reqID != 3 {
+				t.Fatalf("row for wrong req: %+v", dr)
+			}
+			for i, c := range def.cols {
+				if c == "id" {
+					rowIDs = append(rowIDs, dr.values[i].(string))
+				}
+			}
+		case abiKindFrame:
+			respF := decodeResp(t, e.payload)
+			if id, ok := toFloat(respF.ID); !ok || id != 3 {
+				continue
+			}
+			m, ok := respF.Result.(map[string]interface{})
+			if !ok {
+				t.Fatalf("kind-1 frame result not a map: %#v", respF.Result)
+			}
+			if fin, _ := m["final"].(bool); !fin {
+				t.Fatalf("only the Final partial may ship as a frame in row mode, got: %#v", m)
+			}
+			finalSeen = true
+			if v, _ := m["version"].(string); v != "0000000002" {
+				t.Errorf("final version = %q, want 0000000002", v)
+			}
+			nc, _ := toFloat(m["numChanges"])
+			if nc != 1 {
+				t.Errorf("final numChanges = %v, want 1", m["numChanges"])
+			}
+			// The single add row rode the record plane; the final frame
+			// must carry no fallback rows.
+			if rows, exists := m["r"]; exists && rows != nil {
+				t.Errorf("final frame carries fallback rows: %#v", rows)
+			}
+		}
+	}
+	if !finalSeen {
+		t.Fatal("no Final kind-1 frame delivered")
+	}
+	if len(rowIDs) != 1 || rowIDs[0] != "2" {
+		t.Errorf("row records = %v, want [2]", rowIDs)
+	}
+}
+
+// Row-mode + reset (TRUNCATE): the diff aborts BEFORE the engine apply, so no
+// row records exist and the single Final reset frame legitimately rides
+// streamW (ordering trivially preserved — nothing else in flight for the id).
+// Runs everywhere (no engine write → no BEGIN CONCURRENT needed).
+func TestAdvanceToHeadStream_RowModeTruncateResetViaStreamW(t *testing.T) {
+	path, db := makeReplica(t)
+
+	srv := NewServer(tablesource.ModeTable, path)
+	srv.appID = "myapp"
+	srv.advanceToHeadEnabled = true
+	srv.advanceDriveEnabled = true
+	t.Cleanup(srv.closeAll)
+
+	col := newSinkCollector()
+	srv.abiDeliver = col.sink
+
+	initReq := RPCRequest{Method: "init", ID: 1, Params: mustMarshal(t, issueInitParams("cg1"))}
+	if resp := srv.handleInit(initReq); resp.Error != nil {
+		t.Fatalf("init error: %+v", resp.Error)
+	}
+	group := srv.getGroup("cg1", false)
+
+	mustExec(t, db, `INSERT OR REPLACE INTO "_zero.changeLog2" ("stateVersion","pos","table","rowKey","op") VALUES ('0000000002',-1,'issue','0000000002','t')`)
+	mustExec(t, db, `INSERT OR REPLACE INTO "_zero.replicationState" (stateVersion, lock) VALUES ('0000000002', 1)`)
+
+	w, frames := collectAdvanceToHeadStreamFrames()
+	req := RPCRequest{Method: "advanceToHeadStream", ID: float64(2), Params: mustMarshal(t, advanceToHeadParams{
+		ClientGroupID: "cg1", InitEpoch: group.initEpoch, RowMode: true,
+	})}
+	resp := srv.handleAdvanceToHeadStream(req, w)
+	if resp.Error != nil {
+		t.Fatalf("advanceToHeadStream(rowMode truncate) error: %+v", resp.Error)
+	}
+	if resp.Result != "done" {
+		t.Errorf("result = %v, want \"done\"", resp.Result)
+	}
+
+	if len(*frames) != 1 {
+		t.Fatalf("want exactly 1 (reset) streamW frame, got %d", len(*frames))
+	}
+	f := (*frames)[0]
+	if !f.Final || f.Reset == nil || f.Reset.Reason != "truncation" || f.Version != "0000000002" {
+		t.Errorf("reset frame wrong: %+v", f)
+	}
+	// No records were produced (the abort precedes the engine apply).
+	col.mu.Lock()
+	defer col.mu.Unlock()
+	for _, e := range col.entries {
+		if e.kind == abiKindRow || e.kind == abiKindGroupDef {
+			t.Fatalf("unexpected record delivery on the reset path: kind=%d", e.kind)
+		}
+	}
+}

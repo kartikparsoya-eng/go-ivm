@@ -26,6 +26,14 @@ import (
 type advanceToHeadParams struct {
 	ClientGroupID string `json:"clientGroupID"`
 	InitEpoch     uint64 `json:"initEpoch"`
+	// RowMode opts the STREAMING variant into the NAPI row plane: the
+	// engine's RowChanges cross the Go↔JS boundary as per-row flat records
+	// (kind 2/3 deliveries) instead of msgpack partial frames. Same
+	// contract as advanceParams.RowMode — honored only when the in-process
+	// transport is active AND the request ID is numeric; otherwise silently
+	// degrades to the ordinary frame path. Ignored by the non-streaming
+	// advanceToHead (its payload is the derived diff, not RowChanges).
+	RowMode bool `json:"rowMode,omitempty"`
 }
 
 // snapshotChangeWire is the on-wire form of a snapshotter.Change. It carries
@@ -711,6 +719,35 @@ func (s *Server) handleAdvanceToHeadStream(req RPCRequest, streamW streamWriter)
 	// carried on the Final frame by AdvanceStream itself (it recovers the drift
 	// panic and returns nil) — the TS accumulator re-throws it as a DriftError.
 	numChanges := diff.Changes
+
+	// Row mode (NAPI transport only): per-row records via abiDeliver with
+	// chunkSize=1 so each RowChange crosses the boundary as the engine
+	// produces it — the deployed Go-primary trigger path gets the same
+	// row-by-row delivery advanceStream (push mode) has. Fallback rows and
+	// the terminal Final (carrying Version/NumChanges/Timings/Drift) ship
+	// as kind-1 frames on the same ordered queue; "done" follows via the
+	// pipe (see rowplane.go's ordering invariant).
+	if rp := newRowPlane(s, req.ID, p.RowMode); rp != nil {
+		streamErr := group.eng.AdvanceStreamChunked(snapChanges, 1, func(r engine.AdvanceStreamPartial) {
+			rp.emitAdvanceToHeadPartial(r, version, numChanges)
+			if r.Drift != nil {
+				fmt.Fprintf(os.Stderr, "[GO-IVM][drift] advanceToHeadStream(rowMode) cg=%s %s\n",
+					cgID, r.Drift.Error())
+			}
+			if r.Final {
+				// One call → one record on the terminal frame; Final's
+				// ChunkIndex+1 is the total chunk count for this call.
+				metrics.recordAdvanceChunks(r.ChunkIndex + 1)
+			}
+		})
+		rebindCurr()
+		if streamErr != nil {
+			fmt.Fprintf(os.Stderr, "[GO-IVM] advanceToHeadStream(rowMode) ERROR cg=%s: %v\n", cgID, streamErr)
+			return rpcError(req.ID, -32000, "advanceToHeadStream: "+streamErr.Error())
+		}
+		return RPCResponse{JSONRPC: "2.0", Result: "done", ID: req.ID}
+	}
+
 	streamErr := group.eng.AdvanceStream(snapChanges, func(r engine.AdvanceStreamPartial) {
 		pc := toPositional(r.Changes)
 		part := advanceToHeadStreamPartial{

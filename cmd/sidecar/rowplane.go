@@ -43,6 +43,14 @@ type rowPlane struct {
 	reqID   interface{}
 }
 
+// rowPlaneEngagedOnce emits a single operator-facing line the first time any
+// RPC actually opts into the row plane. Answers "is row-by-row delivery ON?"
+// from logs alone — without it the plane engages silently (it only logged on
+// error/drift) and a misconfigured deployment (e.g. napiRowMode=false, or a
+// socket transport silently degrading rowMode) is indistinguishable from a
+// working one.
+var rowPlaneEngagedOnce sync.Once
+
 // newRowPlane returns nil when row mode cannot be honored (no in-process
 // transport, or non-numeric request id) — callers fall back to the
 // ordinary streamW path.
@@ -54,6 +62,10 @@ func newRowPlane(s *Server, reqID interface{}, want bool) *rowPlane {
 	if !ok {
 		return nil
 	}
+	rowPlaneEngagedOnce.Do(func() {
+		fmt.Fprintln(os.Stderr,
+			"[GO-IVM][napi] row plane engaged (per-row Go→JS delivery active)")
+	})
 	return &rowPlane{enc: newRowRecordEncoder(rid), deliver: s.abiDeliver, reqID: reqID}
 }
 
@@ -115,6 +127,36 @@ func (rp *rowPlane) emitAdvancePartial(r engine.AdvanceStreamPartial) {
 		Timings:    r.Timings,
 		Drift:      r.Drift,
 	})
+}
+
+// emitAdvanceToHeadPartial is the DRIVE-mode (advanceToHeadStream)
+// counterpart of emitAdvancePartial. Identical row routing; the only
+// difference is the fallback/terminal frame shape — advanceToHeadStreamPartial
+// additionally carries Version + NumChanges on the Final frame (the TS
+// accumulator commits the CVR watermark from them). Reset never reaches here:
+// the reset path aborts before the engine apply and ships its single Final
+// frame via streamW (no records exist, so ordering is trivially preserved).
+func (rp *rowPlane) emitAdvanceToHeadPartial(r engine.AdvanceStreamPartial, version string, numChanges int) {
+	rp.mu.Lock()
+	defer rp.mu.Unlock()
+	fallback := rp.emitChanges(r.Changes)
+	if len(fallback) == 0 && !r.Final {
+		return
+	}
+	pc := toPositional(fallback)
+	part := advanceToHeadStreamPartial{
+		Dict:       pc.Dict,
+		Rows:       pc.Rows,
+		ChunkIndex: r.ChunkIndex,
+		Final:      r.Final,
+		Timings:    r.Timings,
+		Drift:      r.Drift,
+	}
+	if r.Final {
+		part.Version = version
+		part.NumChanges = numChanges
+	}
+	rp.deliverFrame(part)
 }
 
 // emitHydratePartial is the hydrate counterpart: one engine QueryResult in
