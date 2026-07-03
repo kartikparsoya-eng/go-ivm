@@ -1,6 +1,7 @@
 package ivm
 
 import (
+	"math"
 	"slices"
 	"strconv"
 	"testing"
@@ -310,5 +311,17 @@ func TestCanonicalKeyTypeTags(t *testing.T) {
 	// Same value same key (dedup relies on it).
 	if canonicalKey(Row{"a": "x", "b": float64(2)}, ck) != canonicalKey(Row{"a": "x", "b": float64(2)}, ck) {
 		t.Fatal("identical records must produce identical keys")
+	}
+	// ±0 conflate (review M2): JS String(-0) === "0", so TS keys both zeros
+	// as "d0" (flipped-join.ts:607). A child keyed -0.0 must match a parent
+	// fetched back as +0.0 (SQLite's int-serial encoding normalizes
+	// integral REALs); pre-fix Go emitted "d-0" and the parent row was
+	// silently dropped.
+	negZero := math.Copysign(0, -1)
+	if got, want := canonicalKey(Row{"k": negZero}, pk), canonicalKey(Row{"k": float64(0)}, pk); got != want {
+		t.Fatalf("canonicalKey(-0.0) = %q, canonicalKey(0.0) = %q; JS conflates ±0", got, want)
+	}
+	if got := canonicalKey(Row{"k": negZero}, pk); got != "d0" {
+		t.Fatalf("canonicalKey(-0.0) = %q; want %q (TS 'd' + String(-0))", got, "d0")
 	}
 }

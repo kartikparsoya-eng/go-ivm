@@ -413,6 +413,16 @@ func canonicalValue(v Value) string {
 	case string:
 		return "s" + t
 	case float64:
+		if t == 0 {
+			// JS String(-0) === "0": TS conflates ±0 into "d0"
+			// (flipped-join.ts:607) — the ONLY double pair JS's
+			// shortest-round-trip formatting does not separate. A child
+			// keyed -0.0 must find a parent fetched back as +0.0 (SQLite
+			// stores integral REALs int-serial, normalizing -0.0 to 0);
+			// FormatFloat's "d-0" split the keys and silently dropped the
+			// parent row (napi hostile review M2).
+			return "d0"
+		}
 		return "d" + strconv.FormatFloat(t, 'g', -1, 64)
 	case int64:
 		return "b" + strconv.FormatInt(t, 10)
