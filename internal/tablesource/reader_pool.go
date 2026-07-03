@@ -204,6 +204,11 @@ func (p *ReaderPool) release(r *poolReader) {
 // Version is the stateVersion every reader in the pool is pinned at.
 func (p *ReaderPool) Version() string { return p.version }
 
+// Size is the number of readers (K) the pool was built with. Callers use it
+// to check a still-bound pool against a NEW batch's concurrent-cursor demand
+// (K must stay ≥ P × Cmax for the deadlock-freedom argument above).
+func (p *ReaderPool) Size() int { return len(p.all) }
+
 // Close rolls back and closes every reader. Safe to call on a partially-built
 // pool (NewReaderPool calls it on the error path).
 func (p *ReaderPool) Close() {

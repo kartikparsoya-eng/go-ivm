@@ -103,7 +103,7 @@ func TestAdvanceToHead_DerivesDiff(t *testing.T) {
 
 	advReq := RPCRequest{Method: "advanceToHead", ID: 2, Params: mustMarshal(t, advanceToHeadParams{
 		ClientGroupID: "cg1",
-		InitEpoch:     group.initEpoch,
+		InitEpoch:     group.initEpoch.Load(),
 	})}
 	resp := srv.handleAdvanceToHead(advReq)
 	if resp.Error != nil {
@@ -191,7 +191,7 @@ func TestAdvanceToHead_DriveProducesRowChanges(t *testing.T) {
 		ClientGroupID: "cg1",
 		QueryID:       "q1",
 		AST:           builder.AST{Table: "issue", OrderBy: ivm.Ordering{{"id", "asc"}}},
-		InitEpoch:     group.initEpoch,
+		InitEpoch:     group.initEpoch.Load(),
 	})}
 	if resp := srv.handleAddQuery(addReq); resp.Error != nil {
 		t.Fatalf("addQuery error: %+v", resp.Error)
@@ -203,7 +203,7 @@ func TestAdvanceToHead_DriveProducesRowChanges(t *testing.T) {
 	mustExec(t, db, `INSERT OR REPLACE INTO "_zero.replicationState" (stateVersion, lock) VALUES ('0000000002', 1)`)
 
 	advReq := RPCRequest{Method: "advanceToHead", ID: 3, Params: mustMarshal(t, advanceToHeadParams{
-		ClientGroupID: "cg1", InitEpoch: group.initEpoch,
+		ClientGroupID: "cg1", InitEpoch: group.initEpoch.Load(),
 	})}
 	resp := srv.handleAdvanceToHead(advReq)
 	if resp.Error != nil {
@@ -229,7 +229,7 @@ func TestAdvanceToHead_DriveProducesRowChanges(t *testing.T) {
 	mustExec(t, db, `INSERT OR REPLACE INTO "_zero.changeLog2" ("stateVersion","pos","table","rowKey","op") VALUES ('0000000003',0,'issue','{"id":"1"}','s')`)
 	mustExec(t, db, `INSERT OR REPLACE INTO "_zero.replicationState" (stateVersion, lock) VALUES ('0000000003', 1)`)
 	advReq2 := RPCRequest{Method: "advanceToHead", ID: 4, Params: mustMarshal(t, advanceToHeadParams{
-		ClientGroupID: "cg1", InitEpoch: group.initEpoch,
+		ClientGroupID: "cg1", InitEpoch: group.initEpoch.Load(),
 	})}
 	resp2 := srv.handleAdvanceToHead(advReq2)
 	if resp2.Error != nil {
@@ -284,7 +284,7 @@ func TestAdvanceToHead_SkipsNonSyncableTable(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	advReq := RPCRequest{Method: "advanceToHead", ID: 2, Params: mustMarshal(t, advanceToHeadParams{ClientGroupID: "cg1", InitEpoch: group.initEpoch})}
+	advReq := RPCRequest{Method: "advanceToHead", ID: 2, Params: mustMarshal(t, advanceToHeadParams{ClientGroupID: "cg1", InitEpoch: group.initEpoch.Load()})}
 	resp := srv.handleAdvanceToHead(advReq)
 	if resp.Error != nil {
 		t.Fatalf("advanceToHead error (non-syncable should be skipped, not errored): %+v", resp.Error)

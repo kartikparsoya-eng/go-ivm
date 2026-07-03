@@ -54,7 +54,7 @@ func warmTestServer(t *testing.T) (*Server, *ClientGroup) {
 		ClientGroupID: "cg1",
 		QueryID:       "q1",
 		AST:           builder.AST{Table: "issue", OrderBy: ivm.Ordering{{"id", "asc"}}},
-		InitEpoch:     group.initEpoch,
+		InitEpoch:     group.initEpoch.Load(),
 	})}
 	if resp := srv.handleAddQuery(addReq); resp.Error != nil {
 		t.Fatalf("addQuery error: %+v", resp.Error)
@@ -167,4 +167,72 @@ func assertWarmNoop(t *testing.T, srv *Server, group *ClientGroup) {
 	if got := metrics.readerPoolWarmCoread.Load() - beforeCoread; got != 0 {
 		t.Errorf("warm-coread metric +%d, want +0", got)
 	}
+}
+
+// TestBuildWarmReaderPool_UndersizedColdPoolNotReused is the scale-review C2
+// regression test: a second addQueriesStream arriving BEFORE the first advance
+// routes its hydrate through the still-bound cold pool, whose K was sized for
+// the FIRST batch's Cmax. If the new batch's joins are deeper
+// (P × Cmax(new) > K), every hydrate lane can hold parent readers while
+// blocked in acquire for a child — a resource deadlock held under group.mu +
+// the engine lock, unkillable because acquire's only unblock (CG teardown)
+// itself needs group.mu.
+//
+// Pre-fix, buildWarmReaderPoolLocked returned (nil,nil) unconditionally when
+// group.readerPool != nil, leaving the undersized pool bound. Post-fix the
+// invariant is: after the call, EITHER the bound pool covers the new demand
+// (rebuilt at the same frame with a larger K), OR no pool is bound at all
+// (serial fallback) — never an undersized bound pool.
+func TestBuildWarmReaderPool_UndersizedColdPoolNotReused(t *testing.T) {
+	srv, group := warmTestServer(t)
+	// Cold pool from warmTestServer's single-table q1 (cmax=1):
+	// K1 = max(hydrateReaders=8, hydrateLanes=4 × 1) = 8.
+	if group.readerPool == nil {
+		t.Skip("cold pool not bound on this build (serial cold hydrate); C2 window not exercisable")
+	}
+	if got := group.readerPool.Size(); got != 8 {
+		t.Fatalf("precondition: cold pool size = %d, want 8 (max(readers=8, lanes=4×cmax=1))", got)
+	}
+
+	// Batch 2, pre-first-advance, deeper joins: cmax=3 → demand
+	// K = max(8, 4×3) = 12 > 8. The 8-reader pool can deadlock: 4 lanes ×
+	// (3−1) held readers = 8 = K, all lanes still needing one more.
+	const cmax2 = 3
+	need := srv.hydrateReaders
+	if lc := srv.hydrateLanes * cmax2; lc > need {
+		need = lc
+	}
+
+	pool, cr := srv.buildWarmReaderPoolLocked(group, cmax2)
+	if pool != nil || cr != nil {
+		if cr != nil {
+			cr.Free()
+		}
+		if pool != nil {
+			pool.Close()
+		}
+		t.Fatal("warm path must not return an ephemeral pool while the cold slot is occupied")
+	}
+
+	// THE C2 invariant.
+	if group.readerPool == nil {
+		t.Log("undersized cold pool torn down (serial fallback) — deadlock-free")
+		return
+	}
+	if got := group.readerPool.Size(); got < need {
+		t.Fatalf("undersized cold pool still bound: K=%d < demand=%d (P=%d × Cmax=%d) — "+
+			"second-batch hydrate can deadlock in acquire", got, need, srv.hydrateLanes, cmax2)
+	}
+	// A rebuilt pool must sit on curr's frame — the frame the live pipelines
+	// hydrated at — or the new queries desync.
+	cur, cerr := group.snap.Current()
+	if cerr != nil {
+		t.Fatalf("snap.Current: %v", cerr)
+	}
+	if group.readerPool.Version() != cur.Version() {
+		t.Fatalf("rebuilt pool pinned to frame %s, want curr's frame %s",
+			group.readerPool.Version(), cur.Version())
+	}
+	t.Logf("cold pool rebuilt 8→%d at curr's frame %s — covers P×Cmax=%d",
+		group.readerPool.Size(), cur.Version(), need)
 }

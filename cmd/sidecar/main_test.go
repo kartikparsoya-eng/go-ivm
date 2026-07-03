@@ -104,7 +104,7 @@ func TestMultiGroupParallel(t *testing.T) {
 			var epoch uint64
 			if g != nil {
 				g.mu.Lock()
-				epoch = g.initEpoch
+				epoch = g.initEpoch.Load()
 				g.mu.Unlock()
 			}
 			destroyP := map[string]interface{}{

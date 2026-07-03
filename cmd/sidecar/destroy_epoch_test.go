@@ -9,10 +9,12 @@ package main
 
 import (
 	"testing"
+	"time"
 
 	_ "github.com/mattn/go-sqlite3"
 
 	"github.com/kartikparsoya-eng/go-ivm/internal/tablesource"
+	"github.com/kartikparsoya-eng/go-ivm/ivm"
 	"github.com/kartikparsoya-eng/go-ivm/sqlite"
 )
 
@@ -45,7 +47,7 @@ func initTestServer(t *testing.T) (*Server, string, uint64) {
 		t.Fatal("group not found after init")
 	}
 	g.mu.Lock()
-	epoch := g.initEpoch
+	epoch := g.initEpoch.Load()
 	g.mu.Unlock()
 
 	return srv, cgID, epoch
@@ -162,7 +164,7 @@ func TestDestroy_DefaultClientGroupID(t *testing.T) {
 		t.Fatal("default group not found after init")
 	}
 	g.mu.Lock()
-	epoch := g.initEpoch
+	epoch := g.initEpoch.Load()
 	g.mu.Unlock()
 
 	// Destroy with empty cgID + correct epoch should succeed.
@@ -175,5 +177,118 @@ func TestDestroy_DefaultClientGroupID(t *testing.T) {
 	}
 	if g2 := srv.getGroup("default", false); g2 != nil {
 		t.Fatal("default group still exists after destroy")
+	}
+}
+
+// TestInitEpoch_SurvivesDestroyReinit is the scale-review C3 regression test.
+//
+// Pre-fix, removeGroup deleted the ClientGroup and the next handleInit for
+// the same cgID created a FRESH one whose epoch restarted at 0 → first init
+// of generation 2 handed out epoch 1 == generation 1's epoch 1. A late
+// mutating RPC from the torn-down generation-1 instance (loadRows is the
+// canonical case) then PASSED checkInitEpoch and wrote old-snapshot rows
+// into generation 2's freshly-hydrated engine — the exact cross-instance
+// corruption the epoch guard's own doc comment claims to prevent.
+//
+// Post-fix, Server.lastEpochs (the graveyard) survives removeGroup and
+// seeds the re-created group, so gen-2 epochs are strictly greater than
+// anything gen 1 handed out and the stale RPC is rejected.
+func TestInitEpoch_SurvivesDestroyReinit(t *testing.T) {
+	srv, cgID, epochGen1 := initTestServer(t)
+
+	// Generation 1 tears down (matching-epoch destroy → removeGroup).
+	resp := srv.handleDestroy(RPCRequest{
+		Method: "destroy", ID: 2,
+		Params: mustMarshal(t, destroyParams{ClientGroupID: cgID, InitEpoch: epochGen1}),
+	})
+	if resp.Error != nil {
+		t.Fatalf("destroy error: %+v", resp.Error)
+	}
+	if g := srv.getGroup(cgID, false); g != nil {
+		t.Fatal("group still exists after destroy")
+	}
+
+	// Generation 2: a new view-syncer instance re-inits the SAME cgID.
+	initReq := RPCRequest{Method: "init", ID: 3, Params: mustMarshal(t, initParams{
+		ClientGroupID: cgID,
+		Tables: map[string]tableSchemaParams{
+			"t": {
+				Columns:    map[string]sqlite.ColumnSchema{"id": {Type: "string"}},
+				PrimaryKey: []string{"id"},
+				UniqueKeys: [][]string{{"id"}},
+			},
+		},
+	})}
+	if resp := srv.handleInit(initReq); resp.Error != nil {
+		t.Fatalf("re-init error: %+v", resp.Error)
+	}
+	g2 := srv.getGroup(cgID, false)
+	if g2 == nil {
+		t.Fatal("group not found after re-init")
+	}
+	epochGen2 := g2.initEpoch.Load()
+
+	// THE C3 invariant: epochs never restart across generations.
+	if epochGen2 <= epochGen1 {
+		t.Fatalf("epoch restarted across destroy→re-init: gen1=%d gen2=%d — "+
+			"a late RPC from the torn-down instance would pass checkInitEpoch",
+			epochGen1, epochGen2)
+	}
+
+	// End-to-end: generation 1's late loadRows (stale epoch) must be
+	// rejected, not applied to generation 2's engine.
+	lr := srv.handleLoadRows(RPCRequest{
+		Method: "loadRows", ID: 4,
+		Params: mustMarshal(t, loadRowsParams{
+			ClientGroupID: cgID,
+			Table:         "t",
+			Rows:          []ivm.Row{{"id": "stale-row-from-gen1"}},
+			InitEpoch:     epochGen1,
+		}),
+	})
+	if lr.Error == nil {
+		t.Fatal("stale-epoch loadRows from the torn-down generation was ACCEPTED — " +
+			"old-snapshot rows written into the new engine")
+	}
+	if lr.Error.Code != rpcCodeStaleInitEpoch {
+		t.Fatalf("expected rpcCodeStaleInitEpoch (%d), got %d: %s",
+			rpcCodeStaleInitEpoch, lr.Error.Code, lr.Error.Message)
+	}
+	t.Logf("epochs: gen1=%d gen2=%d; stale gen1 loadRows rejected", epochGen1, epochGen2)
+}
+
+// TestInitEpoch_GraveyardSurvivesReaper verifies the reaper's deletion path
+// also persists the epoch: a group reaped for idleness, then re-created by a
+// reconnecting client, must not restart at epoch 1.
+func TestInitEpoch_GraveyardSurvivesReaper(t *testing.T) {
+	srv, cgID, epochGen1 := initTestServer(t)
+
+	// Reap: pretend the group has been idle past the cutoff.
+	g := srv.getGroup(cgID, false)
+	g.lastUsedNs.Store(0) // epoch start — ancient
+	if n := srv.reapIdleGroups(time.Now()); n != 1 {
+		t.Fatalf("reapIdleGroups reaped %d groups, want 1", n)
+	}
+	if g := srv.getGroup(cgID, false); g != nil {
+		t.Fatal("group still exists after reap")
+	}
+
+	// Re-init the same cgID.
+	initReq := RPCRequest{Method: "init", ID: 3, Params: mustMarshal(t, initParams{
+		ClientGroupID: cgID,
+		Tables: map[string]tableSchemaParams{
+			"t": {
+				Columns:    map[string]sqlite.ColumnSchema{"id": {Type: "string"}},
+				PrimaryKey: []string{"id"},
+				UniqueKeys: [][]string{{"id"}},
+			},
+		},
+	})}
+	if resp := srv.handleInit(initReq); resp.Error != nil {
+		t.Fatalf("re-init error: %+v", resp.Error)
+	}
+	epochGen2 := srv.getGroup(cgID, false).initEpoch.Load()
+	if epochGen2 <= epochGen1 {
+		t.Fatalf("epoch restarted across reap→re-init: gen1=%d gen2=%d", epochGen1, epochGen2)
 	}
 }

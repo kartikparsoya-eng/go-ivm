@@ -726,13 +726,19 @@ type ClientGroup struct {
 	// closeOnce guards close(done) so concurrent shutdownGroup / closeAll
 	// calls don't panic on double-close.
 	closeOnce sync.Once
-	// initEpoch monotonically increments on every handleInit (under mu).
-	// Mutating RPCs (loadRows / addQuery* / advance*) carry the epoch they
-	// were issued under; mismatch → rejected with rpcCodeStaleInitEpoch.
-	// This catches a torn-down view-syncer instance whose late-arriving
-	// loadRows would otherwise mix old-snapshot rows into the freshly
-	// init'd engine of a new instance for the same cgID.
-	initEpoch uint64
+	// initEpoch monotonically increments on every handleInit (atomic Add
+	// under mu). Mutating RPCs (loadRows / addQuery* / advance*) carry the
+	// epoch they were issued under; mismatch → rejected with
+	// rpcCodeStaleInitEpoch. This catches a torn-down view-syncer instance
+	// whose late-arriving loadRows would otherwise mix old-snapshot rows
+	// into the freshly init'd engine of a new instance for the same cgID.
+	// Cross-GENERATION protection (destroy→re-init creates a fresh
+	// ClientGroup) comes from Server.lastEpochs: creation seeds this from
+	// the graveyard so epochs never restart at 0 for a cgID the server has
+	// seen before. Atomic so deletion sites (removeGroup / reaper /
+	// closeAll) can persist it to the graveyard under s.mu without taking
+	// group.mu (no s.mu→group.mu nesting).
+	initEpoch atomic.Uint64
 	// lastUsedNs is set on every request arrival; the idle reaper compares
 	// against `now - groupIdleTimeout` to garbage-collect abandoned groups
 	// (REVIEW-final HIGH-CROSS-2 / HIGH-CROSS-3). Accessed via atomic so the
@@ -800,6 +806,16 @@ type streamWriter func(reqID interface{}, partial interface{})
 type Server struct {
 	mu     sync.RWMutex
 	groups map[string]*ClientGroup // clientGroupID → ClientGroup
+	// lastEpochs is the initEpoch GRAVEYARD (scale-review C3): the highest
+	// epoch each cgID ever reached, surviving group destruction. A destroyed
+	// cgID's re-init seeds the fresh ClientGroup from here, so the new
+	// generation's first epoch is strictly greater than anything the old
+	// generation handed out. Without it, destroy→re-init restarted the count
+	// at 0 and old-gen epoch N == new-gen epoch N: a late loadRows from the
+	// torn-down instance passed checkInitEpoch and wrote old-snapshot rows
+	// into the new engine — the exact corruption the epoch exists to stop.
+	// Guarded by mu (same critical sections that create/delete groups).
+	lastEpochs map[string]uint64
 
 	// abiDeliver, when non-nil, is the in-process (NAPI) transport's
 	// out-of-band delivery callback: (kind, payload) entries land on the
@@ -887,6 +903,7 @@ type Server struct {
 func NewServer(mode tablesource.Mode, replicaPath string) *Server {
 	return &Server{
 		groups:         make(map[string]*ClientGroup),
+		lastEpochs:     make(map[string]uint64),
 		sourceMode:     mode,
 		replicaPath:    replicaPath,
 		hydrateReaders: 1,
@@ -1072,6 +1089,9 @@ func (s *Server) getGroup(id string, createIfMissing bool) *ClientGroup {
 		reqC: make(chan clientGroupReq, 64),
 		done: make(chan struct{}),
 	}
+	// C3: seed the epoch from the graveyard so a re-created cgID continues
+	// its predecessor's count instead of restarting at 0 (see lastEpochs).
+	g.initEpoch.Store(s.lastEpochs[id])
 	g.lastUsedNs.Store(time.Now().UnixNano())
 	s.groups[id] = g
 	// Start a worker goroutine that processes requests in order.
@@ -1167,6 +1187,7 @@ func (s *Server) reapIdleGroups(cutoff time.Time) int {
 			s.mu.Unlock()
 			continue
 		}
+		s.saveEpochLocked(c.id, current)
 		delete(s.groups, c.id)
 		s.mu.Unlock()
 		s.shutdownGroup(c.g)
@@ -1351,12 +1372,24 @@ func (g *ClientGroup) trySendReq(req clientGroupReq) bool {
 	}
 }
 
+// saveEpochLocked persists a group's initEpoch to the graveyard (C3) so a
+// future re-creation of the same cgID cannot restart the epoch count.
+// MUST hold s.mu (write). Monotonic: never lowers an existing entry.
+func (s *Server) saveEpochLocked(id string, g *ClientGroup) {
+	if e := g.initEpoch.Load(); e > s.lastEpochs[id] {
+		s.lastEpochs[id] = e
+	}
+}
+
 // removeGroup destroys a client group and its engine. Closes reqC so the
 // worker goroutine exits cleanly; without this, every destroy leaked a
 // goroutine + the channel + the closed engine reference.
 func (s *Server) removeGroup(id string) {
 	s.mu.Lock()
 	g := s.groups[id]
+	if g != nil {
+		s.saveEpochLocked(id, g)
+	}
 	delete(s.groups, id)
 	s.mu.Unlock()
 	if g != nil {
@@ -1398,6 +1431,9 @@ func (s *Server) shutdownGroup(g *ClientGroup) {
 func (s *Server) closeAll() {
 	s.mu.Lock()
 	groups := s.groups
+	for id, g := range groups {
+		s.saveEpochLocked(id, g)
+	}
 	s.groups = make(map[string]*ClientGroup)
 	s.mu.Unlock()
 	for _, g := range groups {
@@ -1592,8 +1628,7 @@ func (s *Server) handleInit(req RPCRequest) RPCResponse {
 
 	// Bump epoch BEFORE we create the new engine so any in-flight loadRows
 	// from the prior epoch is rejected even if it races the engine swap.
-	group.initEpoch++
-	currentEpoch := group.initEpoch
+	currentEpoch := group.initEpoch.Add(1)
 
 	// Storage path (per client group)
 	storagePath := p.Storage
@@ -1731,9 +1766,9 @@ type loadRowsParams struct {
 // epoch under group.mu. Caller must already hold group.mu. Returns
 // an RPCResponse with rpcCodeStaleInitEpoch if stale, else (response, false).
 func checkInitEpoch(group *ClientGroup, reqID interface{}, callerEpoch uint64) (RPCResponse, bool) {
-	if callerEpoch != group.initEpoch {
+	if cur := group.initEpoch.Load(); callerEpoch != cur {
 		return rpcError(reqID, rpcCodeStaleInitEpoch,
-			fmt.Sprintf("stale init epoch: caller=%d current=%d", callerEpoch, group.initEpoch),
+			fmt.Sprintf("stale init epoch: caller=%d current=%d", callerEpoch, cur),
 		), true
 	}
 	return RPCResponse{}, false

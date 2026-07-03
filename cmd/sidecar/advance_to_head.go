@@ -250,8 +250,25 @@ func (s *Server) buildWarmReaderPoolLocked(group *ClientGroup, cmax int) (*table
 	}
 	// A cold pool is still bound (queries hydrated but no advance yet). It is
 	// already pinned to curr's frame and bound on the sources, so this warm add's
-	// fetches ALREADY run through it — don't build a second pool.
+	// fetches ALREADY run through it — but only reuse it if it is big enough
+	// for THIS batch's concurrent-cursor demand.
+	//
+	// C2 (scale review): the cold pool's K was sized for the FIRST batch's
+	// Cmax. A second addQueriesStream arriving before the first advance
+	// hydrates through that pool; if this batch's joins are deeper
+	// (P × Cmax(new) > K), every hydrate lane can end up holding parent
+	// readers while blocked in acquire for a child — a resource deadlock
+	// with group.mu and the engine lock held. acquire's only unblock is the
+	// Source's CG-lifetime ctx, and CG teardown itself needs group.mu, so
+	// the wedge is unkillable and queues destroys + the reaper behind it.
+	// Rebuild the cold pool at the same frame with the larger K; on any
+	// rebuild failure tear the undersized pool down and hydrate serially —
+	// slower, never deadlocked.
 	if group.readerPool != nil {
+		if group.readerPool.Size() >= k {
+			return nil, nil // cold pool covers this batch's demand
+		}
+		s.rebuildColdReaderPoolLocked(group, cmax)
 		return nil, nil
 	}
 
@@ -309,6 +326,60 @@ func (s *Server) tearDownWarmReaderPool(group *ClientGroup, pool *tablesource.Re
 	if cr != nil {
 		cr.Free()
 	}
+}
+
+// rebuildColdReaderPoolLocked replaces a still-bound cold pool with one sized
+// for a LARGER concurrent-cursor demand (scale-review C2), pinned to the SAME
+// frame — pre-first-advance curr has not rotated, and group.mu (held) blocks
+// advances for the duration. Uses the cold-build recipe (co-read fast path,
+// converge fallback) + the same version-match verification as
+// refreshSnapForInitialHydrateLocked: a converge pool that ratcheted past
+// curr's frame is discarded rather than bound (it would desync the new
+// queries from the live pipelines' frame).
+//
+// Every failure path tears the undersized pool down: serial reads on the
+// bound conn are slow but deadlock-free, whereas leaving the small pool
+// bound reproduces the acquire wedge this exists to prevent. MUST hold
+// group.mu.
+func (s *Server) rebuildColdReaderPoolLocked(group *ClientGroup, cmax int) {
+	oldK := group.readerPool.Size()
+	cur, cerr := group.snap.Current()
+	if cerr != nil {
+		s.tearDownReaderPool(group)
+		metrics.recordReaderPoolBind(poolBindSerial, 1)
+		return
+	}
+	pool, cr, perr := s.buildReaderPoolLocked(cur, cmax)
+	if perr != nil || pool == nil {
+		s.tearDownReaderPool(group)
+		metrics.recordReaderPoolBind(poolBindSerial, 1)
+		return
+	}
+	if pool.Version() != cur.Version() {
+		// Converge fallback landed on a newer head than the live pipelines'
+		// frame — binding it would hydrate the new queries at the wrong
+		// frame. Serial instead.
+		pool.Close()
+		if cr != nil {
+			cr.Free()
+		}
+		s.tearDownReaderPool(group)
+		metrics.recordReaderPoolBind(poolBindSerial, 1)
+		return
+	}
+	// Swap: unbind + close the undersized pool, then bind the bigger one.
+	s.tearDownReaderPool(group)
+	group.readerPool = pool
+	group.coread = cr
+	group.eng.BindTableSourcesToReaderPool(pool)
+	outcome, via := poolBindConverge, "converge"
+	if cr != nil {
+		outcome, via = poolBindCoread, "coread"
+	}
+	metrics.recordReaderPoolBind(outcome, 1)
+	fmt.Fprintf(os.Stderr,
+		"[GO-IVM][POOL] cold-pool resize via %s: readers %d→%d (cmax=%d) frame=%s\n",
+		via, oldK, pool.Size(), cmax, pool.Version())
 }
 
 // buildSnapshotterSpecs maps the init table schemas to snapshotter.TableSpecs.

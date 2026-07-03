@@ -104,7 +104,7 @@ func TestAdvanceToHeadStream_RequiresDriveMode(t *testing.T) {
 
 	w, frames := collectAdvanceToHeadStreamFrames()
 	req := RPCRequest{Method: "advanceToHeadStream", ID: 2, Params: mustMarshal(t, advanceToHeadParams{
-		ClientGroupID: "cg1", InitEpoch: group.initEpoch,
+		ClientGroupID: "cg1", InitEpoch: group.initEpoch.Load(),
 	})}
 	resp := srv.handleAdvanceToHeadStream(req, w)
 
@@ -145,7 +145,7 @@ func TestAdvanceToHeadStream_DriveTruncateEmitsResetFrame(t *testing.T) {
 
 	w, frames := collectAdvanceToHeadStreamFrames()
 	req := RPCRequest{Method: "advanceToHeadStream", ID: 2, Params: mustMarshal(t, advanceToHeadParams{
-		ClientGroupID: "cg1", InitEpoch: group.initEpoch,
+		ClientGroupID: "cg1", InitEpoch: group.initEpoch.Load(),
 	})}
 	resp := srv.handleAdvanceToHeadStream(req, w)
 	if resp.Error != nil {
@@ -206,7 +206,7 @@ func TestAdvanceToHeadStream_DriveReassembles(t *testing.T) {
 		ClientGroupID: "cg1",
 		QueryID:       "q1",
 		AST:           builder.AST{Table: "issue", OrderBy: ivm.Ordering{{"id", "asc"}}},
-		InitEpoch:     group.initEpoch,
+		InitEpoch:     group.initEpoch.Load(),
 	})}
 	if resp := srv.handleAddQuery(addReq); resp.Error != nil {
 		t.Fatalf("addQuery error: %+v", resp.Error)
@@ -219,7 +219,7 @@ func TestAdvanceToHeadStream_DriveReassembles(t *testing.T) {
 
 	w, frames := collectAdvanceToHeadStreamFrames()
 	req := RPCRequest{Method: "advanceToHeadStream", ID: 3, Params: mustMarshal(t, advanceToHeadParams{
-		ClientGroupID: "cg1", InitEpoch: group.initEpoch,
+		ClientGroupID: "cg1", InitEpoch: group.initEpoch.Load(),
 	})}
 	resp := srv.handleAdvanceToHeadStream(req, w)
 	if resp.Error != nil {
@@ -304,7 +304,7 @@ func TestAdvanceToHeadStream_RowMode(t *testing.T) {
 		ClientGroupID: "cg1",
 		QueryID:       "q1",
 		AST:           builder.AST{Table: "issue", OrderBy: ivm.Ordering{{"id", "asc"}}},
-		InitEpoch:     group.initEpoch,
+		InitEpoch:     group.initEpoch.Load(),
 	})}
 	if resp := srv.handleAddQuery(addReq); resp.Error != nil {
 		t.Fatalf("addQuery error: %+v", resp.Error)
@@ -317,7 +317,7 @@ func TestAdvanceToHeadStream_RowMode(t *testing.T) {
 
 	w, frames := collectAdvanceToHeadStreamFrames()
 	req := RPCRequest{Method: "advanceToHeadStream", ID: float64(3), Params: mustMarshal(t, advanceToHeadParams{
-		ClientGroupID: "cg1", InitEpoch: group.initEpoch, RowMode: true,
+		ClientGroupID: "cg1", InitEpoch: group.initEpoch.Load(), RowMode: true,
 	})}
 	resp := srv.handleAdvanceToHeadStream(req, w)
 	if resp.Error != nil {
@@ -426,7 +426,7 @@ func TestAdvanceToHeadStream_RowModeTruncateResetViaStreamW(t *testing.T) {
 
 	w, frames := collectAdvanceToHeadStreamFrames()
 	req := RPCRequest{Method: "advanceToHeadStream", ID: float64(2), Params: mustMarshal(t, advanceToHeadParams{
-		ClientGroupID: "cg1", InitEpoch: group.initEpoch, RowMode: true,
+		ClientGroupID: "cg1", InitEpoch: group.initEpoch.Load(), RowMode: true,
 	})}
 	resp := srv.handleAdvanceToHeadStream(req, w)
 	if resp.Error != nil {
@@ -478,7 +478,7 @@ func TestAdvanceToHeadStream_RowModeStaleEpochNoRecords(t *testing.T) {
 
 	w, frames := collectAdvanceToHeadStreamFrames()
 	req := RPCRequest{Method: "advanceToHeadStream", ID: float64(2), Params: mustMarshal(t, advanceToHeadParams{
-		ClientGroupID: "cg1", InitEpoch: group.initEpoch + 99, RowMode: true,
+		ClientGroupID: "cg1", InitEpoch: group.initEpoch.Load() + 99, RowMode: true,
 	})}
 	resp := srv.handleAdvanceToHeadStream(req, w)
 	if resp.Error == nil {
@@ -527,7 +527,7 @@ func TestPerfMetrics_AdvanceToHeadStreamCountsAsAdvance(t *testing.T) {
 			ID:     float64(1),
 			Params: mustMarshal(t, advanceToHeadParams{
 				ClientGroupID: "cg-perf-a2h",
-				InitEpoch:     g.initEpoch,
+				InitEpoch:     g.initEpoch.Load(),
 			}),
 		},
 		respCh:  respCh,
