@@ -33,11 +33,14 @@ package main
 // are homogeneous (same column set incl. _0_version, NULLs as nil values),
 // so the FIRST row's sorted keys are the group's canonical column order.
 // positional.go banks on the same invariant (its per-chunk sorted union
-// equals each row's key set); shadow mode content-validates it. A later row
-// missing a column encodes null for it; a later row with an EXTRA column
-// would be silently dropped under this contract — defensively, encodeRow
-// returns false in that case and the caller falls back to the msgpack
-// frame path for that partial (correct over fast).
+// equals each row's key set); shadow mode content-validates it. Defensively,
+// encodeRow verifies MEMBERSHIP, not just size: a later row encodes only if
+// every one of its keys is a canonical column (keys it lacks encode null);
+// any row carrying a column outside the canonical order — larger, equal, or
+// smaller — returns false and the caller falls back to the msgpack frame
+// path for that partial (correct over fast). A length-only guard misses the
+// equal-or-smaller shapes ({a,b,x} vs canonical {a,b,c}): x would be
+// silently dropped AND c fabricated as null.
 //
 // reqID rides every record as f64 because TS RPC ids are JS numbers
 // (#nextID counter) — msgpack may deliver them to Go as any int width, but
@@ -238,7 +241,9 @@ func (e *rowRecordEncoder) encodeRow(g *rowGroup, c *engine.RowChange) ([]byte, 
 			return nil, false
 		}
 		if len(c.Row) > len(g.cols) {
-			return nil, false // extra column — homogeneity violated
+			// Fast-path reject before any encoding work; the membership
+			// count after the encode loop below is the complete check.
+			return nil, false
 		}
 	}
 
@@ -248,20 +253,47 @@ func (e *rowRecordEncoder) encodeRow(g *rowGroup, c *engine.RowChange) ([]byte, 
 	e.buf = append(e.buf, byte(c.Type))
 
 	if c.Type == engine.RowChangeRemove {
+		found := 0
 		for _, pkCol := range g.pk {
-			if !e.putValue(c.RowKey[pkCol]) {
+			v, ok := c.RowKey[pkCol]
+			if ok {
+				found++
+			}
+			if !e.putValue(v) {
 				return nil, false
 			}
+		}
+		// Same membership discipline as the add/edit loop below: a RowKey
+		// keyed differently from the group's interned PK would otherwise
+		// encode nulls for the missing PK columns and silently drop the
+		// foreign ones — a remove targeting the wrong key at the client.
+		if found != len(c.RowKey) {
+			return nil, false
 		}
 		if len(e.buf) > maxFrameSize {
 			return nil, false // oversize — fall back to the (capped) frame path
 		}
 		return e.buf, true
 	}
+	found := 0
 	for _, col := range g.cols {
-		if !e.putValue(c.Row[col]) {
+		v, ok := c.Row[col]
+		if ok {
+			found++
+		}
+		if !e.putValue(v) {
 			return nil, false
 		}
+	}
+	// Homogeneity is a MEMBERSHIP check, not a size check: found counts the
+	// row's keys that are canonical columns, so found != len(c.Row) iff the
+	// row carries a column outside g.cols — including the equal-or-smaller
+	// shapes ({a,b,x} vs {a,b,c}) that a length-only guard waves through,
+	// silently dropping x and fabricating c as null. Missing canonical
+	// columns (row ⊂ cols) still encode null above — intended leniency.
+	// Comma-ok on lookups already paid for; this costs one int compare.
+	if found != len(c.Row) {
+		return nil, false
 	}
 	// R1 (REVIEW-napi-transport): kind-3 records carry u32 value lengths (up
 	// to 4GB) with NO cap of their own — unlike frames, which capFrameBytes

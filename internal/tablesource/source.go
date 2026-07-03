@@ -822,6 +822,33 @@ func (s *Source) genPushAndWrite(change ivm.SourceChange, conns []*connection) [
 	s.overlay = &ivm.Overlay{Epoch: epoch, Change: change}
 	s.mu.Unlock()
 
+	// Panic-safety: clear the overlay on UNWIND too. A panic raised inside
+	// the fanout (operator drift like a Take stale-bound, or a DataError
+	// from a poison value hit during a downstream fetch) is recovered
+	// per-goroutine and re-raised on this goroutine (parallel_fanout.go),
+	// unwinding past the success-path clear below. A stuck overlay is
+	// silent staleness, not a crash:
+	//   - OnAdvanceEnd early-returns while overlay != nil, so the engine's
+	//     "signalAdvanceEnd fires on the drift path too" invariant is
+	//     defeated for this source — the prev tx (holding this batch's
+	//     earlier writeChanges) is never rolled back or re-pinned;
+	//   - RefreshSnapshot (drift audit) skips for the same reason;
+	//   - every fetch on an epoch-current connection splices the FAILED
+	//     change into results (fetchForConn applyOverlay,
+	//     fetchDuringPushStream) — a phantom row delivered into any
+	//     hydrate that lands before the TS reset, drive mode included.
+	// Epoch-guarded so this can only clear ITS OWN overlay (defense —
+	// pushes on one source are serialized, so a mismatch implies a bug).
+	// On the success path the primary clear below already ran and this is
+	// a no-op.
+	defer func() {
+		s.mu.Lock()
+		if s.overlay != nil && s.overlay.Epoch == epoch {
+			s.overlay = nil
+		}
+		s.mu.Unlock()
+	}()
+
 	// Fan out to every connection — in parallel across pipeline groups when
 	// enabled (see parallel_fanout.go), serially otherwise. Either way the
 	// returned Changes are in connection-registration order.

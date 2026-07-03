@@ -241,6 +241,94 @@ func TestRowRecordEncoder_RoundTrip(t *testing.T) {
 	}
 }
 
+// TestEncodeRow_HomogeneityIsMembershipNotLength pins the homogeneity guard
+// as a MEMBERSHIP check. The original guard was length-only
+// (len(c.Row) > len(g.cols)), so a row carrying a column OUTSIDE the
+// group's canonical order but with equal-or-smaller size ({a,b,x} vs
+// canonical {a,b,c}) encoded silently wrong: x dropped, c fabricated as
+// null — while the file header claimed the defensive fallback covered
+// extra columns. The frame path (positional.go per-chunk sorted union) is
+// immune, so falling back is always correct.
+func TestEncodeRow_HomogeneityIsMembershipNotLength(t *testing.T) {
+	enc := newRowRecordEncoder(7)
+
+	first := engine.RowChange{
+		Type:    engine.RowChangeAdd,
+		QueryID: "qh",
+		Table:   "t1",
+		RowKey:  map[string]interface{}{"a": "k1"},
+		Row:     ivm.Row{"a": "k1", "b": float64(1), "c": float64(2)},
+	}
+	g, def := enc.groupFor(&first)
+	if def == nil {
+		t.Fatal("first sight must emit a groupDef")
+	}
+	if fmt.Sprint(g.cols) != fmt.Sprint([]string{"a", "b", "c"}) {
+		t.Fatalf("canonical cols = %v, want [a b c]", g.cols)
+	}
+
+	mkAdd := func(row ivm.Row) engine.RowChange {
+		return engine.RowChange{
+			Type: engine.RowChangeAdd, QueryID: "qh", Table: "t1",
+			RowKey: map[string]interface{}{"a": "k"}, Row: row,
+		}
+	}
+
+	// EQUAL size, foreign column: {a,b,x} vs {a,b,c}. The length-only
+	// guard waved this through (x dropped, c encoded null); membership
+	// must reject it to the frame path.
+	sameSize := mkAdd(ivm.Row{"a": "k2", "b": float64(3), "x": float64(9)})
+	if _, ok := enc.encodeRow(g, &sameSize); ok {
+		t.Fatal("row with a foreign column (same size as canonical) must fall back to the frame path")
+	}
+
+	// SMALLER size, foreign column: {a,x} vs {a,b,c} — same hole.
+	smaller := mkAdd(ivm.Row{"a": "k3", "x": float64(9)})
+	if _, ok := enc.encodeRow(g, &smaller); ok {
+		t.Fatal("row with a foreign column (smaller than canonical) must fall back to the frame path")
+	}
+
+	// SUBSET row {a,b}: intended leniency preserved — encodes with c=null.
+	subset := mkAdd(ivm.Row{"a": "k4", "b": float64(5)})
+	rec, ok := enc.encodeRow(g, &subset)
+	if !ok {
+		t.Fatal("subset row (keys ⊆ canonical cols) must still encode")
+	}
+	dr := decodeRowRecord(t, rec, len(g.cols))
+	if dr.values[0] != "k4" || dr.values[1] != float64(5) || dr.values[2] != nil {
+		t.Fatalf("subset row values = %v, want [k4 5 <nil>] (missing canonical col encodes null)", dr.values)
+	}
+
+	// Exact canonical row: still encodes.
+	exact := mkAdd(ivm.Row{"a": "k5", "b": float64(6), "c": float64(7)})
+	if _, ok := enc.encodeRow(g, &exact); !ok {
+		t.Fatal("exact canonical row must encode")
+	}
+
+	// Removes get the same discipline against the interned PK (pk = [a]).
+	// A RowKey keyed differently would otherwise encode null for the
+	// missing PK column and silently drop the foreign one — a remove
+	// targeting the wrong key at the client.
+	badRm := engine.RowChange{
+		Type: engine.RowChangeRemove, QueryID: "qh", Table: "t1",
+		RowKey: map[string]interface{}{"z": "k1"},
+	}
+	if _, ok := enc.encodeRow(g, &badRm); ok {
+		t.Fatal("remove whose RowKey is keyed outside the interned PK must fall back")
+	}
+	goodRm := engine.RowChange{
+		Type: engine.RowChangeRemove, QueryID: "qh", Table: "t1",
+		RowKey: map[string]interface{}{"a": "k1"},
+	}
+	recRm, ok := enc.encodeRow(g, &goodRm)
+	if !ok {
+		t.Fatal("well-keyed remove must encode")
+	}
+	if drm := decodeRowRecord(t, recRm, len(g.pk)); drm.values[0] != "k1" {
+		t.Fatalf("remove PK value = %v, want k1", drm.values)
+	}
+}
+
 // TestABIHost_RowModeHydrateEndToEnd drives the full stack in-process:
 // init (memory mode) → loadRows → addQueriesStream with rowMode → asserts
 // per-row records arrive (kind 2/3), the terminal frame arrives (kind 1,
