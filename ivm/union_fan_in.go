@@ -126,7 +126,16 @@ func (ufi *UnionFanIn) Fetch(req FetchRequest) iter.Seq[Node] {
 			iters[i].head, iters[i].ok = next()
 		}
 
-		comparator := ufi.schema.CompareRows
+		// #5980 (union-fan-in.ts fetch): honor req.Reverse — inputs yield
+		// DESCENDING streams when reverse, so the merge must select by the
+		// NEGATED comparator or the k-way merge emits scrambled order (and
+		// the adjacency dedup below misses duplicates). Reachable: Take
+		// issues reverse fetches on its bound-recompute paths.
+		compareRows := ufi.schema.CompareRows
+		comparator := compareRows
+		if req.Reverse {
+			comparator = func(a, b Row) int { return compareRows(b, a) }
+		}
 		var lastRow Row
 
 		for {
