@@ -12,6 +12,7 @@ package main
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/kartikparsoya-eng/go-ivm/builder"
 	"github.com/kartikparsoya-eng/go-ivm/internal/tablesource"
@@ -492,5 +493,63 @@ func TestAdvanceToHeadStream_RowModeStaleEpochNoRecords(t *testing.T) {
 		if e.kind == abiKindRow || e.kind == abiKindGroupDef {
 			t.Fatalf("stale epoch leaked a row-plane record (kind=%d)", e.kind)
 		}
+	}
+}
+
+// TestPerfMetrics_AdvanceToHeadStreamCountsAsAdvance pins the [GO-IVM][PERF]
+// accounting contract for drive mode: advanceToHeadStream REPLACES
+// advanceStream there, so the worker-loop metric switch must count it in the
+// advances segment. Before this was fixed, drive deployments reported
+// advances=0 in every 10s PERF window while the real advance traffic was
+// visible only as PERF-CHUNKS row counts — advance latency was structurally
+// invisible in exactly the deployments (napi drive) being perf-tuned.
+//
+// Dispatches through trySendReq → g.worker (the REAL path with the metric
+// switch), not a direct handler call. The handler errors (advanceToHead not
+// armed on this bare server) — deliberate and load-bearing: like
+// advanceStream, an errored advance still records into the count/latency
+// metrics, because the metric is dispatch-level, not success-level.
+func TestPerfMetrics_AdvanceToHeadStreamCountsAsAdvance(t *testing.T) {
+	s := NewServer(0, "")
+	t.Cleanup(s.closeAll)
+	g := s.getGroup("cg-perf-a2h", true)
+
+	// metrics is package-global; tests in this package never run in
+	// parallel (no t.Parallel), so a delta assertion is race-free. The
+	// 10s reporter that Swap(0)s these is not started in unit tests.
+	beforeCount := metrics.advanceCount.Load()
+	beforeInFlight := metrics.advancesInFlight.Load()
+
+	respCh := make(chan RPCResponse, 1)
+	ok := g.trySendReq(clientGroupReq{
+		req: RPCRequest{
+			Method: "advanceToHeadStream",
+			ID:     float64(1),
+			Params: mustMarshal(t, advanceToHeadParams{
+				ClientGroupID: "cg-perf-a2h",
+				InitEpoch:     g.initEpoch,
+			}),
+		},
+		respCh:  respCh,
+		streamW: func(_ interface{}, _ interface{}) {},
+	})
+	if !ok {
+		t.Fatal("trySendReq refused the request")
+	}
+
+	select {
+	case resp := <-respCh:
+		if resp.Error == nil {
+			t.Fatalf("expected not-armed error from bare server, got result %+v", resp.Result)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("no terminal response within 10s")
+	}
+
+	if got := metrics.advanceCount.Load() - beforeCount; got != 1 {
+		t.Fatalf("advanceCount delta = %d, want 1 — advanceToHeadStream not counted in the PERF advances segment", got)
+	}
+	if got := metrics.advancesInFlight.Load(); got != beforeInFlight {
+		t.Fatalf("advancesInFlight = %d after completion, want %d — inc/dec unbalanced", got, beforeInFlight)
 	}
 }

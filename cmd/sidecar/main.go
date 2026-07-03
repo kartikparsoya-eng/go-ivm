@@ -1232,8 +1232,16 @@ func (g *ClientGroup) worker(s *Server) {
 		var start time.Time
 		method := req.req.Method
 
+		// advanceToHeadStream is drive mode's REPLACEMENT for advanceStream
+		// (TS ships no changes; Go derives + applies its own diff). Without it
+		// here, drive deployments report advances=0 in every [GO-IVM][PERF]
+		// line while the real advance traffic shows up only as PERF-CHUNKS row
+		// counts. The non-streaming advanceToHead is deliberately NOT counted:
+		// in derive-only shadow mode TS still applies changes via
+		// advanceStream (counted), so counting the derivation call too would
+		// double-count each logical advance.
 		switch method {
-		case "advanceStream":
+		case "advanceStream", "advanceToHeadStream":
 			start = time.Now()
 			n := metrics.advancesInFlight.Add(1)
 			updatePeak(&metrics.peakAdvConc, n)
@@ -1271,7 +1279,7 @@ func (g *ClientGroup) worker(s *Server) {
 		endSpan(resp.Error)
 
 		switch method {
-		case "advanceStream":
+		case "advanceStream", "advanceToHeadStream":
 			metrics.advancesInFlight.Add(-1)
 			metrics.recordAdvance(time.Since(start))
 		case "addQuery", "addQueries", "addQueriesStream":
