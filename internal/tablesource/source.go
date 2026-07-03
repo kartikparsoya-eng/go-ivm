@@ -30,6 +30,7 @@ package tablesource
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"iter"
 	"os"
@@ -164,13 +165,25 @@ type Source struct {
 	// it was prepared on. The conn set is tiny and stable — this Source's own
 	// prevConn plus the Snapshotter's two leapfrog frame conns (bound via
 	// BindConn), all re-pinned in place via ROLLBACK+BEGIN and never reopened
-	// mid-life — so cardinality stays at a few entries and a cached stmt stays
-	// valid across advances (a prepare_v2 stmt is frame-independent and SQLite
-	// auto-recompiles it on the rare replica-schema change). Invalidated
-	// whenever a conn is torn down. Guarded by s.mu. Entries are CHECKED OUT
-	// (removed from the map) while their cursor is open and handed back after —
-	// see checkoutSelectLocked for why sharing a live stmt corrupts.
-	stmtCache map[*sql.Conn]map[string]*sql.Stmt
+	// mid-life — so the OUTER map stays at a few entries and a cached stmt
+	// stays valid across advances (a prepare_v2 stmt is frame-independent and
+	// SQLite auto-recompiles it on the rare replica-schema change).
+	//
+	// The INNER per-SQL map is the unbounded axis (scale review): conn
+	// teardown — the only full invalidation — never happens mid-life for
+	// exactly those long-lived conns, and nothing maps a removed query back
+	// to its SQL shapes, so a long-lived CG with query churn accumulated one
+	// compiled sqlite3_stmt (C heap, invisible to Go's allocator) per
+	// distinct SQL text FOREVER — an RSS ratchet. Bounded now: each conn
+	// bucket holds at most stmtCachePerConnCap entries; overflow evicts the
+	// least-recently-returned quarter (see returnSelectStmtLocked). Guarded
+	// by s.mu. Entries are CHECKED OUT (removed from the map) while their
+	// cursor is open and handed back after — see checkoutSelectLocked for
+	// why sharing a live stmt corrupts.
+	stmtCache map[*sql.Conn]map[string]*cachedStmt
+	// stmtCacheTick is a monotonic recency counter stamped on every stmt
+	// return; the eviction scan sorts on it. Guarded by s.mu.
+	stmtCacheTick uint64
 
 	// readerPool, when non-nil, is a CG-shared pool of read connections ALL
 	// pinned to the same WAL frame (one stateVersion). It is bound ONLY during
@@ -190,6 +203,22 @@ type Source struct {
 	// build). Guarded by s.mu. See parallel_fanout.go.
 	nextConnectGroup string
 }
+
+// cachedStmt pairs a prepared statement with the recency tick of its last
+// return, for the bounded stmt-cache's eviction scan.
+type cachedStmt struct {
+	st       *sql.Stmt
+	lastTick uint64
+}
+
+// stmtCachePerConnCap bounds each conn's stmt-cache bucket. A long-lived
+// CG's active query set is a few hundred shapes at most; abandoned shapes
+// (removed queries, one-off bound permutations) past the cap are evicted
+// coldest-first instead of pinning C-heap sqlite3_stmts for the CG's whole
+// life. Sized so the hot working set never thrashes: at the cap, a
+// checkout+return cycle of an EXISTING shape does not trigger eviction —
+// only genuinely new shapes do.
+const stmtCachePerConnCap = 512
 
 // connection is one downstream pipeline subscribed to this source.
 type connection struct {
@@ -420,14 +449,14 @@ func (s *Source) checkoutSelectLocked(conn *sql.Conn, query string) (*sql.Stmt, 
 	bySQL := s.stmtCache[conn]
 	if bySQL == nil {
 		if s.stmtCache == nil {
-			s.stmtCache = make(map[*sql.Conn]map[string]*sql.Stmt, 3)
+			s.stmtCache = make(map[*sql.Conn]map[string]*cachedStmt, 3)
 		}
-		bySQL = make(map[string]*sql.Stmt, 4)
+		bySQL = make(map[string]*cachedStmt, 4)
 		s.stmtCache[conn] = bySQL
 	}
-	if st, ok := bySQL[query]; ok {
+	if e, ok := bySQL[query]; ok {
 		delete(bySQL, query)
-		return st, nil
+		return e.st, nil
 	}
 	st, err := conn.PrepareContext(context.Background(), query)
 	if err != nil {
@@ -444,6 +473,12 @@ func (s *Source) checkoutSelectLocked(conn *sql.Conn, query string) (*sql.Stmt, 
 // cached per key. In practice a checkout never straddles conn teardown (lazy
 // cursors live only inside a push fanout, during which OnAdvanceEnd's
 // overlay guard blocks the rollback path); the close is defensive.
+//
+// Inserting past stmtCachePerConnCap evicts the least-recently-returned
+// quarter of the bucket (scale review: without a bound, one C-heap
+// sqlite3_stmt per distinct SQL shape accrued for the CG's whole life —
+// conn teardown, the only invalidation, never fires for the long-lived
+// prevConn/externalConn).
 // MUST be called with s.mu held.
 func (s *Source) returnSelectStmtLocked(conn *sql.Conn, query string, st *sql.Stmt) {
 	bySQL := s.stmtCache[conn]
@@ -455,7 +490,43 @@ func (s *Source) returnSelectStmtLocked(conn *sql.Conn, query string, st *sql.St
 		_ = st.Close()
 		return
 	}
-	bySQL[query] = st
+	s.stmtCacheTick++
+	bySQL[query] = &cachedStmt{st: st, lastTick: s.stmtCacheTick}
+	if len(bySQL) > stmtCachePerConnCap {
+		evictColdestStmtsLocked(bySQL)
+	}
+}
+
+// evictColdestStmtsLocked closes and drops the least-recently-returned
+// quarter of bucket. O(n log n) on n≤cap+1, and it runs only when a NEW
+// shape lands on a full bucket — steady-state checkout/return of existing
+// shapes never triggers it. MUST be called with s.mu held.
+func evictColdestStmtsLocked(bySQL map[string]*cachedStmt) {
+	type kv struct {
+		sql  string
+		tick uint64
+	}
+	entries := make([]kv, 0, len(bySQL))
+	for q, e := range bySQL {
+		entries = append(entries, kv{q, e.lastTick})
+	}
+	slices.SortFunc(entries, func(a, b kv) int {
+		switch {
+		case a.tick < b.tick:
+			return -1
+		case a.tick > b.tick:
+			return 1
+		}
+		return 0
+	})
+	evict := len(entries) / 4
+	if evict < 1 {
+		evict = 1
+	}
+	for _, e := range entries[:evict] {
+		_ = bySQL[e.sql].st.Close()
+		delete(bySQL, e.sql)
+	}
 }
 
 // returnSelectStmt is returnSelectStmtLocked for callers not holding s.mu
@@ -475,8 +546,8 @@ func (s *Source) closeCachedStmtsForConnLocked(conn *sql.Conn) {
 	if bySQL == nil {
 		return
 	}
-	for _, st := range bySQL {
-		_ = st.Close()
+	for _, e := range bySQL {
+		_ = e.st.Close()
 	}
 	delete(s.stmtCache, conn)
 }
@@ -485,8 +556,8 @@ func (s *Source) closeCachedStmtsForConnLocked(conn *sql.Conn) {
 // Used at Source teardown. MUST be called with s.mu held.
 func (s *Source) closeAllCachedStmtsLocked() {
 	for _, bySQL := range s.stmtCache {
-		for _, st := range bySQL {
-			_ = st.Close()
+		for _, e := range bySQL {
+			_ = e.st.Close()
 		}
 	}
 	s.stmtCache = nil
@@ -784,16 +855,26 @@ func (s *Source) genPushAndWrite(change ivm.SourceChange, conns []*connection) [
 	// convert to Add (matching TS's lazy iteration: the prev row was
 	// already deleted by a previous writeChange, so TS's prev.getRows
 	// returns empty and TS emits an Add, not an Edit).
-	if change.Type == ivm.ChangeTypeEdit && !s.existsLocked(change.OldRow) {
-		if s.removedInBatch != nil && s.removedInBatch[s.pkKey(change.OldRow)] {
+	if change.Type == ivm.ChangeTypeEdit {
+		oldExists, err := s.existsLocked(change.OldRow)
+		if err != nil {
+			s.mu.Unlock() // never panic holding s.mu (see driftCheck path below)
+			panic(fmt.Sprintf("tablesource.Source.Push %s: %v", s.tableName, err))
+		}
+		if !oldExists && s.removedInBatch != nil && s.removedInBatch[s.pkKey(change.OldRow)] {
 			change = ivm.MakeSourceChangeAdd(change.Row)
 		}
 	}
 	// BUG 1c: if this Add duplicates a row added earlier in this batch,
 	// convert to Edit (matching TS's lazy iteration: TS's prev.getRows sees
 	// the just-INSERTed row and produces an Edit, not a duplicate Add).
-	if change.Type == ivm.ChangeTypeAdd && s.existsLocked(change.Row) {
-		if s.addedInBatch != nil {
+	if change.Type == ivm.ChangeTypeAdd {
+		rowExists, err := s.existsLocked(change.Row)
+		if err != nil {
+			s.mu.Unlock()
+			panic(fmt.Sprintf("tablesource.Source.Push %s: %v", s.tableName, err))
+		}
+		if rowExists && s.addedInBatch != nil {
 			if prevRow, ok := s.addedInBatch[s.pkKey(change.Row)]; ok {
 				change = ivm.MakeSourceChangeEdit(change.Row, prevRow)
 			}
@@ -808,7 +889,19 @@ func (s *Source) genPushAndWrite(change ivm.SourceChange, conns []*connection) [
 	// replaces the previous raw "UNIQUE constraint failed" panic from
 	// writeChange (a dup-Add) which was NOT a *DriftError and would crash the
 	// cg/sidecar instead of triggering a clean re-hydrate.
-	if d := s.driftCheckLocked(change); d != nil {
+	d, derr := s.driftCheckLocked(change)
+	if derr != nil {
+		// A REAL DB error from the exists probe (I/O, SQLITE_BUSY, closed
+		// conn) is NOT drift — raising it as one would spuriously reset the
+		// pipeline; treating it as "absent" (the pre-fix behavior) fabricated
+		// missing-row DriftErrors for every Remove/Edit under I/O pressure
+		// (drift storm). Panic with the plain error: transient (-32000) →
+		// the TS client resets, matching TS where better-sqlite3 THROWS from
+		// the exists closure (table-source.ts:399-413).
+		s.mu.Unlock()
+		panic(fmt.Sprintf("tablesource.Source.Push %s: %v", s.tableName, derr))
+	}
+	if d != nil {
 		// BUG 1: skip Remove against a row removed earlier in this batch
 		if change.Type == ivm.ChangeTypeRemove && s.removedInBatch != nil && s.removedInBatch[s.pkKey(change.Row)] {
 			s.mu.Unlock()
@@ -882,35 +975,64 @@ func (s *Source) genPushAndWrite(change ivm.SourceChange, conns []*connection) [
 //   - EDIT:   assert  exists(oldRow)   → missing-row drift
 //
 // MUST be called with s.mu held (queries the prev tx via prevConn).
-func (s *Source) driftCheckLocked(change ivm.SourceChange) *ivm.DriftError {
+// A non-nil error means the exists probe itself FAILED (real DB error) —
+// the caller must abort the push (unlock, panic), never interpret it.
+func (s *Source) driftCheckLocked(change ivm.SourceChange) (*ivm.DriftError, error) {
 	switch change.Type {
 	case ivm.ChangeTypeAdd:
-		if s.existsLocked(change.Row) {
-			return &ivm.DriftError{Table: s.tableName, Op: "Add", PK: s.pkOf(change.Row), HasCount: s.countLocked()}
+		exists, err := s.existsLocked(change.Row)
+		if err != nil {
+			return nil, err
+		}
+		if exists {
+			return &ivm.DriftError{Table: s.tableName, Op: "Add", PK: s.pkOf(change.Row), HasCount: s.countLocked()}, nil
 		}
 	case ivm.ChangeTypeRemove:
-		if !s.existsLocked(change.Row) {
-			return &ivm.DriftError{Table: s.tableName, Op: "Remove", PK: s.pkOf(change.Row), HasCount: s.countLocked()}
+		exists, err := s.existsLocked(change.Row)
+		if err != nil {
+			return nil, err
+		}
+		if !exists {
+			return &ivm.DriftError{Table: s.tableName, Op: "Remove", PK: s.pkOf(change.Row), HasCount: s.countLocked()}, nil
 		}
 	case ivm.ChangeTypeEdit:
-		if !s.existsLocked(change.OldRow) {
-			return &ivm.DriftError{Table: s.tableName, Op: "Edit", PK: s.pkOf(change.OldRow), HasCount: s.countLocked()}
+		exists, err := s.existsLocked(change.OldRow)
+		if err != nil {
+			return nil, err
+		}
+		if !exists {
+			return &ivm.DriftError{Table: s.tableName, Op: "Edit", PK: s.pkOf(change.OldRow), HasCount: s.countLocked()}, nil
 		}
 	}
-	return nil
+	return nil, nil
 }
 
 // existsLocked reports whether a row with row's primary key exists in the
 // prev tx. Faithful port of TS TableSource's `exists` closure
 // (table-source.ts:399-402): checkExists SELECT 1 ... LIMIT 1.
 //
+// A REAL statement failure (I/O error, SQLITE_BUSY, closed conn — anything
+// but ErrNoRows) returns a non-nil error and MUST NOT be read as "row
+// absent" (scale review): at the drift check that fabricated missing-row
+// DriftErrors for every Remove/Edit under I/O pressure (drift storm →
+// reset loop), and at the BUG-1b/1c conversions it silently turned Edits
+// into Adds against live state. TS's exists closure THROWS on statement
+// error; callers here panic AFTER releasing s.mu.
+//
 // MUST be called with s.mu held (queries prevConn). ensurePrevTxLocked has
 // already run by the time genPushAndWrite reaches the drift check.
-func (s *Source) existsLocked(row ivm.Row) bool {
+func (s *Source) existsLocked(row ivm.Row) (bool, error) {
 	args := s.rowToPKArgs(row)
 	var one int
 	err := s.activeConn().QueryRowContext(context.Background(), s.checkExistsSQL, args...).Scan(&one)
-	return err == nil && one == 1
+	switch {
+	case err == nil:
+		return one == 1, nil
+	case errors.Is(err, sql.ErrNoRows):
+		return false, nil
+	default:
+		return false, fmt.Errorf("checkExists: %w", err)
+	}
 }
 
 // pkOf extracts the primary-key columns of row into a fresh map, matching

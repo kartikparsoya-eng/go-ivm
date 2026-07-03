@@ -361,7 +361,7 @@ func TestStmtCheckoutSemantics(t *testing.T) {
 	}
 	src.returnSelectStmtLocked(conn, q, st1)
 	src.returnSelectStmtLocked(conn, q, st2) // slot occupied → must close st2
-	if cached := src.stmtCache[conn][q]; cached != st1 {
+	if cached := src.stmtCache[conn][q]; cached == nil || cached.st != st1 {
 		src.mu.Unlock()
 		t.Fatal("cache does not hold the first-returned stmt")
 	}
