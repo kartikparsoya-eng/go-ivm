@@ -62,21 +62,21 @@ func TestAdvanceFanout_OperatorChunking(t *testing.T) {
 
 // TestAdvanceFanout_OperatorChunking_ParallelSinkRace closes the coverage gap
 // for Win 2's headline concurrency claim: "flushMu keeps chunkIndex monotonic
-// across the parallel push-fanout" (engine.go sendFrame). The single-parent
+// across the parallel push-fanout" (engine.go emitLocked). The single-parent
 // TestAdvanceFanout_OperatorChunking never exercises it — one parent row = one
 // connection = GenPushParallel's single-conn fast path (parallel.go:71), so the
 // sink is only ever called sequentially there.
 //
 // Here N identical queries give the users source N connections, so pushing ONE
 // user ADD fans out across N goroutines concurrently (parallel.go:100-117), each
-// flattening childCount+1 rows and calling the shared chunkSink (→ sendFrame)
+// flattening childCount+1 rows and calling the shared chunkSink (→ emitLocked)
 // mid-flatten at chunk=50. That drives many concurrent sink calls.
 //
 // Two independent detectors guard the flushMu contract; run under -race:
 //  1. the race detector flags any unsynchronized chunkIndex++/onResult in
 //     production code if flushMu were insufficient;
 //  2. the chunkIndex-contiguity assertion below fails if two concurrent flushes
-//     ever duplicated, skipped, or reordered a frame index — because sendFrame
+//     ever duplicated, skipped, or reordered a frame index — because the sink
 //     assigns chunkIndex AND calls onResult under the SAME flushMu, so arrival
 //     order MUST equal 0,1,2,…,N with no gaps.
 //

@@ -1383,28 +1383,22 @@ func (e *Engine) advanceStreamChunked(
 	var drift *ivm.DriftError
 	var flushMu sync.Mutex
 
-	// sendFrame emits ONE partial/final frame under flushMu so chunkIndex stays
-	// monotonic and frame SEND order matches it — even when parallel push-fanout
-	// goroutines flush mid-flatten chunks (via the streamer's chunkSink)
-	// concurrently. Timings ride the final frame only; drift is set only on the
-	// terminal drift frame (drift is validated pre-fanout, so chunkSink never
-	// fires on a drift path). `changes` is consumed synchronously — the sidecar's
-	// streamW → mpMarshal encodes it into a separate byte buffer before onResult
-	// returns, so callers may reuse the backing array after (T1-5 invariant).
-	sendFrame := func(changes []RowChange, final bool) {
+	// emitLocked writes ONE partial/final frame to the wire. Callers MUST hold
+	// flushMu — that is what keeps chunkIndex monotonic and frame SEND order
+	// equal to it, even when parallel push-fanout goroutines flush mid-flatten
+	// chunks (via the streamer's chunkSink) concurrently. Timings ride the
+	// final frame only; drift is set only on the terminal drift frame (drift
+	// is validated pre-fanout, so chunkSink never fires on a drift path).
+	// `rows` is consumed synchronously — the sidecar's streamW → mpMarshal
+	// encodes it into a separate byte buffer before onResult returns, so
+	// callers may reuse the backing array after (T1-5 invariant).
+	emitLocked := func(rows []RowChange, final bool) {
 		var t []TableTiming
 		if final {
 			t = timings
 		}
-		flushMu.Lock()
-		// Deferred unlock: onResult is caller-supplied and may panic (e.g. a
-		// wire-write failure surfacing as panic). A bare Unlock after the call
-		// would leave flushMu held on that panic, and the guaranteed terminal
-		// flush(true) below would then deadlock on flushMu.Lock() — wedging the
-		// engine with e.mu held, i.e. every CG sharing this engine.
-		defer flushMu.Unlock()
 		onResult(AdvanceStreamPartial{
-			Changes:    bumpRowVersions(changes, e.minRowVersions),
+			Changes:    bumpRowVersions(rows, e.minRowVersions),
 			ChunkIndex: chunkIndex,
 			Final:      final,
 			Timings:    t,
@@ -1413,10 +1407,47 @@ func (e *Engine) advanceStreamChunked(
 		chunkIndex++
 	}
 
-	flush := func(final bool) {
-		sendFrame(pending, final)
+	// flushPendingLocked ships the buffered sub-threshold residual of EARLIER
+	// pushes as its own partial frame. Callers MUST hold flushMu.
+	//
+	// Cross-push wire order (scale-review C1): the chunkSink flushes full
+	// chunks of the CURRENT push's fan-out directly to the wire mid-flatten.
+	// If a previous push's residual were still sitting in `pending`, the newer
+	// rows would overtake it on the wire — remove(X) (push N, buffered) +
+	// add(X) (push N+1, chunk-flushed) would arrive at the client as
+	// add-then-remove, permanently deleting the row, while chunkIndex stays
+	// monotonic so nothing downstream detects it. Draining `pending` before
+	// every chunk emission keeps the wire in push order. Memory safety: the
+	// chunkSink only fires while the main goroutine is blocked inside
+	// source.Push (both fanout paths wg.Wait before returning — see
+	// ivm/parallel.go and tablesource/parallel_fanout.go), so main-goroutine
+	// access to pending never overlaps a sink call; the goroutine start/join
+	// edges plus flushMu give cross-goroutine visibility.
+	flushPendingLocked := func() {
+		if len(pending) == 0 {
+			return
+		}
+		emitLocked(pending, false)
 		pending = pending[:0]
 		pendingBytes = 0
+	}
+
+	flush := func(final bool) {
+		flushMu.Lock()
+		// Deferred unlock: onResult is caller-supplied and may panic (e.g. a
+		// wire-write failure surfacing as panic). A bare Unlock after the call
+		// would leave flushMu held on that panic, and the guaranteed terminal
+		// flush(true) below would then deadlock on flushMu.Lock() — wedging the
+		// engine with e.mu held, i.e. every CG sharing this engine.
+		defer flushMu.Unlock()
+		if final {
+			// Terminal frame always goes out, even with empty changes.
+			emitLocked(pending, true)
+			pending = pending[:0]
+			pendingBytes = 0
+			return
+		}
+		flushPendingLocked()
 	}
 
 	// Operator-level streaming (DESIGN-streaming-advance §Win-2): a single
@@ -1427,7 +1458,14 @@ func (e *Engine) advanceStreamChunked(
 	// <chunkSize residual coalesces into the streamer's rows and is drained per
 	// source-change below. Cleared on return (under e.mu, before Unlock) so
 	// hydrate/companion Accumulate stay in slice mode.
-	e.streamer.SetChunkSink(func(chunk []RowChange) { sendFrame(chunk, false) }, chunkSize, softChunkBytes)
+	e.streamer.SetChunkSink(func(chunk []RowChange) {
+		flushMu.Lock()
+		defer flushMu.Unlock() // deferred: onResult may panic (see flush)
+		// C1: ship earlier pushes' buffered residual BEFORE this mid-flatten
+		// chunk so the wire never carries newer rows ahead of older ones.
+		flushPendingLocked()
+		emitLocked(chunk, false)
+	}, chunkSize, softChunkBytes)
 	defer e.streamer.SetChunkSink(nil, 0, 0)
 
 	// Non-Drift panic capture: pre-fix this re-raised inline (panic(r)

@@ -36,7 +36,7 @@ package tablesource
 //     are per-query (TS routes RowChanges by queryID; the CVR merge keys
 //     by (query,row); the shadow comparator sorts), so cross-query
 //     interleave is semantically inert.
-//   - the AdvanceStream chunkSink: sendFrame serializes under flushMu
+//   - the AdvanceStream chunkSink: frame emission serializes under flushMu
 //     (engine.go) — built parallel-ready for exactly this.
 //
 // Panic discipline mirrors ivm/parallel.go: a panic on a spawned goroutine
