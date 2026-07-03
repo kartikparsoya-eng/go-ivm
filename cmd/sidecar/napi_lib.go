@@ -61,7 +61,11 @@ import (
 // goivmABIVersion increments on ANY breaking change to the exported
 // functions, the delivery-kind tags, or the row-record layout
 // (rowrecord.go). The addon refuses to start on a mismatch.
-const goivmABIVersion = 1
+//
+//	v2: added delivery kind 4 (host death — abi.go's death watcher; the
+//	    client must fatal the worker on receipt, so a v1 addon that would
+//	    silently warn-and-drop it must not pair with a v2 library).
+const goivmABIVersion = 2
 
 var (
 	abiMu   sync.Mutex

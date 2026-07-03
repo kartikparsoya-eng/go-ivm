@@ -717,3 +717,49 @@ func TestRowRecord_OversizedRecordFallsBackToFrame(t *testing.T) {
 		t.Fatal("a normal row after an oversized one must still encode")
 	}
 }
+
+// TestNumericReqID_ExactnessGuard (scale review): integer RPC ids beyond
+// f64's exact-integer range (|id| > 2^53) must DECLINE row mode (frame
+// fallback) instead of silently rounding. A rounded reqID can collide with
+// a different RPC's id, delivering this stream's row records into that
+// RPC's decode — cross-RPC record bleed.
+func TestNumericReqID_ExactnessGuard(t *testing.T) {
+	exact := int64(1) << 53
+
+	// In-range ids (all widths) convert exactly.
+	for _, tc := range []struct {
+		id   interface{}
+		want float64
+	}{
+		{float64(42), 42},
+		{int(7), 7},
+		{int64(exact), float64(exact)},        // 2^53 itself is exact
+		{int64(-exact), float64(-exact)},      // and its negative
+		{uint64(uint64(exact)), float64(exact)},
+		{int32(-5), -5},
+		{uint32(9), 9},
+	} {
+		got, ok := numericReqID(tc.id)
+		if !ok || got != tc.want {
+			t.Fatalf("numericReqID(%T %v) = (%v,%v), want (%v,true)", tc.id, tc.id, got, ok, tc.want)
+		}
+	}
+
+	// Beyond 2^53: int64(2^53+1) is NOT representable in f64 — float64()
+	// rounds it to 2^53, colliding with the id above. Must return false.
+	for _, id := range []interface{}{
+		int64(exact + 1),
+		int64(-(exact + 1)),
+		uint64(uint64(exact) + 1),
+		int64(1) << 60,
+	} {
+		if got, ok := numericReqID(id); ok {
+			t.Fatalf("numericReqID(%T %v) = (%v,true) — inexact id accepted (record-bleed risk)", id, id, got)
+		}
+	}
+
+	// Non-numeric ids still decline.
+	if _, ok := numericReqID("req-1"); ok {
+		t.Fatal("string id accepted")
+	}
+}

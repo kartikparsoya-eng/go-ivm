@@ -269,6 +269,83 @@ func TestABIHost_ShutdownSemantics(t *testing.T) {
 	}
 }
 
+// TestABIHost_DeathDeliversHostDeathRecord (scale-review A3): when the
+// in-process connection dies UNEXPECTEDLY — handleConnection exit or pipe
+// teardown, anything but a deliberate Shutdown — the host must deliver ONE
+// kind-4 host-death record so the JS client can fail its pending RPCs
+// immediately and fatal the worker (crash-don't-degrade). Pre-fix the death
+// was silent: pending RPCs hung to their full timeout with no signal, and
+// in-process there is no socket 'close' event to observe.
+//
+// Closing serverEnd reproduces exactly what an unexpected handleConnection
+// exit does (its `defer conn.Close()` — main.go): the pump reader errors,
+// both pumps exit, and the death watcher fires.
+func TestABIHost_DeathDeliversHostDeathRecord(t *testing.T) {
+	col := newSinkCollector()
+	h := startABIHostWithServer(NewServer(0, ""), col.sink, nil)
+	defer h.Shutdown()
+
+	// Prove liveness first so the death is unambiguous.
+	if err := h.Send(encodeReq(t, "ping", 1, nil)); err != nil {
+		t.Fatalf("send ping: %v", err)
+	}
+	col.waitFrames(t, 1, 5*time.Second)
+
+	// Kill the server side of the pipe (== handleConnection exiting).
+	_ = h.serverEnd.Close()
+
+	deadline := time.After(5 * time.Second)
+	for {
+		var death *sinkEntry
+		col.mu.Lock()
+		for i := range col.entries {
+			if col.entries[i].kind == abiKindHostDeath {
+				death = &col.entries[i]
+			}
+		}
+		col.mu.Unlock()
+		if death != nil {
+			if len(death.payload) == 0 {
+				t.Fatal("host-death record must carry a UTF-8 reason payload")
+			}
+			break
+		}
+		select {
+		case <-col.notify:
+		case <-deadline:
+			t.Fatal("no kind-4 host-death record delivered after pipe death (A3)")
+		}
+	}
+
+	// After death the host must fail sends fast, not queue them silently.
+	if err := h.Send([]byte{0x01}); err != errHostClosed {
+		t.Fatalf("Send after host death: got %v, want errHostClosed", err)
+	}
+}
+
+// TestABIHost_ShutdownDoesNotDeliverDeathRecord: a DELIBERATE Shutdown must
+// NOT deliver kind 4 — the embedder initiated the teardown; a death record
+// would trigger a spurious worker fatal during graceful exit.
+func TestABIHost_ShutdownDoesNotDeliverDeathRecord(t *testing.T) {
+	col := newSinkCollector()
+	h := startABIHostWithServer(NewServer(0, ""), col.sink, nil)
+
+	if err := h.Send(encodeReq(t, "ping", 1, nil)); err != nil {
+		t.Fatalf("send ping: %v", err)
+	}
+	col.waitFrames(t, 1, 5*time.Second)
+
+	h.Shutdown() // joins the death watcher via <-h.done, so this is race-free
+
+	col.mu.Lock()
+	defer col.mu.Unlock()
+	for _, e := range col.entries {
+		if e.kind == abiKindHostDeath {
+			t.Fatal("deliberate Shutdown must not deliver a host-death record")
+		}
+	}
+}
+
 // TestNewServerFromEnv_ParallelismKnob covers the consolidated production
 // env contract (shared by BOTH entry points — socket main() and the NAPI
 // host): GO_IVM_PARALLELISM is the one parallelism knob (lanes=P,

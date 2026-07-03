@@ -10,12 +10,17 @@ package main
 // hands the record bytes to JS, which reads them with a DataView and
 // assembles the RowChange directly.
 //
-// Delivery kinds (the addon's single ordered TSFN queue carries all three,
-// so cross-kind ordering is preserved end-to-end):
+// Delivery kinds (the addon's single ordered TSFN queue carries all of
+// them, so cross-kind ordering is preserved end-to-end):
 //
 //	kind 1 = msgpack RPC frame (control plane; unchanged wire bytes)
 //	kind 2 = groupDef record   (row plane; one per (queryID,table) per RPC)
 //	kind 3 = row record        (row plane; one per RowChange)
+//	kind 4 = host death        (control plane; payload is a UTF-8 reason.
+//	         The in-process host's pump died unexpectedly — no response
+//	         can ever arrive again. The client fails all pending RPCs and
+//	         fatals the worker. See abi.go's death watcher. NOT emitted
+//	         on deliberate Shutdown.)
 //
 // Record layouts (all integers little-endian; str = u16 len + UTF-8 bytes,
 // except value strings/blobs which use u32 len):
@@ -56,9 +61,10 @@ import (
 )
 
 const (
-	abiKindFrame    = 1
-	abiKindGroupDef = 2
-	abiKindRow      = 3
+	abiKindFrame     = 1
+	abiKindGroupDef  = 2
+	abiKindRow       = 3
+	abiKindHostDeath = 4
 )
 
 const (
@@ -99,7 +105,13 @@ func newRowRecordEncoder(reqID float64) *rowRecordEncoder {
 
 // numericReqID converts a decoded RPC id to f64. Returns false for
 // non-numeric ids (string ids are legal JSON-RPC; row mode requires numeric
-// — the caller falls back to frame mode for such requests).
+// — the caller falls back to frame mode for such requests) AND for integer
+// ids whose f64 conversion is not exact (|id| > 2^53, scale review): a
+// silently-rounded reqID can COLLIDE with a different RPC's reqID, routing
+// this stream's row records into that RPC's pending decode — cross-RPC
+// record bleed. The production TS client's ids are small counters, so the
+// guard only ever fires for foreign/buggy clients; frame mode is the
+// correct-over-fast fallback either way.
 func numericReqID(id interface{}) (float64, bool) {
 	switch v := id.(type) {
 	case float64:
@@ -107,7 +119,7 @@ func numericReqID(id interface{}) (float64, bool) {
 	case float32:
 		return float64(v), true
 	case int:
-		return float64(v), true
+		return exactIntReqID(int64(v))
 	case int8:
 		return float64(v), true
 	case int16:
@@ -115,7 +127,7 @@ func numericReqID(id interface{}) (float64, bool) {
 	case int32:
 		return float64(v), true
 	case int64:
-		return float64(v), true
+		return exactIntReqID(v)
 	case uint8:
 		return float64(v), true
 	case uint16:
@@ -123,9 +135,24 @@ func numericReqID(id interface{}) (float64, bool) {
 	case uint32:
 		return float64(v), true
 	case uint64:
+		if v > uint64(reqIDMaxExact) {
+			return 0, false
+		}
 		return float64(v), true
 	}
 	return 0, false
+}
+
+// reqIDMaxExact is 2^53 — every integer with |v| ≤ 2^53 is exactly
+// representable in f64. Larger magnitudes MAY be exact but are rejected
+// wholesale: correctness by construction beats sparse exactness.
+const reqIDMaxExact = int64(1) << 53
+
+func exactIntReqID(v int64) (float64, bool) {
+	if v > reqIDMaxExact || v < -reqIDMaxExact {
+		return 0, false
+	}
+	return float64(v), true
 }
 
 func (e *rowRecordEncoder) putU16(v uint16) {

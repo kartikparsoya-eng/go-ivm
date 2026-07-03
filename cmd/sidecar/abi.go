@@ -138,7 +138,8 @@ type abiHost struct {
 
 	// deliver receives every outbound entry: (kind, payload). Kind 1 =
 	// msgpack RPC frame (length prefix stripped), kinds 2/3 = row-plane
-	// records (see rowrecord.go). The bytes are valid ONLY for the
+	// records (see rowrecord.go), kind 4 = host death (see the death
+	// watcher in startABIHostWithServer). The bytes are valid ONLY for the
 	// duration of the call — the receiver must copy before returning
 	// (the cgo shim's C callback contract; the addon memcpy's into its
 	// TSFN queue entry).
@@ -148,8 +149,15 @@ type abiHost struct {
 	cond   *sync.Cond
 	sendQ  [][]byte
 	closed bool
-	done   chan struct{} // closed when both pump goroutines have exited
-	wg     sync.WaitGroup
+	// shuttingDown marks a DELIBERATE Shutdown() so the death watcher can
+	// distinguish it from an unexpected pipe/handler death (A3): only the
+	// latter delivers a kind-4 host-death record. Guarded by mu.
+	shuttingDown bool
+	// deathCause records the FIRST pump-exit error (read or write side) as
+	// the reason payload of the host-death record. Guarded by mu.
+	deathCause error
+	done       chan struct{} // closed when the pumps have exited AND the death record (if any) was delivered
+	wg         sync.WaitGroup
 
 	// reaperCancel stops the idle-group reaper goroutine on Shutdown. The
 	// socket transport runs this reaper from main(); the in-process host
@@ -261,6 +269,7 @@ func startABIHostWithServer(server *Server, deliver func(kind int32, payload []b
 			if err := writeFrame(clientEnd, frame); err != nil {
 				// Pipe torn down (shutdown or handler exit): drop the
 				// remaining queue; pending RPCs fail via the sink close.
+				h.setDeathCause(err)
 				h.markClosed()
 				return
 			}
@@ -279,6 +288,7 @@ func startABIHostWithServer(server *Server, deliver func(kind int32, payload []b
 		for {
 			payload, err := readFrame(reader)
 			if err != nil {
+				h.setDeathCause(err)
 				return
 			}
 			h.deliver(abiKindFrame, payload)
@@ -287,6 +297,28 @@ func startABIHostWithServer(server *Server, deliver func(kind int32, payload []b
 
 	go func() {
 		h.wg.Wait()
+		// Death watcher (A3, scale review): an UNEXPECTED pump death —
+		// handleConnection exit (bad frame, internal error) or pipe
+		// teardown, anything but a deliberate Shutdown — was previously
+		// silent: every pending RPC hung to its full timeout and JS had no
+		// way to notice (in-process there is no socket 'close' event to
+		// observe). Deliver ONE kind-4 host-death record so the client
+		// sweeps pending RPCs immediately and fatals the worker
+		// (crash-don't-degrade — the host cannot be restarted in-process;
+		// see napi_lib.go on Go runtime re-init). Delivered BEFORE
+		// close(h.done) so Shutdown() cannot return — and the embedder
+		// cannot release the TSFN — while this callback is still running.
+		h.mu.Lock()
+		deliberate := h.shuttingDown
+		cause := h.deathCause
+		h.mu.Unlock()
+		if !deliberate {
+			reason := "goivm host pump terminated"
+			if cause != nil {
+				reason += ": " + cause.Error()
+			}
+			h.deliver(abiKindHostDeath, []byte(reason))
+		}
 		close(h.done)
 	}()
 	return h
@@ -318,10 +350,28 @@ func (h *abiHost) markClosed() {
 	_ = h.serverEnd.Close()
 }
 
+// setDeathCause records the first pump-exit error; later causes are noise
+// (the teardown cascade after the first failure).
+func (h *abiHost) setDeathCause(err error) {
+	if err == nil {
+		return
+	}
+	h.mu.Lock()
+	if h.deathCause == nil {
+		h.deathCause = err
+	}
+	h.mu.Unlock()
+}
+
 // Shutdown tears down the pipe (handleConnection exits via read error, its
 // deferred flusher drain runs) and waits for the pump goroutines, then
-// closes all client groups. Idempotent.
+// closes all client groups. Idempotent. Marks the teardown DELIBERATE
+// first, so the death watcher does not deliver a host-death record (which
+// would trigger a spurious worker fatal during graceful teardown).
 func (h *abiHost) Shutdown() {
+	h.mu.Lock()
+	h.shuttingDown = true
+	h.mu.Unlock()
 	if h.reaperCancel != nil {
 		h.reaperCancel()
 	}
