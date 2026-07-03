@@ -181,12 +181,8 @@ func simpleConditionToSQL(cond *Condition) (string, []interface{}) {
 	if !allowedOps[op] {
 		return "1=0", nil
 	}
-	// SQLite LIKE is case-insensitive, so ILIKE → LIKE
-	switch op {
-	case "ILIKE":
-		op = "LIKE"
-	case "NOT ILIKE":
-		op = "NOT LIKE"
+	if op == "LIKE" || op == "NOT LIKE" || op == "ILIKE" || op == "NOT ILIKE" {
+		return likeConditionToSQL(cond, op)
 	}
 
 	if op == "IN" || op == "NOT IN" {
@@ -204,6 +200,38 @@ func simpleConditionToSQL(cond *Condition) (string, []interface{}) {
 	rightSQL, rightParams := valuePositionToSQL(cond.Right)
 	return fmt.Sprintf("%s %s %s", leftSQL, op, rightSQL),
 		append(leftParams, rightParams...)
+}
+
+// likeConditionToSQL mirrors TS's likeConditionToSQL (zqlite/query-builder.ts
+// @ v1.7.0), which aligned SQL pattern matching with Postgres / the in-memory
+// IVM matcher (like.ts):
+//   - LIKE is case-sensitive: the replica connections run with
+//     `PRAGMA case_sensitive_like = ON` (see internal/tablesource/db.go), so
+//     the bare LIKE operator is case-sensitive.
+//   - ILIKE is case-insensitive: lower() both operands. TS uses the
+//     Unicode-aware ICU lower() from @rocicorp/zero-sqlite3; our connections
+//     override SQLite's ASCII-only built-in lower() with a full Unicode case
+//     mapping (db.go ConnectHook) to match.
+//   - Backslash is the default escape character in Postgres and in the IVM
+//     matcher, but SQLite has no default — emit `ESCAPE '\'` explicitly.
+//     (SQLite string literals don't process backslash escapes, so '\' in the
+//     SQL text is a single literal backslash.)
+//
+// Pre-1.7.0 this mapped ILIKE→LIKE and relied on SQLite's case-insensitive
+// default with no escape; upstream changed the contract.
+func likeConditionToSQL(cond *Condition, op string) (string, []interface{}) {
+	caseInsensitive := op == "ILIKE" || op == "NOT ILIKE"
+	likeOp := "LIKE"
+	if op == "NOT LIKE" || op == "NOT ILIKE" {
+		likeOp = "NOT LIKE"
+	}
+	leftSQL, leftParams := valuePositionToSQL(cond.Left)
+	rightSQL, rightParams := valuePositionToSQL(cond.Right)
+	params := append(leftParams, rightParams...)
+	if caseInsensitive {
+		return fmt.Sprintf(`lower(%s) %s lower(%s) ESCAPE '\'`, leftSQL, likeOp, rightSQL), params
+	}
+	return fmt.Sprintf(`%s %s %s ESCAPE '\'`, leftSQL, likeOp, rightSQL), params
 }
 
 func valuePositionToSQL(vp ValuePos) (string, []interface{}) {

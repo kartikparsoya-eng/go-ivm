@@ -43,8 +43,8 @@ func TestSimpleCondition_AllWhitelistedComparisonOps(t *testing.T) {
 		{"<", `"col" < ?`},
 		{">=", `"col" >= ?`},
 		{"<=", `"col" <= ?`},
-		{"LIKE", `"col" LIKE ?`},
-		{"NOT LIKE", `"col" NOT LIKE ?`},
+		{"LIKE", `"col" LIKE ? ESCAPE '\'`},
+		{"NOT LIKE", `"col" NOT LIKE ? ESCAPE '\'`},
 		{"IS", `"col" IS ?`},
 		{"IS NOT", `"col" IS NOT ?`},
 	}
@@ -62,19 +62,20 @@ func TestSimpleCondition_AllWhitelistedComparisonOps(t *testing.T) {
 }
 
 func TestSimpleCondition_ILIKEMapsToLIKE(t *testing.T) {
-	// SQLite LIKE is case-insensitive, so ILIKE → LIKE. The whitelist must NOT
-	// break this special-case (it runs after the allowedOps check).
+	// zero 1.7.0: ILIKE → lower() LIKE lower() ESCAPE '\' (Postgres semantics;
+	// see likeConditionToSQL). The whitelist must NOT break this special-case
+	// (it runs after the allowedOps check).
 	got, params := simpleConditionToSQL(colLit("col", "ILIKE", "x"))
-	if got != `"col" LIKE ?` {
-		t.Fatalf("ILIKE: got %q, want %q", got, `"col" LIKE ?`)
+	if got != `lower("col") LIKE lower(?) ESCAPE '\'` {
+		t.Fatalf("ILIKE: got %q, want %q", got, `lower("col") LIKE lower(?) ESCAPE '\'`)
 	}
 	if len(params) != 1 || params[0] != "x" {
 		t.Fatalf("ILIKE: params=%v, want [x]", params)
 	}
-	// NOT ILIKE → NOT LIKE
+	// NOT ILIKE → lower() NOT LIKE lower()
 	got, _ = simpleConditionToSQL(colLit("col", "NOT ILIKE", "x"))
-	if got != `"col" NOT LIKE ?` {
-		t.Fatalf("NOT ILIKE: got %q, want %q", got, `"col" NOT LIKE ?`)
+	if got != `lower("col") NOT LIKE lower(?) ESCAPE '\'` {
+		t.Fatalf("NOT ILIKE: got %q, want %q", got, `lower("col") NOT LIKE lower(?) ESCAPE '\'`)
 	}
 }
 

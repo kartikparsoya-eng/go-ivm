@@ -12,6 +12,9 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"golang.org/x/text/cases"
+	"golang.org/x/text/language"
+
 	"github.com/kartikparsoya-eng/go-ivm/ivm"
 )
 
@@ -292,26 +295,54 @@ var (
 	likeRegexCacheCap = int64(1 << 14) // 16k compiled patterns; tune via GO_IVM_LIKE_CACHE_CAP
 )
 
-// matchLike reports whether s matches a SQL LIKE/ILIKE pattern, using SQLite's
-// default LIKE semantics (the engine both TS and Go ultimately read through):
-// `%` -> .*, `_` -> ., and EVERY other character — including `\` — is a literal
-// (no escape character; SQLite requires an explicit `ESCAPE` clause for that,
-// which Zero never emits). The pattern is compiled to an anchored, multiline,
-// Unicode-aware regexp. caseInsensitive maps to (?i) (ILIKE).
+// matchLike reports whether s matches a SQL LIKE/ILIKE pattern, mirroring
+// TS's in-memory matcher (zql/src/builder/like.ts @ v1.7.0), which upstream
+// aligned the SQL side to in the 1.7.0 release (zqlite/db.ts sets
+// `PRAGMA case_sensitive_like = ON`; zqlite/query-builder.ts emits
+// `ESCAPE '\'` and lower()s both ILIKE operands):
+//   - `%` -> .*, `_` -> . (both DOTALL: wildcards cross newlines, and ^/$
+//     anchor the WHOLE string — like.ts's 'm'->'s' flag fix).
+//   - `\x` -> literal x (Postgres default escape). A trailing `\` is
+//     invalid — TS throws "LIKE pattern must not end with escape character"
+//     at predicate build; we panic a DataError (recovered per-query, so the
+//     query errors like TS instead of silently matching nothing).
+//   - LIKE is case-SENSITIVE (Postgres), ILIKE case-insensitive.
+//   - Non-wildcard patterns take like.ts's fast path: plain equality, or
+//     full-Unicode-lowercased equality for ILIKE (mirrors JS toLowerCase /
+//     the ICU lower() TS pushes into SQL — NOT regex (?i) simple folding,
+//     which diverges on e.g. Greek final sigma).
 //
-// Earlier this treated `\` as an escape (mirroring TS's in-memory patternToRegExp).
-// But TS's TableSource hydrates by pushing `col LIKE ?` into SQLite with no
-// ESCAPE clause, so `\` is literal there — and a `%\%%` pattern matched
-// backslash-content in TS but percent-content in Go, a deterministic hydrate
-// divergence. Matching SQLite is the faithful behavior.
+// Pre-1.7.0 this deliberately mirrored SQLite's DEFAULT semantics (backslash
+// literal, no escape) because TS's TableSource pushed `col LIKE ?` into
+// SQLite with no ESCAPE clause. Upstream #6097-era changes made TS's SQL
+// side match like.ts, so the like.ts contract is now authoritative on both
+// paths.
 func matchLike(s, pattern string, caseInsensitive bool) bool {
+	// Fast path — no wildcard or escape chars (like.ts likePatternRe): plain
+	// string comparison, lowercased for ILIKE.
+	if !strings.ContainsAny(pattern, "%_\\") {
+		if caseInsensitive {
+			return unicodeLower(s) == unicodeLower(pattern)
+		}
+		return s == pattern
+	}
 	re := likeRegexpFor(pattern, caseInsensitive)
 	if re == nil {
-		// Unparsable pattern (e.g. trailing escape — TS throws). Fail the match
-		// rather than crash the predicate.
-		return false
+		// Invalid pattern (trailing escape). TS throws at predicate build;
+		// panic a DataError so the engine fails THIS query the way TS does
+		// (recovered per-query / per-push), instead of silently no-matching.
+		panic(ivm.NewDataError("LIKE pattern must not end with escape character"))
 	}
 	return re.MatchString(s)
+}
+
+// unicodeLower is the Go mirror of JS String.prototype.toLowerCase() / the
+// ICU lower() SQLite function TS uses: full Unicode case mapping (including
+// context-sensitive rules like Greek final sigma), locale-independent.
+// strings.ToLower would NOT match (it applies only simple, unconditional
+// mappings: "ΟΔΟΣ" -> "οδοσ" vs toLowerCase's "οδος").
+func unicodeLower(s string) string {
+	return cases.Lower(language.Und).String(s)
 }
 
 func likeRegexpFor(pattern string, caseInsensitive bool) *regexp.Regexp {
@@ -357,14 +388,18 @@ var applyLikeCacheCap = sync.OnceValue(func() int64 {
 	return likeRegexCacheCap
 })
 
-// compileLikePattern translates a SQL LIKE pattern to a Go regexp, mirroring TS
-// patternToRegExp. Returns nil on an invalid pattern (TS throws).
+// compileLikePattern translates a SQL LIKE pattern to a Go regexp, mirroring
+// TS patternToRegExp (like.ts @ v1.7.0). Returns nil on an invalid pattern
+// (trailing escape — TS throws); matchLike converts nil to a DataError panic.
 func compileLikePattern(source string, caseInsensitive bool) *regexp.Regexp {
 	var b strings.Builder
-	// (?m): multiline so ^/$ anchor at line boundaries, matching JS's 'm' flag.
-	// Go RE2 '.' already excludes \n (like JS without 's'), so % (-> .*) won't
-	// cross newlines.
-	b.WriteString("(?m)")
+	// (?s): dotall, mirroring like.ts's 's' flag — `_` (-> .) and `%` (-> .*)
+	// match newlines, and ^/$ anchor the WHOLE string. The previous (?m)
+	// multiline form mirrored like.ts's old 'm' flag, which upstream fixed in
+	// 1.7.0: 'm' let ^/$ match interior line boundaries (false positives,
+	// 'fooa\nbar' LIKE 'foo_') while wildcards still refused to cross
+	// newlines (false negatives, 'a\nb' NOT LIKE 'a%b').
+	b.WriteString("(?s)")
 	if caseInsensitive {
 		b.WriteString("(?i)")
 	}
@@ -376,15 +411,16 @@ func compileLikePattern(source string, caseInsensitive bool) *regexp.Regexp {
 			b.WriteString(".*")
 		case '_':
 			b.WriteString(".")
+		case '\\':
+			// Postgres/like.ts escape: `\x` is a literal x. A trailing `\`
+			// is invalid (TS: "LIKE pattern must not end with escape
+			// character").
+			if i == len(runes)-1 {
+				return nil
+			}
+			i++
+			b.WriteString(regexp.QuoteMeta(string(runes[i])))
 		default:
-			// NOTE: backslash is NOT an escape character here. TS's TableSource
-			// pushes the LIKE filter into SQLite SQL (`col LIKE ?`) with NO
-			// `ESCAPE` clause (zqlite/query-builder.ts), so SQLite — the engine
-			// both sides share — treats `\` (and every non-`%`/`_` char) as a
-			// LITERAL. We MUST match that, or a pattern like `%\%%` diverges:
-			// SQLite/TS reads it as "contains a backslash" while a backslash-as-
-			// escape reading is "contains a percent". Treating `\` as a metachar
-			// to quote keeps it literal — exactly SQLite's default.
 			b.WriteString(regexp.QuoteMeta(string(c)))
 		}
 	}

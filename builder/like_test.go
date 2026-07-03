@@ -2,10 +2,17 @@ package builder
 
 import "testing"
 
-// TestMatchLike covers the HIGH-8 cases the old byte-by-byte matcher got
-// wrong: multi-byte UTF-8 under `_` and `%`/`_` vs embedded newlines — plus
-// ILIKE case folding. Backslash is a LITERAL (SQLite default LIKE, which TS's
-// SQL pushdown uses — no ESCAPE clause).
+// TestMatchLike pins matchLike to TS's in-memory matcher contract
+// (zql/src/builder/like.ts @ v1.7.0), which zero 1.7.0 made authoritative on
+// BOTH paths (the SQL side now runs case_sensitive_like=ON with ESCAPE '\'
+// and lower()ed ILIKE operands):
+//   - backslash escapes the next character (Postgres default)
+//   - wildcards are DOTALL (cross newlines) and ^/$ anchor the whole string
+//   - LIKE is case-sensitive; ILIKE lowercases with full Unicode mapping
+//   - a trailing backslash is invalid (TS throws; Go panics a DataError)
+//
+// Also keeps the HIGH-8 cases the old byte-by-byte matcher got wrong
+// (multi-byte UTF-8 under `_`).
 func TestMatchLike(t *testing.T) {
 	cases := []struct {
 		name            string
@@ -13,34 +20,43 @@ func TestMatchLike(t *testing.T) {
 		caseInsensitive bool
 		want            bool
 	}{
-		// Multi-byte UTF-8: `_` matches one CODE POINT, not one byte. The old
-		// matcher matched a single byte of 'é' (0xC3) and left 0xA9 dangling.
+		// Multi-byte UTF-8: `_` matches one CODE POINT, not one byte.
 		{"underscore matches multibyte rune", "café", "caf_", false, true},
 		{"underscore one rune not two", "café", "ca_", false, false},
 
-		// Backslash is LITERAL (no escape — SQLite default; TS pushes LIKE to
-		// SQLite without ESCAPE). So `\_` = literal backslash + any char, and
-		// `\%` = literal backslash + zero-or-more chars.
-		{"backslash is literal not escape", `a\b`, `a\%`, false, true},
-		{"backslash underscore one char after slash", `a\b`, `a\_`, false, true},
-		{"no backslash no match", "ab", `a\_`, false, false},
-		// The exact regression: %\%% matches content containing a backslash,
-		// NOT content containing a percent (matches TS's SQLite fetch).
-		{"escaped-percent pattern matches backslash", `path\to`, `%\%%`, false, true},
-		{"escaped-percent pattern not percent", "50% off", `%\%%`, false, false},
-		// `_` after the literal backslash is still a single-char wildcard.
-		{"underscore still wildcard after literal", "10%", `10_`, false, true},
+		// Backslash ESCAPES the next char (like.ts / Postgres — the 1.7.0
+		// contract; pre-1.7.0 both TS SQL and this matcher treated it as a
+		// literal). `\%` = literal percent, `\_` = literal underscore.
+		{"escaped percent is literal percent", "a%", `a\%`, false, true},
+		{"escaped percent does not match backslash", `a\b`, `a\%`, false, false},
+		{"escaped underscore is literal underscore", "a_", `a\_`, false, true},
+		{"escaped underscore not a wildcard", "ab", `a\_`, false, false},
+		// The flipped regression: %\%% now matches content containing a
+		// PERCENT (escape), not content containing a backslash.
+		{"escaped-percent pattern matches percent", "50% off", `%\%%`, false, true},
+		{"escaped-percent pattern not backslash", `path\to`, `%\%%`, false, false},
+		// Escaped backslash is a literal backslash.
+		{"escaped backslash literal", `a\b`, `a\\b`, false, true},
+		// `_` not preceded by escape is still a wildcard.
+		{"underscore still wildcard", "10%", `10_`, false, true},
 
-		// Newlines: `.` (from _/%) does not cross \n (Go RE2 default, like JS).
-		{"underscore does not cross newline", "foo\nbar", "foo_bar", false, false},
+		// Newlines: dotall (like.ts 's' flag) — wildcards cross newlines,
+		// and ^/$ anchor the WHOLE string, not line boundaries.
+		{"underscore crosses newline", "foo\nbar", "foo_bar", false, true},
+		{"percent crosses newline", "a\nb", "a%b", false, true},
+		{"no interior line-boundary anchoring", "fooa\nbar", "foo_", false, false},
 		{"percent matches within a line", "bar\nfoo", "%foo%", false, true},
 
-		// ILIKE: Unicode-aware case folding via (?i).
-		{"ilike folds unicode", "CAFÉ", "café", true, true},
+		// Case sensitivity: LIKE is case-SENSITIVE (Postgres semantics, needs
+		// case_sensitive_like=ON on the SQL side); ILIKE folds case.
 		{"like is case sensitive", "CAFE", "cafe", false, false},
-
-		// Trailing backslash is now just a literal backslash (no longer invalid).
-		{"trailing backslash literal", `x\`, `x\`, false, true},
+		{"ilike folds ascii (fast path)", "CAFE", "cafe", true, true},
+		{"ilike folds unicode (fast path)", "CAFÉ", "café", true, true},
+		// Full Unicode case mapping on the non-wildcard fast path: Greek
+		// final sigma. toLowerCase("ΟΔΟΣ") = "οδος"; a simple fold or
+		// strings.ToLower gives "οδοσ" and would NOT match.
+		{"ilike final sigma full mapping", "ΟΔΟΣ", "οδος", true, true},
+		{"ilike wildcard path folds", "CAFÉ!", "caf_!", true, true},
 
 		// Plain wildcards still work.
 		{"percent prefix", "hello world", "%world", false, true},
@@ -54,4 +70,17 @@ func TestMatchLike(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestMatchLikeTrailingEscapePanics: TS throws "LIKE pattern must not end
+// with escape character" at predicate build; Go must panic a DataError (the
+// engine recovers it per-query) rather than silently matching nothing.
+func TestMatchLikeTrailingEscapePanics(t *testing.T) {
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("matchLike with trailing escape did not panic; TS throws")
+		}
+	}()
+	matchLike(`x\`, `x\`, false)
 }

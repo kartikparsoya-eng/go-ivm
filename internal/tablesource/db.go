@@ -22,10 +22,44 @@ import (
 	"database/sql"
 	"fmt"
 	"strconv"
+	"sync"
 	"time"
 
-	_ "github.com/mattn/go-sqlite3"
+	sqlite3 "github.com/mattn/go-sqlite3"
+	"golang.org/x/text/cases"
+	"golang.org/x/text/language"
 )
+
+// goivmDriverName is the database/sql driver this package's pools open with.
+// It is mattn/go-sqlite3 plus a ConnectHook that overrides SQLite's built-in
+// ASCII-only lower() with a full Unicode case mapping.
+//
+// Why: zero 1.7.0 aligned SQL LIKE/ILIKE with Postgres (zqlite/db.ts sets
+// `case_sensitive_like = ON`; zqlite/query-builder.ts lower()s both ILIKE
+// operands). TS's lower() is the Unicode-aware ICU one that
+// @rocicorp/zero-sqlite3 provides — mattn's bundled SQLite (and a non-ICU
+// system libsqlite3) only lowercases ASCII, so `col ILIKE 'é%'` would
+// diverge from TS on any non-ASCII text. The override applies per connection
+// (application-defined functions shadow built-ins of the same name/arity),
+// so every conn the pools open behaves like TS's replica connection.
+const goivmDriverName = "sqlite3_goivm"
+
+var registerGoivmDriver = sync.OnceValue(func() string {
+	sql.Register(goivmDriverName, &sqlite3.SQLiteDriver{
+		ConnectHook: func(conn *sqlite3.SQLiteConn) error {
+			return conn.RegisterFunc("lower", unicodeLowerSQL, true)
+		},
+	})
+	return goivmDriverName
+})
+
+// unicodeLowerSQL mirrors ICU lower() / JS toLowerCase(): full Unicode case
+// mapping including context-sensitive rules (e.g. Greek final sigma
+// "ΟΔΟΣ"→"οδος"), locale-independent. strings.ToLower applies only simple
+// unconditional mappings and would diverge from TS on those.
+func unicodeLowerSQL(s string) string {
+	return cases.Lower(language.Und).String(s)
+}
 
 // Defaults chosen to match the design doc (parallelization is a hard
 // constraint, not a tuning knob).
@@ -107,15 +141,20 @@ func Open(path string, opts OpenOptions) (*sql.DB, error) {
 	// _pragma=KEY(VAL) form modernc used) so every new connection the
 	// pool opens applies them — multi-conn parallelism keeps the
 	// pragma guarantees on each backing connection.
+	//
+	// _case_sensitive_like: zero 1.7.0 runs every replica connection with
+	// `PRAGMA case_sensitive_like = ON` (zqlite/db.ts) so bare LIKE matches
+	// Postgres; the generated SQL (sqlite/query_builder.go) relies on it.
 	dsn := "file:" + path +
 		"?_busy_timeout=" + strconv.Itoa(busyMs) +
-		"&_query_only=true"
+		"&_query_only=true" +
+		"&_case_sensitive_like=true"
 	if opts.CacheSizeKB > 0 {
 		// Negative value = KB units (https://sqlite.org/pragma.html#pragma_cache_size).
 		dsn += "&_cache_size=-" + strconv.Itoa(opts.CacheSizeKB)
 	}
 
-	db, err := sql.Open("sqlite3", dsn)
+	db, err := sql.Open(registerGoivmDriver(), dsn)
 	if err != nil {
 		return nil, fmt.Errorf("tablesource.Open: sql.Open: %w", err)
 	}
@@ -202,15 +241,18 @@ func OpenWritable(path string, opts OpenOptions) (*sql.DB, error) {
 
 	// No `_query_only` — we run INSERT/UPDATE/DELETE on the prev tx.
 	// `_synchronous=OFF` matches TS Snapshotter (writes never commit).
+	// `_case_sensitive_like=true` matches every TS replica connection
+	// (zqlite/db.ts @ 1.7.0) — see Open.
 	dsn := "file:" + path +
 		"?_busy_timeout=" + strconv.Itoa(busyMs) +
-		"&_synchronous=OFF"
+		"&_synchronous=OFF" +
+		"&_case_sensitive_like=true"
 	if opts.CacheSizeKB > 0 {
 		// Negative value = KB units (see Open).
 		dsn += "&_cache_size=-" + strconv.Itoa(opts.CacheSizeKB)
 	}
 
-	db, err := sql.Open("sqlite3", dsn)
+	db, err := sql.Open(registerGoivmDriver(), dsn)
 	if err != nil {
 		return nil, fmt.Errorf("tablesource.OpenWritable: sql.Open: %w", err)
 	}
