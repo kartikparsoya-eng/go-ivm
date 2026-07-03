@@ -302,7 +302,7 @@ func NewCoReadReaderPool(ctx context.Context, db *sql.DB, cr *CoRead, k int) (*R
 			}
 			return nil, fmt.Errorf("coread reader pool: read stateVersion conn %d: %w", i, err)
 		}
-		readers[i] = &poolReader{conn: conn, stmts: map[string]*sql.Stmt{}}
+		readers[i] = &poolReader{conn: conn, stmts: map[string]*poolStmt{}}
 		if i == 0 {
 			version = ver
 		} else if ver != version {
