@@ -263,11 +263,12 @@ func (e *rowRecordEncoder) encodeRow(g *rowGroup, c *engine.RowChange) ([]byte, 
 				return nil, false
 			}
 		}
-		// Same membership discipline as the add/edit loop below: a RowKey
-		// keyed differently from the group's interned PK would otherwise
-		// encode nulls for the missing PK columns and silently drop the
-		// foreign ones — a remove targeting the wrong key at the client.
-		if found != len(c.RowKey) {
+		// Membership must hold in BOTH directions against the interned PK:
+		// found == len(c.RowKey) rejects foreign keys (RowKey ⊄ pk), and
+		// found == len(g.pk) rejects PK-SUBSET RowKeys ({a} vs pk=[a,b]) —
+		// which the one-sided check waved through, encoding the missing PK
+		// column as null: a remove targeting (a, null) at the client.
+		if found != len(c.RowKey) || found != len(g.pk) {
 			return nil, false
 		}
 		if len(e.buf) > maxFrameSize {

@@ -316,6 +316,22 @@ func TestEncodeRow_HomogeneityIsMembershipNotLength(t *testing.T) {
 	if _, ok := enc.encodeRow(g, &badRm); ok {
 		t.Fatal("remove whose RowKey is keyed outside the interned PK must fall back")
 	}
+	// PK-SUBSET RowKey (review C4): group interned pk=[a]; craft a group
+	// with pk=[a,b] and remove keyed {a} only — found==len(RowKey) passes
+	// the one-sided check but the missing PK col would encode null.
+	firstAB := engine.RowChange{
+		Type: engine.RowChangeAdd, QueryID: "qpk2", Table: "t2",
+		RowKey: map[string]interface{}{"a": "x", "b": "y"},
+		Row:    ivm.Row{"a": "x", "b": "y", "c": float64(1)},
+	}
+	g2, _ := enc.groupFor(&firstAB)
+	subsetRm := engine.RowChange{
+		Type: engine.RowChangeRemove, QueryID: "qpk2", Table: "t2",
+		RowKey: map[string]interface{}{"a": "x"},
+	}
+	if _, ok := enc.encodeRow(g2, &subsetRm); ok {
+		t.Fatal("remove whose RowKey is a strict SUBSET of the interned PK must fall back (would encode null PK)")
+	}
 	goodRm := engine.RowChange{
 		Type: engine.RowChangeRemove, QueryID: "qh", Table: "t1",
 		RowKey: map[string]interface{}{"a": "k1"},
