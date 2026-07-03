@@ -16,6 +16,7 @@ import (
 	"database/sql"
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/kartikparsoya-eng/go-ivm/engine"
 	"github.com/kartikparsoya-eng/go-ivm/internal/snapshotter"
@@ -196,6 +197,7 @@ func (s *Server) tearDownReaderPool(group *ClientGroup) {
 	}
 	group.readerPool.Close()
 	group.readerPool = nil
+	group.readerPoolBoundAt = time.Time{}
 	if group.coread != nil {
 		group.coread.Free()
 		group.coread = nil
@@ -370,6 +372,7 @@ func (s *Server) rebuildColdReaderPoolLocked(group *ClientGroup, cmax int) {
 	// Swap: unbind + close the undersized pool, then bind the bigger one.
 	s.tearDownReaderPool(group)
 	group.readerPool = pool
+	group.readerPoolBoundAt = time.Now()
 	group.coread = cr
 	group.eng.BindTableSourcesToReaderPool(pool)
 	outcome, via := poolBindConverge, "converge"
@@ -485,6 +488,7 @@ func (s *Server) refreshSnapForInitialHydrateLocked(cgID string, group *ClientGr
 
 	if pool.Version() == cur.Version() {
 		group.readerPool = pool
+		group.readerPoolBoundAt = time.Now()
 		group.coread = cr
 		group.eng.BindTableSourcesToReaderPool(pool)
 		outcome, via := poolBindConverge, "converge"

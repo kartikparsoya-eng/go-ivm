@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	_ "net/http/pprof" // registers /debug/pprof on http.DefaultServeMux when active
@@ -744,6 +745,19 @@ type ClientGroup struct {
 	// (REVIEW-final HIGH-CROSS-2 / HIGH-CROSS-3). Accessed via atomic so the
 	// reaper doesn't need mu.
 	lastUsedNs atomic.Int64
+	// inFlight is true while the worker is executing a handler (dequeue
+	// through respCh delivery). The reaper must never reap a group whose
+	// worker is mid-handler (scale-review A4): lastUsedNs is stamped at
+	// DEQUEUE, so a handler outliving the idle window (long hydrate under
+	// backpressure) made a LIVE group reap-eligible — it was deleted from
+	// s.groups while its handler streamed, and the next RPC for the same
+	// cgID created a SECOND group+engine over the same storage
+	// (split-brain). Set/cleared only by the worker goroutine; read by the
+	// reaper. The worker stamps lastUsedNs fresh BEFORE clearing this flag
+	// (sync/atomic is seq-cst), so a reaper that observes inFlight==false
+	// is guaranteed to then observe the post-completion timestamp — a
+	// just-finished group is never "idle since dequeue".
+	inFlight atomic.Bool
 
 	// sendMu closes the orphaned-respCh race between trySendReq and the
 	// worker's post-done drain (full-scale review 2026-07-03). trySendReq
@@ -772,11 +786,18 @@ type ClientGroup struct {
 
 	// readerPool is the cold-start parallel-hydrate reader pool (drive mode,
 	// GO_IVM_HYDRATE_READERS>1). Built+bound in buildSnapshotterLocked at curr's
-	// stateVersion; torn down at the first advance (tearDownReaderPool) and on
-	// shutdownGroup / re-init. Nil when the feature is off or the pool couldn't
+	// stateVersion; torn down at the first advance (tearDownReaderPool), on
+	// shutdownGroup / re-init, and by the reaper once readerPoolBoundAt is
+	// older than coldPoolTTL (scale review: an advance-less CG kept alive by
+	// non-advance RPCs pinned the init-time WAL frame indefinitely — on a
+	// busy replica wal2 cannot checkpoint past the pinned frame, so the WAL
+	// grows without bound). Nil when the feature is off or the pool couldn't
 	// pin (replica advanced past curr) — both fall back to the single-conn path.
 	readerPool *tablesource.ReaderPool
-	coread     *tablesource.CoRead
+	// readerPoolBoundAt is when the CURRENT cold pool was bound (zero when
+	// readerPool is nil). Guarded by group.mu, like readerPool itself.
+	readerPoolBoundAt time.Time
+	coread            *tablesource.CoRead
 }
 
 type clientGroupReq struct {
@@ -1127,6 +1148,25 @@ func reaperIdleTimeout() time.Duration {
 	return groupIdleTimeout
 }
 
+// coldPoolTTL is how long a cold-start reader pool may stay bound before the
+// reaper tears it down (scale review). The pool exists to parallelize the
+// cold-start hydrate burst and is normally dropped at the FIRST advance —
+// but a CG that hydrates and then never advances (client keeps it alive
+// with non-advance RPCs, or advances simply stop being driven) kept K
+// readers pinned at the init-time WAL frame indefinitely, blocking wal2
+// checkpointing past that frame: unbounded WAL growth on a busy replica.
+// Five minutes comfortably covers any legitimate cold-start window (the
+// TTL clock starts at BIND, and hydrates in progress hold group.mu, which
+// the sweep never waits on). Env-tunable via GO_IVM_COLD_POOL_TTL_SEC.
+func coldPoolTTL() time.Duration {
+	if v := os.Getenv("GO_IVM_COLD_POOL_TTL_SEC"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return time.Duration(n) * time.Second
+		}
+	}
+	return 5 * time.Minute
+}
+
 // runReaper periodically reaps idle client groups until ctx is cancelled.
 // Started by BOTH transports — main() for the socket sidecar AND the NAPI
 // ABI host (abi.go). Before the ABI host wired this, in-process (napi) mode
@@ -1138,6 +1178,7 @@ func (s *Server) runReaper(ctx context.Context) {
 	ticker := time.NewTicker(reaperInterval())
 	defer ticker.Stop()
 	idle := reaperIdleTimeout()
+	poolTTL := coldPoolTTL()
 	for {
 		select {
 		case <-ctx.Done():
@@ -1147,8 +1188,42 @@ func (s *Server) runReaper(ctx context.Context) {
 			if n > 0 {
 				fmt.Fprintf(os.Stderr, "[GO-IVM] reaped %d idle client groups\n", n)
 			}
+			if p := s.reapStaleColdPools(now, poolTTL); p > 0 {
+				fmt.Fprintf(os.Stderr, "[GO-IVM] tore down %d stale cold reader pool(s) past TTL\n", p)
+			}
 		}
 	}
+}
+
+// reapStaleColdPools tears down every group's cold-start reader pool whose
+// bind is older than ttl (see coldPoolTTL for why). Skips groups whose
+// worker is mid-handler and uses TryLock so a long hydrate (which holds
+// group.mu for its whole duration) can never wedge the reaper goroutine —
+// the sweep just retries next tick. Returns the number of pools dropped.
+func (s *Server) reapStaleColdPools(now time.Time, ttl time.Duration) int {
+	s.mu.RLock()
+	groups := make([]*ClientGroup, 0, len(s.groups))
+	for _, g := range s.groups {
+		groups = append(groups, g)
+	}
+	s.mu.RUnlock()
+
+	dropped := 0
+	for _, g := range groups {
+		if g.inFlight.Load() {
+			continue // its handler likely holds group.mu; next tick
+		}
+		if !g.mu.TryLock() {
+			continue
+		}
+		if g.readerPool != nil && !g.readerPoolBoundAt.IsZero() &&
+			now.Sub(g.readerPoolBoundAt) > ttl {
+			s.tearDownReaderPool(g)
+			dropped++
+		}
+		g.mu.Unlock()
+	}
+	return dropped
 }
 
 // reapIdleGroups scans the group map and destroys any group whose lastUsedNs
@@ -1164,6 +1239,9 @@ func (s *Server) reapIdleGroups(cutoff time.Time) int {
 		g  *ClientGroup
 	}, 0, len(s.groups))
 	for id, g := range s.groups {
+		if g.inFlight.Load() {
+			continue // A4: worker mid-handler — alive by definition
+		}
 		if g.lastUsedNs.Load() < cutoffNs {
 			candidates = append(candidates, struct {
 				id string
@@ -1183,7 +1261,7 @@ func (s *Server) reapIdleGroups(cutoff time.Time) int {
 			s.mu.Unlock()
 			continue
 		}
-		if current.lastUsedNs.Load() >= cutoffNs {
+		if current.inFlight.Load() || current.lastUsedNs.Load() >= cutoffNs {
 			s.mu.Unlock()
 			continue
 		}
@@ -1250,6 +1328,7 @@ func (g *ClientGroup) worker(s *Server) {
 			}
 		}
 		g.lastUsedNs.Store(time.Now().UnixNano())
+		g.inFlight.Store(true) // A4: reap-proof while the handler runs
 		var start time.Time
 		method := req.req.Method
 
@@ -1317,6 +1396,12 @@ func (g *ClientGroup) worker(s *Server) {
 		}
 
 		req.respCh <- resp
+		// Completion stamp BEFORE clearing inFlight (see the field comment):
+		// without it, a handler that ran longer than the idle window left
+		// lastUsedNs at its DEQUEUE time — instantly reap-eligible the
+		// moment inFlight cleared, despite having JUST finished work.
+		g.lastUsedNs.Store(time.Now().UnixNano())
+		g.inFlight.Store(false)
 	}
 }
 
@@ -2600,6 +2685,34 @@ func handleConnection(conn net.Conn, server *Server) {
 //
 // The standard GOGC env (already applied by the runtime) takes precedence when
 // GO_IVM_GOGC is unset, so existing deployments that tuned GOGC are unaffected.
+
+// parseByteSize parses a byte count with an optional binary suffix
+// (B, KiB, MiB, GiB, TiB) — the same shapes the Go runtime's own GOMEMLIMIT
+// accepts, because operators habitually write "4GiB" for GO_IVM_GOMEMLIMIT
+// too (pre-fix that parsed as an error and silently disabled every memory
+// fallback; see tuneRuntime).
+func parseByteSize(s string) (int64, bool) {
+	mult := int64(1)
+	num := s
+	for _, suf := range []struct {
+		s string
+		m int64
+	}{
+		{"KiB", 1 << 10}, {"MiB", 1 << 20}, {"GiB", 1 << 30}, {"TiB", 1 << 40}, {"B", 1},
+	} {
+		if strings.HasSuffix(s, suf.s) {
+			mult = suf.m
+			num = strings.TrimSuffix(s, suf.s)
+			break
+		}
+	}
+	n, err := strconv.ParseInt(strings.TrimSpace(num), 10, 64)
+	if err != nil || n < 0 || (mult > 1 && n > math.MaxInt64/mult) {
+		return 0, false
+	}
+	return n * mult, true
+}
+
 func tuneRuntime() {
 	// Crash forensics (REVIEW-napi-transport C1): a Go runtime FATAL (not a
 	// recovered panic — concurrent map write, stack overflow, etc.) prints its
@@ -2623,11 +2736,19 @@ func tuneRuntime() {
 		fmt.Fprintf(os.Stderr, "[GO-IVM] GC percent defaulted to 200 (override GO_IVM_GOGC / GOGC)\n")
 	}
 	if v := os.Getenv("GO_IVM_GOMEMLIMIT"); v != "" {
-		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+		if n, ok := parseByteSize(v); ok && n > 0 {
 			debug.SetMemoryLimit(n)
-			fmt.Fprintf(os.Stderr, "[GO-IVM] soft memory limit set to %d bytes (GO_IVM_GOMEMLIMIT)\n", n)
+			fmt.Fprintf(os.Stderr, "[GO-IVM] soft memory limit set to %d bytes (GO_IVM_GOMEMLIMIT=%s)\n", n, v)
+			return
 		}
-		return
+		// Scale review: a malformed value used to `return` here anyway —
+		// silently disabling EVERY fallback below (GOMEMLIMIT, cgroup
+		// percent, absolute) — so one typo ran the engine with no memory
+		// ceiling at GOGC=200: heap balloons to 3x live data, container
+		// OOM. Warn loudly and FALL THROUGH to the fallback chain.
+		fmt.Fprintf(os.Stderr,
+			"[GO-IVM] WARNING: unparseable GO_IVM_GOMEMLIMIT=%q ignored "+
+				"(want bytes or a KiB/MiB/GiB/TiB suffix); falling back to the default budget\n", v)
 	}
 	if os.Getenv("GOMEMLIMIT") != "" {
 		return // runtime already applied it
