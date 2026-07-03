@@ -5,7 +5,6 @@ package sqlite
 import (
 	"encoding/json"
 	"fmt"
-	"strconv"
 	"strings"
 	"time"
 
@@ -33,10 +32,9 @@ type Condition struct {
 
 // ValuePos represents a value position in a condition.
 type ValuePos struct {
-	Type    string    // "column", "literal", "static"
-	Name    string    // for column
-	Value   ivm.Value // for literal
-	ColType string    // optional: column type for literal conversion
+	Type  string    // "column", "literal", "static"
+	Name  string    // for column
+	Value ivm.Value // for literal
 }
 
 // ColumnSchema describes a column's type and nullability.
@@ -325,16 +323,38 @@ func valuePositionToSQL(vp ValuePos) (string, []interface{}) {
 	case "column":
 		return quoteIdent(vp.Name), nil
 	case "literal":
-		// Convert literal value through ToSQLiteType if column type known
-		converted := vp.Value
-		if vp.ColType != "" {
-			converted = ToSQLiteType(vp.Value, vp.ColType)
-		}
-		return "?", []interface{}{converted}
+		// M3 (napi review): TS types filter literals by the LITERAL's OWN JS
+		// type — valuePositionToSQL → toSQLiteType(v, getJsType(v))
+		// (zqlite/query-builder.ts:257,265) — NOT by the column's schema
+		// type. The old ColType plumbing coerced by COLUMN type, so e.g. a
+		// string literal compared against a json column was bound as its
+		// JSON encoding ('"x"' instead of x), and a string literal against a
+		// boolean column ('true') was bound as 1 — both silently matching
+		// different rows than TS. Constraints and cursors are DIFFERENT: TS
+		// types those by column schema (table-source toSQLiteTypes), which
+		// the constraint/start paths here still do.
+		return "?", []interface{}{ToSQLiteType(vp.Value, jsValueType(vp.Value))}
 	case "static":
 		panic("Static parameters must be replaced before conversion to SQL")
 	}
 	return "?", []interface{}{vp.Value}
+}
+
+// jsValueType mirrors zqlite/query-builder.ts getJsType: the ValueType of a
+// LITERAL as JS typeof sees it — null, string, number, boolean, else json.
+func jsValueType(v ivm.Value) string {
+	switch v.(type) {
+	case nil:
+		return "null"
+	case string:
+		return "string"
+	case float64, float32, int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64:
+		return "number"
+	case bool:
+		return "boolean"
+	default:
+		return "json"
+	}
 }
 
 // orderByToSQL generates ORDER BY clause.
@@ -589,19 +609,26 @@ func FromSQLiteType(v interface{}, colType string) ivm.Value {
 		case float64:
 			return boxFloat64(val)
 		case string:
-			// modernc.org/sqlite may return REAL values as strings
-			f, err := strconv.ParseFloat(val, 64)
-			if err != nil {
-				return v
-			}
-			return boxFloat64(f)
+			// User's-audit item (numeric-string coercion on the advance path):
+			// TS's fromSQLiteType 'number' branch NEVER parses strings — it
+			// only downcasts bigint and returns everything else AS-IS
+			// (table-source.ts fromSQLiteType), and the TS push path consumes
+			// incoming change rows without re-coercing at all. The old
+			// ParseFloat here (a modernc.org/sqlite legacy; mattn returns REAL
+			// as float64, so the hydrate path never took it) fired on the
+			// ADVANCE path via NormalizeRow: a numeric-looking string in a
+			// number column became float64 in Go while TS kept the string —
+			// row-content drift between engines. Pass through, like TS.
+			return val
 		case []byte:
-			f, err := strconv.ParseFloat(string(val), 64)
-			if err != nil {
-				return v
-			}
-			return boxFloat64(f)
+			// better-sqlite3 surfaces TEXT as a JS string, so TS's `return v`
+			// yields a STRING for text stored in a number column; mattn hands
+			// us []byte — convert the representation, never the value.
+			return string(val)
 		case bool:
+			// mattn's decltype conversion can surface BOOLEAN-declared INTEGER
+			// columns as bool; better-sqlite3 would have handed TS 0/1 →
+			// Number. Normalize back to the numeric the TS engine holds.
 			if val {
 				return boxFloat64(1)
 			}
@@ -634,17 +661,31 @@ func FromSQLiteType(v interface{}, colType string) ivm.Value {
 			return v
 		}
 	case "string":
+		// TS folds 'string' into the same branch as 'number'|'null'
+		// (table-source.ts fromSQLiteType): bigint → bounds-check → Number,
+		// everything else returned AS-IS. So an INTEGER stored in a string
+		// column surfaces in TS's engine as a JS NUMBER — not the formatted
+		// text the old FormatInt/FormatFloat produced (user's-audit coercion
+		// item; same class as the 'null'-branch divergence fixed 2026-07-03).
+		// []byte→string stays: better-sqlite3 hands TS TEXT as a JS string,
+		// mattn hands us []byte — representation conversion, not value.
 		switch val := v.(type) {
 		case []byte:
 			return string(val)
 		case string:
 			return val
 		case int64:
-			return strconv.FormatInt(val, 10)
-		case float64:
-			return strconv.FormatFloat(val, 'f', -1, 64)
+			if val > maxSafeInteger || val < -maxSafeInteger {
+				panic(ivm.NewDataError("FromSQLiteType(string): int64 %d exceeds JS MAX_SAFE_INTEGER (±2^53-1)", val))
+			}
+			return boxFloat64(float64(val))
+		case uint64:
+			if val > uint64(maxSafeInteger) {
+				panic(ivm.NewDataError("FromSQLiteType(string): uint64 %d exceeds JS MAX_SAFE_INTEGER (2^53-1)", val))
+			}
+			return boxFloat64(float64(val))
 		default:
-			return fmt.Sprintf("%v", v)
+			return v
 		}
 	case "null":
 		// TS folds 'null' with 'number'|'string' into ONE branch
@@ -692,7 +733,14 @@ func SelfCheckCoercion() error {
 		{"boolean", int64(1), true},
 		{"boolean", int64(0), false},
 		{"number", int64(42), float64(42)},
-		{"string", int64(7), "7"},
+		// 'string' type: the replica stores TEXT for string columns, so the
+		// init path's raw shape is []byte (mattn) where better-sqlite3 hands
+		// TS a JS string; the advance path ships the string directly. The
+		// previous {int64(7), "7"} pair modeled the OLD FormatInt behavior —
+		// which itself diverged from TS (TS's shared number|string|null
+		// branch turns bigint into Number, never into text), fixed under the
+		// user's-audit coercion item.
+		{"string", []byte("7"), "7"},
 		// 'null' type: TS's shared 'number|string|null' branch converts
 		// bigint→Number, so an int64 from the replica and a float64 from an
 		// advance row must converge on the same float64.

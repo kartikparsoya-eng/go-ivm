@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"unicode"
 
 	"golang.org/x/text/cases"
 	"golang.org/x/text/language"
@@ -130,7 +131,13 @@ func eagerLikePredicate(cond *Condition) (Predicate, bool) {
 			// TS patternToRegExp throw, at the same (build) time.
 			panic(ivm.NewDataError("LIKE pattern must not end with escape character"))
 		}
-		match = re.MatchString
+		if ci {
+			// M6: the regex literals were JS-canonicalized at compile; the
+			// input must go through the same mapping (see jsCanonicalize).
+			match = func(s string) bool { return re.MatchString(jsCanonicalize(s)) }
+		} else {
+			match = re.MatchString
+		}
 	}
 
 	left := cond.Left
@@ -142,8 +149,24 @@ func eagerLikePredicate(cond *Condition) (Predicate, bool) {
 			// BEFORE negation.
 			return false
 		}
-		return match(fmt.Sprintf("%v", lv)) != negate
+		return match(assertLikeString(lv)) != negate
 	}, true
+}
+
+// assertLikeString mirrors TS getLikePredicate's `assertString(lhs)`
+// (like.ts:10): a non-null, non-string LHS — reachable only via JSON-column
+// values, since zql's type system rejects LIKE on non-string columns — THROWS
+// in TS rather than being coerced. The old `fmt.Sprintf("%v", lv)` coercion
+// silently matched where TS errors (napi hostile review M7). DataError →
+// recovered per-query/per-push → RPC_CODE_DATA_ERROR → the TS side's
+// 'data-error' bucket (teardown, never reset) — the same terminal outcome as
+// TS's thrown assertion.
+func assertLikeString(v ivm.Value) string {
+	s, ok := v.(string)
+	if !ok {
+		panic(ivm.NewDataError("Expected string. Got %v", v))
+	}
+	return s
 }
 
 func resolveValue(vp *ValuePos, row ivm.Row) ivm.Value {
@@ -209,13 +232,13 @@ func evalOp(op string, left, right ivm.Value) bool {
 	case ">=":
 		return compareForOrder(left, right) >= 0
 	case "LIKE":
-		return matchLike(fmt.Sprintf("%v", left), fmt.Sprintf("%v", right), false)
+		return matchLike(assertLikeString(left), fmt.Sprintf("%v", right), false)
 	case "NOT LIKE":
-		return !matchLike(fmt.Sprintf("%v", left), fmt.Sprintf("%v", right), false)
+		return !matchLike(assertLikeString(left), fmt.Sprintf("%v", right), false)
 	case "ILIKE":
-		return matchLike(fmt.Sprintf("%v", left), fmt.Sprintf("%v", right), true)
+		return matchLike(assertLikeString(left), fmt.Sprintf("%v", right), true)
 	case "NOT ILIKE":
-		return !matchLike(fmt.Sprintf("%v", left), fmt.Sprintf("%v", right), true)
+		return !matchLike(assertLikeString(left), fmt.Sprintf("%v", right), true)
 	case "IN":
 		return valueIn(left, right)
 	case "NOT IN":
@@ -403,7 +426,26 @@ func matchLike(s, pattern string, caseInsensitive bool) bool {
 		// (recovered per-query / per-push), instead of silently no-matching.
 		panic(ivm.NewDataError("LIKE pattern must not end with escape character"))
 	}
+	if caseInsensitive {
+		// M6: canonicalize the input through the same JS non-'u' 'i'-flag
+		// mapping the compiled literals went through (see jsCanonicalize).
+		return re.MatchString(jsCanonicalize(s))
+	}
 	return re.MatchString(s)
+}
+
+// lowerCaserPool amortizes cases.Lower(language.Und) construction (napi
+// hostile review M5): a cases.Caser is stateful — NOT safe for concurrent
+// use — so the previous code built a fresh one PER unicodeLower CALL, i.e.
+// per row on the ILIKE fast path (~220ms per 441k-row hydrate in caser
+// construction alone, ×2 before H1 hoisted the RHS lowercase to build time).
+// Pool them: the transform machinery is reused across rows, and the pool
+// keeps the per-row path allocation-free under steady state.
+var lowerCaserPool = sync.Pool{
+	New: func() any {
+		c := cases.Lower(language.Und)
+		return &c
+	},
 }
 
 // unicodeLower is the Go mirror of JS String.prototype.toLowerCase() / the
@@ -412,7 +454,52 @@ func matchLike(s, pattern string, caseInsensitive bool) bool {
 // strings.ToLower would NOT match (it applies only simple, unconditional
 // mappings: "ΟΔΟΣ" -> "οδοσ" vs toLowerCase's "οδος").
 func unicodeLower(s string) string {
-	return cases.Lower(language.Und).String(s)
+	c := lowerCaserPool.Get().(*cases.Caser)
+	out := c.String(s)
+	lowerCaserPool.Put(c)
+	return out
+}
+
+// jsCanonicalRune mirrors ECMA-262 Canonicalize for a NON-'u' 'i'-flag
+// RegExp — what like.ts's `new RegExp(pattern, flags + 's')` actually
+// applies: uppercase the character; reject multi-char expansions (keep the
+// original); and NEVER fold a non-ASCII character into an ASCII one. RE2's
+// `(?i)` instead applies Unicode simple case folding, which over-matches TS
+// on exactly the orbits that last rule splits: ſ (U+017F LATIN SMALL LETTER
+// LONG S) folds with s/S under RE2 but stays distinct in JS (its uppercase
+// 'S' is ASCII while ſ is not → no fold), and KELVIN SIGN (U+212A) folds
+// with k/K under RE2 but not in JS (it uppercases to itself, ≠ 'K') — napi
+// hostile review M6.
+//
+// Go's unicode.ToUpper is the SIMPLE (single-rune) mapping; JS toUpperCase
+// is the full mapping, with multi-char results rejected by Canonicalize.
+// These agree by construction: UnicodeData leaves the simple uppercase
+// mapping empty exactly where SpecialCasing expands to multiple characters
+// (ß, ligatures, ΐ, …), so both sides keep the original rune there.
+// Astral runes never fold: JS canonicalizes UTF-16 code units and a lone
+// surrogate uppercases to itself, so anything above the BMP is identity.
+func jsCanonicalRune(r rune) rune {
+	if r > 0xFFFF {
+		return r
+	}
+	u := unicode.ToUpper(r)
+	if r >= 0x80 && u < 0x80 {
+		return r
+	}
+	return u
+}
+
+// jsCanonicalize maps every rune of s through jsCanonicalRune — the input-
+// side half of JS 'i'-flag matching (the pattern-literal side happens once
+// at compile in compileLikePattern). Rune-to-rune, so wildcard positions
+// (`.` from `_`) are unaffected.
+func jsCanonicalize(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		b.WriteRune(jsCanonicalRune(r))
+	}
+	return b.String()
 }
 
 func likeRegexpFor(pattern string, caseInsensitive bool) *regexp.Regexp {
@@ -469,9 +556,17 @@ func compileLikePattern(source string, caseInsensitive bool) *regexp.Regexp {
 	// 1.7.0: 'm' let ^/$ match interior line boundaries (false positives,
 	// 'fooa\nbar' LIKE 'foo_') while wildcards still refused to cross
 	// newlines (false negatives, 'a\nb' NOT LIKE 'a%b').
+	// Case-insensitivity is NOT RE2's (?i): that is Unicode simple folding,
+	// which over-matches JS's non-'u' 'i' flag on ſ / KELVIN SIGN (M6).
+	// Instead every literal rune is JS-canonicalized here, and the INPUT is
+	// canonicalized at match time (jsCanonicalize) — reproducing exactly how
+	// a JS 'i'-flag regex compares (Canonicalize both sides, then exact).
 	b.WriteString("(?s)")
-	if caseInsensitive {
-		b.WriteString("(?i)")
+	lit := func(r rune) {
+		if caseInsensitive {
+			r = jsCanonicalRune(r)
+		}
+		b.WriteString(regexp.QuoteMeta(string(r)))
 	}
 	b.WriteByte('^')
 	runes := []rune(source)
@@ -489,9 +584,9 @@ func compileLikePattern(source string, caseInsensitive bool) *regexp.Regexp {
 				return nil
 			}
 			i++
-			b.WriteString(regexp.QuoteMeta(string(runes[i])))
+			lit(runes[i])
 		default:
-			b.WriteString(regexp.QuoteMeta(string(c)))
+			lit(c)
 		}
 	}
 	b.WriteByte('$')

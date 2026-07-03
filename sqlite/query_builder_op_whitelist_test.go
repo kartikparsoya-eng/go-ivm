@@ -22,9 +22,8 @@ func colLit(col, op string, lit interface{}) *Condition {
 		Op:   op,
 		Left: ValuePos{Type: "column", Name: col},
 		Right: ValuePos{
-			Type:    "literal",
-			Value:   lit,
-			ColType: "text",
+			Type:  "literal",
+			Value: lit,
 		},
 	}
 }

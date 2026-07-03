@@ -3,10 +3,11 @@ package main
 // Regression tests for the row plane's ALL-OR-NOTHING partial contract
 // (REVIEW-napi-transport B2). Before the fix, emitChanges delivered
 // encodable rows as records IMMEDIATELY while unencodable ones waited for
-// the trailing fallback frame — reordering changes WITHIN a partial. The
-// canonical corruption: a remove-first group (cols never interned → every
-// later add/edit falls back) makes [add X (fallback), remove X (record)]
-// arrive at the client as remove-then-add → net phantom row → drift.
+// the trailing fallback frame — reordering changes WITHIN a partial: [add X
+// (fallback), remove X (record)] arrived at the client as remove-then-add →
+// net phantom row → drift. (The unencodable trigger in these tests is a
+// heterogeneous row — a column outside the group's canonical order; the
+// original remove-first trigger now encodes via replacement defs.)
 //
 // Drives rowPlane directly with a sinkCollector (no engine, no addon):
 // the contract under test is purely the record/frame routing.
@@ -60,29 +61,34 @@ func countKinds(col *sinkCollector) (defs, rows, frames int) {
 }
 
 // TestRowPlane_MixedPartialAllOrNothing is the B2 repro: a partial holding
-// one unencodable add (remove-first group) and one encodable remove must
-// ship ENTIRELY as one frame, in original change order, with ZERO records.
+// one unencodable add (foreign column outside the group's canonical order)
+// and one encodable remove must ship ENTIRELY as one frame, in original
+// change order, with ZERO records. (This originally used a remove-first
+// group as the unencodable trigger; the user's-audit fix made those encode
+// via replacement defs, so the trigger is now a heterogeneous row — the
+// remaining unencodable shape.)
 func TestRowPlane_MixedPartialAllOrNothing(t *testing.T) {
 	col := newSinkCollector()
 	rp := rowPlaneForTest(t, col, 5)
 
-	// Partial 1: a lone remove interns group (q1,t) with NO columns
-	// (remove-first). It row-encodes fine (removes carry PK values only).
+	// Partial 1: an ordinary add interns group (q1,t) with cols {id,n}.
 	rp.emitAdvancePartial(engine.AdvanceStreamPartial{
-		Changes: []engine.RowChange{rcRemove("q1", "seed")}, ChunkIndex: 0,
+		Changes: []engine.RowChange{rcAdd("q1", "seed")}, ChunkIndex: 0,
 	})
 	defs, rows, frames := countKinds(col)
 	if defs != 1 || rows != 1 || frames != 0 {
 		t.Fatalf("after partial1: defs=%d rows=%d frames=%d, want 1/1/0", defs, rows, frames)
 	}
 
-	// Partial 2: [add X (UNencodable — the group's cols were never
-	// interned), remove X (encodable)]. Pre-fix: remove left as a record
-	// BEFORE the add's fallback frame → client applied remove-then-add →
-	// phantom X. Post-fix: zero new records; ONE frame carrying both
-	// changes in original order.
+	// Partial 2: [add X (UNencodable — carries a column outside the
+	// canonical order), remove X (encodable)]. Pre-fix: remove left as a
+	// record BEFORE the add's fallback frame → client applied
+	// remove-then-add → phantom X. Post-fix: zero new records; ONE frame
+	// carrying both changes in original order.
+	heteroAdd := rcAdd("q1", "x")
+	heteroAdd.Row = ivm.Row{"id": "x", "zz": float64(9)} // zz ∉ {id,n}
 	rp.emitAdvancePartial(engine.AdvanceStreamPartial{
-		Changes:    []engine.RowChange{rcAdd("q1", "x"), rcRemove("q1", "x")},
+		Changes:    []engine.RowChange{heteroAdd, rcRemove("q1", "x")},
 		ChunkIndex: 1,
 	})
 	defs, rows, frames = countKinds(col)
@@ -157,12 +163,15 @@ func TestRowPlane_MixedFinalPartialCarriesEverything(t *testing.T) {
 	col := newSinkCollector()
 	rp := rowPlaneForTest(t, col, 9)
 
-	// Remove-first group again, then a final partial with add+remove.
+	// Ordinary group, then a final partial mixing a heterogeneous
+	// (unencodable) add with an encodable remove.
 	rp.emitAdvancePartial(engine.AdvanceStreamPartial{
-		Changes: []engine.RowChange{rcRemove("q2", "seed")},
+		Changes: []engine.RowChange{rcAdd("q2", "seed")},
 	})
+	heteroAdd := rcAdd("q2", "y")
+	heteroAdd.Row = ivm.Row{"id": "y", "zz": float64(1)} // zz ∉ canonical cols
 	rp.emitAdvancePartial(engine.AdvanceStreamPartial{
-		Changes:    []engine.RowChange{rcAdd("q2", "y"), rcRemove("q2", "z")},
+		Changes:    []engine.RowChange{heteroAdd, rcRemove("q2", "z")},
 		ChunkIndex: 1,
 		Final:      true,
 	})

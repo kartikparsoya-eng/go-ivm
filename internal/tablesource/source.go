@@ -1855,8 +1855,11 @@ func (s *Source) UnbindReaderPool() {
 }
 
 // convertFilter converts a builder.Condition (AST-level) to a sqlite.Condition
-// for SQL pushdown. Sets ColType on literal sides from the column side's schema
-// so ToSQLiteType can handle booleans (true→1, false→0) and JSON marshalling.
+// for SQL pushdown. Literal typing happens in the sqlite layer by the
+// LITERAL's own JS-type (query_builder.go jsValueType — mirrors TS
+// query-builder.ts getJsType); the old column-schema ColType stamping made a
+// string literal on a json column bind as its JSON encoding, diverging from
+// TS (napi review M3).
 func (s *Source) convertFilter(cond *builder.Condition) *sqlite.Condition {
 	if cond == nil {
 		return nil
@@ -1905,20 +1908,6 @@ func (s *Source) convertSimpleCondition(cond *builder.Condition) *sqlite.Conditi
 	}
 	out.Left = s.convertValuePos(cond.Left)
 	out.Right = s.convertValuePos(cond.Right)
-	if cond.Left != nil && cond.Left.Type == "column" {
-		if cs, ok := s.columns[cond.Left.Name]; ok {
-			if out.Right.Type == "literal" {
-				out.Right.ColType = cs.Type
-			}
-		}
-	}
-	if cond.Right != nil && cond.Right.Type == "column" {
-		if cs, ok := s.columns[cond.Right.Name]; ok {
-			if out.Left.Type == "literal" {
-				out.Left.ColType = cs.Type
-			}
-		}
-	}
 	return out
 }
 

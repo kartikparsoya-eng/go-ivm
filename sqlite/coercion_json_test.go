@@ -146,16 +146,44 @@ func TestFromSQLiteType_NumberHigh9AtBoundarySucceeds(t *testing.T) {
 	}
 }
 
-// TestFromSQLiteType_StringPreservesLargeInt verifies that the string
-// type path preserves full int64 precision — converting to a decimal
-// string via strconv.FormatInt, NOT through float64. A string column
-// holding a large int must not lose precision.
-func TestFromSQLiteType_StringPreservesLargeInt(t *testing.T) {
-	large := int64(1) << 60 // 1152921504606846976 — far beyond 2^53
-	got := FromSQLiteType(large, "string")
-	want := "1152921504606846976"
-	if got != want {
-		t.Fatalf("FromSQLiteType(int64(%d), string) = %#v, want %#v", large, got, want)
+// TestFromSQLiteType_StringMirrorsTS (user's-audit coercion item): TS folds
+// 'string' into the SAME branch as 'number'|'null' (table-source.ts
+// fromSQLiteType) — bigint → bounds-check → Number(v), everything else
+// returned AS-IS. So an INTEGER stored in a string column surfaces in TS's
+// engine as a JS NUMBER, and one beyond ±(2^53−1) THROWS
+// UnsupportedValueError. The old Go behavior (strconv.FormatInt to a
+// decimal string, "preserving" precision) was itself the divergence: it
+// handed Go a string where TS holds a number, splitting comparators and
+// canonical keys between the engines.
+func TestFromSQLiteType_StringMirrorsTS(t *testing.T) {
+	// In-range int64 → float64, like TS's Number(bigint).
+	if got := FromSQLiteType(int64(42), "string"); got != float64(42) {
+		t.Fatalf("FromSQLiteType(int64(42), string) = %#v, want float64(42) (TS Number)", got)
+	}
+	// float64 passthrough (TS `return v`).
+	if got := FromSQLiteType(float64(1.5), "string"); got != float64(1.5) {
+		t.Fatalf("FromSQLiteType(1.5, string) = %#v, want 1.5 passthrough", got)
+	}
+	// Beyond MAX_SAFE → panic, mirroring TS's UnsupportedValueError throw.
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatal("FromSQLiteType(int64(1<<60), string) should panic like TS's UnsupportedValueError")
+		}
+	}()
+	FromSQLiteType(int64(1)<<60, "string")
+}
+
+// TestFromSQLiteType_NumberStringNotParsed (user's-audit item — the
+// numeric-string coercion on the advance path): TS's 'number' branch never
+// parses strings; the old Go ParseFloat (a modernc legacy, dead on the
+// mattn hydrate path) fired via NormalizeRow on the ADVANCE path, turning a
+// numeric-looking string into float64 where TS keeps the string.
+func TestFromSQLiteType_NumberStringNotParsed(t *testing.T) {
+	if got := FromSQLiteType("123.45", "number"); got != "123.45" {
+		t.Fatalf("FromSQLiteType(%q, number) = %#v; TS returns the string unchanged", "123.45", got)
+	}
+	if got := FromSQLiteType([]byte("67.8"), "number"); got != "67.8" {
+		t.Fatalf("FromSQLiteType([]byte %q, number) = %#v; want the TEXT as string, unparsed", "67.8", got)
 	}
 }
 

@@ -210,7 +210,9 @@ func TestRowRecordEncoder_RoundTrip(t *testing.T) {
 		t.Fatalf("remove decode wrong: %+v", drm)
 	}
 
-	// Remove-FIRST group: def emitted with no cols; later add falls back.
+	// Remove-FIRST group: def emitted with PK-only cols; a later add/edit
+	// mints a REPLACEMENT group with full columns (user's-audit fix —
+	// pre-fix the (queryID,table) was pinned to the frame plane forever).
 	rmFirst := engine.RowChange{
 		Type:    engine.RowChangeRemove,
 		QueryID: "q2",
@@ -235,9 +237,21 @@ func TestRowRecordEncoder_RoundTrip(t *testing.T) {
 		RowKey:  map[string]interface{}{"pid": int64(9)},
 		Row:     ivm.Row{"pid": int64(9), "title": "x"},
 	}
-	gL, _ := enc.groupFor(&addLater)
-	if _, ok := enc.encodeRow(gL, &addLater); ok {
-		t.Fatal("add against a remove-first (col-less) group MUST fall back")
+	gL, defL := enc.groupFor(&addLater)
+	if defL == nil {
+		t.Fatal("first add after a remove-first def must mint a REPLACEMENT def")
+	}
+	dL := decodeGroupDef(t, defL)
+	if dL.groupID == d2.groupID {
+		t.Fatalf("replacement def must carry a FRESH groupID (got %d twice) — "+
+			"defs are immutable JS-side", dL.groupID)
+	}
+	if fmt.Sprint(dL.cols) != fmt.Sprint([]string{"pid", "title"}) {
+		t.Fatalf("replacement def cols = %v, want [pid title]", dL.cols)
+	}
+	if _, ok := enc.encodeRow(gL, &addLater); !ok {
+		t.Fatal("add after the replacement def must encode as a record " +
+			"(pre-fix it fell back to the frame plane forever)")
 	}
 }
 

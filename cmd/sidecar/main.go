@@ -674,6 +674,19 @@ func connMaxIdleFromEnv() time.Duration {
 // re-hydrate anyway.
 var maxDiffChanges = envPositiveInt("GO_IVM_MAX_DIFF_CHANGES", 50_000)
 
+// advanceBudgetMs is the wall-clock budget for ONE advanceToHead[Stream]
+// call (derive + Collect + engine apply + emit). User's-audit item: a
+// pathologically slow advance pins the WAL2 frame the diff was derived
+// against for its whole duration (blocking checkpointing of that range),
+// and in Go-primary mode TS suppresses its own advance-time breaker — so
+// nothing bounded a wedged advance. On budget exceed the RPC errors
+// mid-stream (a plain error, NOT a DataError: it must land in the TS
+// classifier's 'unclassified' → ResetPipelinesSignal bucket so the caller
+// resets/re-hydrates with bounded time, exactly like the
+// GO_IVM_MAX_DIFF_CHANGES refusal bounds memory). Var, not const, for
+// tests. Practically disable by setting it very large.
+var advanceBudgetMs = envPositiveInt("GO_IVM_ADVANCE_BUDGET_MS", 60_000)
+
 // --- RPC types ---
 
 type RPCRequest struct {

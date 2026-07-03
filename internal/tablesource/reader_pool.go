@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"sort"
 )
 
 // stateVersionSQL reads the replica's monotonic replication version — TS's
@@ -31,26 +32,78 @@ const maxConvergeAttempts = 10
 // cache. It is borrowed exclusively (one goroutine at a time) via ReaderPool,
 // so it needs no internal locking — the per-reader stmt cache replaces the
 // s.mu-guarded Source.stmtCache used on the single-conn path.
+//
+// The cache is BOUNDED (napi review M4): IN-clause SQL shapes vary by list
+// LENGTH — `IN (?,?)` vs `IN (?,?,?)` are distinct texts — so a batched
+// flipped-join hydrate with varying key-set sizes mints unbounded distinct
+// shapes, each pinning a compiled sqlite3_stmt on the C heap (invisible to
+// Go's allocator and GOMEMLIMIT) for the reader's lifetime. Same bound and
+// eviction policy as Source.stmtCache (stmtCachePerConnCap, evict the
+// least-recently-USED quarter): warm pools survive across a whole
+// addQueries batch, and cold-start pools across the entire initial-hydrate
+// window, so "torn down soon anyway" does not bound the growth.
+//
+// Eviction closing an in-use stmt cannot happen: fetchViaPool drains each
+// SELECT eagerly (scanRows materialises before returning), so no cursor is
+// open when the NEXT prepared() call — the only eviction trigger — runs on
+// this exclusively-borrowed reader.
 type poolReader struct {
 	conn  *sql.Conn
-	stmts map[string]*sql.Stmt
+	stmts map[string]*poolStmt
+	tick  uint64
+}
+
+// poolStmt pairs a prepared statement with its last-use tick for the
+// eviction scan (mirrors Source.cachedStmt).
+type poolStmt struct {
+	st       *sql.Stmt
+	lastTick uint64
 }
 
 func (r *poolReader) prepared(ctx context.Context, query string) (*sql.Stmt, error) {
-	if st, ok := r.stmts[query]; ok {
-		return st, nil
+	r.tick++
+	if e, ok := r.stmts[query]; ok {
+		e.lastTick = r.tick
+		return e.st, nil
 	}
 	st, err := r.conn.PrepareContext(ctx, query)
 	if err != nil {
 		return nil, err
 	}
-	r.stmts[query] = st
+	r.stmts[query] = &poolStmt{st: st, lastTick: r.tick}
+	if len(r.stmts) > stmtCachePerConnCap {
+		r.evictColdest()
+	}
 	return st, nil
 }
 
+// evictColdest closes and drops the least-recently-used quarter of the
+// cache. Runs only when a NEW shape lands on a full cache; steady-state
+// reuse of existing shapes never triggers it. The just-inserted entry has
+// the highest tick, so it always survives.
+func (r *poolReader) evictColdest() {
+	type kv struct {
+		sql  string
+		tick uint64
+	}
+	entries := make([]kv, 0, len(r.stmts))
+	for q, e := range r.stmts {
+		entries = append(entries, kv{q, e.lastTick})
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].tick < entries[j].tick })
+	drop := len(entries) / 4
+	if drop < 1 {
+		drop = 1
+	}
+	for _, e := range entries[:drop] {
+		_ = r.stmts[e.sql].st.Close()
+		delete(r.stmts, e.sql)
+	}
+}
+
 func (r *poolReader) close(ctx context.Context) {
-	for _, st := range r.stmts {
-		_ = st.Close()
+	for _, e := range r.stmts {
+		_ = e.st.Close()
 	}
 	_, _ = r.conn.ExecContext(ctx, "ROLLBACK")
 	_ = r.conn.Close()
@@ -127,7 +180,7 @@ func NewReaderPool(ctx context.Context, db *sql.DB, _ string, k int) (*ReaderPoo
 			}
 			return nil, fmt.Errorf("reader pool: read stateVersion conn %d: %w", i, err)
 		}
-		readers[i] = &poolReader{conn: conn, stmts: map[string]*sql.Stmt{}}
+		readers[i] = &poolReader{conn: conn, stmts: map[string]*poolStmt{}}
 		versions[i] = ver
 	}
 

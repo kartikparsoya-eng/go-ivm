@@ -53,6 +53,25 @@ var registerGoivmDriver = sync.OnceValue(func() string {
 	return goivmDriverName
 })
 
+// sqlLowerCaserPool amortizes cases.Lower(language.Und) construction (napi
+// review M5 twin): the lower() override runs PER VALUE PER ROW during every
+// ILIKE scan, and a cases.Caser is stateful (not concurrency-safe), so the
+// previous per-call construction paid the language lookup + transformer
+// build on every row.
+var sqlLowerCaserPool = sync.Pool{
+	New: func() any {
+		c := cases.Lower(language.Und)
+		return &c
+	},
+}
+
+func sqlUnicodeLower(s string) string {
+	c := sqlLowerCaserPool.Get().(*cases.Caser)
+	out := c.String(s)
+	sqlLowerCaserPool.Put(c)
+	return out
+}
+
 // unicodeLowerSQL mirrors the full ICU lower() contract, not just its case
 // mapping — the argument is `any` so mattn uses callbackArgGeneric, which
 // accepts every SQLite type. The previous func(string) string registration
@@ -86,9 +105,9 @@ func unicodeLowerSQL(v any) any {
 		if x == nil {
 			return nil // SQLITE_NULL
 		}
-		return cases.Lower(language.Und).String(string(x))
+		return sqlUnicodeLower(string(x))
 	case string:
-		return cases.Lower(language.Und).String(x)
+		return sqlUnicodeLower(x)
 	case int64:
 		return strconv.FormatInt(x, 10)
 	case float64:

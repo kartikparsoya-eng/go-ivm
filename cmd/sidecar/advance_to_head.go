@@ -54,6 +54,29 @@ type resetWire struct {
 	Msg    string `json:"msg"`
 }
 
+// advanceDeadline computes this call's budget deadline from
+// advanceBudgetMs. ok=false when the budget is non-positive (disabled).
+func advanceDeadline() (time.Time, bool) {
+	if advanceBudgetMs <= 0 {
+		return time.Time{}, false
+	}
+	return time.Now().Add(time.Duration(advanceBudgetMs) * time.Millisecond), true
+}
+
+// checkAdvanceBudget panics a PLAIN error (recovered by
+// handleStreamWithRecover → rpcError) when the budget deadline has passed.
+// Deliberately NOT a DataError: the TS classifier must file this under
+// 'unclassified' (→ ResetPipelinesSignal → re-hydrate), not 'data-error'
+// (→ CG teardown, never reset).
+func checkAdvanceBudget(deadline time.Time, on bool, phase, cgID string) {
+	if on && time.Now().After(deadline) {
+		panic(fmt.Sprintf(
+			"advance exceeded GO_IVM_ADVANCE_BUDGET_MS=%d during %s (cg=%s) — "+
+				"caller should reset/re-hydrate; a slow advance pins the WAL frame "+
+				"the diff was derived against", advanceBudgetMs, phase, cgID))
+	}
+}
+
 type advanceToHeadResult struct {
 	// Changes is the Go-derived diff (P1 pure-derivation / shadow compare).
 	// Populated when NOT in drive mode; omitted in drive mode.
@@ -551,6 +574,9 @@ func (s *Server) handleAdvanceToHead(req RPCRequest) RPCResponse {
 	}
 	version := diff.Curr().Version()
 	drive := s.advanceDriveEnabled
+	// Advance-time budget (user's-audit item): starts at the leapfrog — from
+	// here the diff pins prev's WAL frame until the apply finishes.
+	budgetDeadline, budgetOn := advanceDeadline()
 
 	// After the leapfrog, the sources (sticky-bound to the old curr) ARE bound
 	// to diff.Prev() — the exact frame the diff was derived against. Make it
@@ -610,6 +636,16 @@ func (s *Server) handleAdvanceToHead(req RPCRequest) RPCResponse {
 	// coordinated against diff.Prev()) and return the resulting RowChanges +
 	// version — a fully self-consistent advance with no TS-shipped diff.
 	if drive {
+		// Budget check between derive and apply: Collect of a near-cap diff
+		// can alone consume the budget; refuse before pinning prev through a
+		// long engine apply too. The non-streaming call has no per-chunk
+		// checkpoint, so this is its only cut point.
+		if budgetOn && time.Now().After(budgetDeadline) {
+			rebindCurr()
+			return rpcError(req.ID, -32000, fmt.Sprintf(
+				"advanceToHead exceeded GO_IVM_ADVANCE_BUDGET_MS=%d before apply (cg=%s) — "+
+					"caller should reset/re-hydrate", advanceBudgetMs, cgID))
+		}
 		snapChanges := make([]engine.SnapshotChange, len(changes))
 		for i, c := range changes {
 			snapChanges[i] = engine.SnapshotChange{
@@ -742,6 +778,13 @@ func (s *Server) handleAdvanceToHeadStream(req RPCRequest, streamW streamWriter)
 		return resp
 	}
 
+	// Advance-time budget (user's-audit item): one deadline covers derive +
+	// Collect + engine apply + emit — the whole window during which the diff
+	// pins prev's WAL frame. Checked between phases and per streamed partial
+	// (checkAdvanceBudget panics; handleStreamWithRecover → rpcError → the
+	// TS classifier's reset bucket).
+	budgetDeadline, budgetOn := advanceDeadline()
+
 	// First advance ends the cold-start hydrate window; drop the reader pool
 	// before curr rotates off its pinned frame.
 	s.tearDownReaderPool(group)
@@ -808,6 +851,9 @@ func (s *Server) handleAdvanceToHeadStream(req RPCRequest, streamW streamWriter)
 			NextValue:  c.NextValue,
 		}
 	}
+	// Budget cut between Collect and the engine apply (the apply itself is
+	// checked per emitted partial below).
+	checkAdvanceBudget(budgetDeadline, budgetOn, "collect", cgID)
 
 	// Apply Go's own derived diff to Go's engine, frame-coordinated against
 	// diff.Prev(), streaming the resulting RowChanges in advanceChunkSize-sized
@@ -825,6 +871,11 @@ func (s *Server) handleAdvanceToHeadStream(req RPCRequest, streamW streamWriter)
 	// pipe (see rowplane.go's ordering invariant).
 	if rp := newRowPlane(s, req.ID, p.RowMode); rp != nil {
 		streamErr := group.eng.AdvanceStreamChunked(snapChanges, 1, func(r engine.AdvanceStreamPartial) {
+			// Per-partial budget checkpoint: a panic here escapes
+			// AdvanceStreamChunked cleanly (engine stays reusable — see
+			// TestAdvanceStream_PanickingSink_NoDeadlockAndEngineReusable)
+			// and handleStreamWithRecover converts it to an RPC error.
+			checkAdvanceBudget(budgetDeadline, budgetOn, "apply", cgID)
 			rp.emitAdvanceToHeadPartial(r, version, numChanges)
 			if r.Drift != nil {
 				fmt.Fprintf(os.Stderr, "[GO-IVM][drift] advanceToHeadStream(rowMode) cg=%s %s\n",
@@ -846,6 +897,7 @@ func (s *Server) handleAdvanceToHeadStream(req RPCRequest, streamW streamWriter)
 	}
 
 	streamErr := group.eng.AdvanceStream(snapChanges, func(r engine.AdvanceStreamPartial) {
+		checkAdvanceBudget(budgetDeadline, budgetOn, "apply", cgID)
 		pc := toPositional(r.Changes)
 		part := advanceToHeadStreamPartial{
 			Dict:       pc.Dict,

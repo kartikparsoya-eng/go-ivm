@@ -77,6 +77,153 @@ func TestMatchLike(t *testing.T) {
 	}
 }
 
+// TestMatchLikeUpstreamCases ports the ENTIRE upstream corpus from
+// packages/zql/src/builder/like-test-cases.ts 1:1 (napi review M9: nine of
+// these blocks had no Go counterpart). Every input/expectation pair is
+// upstream's — verified there against SQLite — so this is the strongest
+// like.ts-parity pin we can hold without executing TS.
+func TestMatchLikeUpstreamCases(t *testing.T) {
+	type block struct {
+		pattern string
+		ci      bool // upstream flags: 'i' | ''
+		inputs  []struct {
+			s    string
+			want bool
+		}
+	}
+	in := func(pairs ...any) (out []struct {
+		s    string
+		want bool
+	}) {
+		for i := 0; i < len(pairs); i += 2 {
+			out = append(out, struct {
+				s    string
+				want bool
+			}{pairs[i].(string), pairs[i+1].(bool)})
+		}
+		return
+	}
+	blocks := []block{
+		{"foo", false, in("foo", true, "bar", false, "Foo", false, "FOO", false,
+			"fo", false, "fooa", false, "afoo", false, "afoob", false)},
+		{"foo", true, in("foo", true, "bar", false, "Foo", true, "FOO", true,
+			"fo", false, "fooa", false, "afoo", false, "afoob", false)},
+		{"foo%", false, in("foo", true, "foobar", true, "bar", false, "Foo", false,
+			"FOO", false, "fo", false, "fooa", true, "afoo", false, "afoob", false)},
+		{"foo%", true, in("foo", true, "foobar", true, "bar", false, "Foo", true,
+			"FOO", true, "fo", false, "fooa", true, "afoo", false, "afoob", false,
+			"foo\nbar", true, "foobar\nbaz", true)},
+		{"foo_", false, in("foo", false, "foobar", false, "foob", true, "bar", false,
+			"Foo", false, "FOO", false, "fo", false, "afoo", false, "afoob", false,
+			// 8 chars vs exactly-4 pattern; the buggy 'm' flag matched "fooa".
+			"fooa\nbar", false)},
+		{"a%b", false, in("a\nb", true, "axb", true, "ab", true, "z\nab", false, "a\nbz", false)},
+		{"a_b", false, in("a\nb", true, "axb", true, "ab", false, "a\nbc", false)},
+		{`foo\%`, false, in("foo%", true, "foobar", false, "bar", false, "Foo", false,
+			"FOO", false, "fo", false, "fooa", false, "afoo", false, "afoob", false)},
+		{`foo\%`, true, in("foo%", true, "FOO%", true, "foobar", false, "bar", false,
+			"Foo", false, "FOO", false, "fo", false, "fooa", false, "afoo", false, "afoob", false)},
+		{`foo\_`, false, in("foo_", true, "FOO_", false, "foobar", false, "bar", false,
+			"Foo", false, "FOO", false, "fo", false, "fooa", false, "afoo", false, "afoob", false)},
+		{"%foo", false, in("foo", true, "foobar", false, "bar", false, "Foo", false,
+			"FOO", false, "fo", false, "fooa", false, "afoo", true, "afoob", false,
+			"monkey\nfoo", true, "mon\nkeyfoo", true)},
+		{"%foo%", false, in("foo", true, "foobar", true, "bar", false, "Foo", false,
+			"FOO", false, "fo", false, "fooa", true, "afoo", true, "afoob", true,
+			"mon\nfoo\nkey", true, "m\nonfooke\ny", true)},
+		{"%foo\nbar%", false, in("foo\nbar", true, "foo\nbar\n", true,
+			"foo\nbar\nbaz", true, "monkey\nfoo\nbar", true)},
+	}
+	for _, blk := range blocks {
+		flag := ""
+		if blk.ci {
+			flag = "i"
+		}
+		for _, c := range blk.inputs {
+			if got := matchLike(c.s, blk.pattern, blk.ci); got != c.want {
+				t.Errorf("matchLike(%q, %q, %q) = %v, want %v (upstream like-test-cases.ts)",
+					c.s, blk.pattern, flag, got, c.want)
+			}
+		}
+	}
+}
+
+// TestMatchLikeJSCanonicalizeFold pins M6: like.ts uses a NON-'u' 'i'-flag
+// RegExp, whose ECMA-262 Canonicalize never folds a non-ASCII character into
+// an ASCII one and never folds KELVIN SIGN into k. RE2's (?i) — the pre-fix
+// implementation — applies Unicode simple case folding, which conflates all
+// of these and silently over-matched TS.
+func TestMatchLikeJSCanonicalizeFold(t *testing.T) {
+	cases := []struct {
+		name       string
+		s, pattern string
+		want       bool
+	}{
+		// ſ (U+017F): RE2 (?i) folds ſ~s~S (pre-fix: true); JS does not.
+		{"long s does not fold into s (wildcard)", "\u017Ftra\u00DFe", "s%", false},
+		{"s does not fold into long s (wildcard)", "strasse", "\u017F%", false},
+		// KELVIN SIGN (U+212A): RE2 (?i) folds K~k~K; JS does not.
+		{"kelvin does not fold into k (wildcard)", "\u212Aelvin", "k%", false},
+		{"k does not fold into kelvin (wildcard)", "kelvin", "\u212A%", false},
+		// Positive controls: ordinary folds still work through canonicalize.
+		{"ascii fold still matches", "Kelvin", "k%", true},
+		{"accents fold still matches", "\u00C9cole", "\u00E9%", true},
+		{"greek fold still matches", "\u03A3\u03BF\u03C6", "\u03C3%", true},
+		// Final sigma: Canonicalize(ς)=Σ=Canonicalize(σ) — JS matches these.
+		{"final sigma folds via uppercase", "\u03BF\u03B4\u03BF\u03C2!", "\u03BF\u03B4\u03BF\u03C3_", true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := matchLike(c.s, c.pattern, true); got != c.want {
+				t.Fatalf("ILIKE matchLike(%q, %q) = %v, want %v (JS 'i' Canonicalize)",
+					c.s, c.pattern, got, c.want)
+			}
+		})
+	}
+}
+
+// TestLikeNonStringLHSPanics pins M7: TS's getLikePredicate asserts the LHS
+// is a string (like.ts:10 assertString) — reachable via JSON-column values —
+// and THROWS. Go previously coerced via fmt.Sprintf("%v"), silently matching
+// (`5 LIKE '5'` was true) where TS errors. Both the eager (literal-RHS) and
+// lazy (evalOp) paths must panic a DataError.
+func TestLikeNonStringLHSPanics(t *testing.T) {
+	mustPanic := func(t *testing.T, f func()) {
+		t.Helper()
+		defer func() {
+			r := recover()
+			if r == nil {
+				t.Fatal("non-string LIKE LHS did not panic; TS assertString throws")
+			}
+			if _, ok := r.(*ivm.DataError); !ok {
+				t.Fatalf("panic value = %T (%v); want *ivm.DataError", r, r)
+			}
+		}()
+		f()
+	}
+	t.Run("eager literal-RHS path", func(t *testing.T) {
+		pred := BuildPredicate(&Condition{
+			Type: "simple", Op: "LIKE",
+			Left:  &ValuePos{Type: "column", Name: "j"},
+			Right: &ValuePos{Type: "literal", Value: "5%"},
+		})
+		mustPanic(t, func() { pred(ivm.Row{"j": float64(55)}) })
+	})
+	t.Run("lazy evalOp path", func(t *testing.T) {
+		mustPanic(t, func() { evalOp("ILIKE", float64(5), "5") })
+	})
+	// Null LHS stays FALSE (short-circuits before the assert), matching
+	// filter.ts:88-93.
+	pred := BuildPredicate(&Condition{
+		Type: "simple", Op: "LIKE",
+		Left:  &ValuePos{Type: "column", Name: "j"},
+		Right: &ValuePos{Type: "literal", Value: "5%"},
+	})
+	if pred(ivm.Row{"j": nil}) {
+		t.Fatal("null LHS must be false, not a panic or a match")
+	}
+}
+
 // TestMatchLikeTrailingEscapePanics: TS throws "LIKE pattern must not end
 // with escape character" at predicate build; Go must panic a DataError (the
 // engine recovers it per-query) rather than silently matching nothing.

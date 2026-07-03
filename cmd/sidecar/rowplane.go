@@ -22,16 +22,17 @@ package main
 //
 // Fallback contract (ALL-OR-NOTHING per partial — REVIEW-napi-transport
 // B2): if ANY change in a partial can't be row-encoded (non-homogeneous
-// column set, remove-first group taking a later add — see encodeRow), the
-// ENTIRE partial ships inside one positional msgpack partial and ZERO of
-// its rows go out as records. Mixing planes within a partial would reorder
-// its changes — encodable rows left immediately as records while fallback
-// rows waited for the trailing frame, so [add X (fallback), remove X
-// (record)] arrived at the client as remove-then-add: net phantom row →
-// drift. chunkSize=1 partials mostly dodge this, but remove-first groups
-// fall back forever and the residual-drain path produces multi-change
-// partials, so the interleave was reachable. Correct over fast; the TS
-// row-mode accumulator accepts both planes.
+// column set — see encodeRow), the ENTIRE partial ships inside one
+// positional msgpack partial and ZERO of its rows go out as records. Mixing
+// planes within a partial would reorder its changes — encodable rows left
+// immediately as records while fallback rows waited for the trailing frame,
+// so [add X (fallback), remove X (record)] arrived at the client as
+// remove-then-add: net phantom row → drift. chunkSize=1 partials mostly
+// dodge this, and remove-first groups regained the record path via
+// groupFor's replacement-def minting (user's-audit fix), but the
+// residual-drain path still produces multi-change partials, so the
+// interleave stays reachable. Correct over fast; the TS row-mode
+// accumulator accepts both planes.
 
 import (
 	"fmt"

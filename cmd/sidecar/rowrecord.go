@@ -86,6 +86,10 @@ type rowRecordEncoder struct {
 	reqID  float64
 	groups map[pgKey]*rowGroup
 	buf    []byte
+	// nextGroupID mints per-RPC-unique group ids. NOT len(groups): a
+	// remove-first group is REPLACED in the map by a fresh full-column group
+	// on its first add/edit (see groupFor), so len(groups) can repeat.
+	nextGroupID uint32
 }
 
 type rowGroup struct {
@@ -97,6 +101,12 @@ type rowGroup struct {
 	// putShortStr). The def was never delivered, so NO record may reference
 	// this group (removes included) or the JS side throws "unknown group".
 	frameOnly bool
+	// needsCols marks a remove-first group: its def shipped with ncols=0
+	// (removes carry PK values only, so that def is fully usable for
+	// removes). Defs are immutable JS-side, so the first add/edit cannot
+	// amend it — instead groupFor mints a REPLACEMENT group (fresh id, full
+	// columns) for the same (queryID,table) and swaps it into the map.
+	needsCols bool
 }
 
 func newRowRecordEncoder(reqID float64) *rowRecordEncoder {
@@ -186,25 +196,35 @@ func (e *rowRecordEncoder) putShortStr(s string) bool {
 // into e.buf on first sight. Returns (group, defRecord) where defRecord is
 // nil if the group was already known. The returned slice aliases e.buf and
 // must be consumed (copied by abiDeliver's sink) before the next encode.
+//
+// Remove-first groups (user's-audit item): removes carry no Row, so a group
+// whose FIRST change is a remove interns with PK-only columns (ncols=0) and
+// needsCols=true — sufficient for every remove record. When the first
+// add/edit arrives, the def cannot be amended (immutable JS-side), so a
+// REPLACEMENT group is minted — fresh id, full columns — and swapped into
+// the map. Old records keep referencing the old (still-registered) def;
+// everything later rides the new one. Pre-fix, the remove-first group froze
+// cols=nil forever and every subsequent add/edit for that (queryID,table)
+// fell back to the msgpack frame plane for the rest of the RPC — an entire
+// advance losing per-row delivery because a delete happened to come first.
 func (e *rowRecordEncoder) groupFor(c *engine.RowChange) (*rowGroup, []byte) {
 	k := pgKey{c.QueryID, c.Table}
+	haveRow := c.Type != engine.RowChangeRemove && c.Row != nil
 	if g, ok := e.groups[k]; ok {
-		return g, nil
+		if !(g.needsCols && haveRow) {
+			return g, nil
+		}
+		// Remove-first group receiving its first add/edit: fall through and
+		// mint the full-column replacement.
 	}
-	g := &rowGroup{id: uint32(len(e.groups)), pk: sortedMapKeys(c.RowKey)}
-	// Canonical column order: first row's sorted keys (homogeneity
-	// contract — see file comment). Removes carry no Row; their group's
-	// cols stay empty until an add/edit arrives... except a group whose
-	// FIRST change is a remove: encode its def with PK only; a later
-	// add/edit for the same group would then find cols empty. Guard: only
-	// intern column order when we have a Row; remove-first groups defer
-	// column fixing to the first add/edit by re-encoding a fresh def is
-	// NOT possible (defs are immutable JS-side). Instead: remove-only
-	// groups never need cols (removes encode PK values), and a mixed
-	// group starting with a remove takes the FIRST ADD/EDIT's keys via
-	// lazy fill below.
-	if c.Type != engine.RowChangeRemove && c.Row != nil {
+	g := &rowGroup{id: e.nextGroupID, pk: sortedMapKeys(c.RowKey)}
+	e.nextGroupID++
+	if haveRow {
+		// Canonical column order: first ROW-carrying change's sorted keys
+		// (homogeneity contract — see file comment).
 		g.cols = sortedRowKeys(c.Row)
+	} else {
+		g.needsCols = true
 	}
 	e.groups[k] = g
 
@@ -262,9 +282,10 @@ func (e *rowRecordEncoder) encodeRow(g *rowGroup, c *engine.RowChange) ([]byte, 
 			return nil, false
 		}
 		if g.cols == nil {
-			// Remove-first group: fix columns now from this first add/edit.
-			// The JS side learns them from a SUPPLEMENTARY def... which the
-			// format doesn't support. Fall back for this group entirely.
+			// Defensive: an add/edit against a PK-only (remove-first) def.
+			// groupFor now mints a full-column replacement group before this
+			// point, so this is unreachable in practice — kept as the
+			// correct-over-fast fallback if a caller bypasses groupFor.
 			return nil, false
 		}
 		if len(c.Row) > len(g.cols) {
