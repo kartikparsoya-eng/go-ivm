@@ -1,9 +1,13 @@
 package ivm
 
 import (
+	"encoding/json"
 	"iter"
 	"slices"
 	"sort"
+	"strconv"
+	"strings"
+	"sync/atomic"
 )
 
 type FlippedJoinArgs struct {
@@ -97,13 +101,54 @@ func (fj *FlippedJoin) GetSchema() *SourceSchema {
 	return fj.schema
 }
 
+// multiConstraintChunkSize is the maximum number of entries sent in a single
+// batched parent fetch (TS MULTI_CONSTRAINT_CHUNK_SIZE, flipped-join.ts @
+// 1.7.0). Larger child-node sets are split into multiple fetches whose
+// sorted results are merged.
+//
+// Why bound this (TS rationale, applies to the SQL leaf identically):
+//   - Bounded overfetch on early termination at chunk N.
+//   - Parameter limit: well under SQLite's default
+//     SQLITE_MAX_VARIABLE_NUMBER (32766); compound keys multiply the
+//     parameter count by key length.
+//   - Statement-cache hits across calls of the same chunk size.
+//
+// Atomic because the engine fetches pipelines from multiple goroutines
+// (parallel hydrate) while a test may have adjusted it; production never
+// writes it after init.
+var multiConstraintChunkSize atomic.Int32
+
+func init() { multiConstraintChunkSize.Store(256) }
+
+// SetMultiConstraintChunkSizeForTest overrides the chunk size and returns a
+// restore function. Test only (TS setMultiConstraintChunkSizeForTest).
+func SetMultiConstraintChunkSizeForTest(size int) func() {
+	prev := multiConstraintChunkSize.Swap(int32(size))
+	return func() { multiConstraintChunkSize.Store(prev) }
+}
+
 // Fetch fetches child nodes first (eager — small filtered set), then fetches
-// matching parents for each child sequentially (one reader at a time, no
-// iter.Pull goroutines), collects all (parent, child) pairs, sorts by parent
-// row, groups by parent (deduplicating), and yields each unique parent with
-// its related children. This avoids the pool deadlock that iter.Pull caused
-// (N children × iter.Pull = N concurrent readers > pool size K) and eliminates
-// the goroutine leak (no iter.Pull coroutines to leak).
+// the matching parents in BATCHED calls using FetchRequest.MultiConstraints
+// (TS #fetchBatched, zero 1.7.0 #5928): the deduped child→parent key tuples
+// become one multi-row IN clause per chunk, so the source issues one indexed
+// SQL query per chunk instead of N per-child cursors. Within a chunk the
+// source returns parents in compareRows order; across chunks the sorted
+// results are merged, so the overall stream is ordered.
+//
+// This replaces the previous per-child fetch strategy (fetch parents for
+// each child sequentially, collect all pairs, sort, group). The batched form
+// is result-equivalent: a parent row's key tuple matches exactly one deduped
+// multi entry, so it appears in exactly one chunk exactly once, and children
+// map back to it via the same canonical key.
+//
+// Go deviation from TS (deliberate): when the multi exceeds the chunk size,
+// TS opens ALL chunk cursors up front and lazily heap-merges
+// (mergeSortedStreams). Doing that here would need iter.Pull — N concurrent
+// leaf readers — which is exactly the reader-pool deadlock the pre-batched
+// Go code was rewritten to avoid (N readers > pool size K wedges the CG).
+// Instead chunks are fetched SEQUENTIALLY and eagerly (one reader at a
+// time), then merged; output order and content are identical. The common
+// case (≤ chunk-size unique keys, i.e. one chunk) stays fully lazy.
 func (fj *FlippedJoin) Fetch(req FetchRequest) iter.Seq[Node] {
 	// Translate constraints for the parent on parts of the join key to constraints for the child.
 	var childConstraint Constraint
@@ -139,103 +184,254 @@ func (fj *FlippedJoin) Fetch(req FetchRequest) iter.Seq[Node] {
 		childNodes[insertPos] = removedNode
 	}
 
-	compare := func(a, b Node) int {
-		cmp := fj.schema.CompareRows(a.Row, b.Row)
-		if req.Reverse {
-			cmp = -cmp
+	return fj.fetchBatched(req, childNodes)
+}
+
+// fetchBatched builds the deduped multi-constraint + key→child-indexes map
+// and yields each fetched parent with its related children (TS
+// #fetchBatched). See Fetch for the chunking strategy.
+func (fj *FlippedJoin) fetchBatched(req FetchRequest, childNodes []Node) iter.Seq[Node] {
+	parentKey := fj.parentKey
+	childKey := fj.childKey
+
+	// Build (deduped) multi-constraint and a key→child-indexes map. Same
+	// parent-key value across multiple children groups them together.
+	var computedMulti MultiConstraint
+	childIndexesByKey := make(map[string][]int)
+	for i := range childNodes {
+		constraintFromChild := BuildJoinConstraint(childNodes[i].Row, childKey, parentKey)
+		if constraintFromChild == nil ||
+			(req.Constraint != nil && !constraintsAreCompatible(*constraintFromChild, *req.Constraint)) {
+			continue
 		}
-		return cmp
+		key := canonicalKey(*constraintFromChild, parentKey)
+		if existing, ok := childIndexesByKey[key]; ok {
+			childIndexesByKey[key] = append(existing, i)
+		} else {
+			childIndexesByKey[key] = []int{i}
+			computedMulti = append(computedMulti, *constraintFromChild)
+		}
+	}
+
+	if len(computedMulti) == 0 {
+		return emptyNodeSeq
+	}
+
+	// The parent request mirrors TS's `{...req, multiConstraints: [...]}`:
+	// Constraint/Start/Reverse ride along unchanged; our computed multi is
+	// APPENDED to whatever req.MultiConstraints already contained — chained
+	// FlippedJoins each contribute one entry, so the source ANDs them all
+	// (e.g. `assigneeID IN (…) AND creatorID IN (…)`).
+	parentReq := req
+	// Limit is a Go-only extension TS has no analog for; the pre-batched
+	// code never forwarded it to the parent, and it would be UNSAFE here:
+	// the canonical-key miss filter and the in-progress-child overlay below
+	// can drop fetched parents, so a source-side truncation could
+	// under-fetch. Strip it.
+	parentReq.Limit = 0
+	incoming := req.MultiConstraints
+
+	chunkSize := int(multiConstraintChunkSize.Load())
+	var parents iter.Seq[Node]
+	if len(computedMulti) <= chunkSize {
+		parentReq.MultiConstraints = appendMulti(incoming, computedMulti)
+		parents = fj.parent.Fetch(parentReq) // fully lazy single-chunk path
+	} else {
+		parents = fj.fetchChunkedSequential(parentReq, incoming, computedMulti, chunkSize, req.Reverse)
 	}
 
 	return func(yield func(Node) bool) {
-		type parentChild struct {
-			parent   Node
-			childIdx int
-		}
-		var pairs []parentChild
-		for i, childNode := range childNodes {
-			constraintFromChild := BuildJoinConstraint(childNode.Row, fj.childKey, fj.parentKey)
-			if constraintFromChild == nil || (req.Constraint != nil && !constraintsAreCompatible(*constraintFromChild, *req.Constraint)) {
+		for node := range parents {
+			key := canonicalKey(node.Row, parentKey)
+			idxs, ok := childIndexesByKey[key]
+			if !ok {
+				// This row's parent-key doesn't match any of our computed
+				// multi-constraint entries. Happens when our parent is an
+				// intermediate operator (e.g. a chained FlippedJoin) that
+				// passes multiConstraints through unchanged instead of
+				// filtering — see FetchRequest.MultiConstraints contract.
+				// The lookup miss here performs the required filter, so
+				// just skip the row. (TS #fetchBatched does the same.)
 				continue
 			}
-			merged := mergeConstraints(req.Constraint, constraintFromChild)
-			parentReq := FetchRequest{
-				Constraint: merged,
-				Start:      req.Start,
-				Reverse:    req.Reverse,
+			// Children retain their original input order within the group
+			// because indexes were appended in iteration order.
+			relatedChildNodes := make([]Node, 0, len(idxs))
+			for _, i := range idxs {
+				relatedChildNodes = append(relatedChildNodes, childNodes[i])
 			}
-			for pn := range fj.parent.Fetch(parentReq) {
-				pairs = append(pairs, parentChild{parent: pn, childIdx: i})
+			if !fj.yieldParentWithOverlay(node, relatedChildNodes, yield) {
+				return
 			}
 		}
+	}
+}
 
-		sort.SliceStable(pairs, func(i, j int) bool {
-			return compare(pairs[i].parent, pairs[j].parent) < 0
-		})
-
-		i := 0
-		for i < len(pairs) {
-			j := i + 1
-			for j < len(pairs) && compare(pairs[j].parent, pairs[i].parent) == 0 {
-				j++
+// fetchChunkedSequential fetches computedMulti in chunkSize slices —
+// SEQUENTIALLY and eagerly, one leaf reader at a time (see Fetch for why Go
+// must not open all chunk cursors concurrently) — and merges the per-chunk
+// sorted results into one globally ordered sequence.
+func (fj *FlippedJoin) fetchChunkedSequential(
+	parentReq FetchRequest,
+	incoming []MultiConstraint,
+	computedMulti MultiConstraint,
+	chunkSize int,
+	reverse bool,
+) iter.Seq[Node] {
+	compareRows := fj.schema.CompareRows
+	compare := func(a, b Node) int {
+		c := compareRows(a.Row, b.Row)
+		if reverse {
+			c = -c
+		}
+		return c
+	}
+	return func(yield func(Node) bool) {
+		var chunks [][]Node
+		for i := 0; i < len(computedMulti); i += chunkSize {
+			end := min(i+chunkSize, len(computedMulti))
+			creq := parentReq
+			creq.MultiConstraints = appendMulti(incoming, computedMulti[i:end])
+			chunks = append(chunks, slices.Collect(fj.parent.Fetch(creq)))
+		}
+		// K-pointer merge of the (already sorted) chunk slices. K is small
+		// (unique keys / chunkSize) so a linear min scan per emit is fine.
+		heads := make([]int, len(chunks))
+		for {
+			best := -1
+			for c := range chunks {
+				if heads[c] >= len(chunks[c]) {
+					continue
+				}
+				if best == -1 || compare(chunks[c][heads[c]], chunks[best][heads[best]]) < 0 {
+					best = c
+				}
 			}
-
-			relatedChildNodes := make([]Node, 0, j-i)
-			for k := i; k < j; k++ {
-				relatedChildNodes = append(relatedChildNodes, childNodes[pairs[k].childIdx])
+			if best == -1 {
+				return
 			}
+			if !yield(chunks[best][heads[best]]) {
+				return
+			}
+			heads[best]++
+		}
+	}
+}
 
-			minHead := pairs[i].parent
+// appendMulti returns incoming + mc as a fresh slice (never aliasing
+// incoming's backing array — chained joins may reuse it across chunks).
+func appendMulti(incoming []MultiConstraint, mc MultiConstraint) []MultiConstraint {
+	out := make([]MultiConstraint, 0, len(incoming)+1)
+	out = append(out, incoming...)
+	return append(out, mc)
+}
 
-			overlaidRelatedChildNodes := relatedChildNodes
-			if fj.inprogressChildChange != nil && fj.inprogressChildChangePosition != nil &&
-				IsJoinMatch(fj.inprogressChildChange.Node.Row, fj.childKey, minHead.Row, fj.parentKey) {
+// yieldParentWithOverlay applies the in-progress child-change overlay to one
+// fetched parent's related children and yields the decorated parent node
+// (TS #yieldParentWithOverlay). Returns false when the consumer stopped.
+// Logic is unchanged from the pre-batched implementation.
+func (fj *FlippedJoin) yieldParentWithOverlay(minHead Node, relatedChildNodes []Node, yield func(Node) bool) bool {
+	overlaidRelatedChildNodes := relatedChildNodes
+	if fj.inprogressChildChange != nil && fj.inprogressChildChangePosition != nil &&
+		IsJoinMatch(fj.inprogressChildChange.Node.Row, fj.childKey, minHead.Row, fj.parentKey) {
 
-				hasBeenPushed := fj.parent.GetSchema().CompareRows(minHead.Row, fj.inprogressChildChangePosition) <= 0
+		hasBeenPushed := fj.parent.GetSchema().CompareRows(minHead.Row, fj.inprogressChildChangePosition) <= 0
 
-				if fj.inprogressChildChange.Type == ChangeTypeRemove {
-					if hasBeenPushed {
-						// Filter out the removed node. TS filters by reference
-						// identity (flipped-join.ts:271-272: `n !== change.node`)
-						// because the removed node was spliced into childNodes by
-						// reference. Go copies nodes through slices, so identity
-						// is unavailable — we match by the child schema's full
-						// comparator instead. Equivalent ONLY because the child
-						// sort is total (Zero always appends the PK to the
-						// ordering), so CompareRows==0 ⟺ same row. If a non-total
-						// child sort is ever introduced, this could filter a
-						// DIFFERENT child that ties with the removed one.
-						filtered := make([]Node, 0, len(relatedChildNodes))
-						for _, n := range relatedChildNodes {
-							if fj.child.GetSchema().CompareRows(n.Row, fj.inprogressChildChange.Node.Row) != 0 {
-								filtered = append(filtered, n)
-							}
-						}
-						overlaidRelatedChildNodes = filtered
+		if fj.inprogressChildChange.Type == ChangeTypeRemove {
+			if hasBeenPushed {
+				// Filter out the removed node. TS filters by reference
+				// identity (flipped-join.ts: `n !== change.node`)
+				// because the removed node was spliced into childNodes by
+				// reference. Go copies nodes through slices, so identity
+				// is unavailable — we match by the child schema's full
+				// comparator instead. Equivalent ONLY because the child
+				// sort is total (Zero always appends the PK to the
+				// ordering), so CompareRows==0 ⟺ same row. If a non-total
+				// child sort is ever introduced, this could filter a
+				// DIFFERENT child that ties with the removed one.
+				filtered := make([]Node, 0, len(relatedChildNodes))
+				for _, n := range relatedChildNodes {
+					if fj.child.GetSchema().CompareRows(n.Row, fj.inprogressChildChange.Node.Row) != 0 {
+						filtered = append(filtered, n)
 					}
-				} else if !hasBeenPushed {
-					overlaidRelatedChildNodes = GenerateWithOverlay(relatedChildNodes, *fj.inprogressChildChange, fj.child.GetSchema())
 				}
+				overlaidRelatedChildNodes = filtered
 			}
-
-			if len(overlaidRelatedChildNodes) > 0 {
-				captured := overlaidRelatedChildNodes
-				// New relationship wins over any same-named parent relationship,
-				// matching TS's spread order ({...parent, [relName]: ...}) at
-				// flipped-join.ts:291-292 and the FlippedJoin schema (new key last).
-				nodeOut := Node{
-					Row: minHead.Row,
-					Relationships: mergeRelationshipMaps(Relationships{
-						fj.relationshipName: func() iter.Seq[Node] { return slices.Values(captured) },
-					}, minHead.Relationships),
-				}
-				if !yield(nodeOut) {
-					return
-				}
-			}
-
-			i = j
+		} else if !hasBeenPushed {
+			overlaidRelatedChildNodes = GenerateWithOverlay(relatedChildNodes, *fj.inprogressChildChange, fj.child.GetSchema())
 		}
+	}
+
+	if len(overlaidRelatedChildNodes) > 0 {
+		captured := overlaidRelatedChildNodes
+		// New relationship wins over any same-named parent relationship,
+		// matching TS's spread order ({...parent, [relName]: ...}) at
+		// flipped-join.ts and the FlippedJoin schema (new key last).
+		nodeOut := Node{
+			Row: minHead.Row,
+			Relationships: mergeRelationshipMaps(Relationships{
+				fj.relationshipName: func() iter.Seq[Node] { return slices.Values(captured) },
+			}, minHead.Relationships),
+		}
+		if !yield(nodeOut) {
+			return false
+		}
+	}
+	return true
+}
+
+// canonicalKey builds a canonical string key over `keys` of `record`
+// (Constraint and Row share the map[string]Value shape), used by
+// fetchBatched both to dedupe multi-constraint entries and to map each
+// returned parent row back to the children that referenced its parent-key
+// tuple. Port of TS canonicalKey (flipped-join.ts @ 1.7.0).
+func canonicalKey[M ~map[string]Value](record M, keys CompoundKey) string {
+	if len(keys) == 1 {
+		return canonicalValue(record[keys[0]])
+	}
+	var b strings.Builder
+	for i, k := range keys {
+		if i > 0 {
+			b.WriteByte(0)
+		}
+		b.WriteString(canonicalValue(record[k]))
+	}
+	return b.String()
+}
+
+// canonicalValue tags values by type so e.g. 1 (number) and "1" (string)
+// don't conflate (TS canonicalValue: n/s/d/b/t/f/j tags). int64/uint64 take
+// the bigint tag — TS sees bigint at runtime under zqlite's safeIntegers.
+// The exact numeric string format need not match JS: keys never leave the
+// process; injectivity within one fetch (same Go value → same key) is the
+// only requirement, and both map-build values (child rows) and lookup
+// values (parent rows) pass through the same source normalization.
+func canonicalValue(v Value) string {
+	switch t := v.(type) {
+	case nil:
+		return "n"
+	case string:
+		return "s" + t
+	case float64:
+		return "d" + strconv.FormatFloat(t, 'g', -1, 64)
+	case int64:
+		return "b" + strconv.FormatInt(t, 10)
+	case uint64:
+		return "b" + strconv.FormatUint(t, 10)
+	case bool:
+		if t {
+			return "t"
+		}
+		return "f"
+	default:
+		j, err := json.Marshal(t)
+		if err != nil {
+			// Join-key values are scalars in practice; an unmarshalable
+			// value cannot form a coherent key. Fail this query like TS
+			// would on a malformed Value.
+			panic(NewDataError("canonicalValue: unsupported join-key value %T", v))
+		}
+		return "j" + string(j)
 	}
 }
 
@@ -423,22 +619,4 @@ func constraintsAreCompatible(a, b Constraint) bool {
 		}
 	}
 	return true
-}
-
-func mergeConstraints(existing *Constraint, additional *Constraint) *Constraint {
-	if existing == nil && additional == nil {
-		return nil
-	}
-	merged := make(Constraint)
-	if existing != nil {
-		for k, v := range *existing {
-			merged[k] = v
-		}
-	}
-	if additional != nil {
-		for k, v := range *additional {
-			merged[k] = v
-		}
-	}
-	return &merged
 }

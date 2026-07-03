@@ -67,18 +67,29 @@ func editChangesSplitKeys(change ivm.SourceChange, splitKeys map[string]bool) bo
 // is "after" — is dropped, because the windowed fetch starts at that
 // cursor. Without this, Take's start:bound reverse fetch would splice an
 // in-flight row that belongs outside the requested window.
+//
+// multis gates overlay-ADD rows by the fetch's MultiConstraints, mirroring
+// TS applyMultiConstraintsToOverlays (memory-source.ts @1.7.0): an in-flight
+// add that matches none of a multi's entries is outside the batched-IN
+// window and must not be spliced. (TS also nils the REMOVE overlay; here
+// remove needs no gate — a non-matching removed row is absent from the
+// IN-filtered SQL result, so removeByPK is a no-op, same net effect.)
 func applyOverlay(
 	nodes []ivm.Node,
 	change ivm.SourceChange,
 	comparator ivm.Comparator,
 	constraint *ivm.Constraint,
+	multis []ivm.MultiConstraint,
 	start *ivm.Start,
 	primaryKey []string,
 ) []ivm.Node {
-	// addAllowed mirrors TS computeOverlays' constraint + start filtering
-	// for an add candidate row.
+	// addAllowed mirrors TS computeOverlays' constraint + multi + start
+	// filtering for an add candidate row.
 	addAllowed := func(row ivm.Row) bool {
 		if constraint != nil && !constraintMatchesRow(*constraint, row) {
+			return false
+		}
+		if !ivm.RowMatchesMultiConstraints(multis, row) {
 			return false
 		}
 		return overlayRowAtOrAfterStart(row, start, comparator)
@@ -95,7 +106,9 @@ func applyOverlay(
 		return removeByPK(nodes, change.Row, primaryKey)
 
 	case ivm.ChangeTypeEdit:
-		if constraint != nil && !constraintMatchesRow(*constraint, change.OldRow) {
+		oldOutsideWindow := (constraint != nil && !constraintMatchesRow(*constraint, change.OldRow)) ||
+			!ivm.RowMatchesMultiConstraints(multis, change.OldRow)
+		if oldOutsideWindow {
 			if addAllowed(change.Row) {
 				return insertSorted(nodes, ivm.Node{Row: change.Row}, comparator)
 			}
@@ -151,10 +164,14 @@ func overlaySplicePlan(
 	change ivm.SourceChange,
 	comparator ivm.Comparator,
 	constraint *ivm.Constraint,
+	multis []ivm.MultiConstraint,
 	start *ivm.Start,
 ) (add, remove ivm.Row) {
 	addAllowed := func(row ivm.Row) bool {
 		if constraint != nil && !constraintMatchesRow(*constraint, row) {
+			return false
+		}
+		if !ivm.RowMatchesMultiConstraints(multis, row) {
 			return false
 		}
 		return overlayRowAtOrAfterStart(row, start, comparator)
@@ -167,9 +184,11 @@ func overlaySplicePlan(
 	case ivm.ChangeTypeRemove:
 		remove = change.Row
 	case ivm.ChangeTypeEdit:
-		if constraint != nil && !constraintMatchesRow(*constraint, change.OldRow) {
-			// Old row outside the constraint window — nothing of it is in
-			// the streamed set; the edit degrades to a pure add (mirrors
+		oldOutsideWindow := (constraint != nil && !constraintMatchesRow(*constraint, change.OldRow)) ||
+			!ivm.RowMatchesMultiConstraints(multis, change.OldRow)
+		if oldOutsideWindow {
+			// Old row outside the constraint/multi window — nothing of it is
+			// in the streamed set; the edit degrades to a pure add (mirrors
 			// applyOverlay's Edit early branch).
 			if addAllowed(change.Row) {
 				add = change.Row

@@ -55,7 +55,9 @@ type QueryResult struct {
 	Params []interface{}
 }
 
-// BuildSelectQuery generates a SELECT query matching the TS buildSelectQuery.
+// BuildSelectQuery generates a SELECT query matching the TS buildSelectQuery
+// (zqlite/query-builder.ts @ 1.7.0, incl. the multiConstraints batched-IN
+// clauses from #5928).
 func BuildSelectQuery(
 	tableName string,
 	columns map[string]ColumnSchema,
@@ -64,6 +66,7 @@ func BuildSelectQuery(
 	order ivm.Ordering,
 	reverse bool,
 	start *ivm.Start,
+	multiConstraints []ivm.MultiConstraint,
 ) QueryResult {
 	var params []interface{}
 	colNames := sortedColumnNames(columns)
@@ -87,6 +90,17 @@ func BuildSelectQuery(
 			constraints = append(constraints, fmt.Sprintf("%s = ?", quoteIdent(key)))
 			params = append(params, sqlVal)
 		}
+	}
+
+	// Multi-constraints (batched IN clauses). Empty entries are skipped —
+	// same as TS buildSelectQuery's `mc.length > 0` guard.
+	for _, mc := range multiConstraints {
+		if len(mc) == 0 {
+			continue
+		}
+		mcSQL, mcParams := multiConstraintToSQL(mc, columns)
+		constraints = append(constraints, mcSQL)
+		params = append(params, mcParams...)
 	}
 
 	// Start cursor
@@ -113,6 +127,78 @@ func BuildSelectQuery(
 	}
 
 	return QueryResult{SQL: query, Params: params}
+}
+
+// multiConstraintToSQL builds a single batched IN clause from a
+// MultiConstraint (TS multiConstraintToSQL, zqlite/query-builder.ts @
+// 1.7.0). All entries must share the same column shape; FlippedJoin derives
+// them from the same parentKey for all children.
+//
+// Single-column form: `"col" IN (?, ?, ?)`
+// Compound form:      `("a", "b") IN (VALUES (?, ?), (?, ?), …)`
+//
+// SQLite optimizes `col IN (literal-list)` using the column's index
+// (verified upstream via EXPLAIN QUERY PLAN).
+//
+// Go deviation: TS takes the column list from Object.keys(entry[0])
+// (JS insertion order); Go map iteration is randomized, so the keys are
+// SORTED for a deterministic clause — required for prepared-statement
+// cache hits and semantically identical (the tuple order pairs each
+// column with its own values either way).
+//
+// Panics with a DataError on heterogeneous entry shapes (TS asserts).
+// MultiConstraints are engine-generated (FlippedJoin), never client-sent,
+// so this is an internal-invariant check, not an input-validation boundary.
+func multiConstraintToSQL(mc ivm.MultiConstraint, columns map[string]ColumnSchema) (string, []interface{}) {
+	keys := make([]string, 0, len(mc[0]))
+	for k := range mc[0] {
+		keys = append(keys, k)
+	}
+	sortStrings(keys)
+	if len(keys) == 0 {
+		panic(ivm.NewDataError("multiConstraintToSQL: entries must have at least one key"))
+	}
+	for i := 1; i < len(mc); i++ {
+		if len(mc[i]) != len(keys) {
+			panic(ivm.NewDataError("multiConstraintToSQL: entries must share the same keys (entry 0 has %d, entry %d has %d)", len(keys), i, len(mc[i])))
+		}
+		for _, k := range keys {
+			if _, ok := mc[i][k]; !ok {
+				panic(ivm.NewDataError("multiConstraintToSQL: entry %d missing key %q", i, k))
+			}
+		}
+	}
+
+	if len(keys) == 1 {
+		key := keys[0]
+		colType := columns[key].Type
+		placeholders := make([]string, len(mc))
+		params := make([]interface{}, len(mc))
+		for i, c := range mc {
+			placeholders[i] = "?"
+			params[i] = ToSQLiteType(c[key], colType)
+		}
+		return fmt.Sprintf("%s IN (%s)", quoteIdent(key), strings.Join(placeholders, ",")), params
+	}
+
+	// Compound: `("a", "b") IN (VALUES (?, ?), …)`
+	quotedKeys := make([]string, len(keys))
+	rowPlaceholders := make([]string, len(keys))
+	for i, k := range keys {
+		quotedKeys[i] = quoteIdent(k)
+		rowPlaceholders[i] = "?"
+	}
+	rowForm := "(" + strings.Join(rowPlaceholders, ", ") + ")"
+	rows := make([]string, len(mc))
+	params := make([]interface{}, 0, len(mc)*len(keys))
+	for i, c := range mc {
+		rows[i] = rowForm
+		for _, k := range keys {
+			params = append(params, ToSQLiteType(c[k], columns[k].Type))
+		}
+	}
+	return fmt.Sprintf("(%s) IN (VALUES %s)",
+		strings.Join(quotedKeys, ", "), strings.Join(rows, ",")), params
 }
 
 // filtersToSQL converts a Condition tree to SQL.

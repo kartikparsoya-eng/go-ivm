@@ -102,8 +102,11 @@ func (s *Skip) Fetch(req FetchRequest) iter.Seq[Node] {
 
 	newReq := FetchRequest{
 		Constraint: req.Constraint,
-		Start:      start,
-		Reverse:    req.Reverse,
+		// TS skip.ts spreads `...req` — multiConstraints ride through to the
+		// source (FlippedJoin's batched parent fetch may sit above a Skip).
+		MultiConstraints: req.MultiConstraints,
+		Start:            start,
+		Reverse:          req.Reverse,
 	}
 	// Forward Limit in the forward case only. In reverse, Skip's
 	// shouldBePresent post-filter can discard rows, so forwarding

@@ -46,7 +46,7 @@ func TestApplyOverlayPartialCursorBoundary(t *testing.T) {
 
 	t.Run("after (exclusive) drops the boundary row", func(t *testing.T) {
 		cmp := ivm.MakePartialBoundComparator(sort, false)
-		out := applyOverlay(append([]ivm.Node(nil), base...), boundaryAdd, cmp, nil, partialCursor("after"), pk)
+		out := applyOverlay(append([]ivm.Node(nil), base...), boundaryAdd, cmp, nil, nil, partialCursor("after"), pk)
 		if has(out, "8ec82a40") {
 			t.Fatalf("Basis 'after' must EXCLUDE the boundary overlay row at the cursor's createdAt; got it included: %v", out)
 		}
@@ -54,7 +54,7 @@ func TestApplyOverlayPartialCursorBoundary(t *testing.T) {
 
 	t.Run("at (inclusive) keeps the boundary row", func(t *testing.T) {
 		cmp := ivm.MakePartialBoundComparator(sort, false)
-		out := applyOverlay(append([]ivm.Node(nil), base...), boundaryAdd, cmp, nil, partialCursor("at"), pk)
+		out := applyOverlay(append([]ivm.Node(nil), base...), boundaryAdd, cmp, nil, nil, partialCursor("at"), pk)
 		if !has(out, "8ec82a40") {
 			t.Fatalf("Basis 'at' must INCLUDE the boundary overlay row; got it dropped: %v", out)
 		}
@@ -62,7 +62,7 @@ func TestApplyOverlayPartialCursorBoundary(t *testing.T) {
 
 	t.Run("regression: the plain full comparator wrongly keeps it (proves the bug)", func(t *testing.T) {
 		cmp := ivm.MakeComparator(sort, false) // the pre-fix comparator
-		out := applyOverlay(append([]ivm.Node(nil), base...), boundaryAdd, cmp, nil, partialCursor("after"), pk)
+		out := applyOverlay(append([]ivm.Node(nil), base...), boundaryAdd, cmp, nil, nil, partialCursor("after"), pk)
 		if !has(out, "8ec82a40") {
 			t.Skip("full comparator no longer over-includes — bug premise changed")
 		}
@@ -131,7 +131,7 @@ func TestConstraintMatchesRowNullEquality(t *testing.T) {
 		cmp := ivm.MakeComparator(sort, false)
 		constraint := &ivm.Constraint{"ownerId": nil}
 		add := ivm.SourceChange{Type: ivm.ChangeTypeAdd, Row: ivm.Row{"ownerId": nil, "id": "a"}}
-		out := applyOverlay(nil, add, cmp, constraint, nil, pk)
+		out := applyOverlay(nil, add, cmp, constraint, nil, nil, pk)
 		if len(out) != 0 {
 			t.Fatalf("NULL-constrained overlay ADD must be dropped to match TS; got %v", out)
 		}
@@ -143,7 +143,7 @@ func TestConstraintMatchesRowNullEquality(t *testing.T) {
 		cmp := ivm.MakeComparator(sort, false)
 		constraint := &ivm.Constraint{"ownerId": "u1"}
 		add := ivm.SourceChange{Type: ivm.ChangeTypeAdd, Row: ivm.Row{"ownerId": "u1", "id": "a"}}
-		out := applyOverlay(nil, add, cmp, constraint, nil, pk)
+		out := applyOverlay(nil, add, cmp, constraint, nil, nil, pk)
 		if len(out) != 1 {
 			t.Fatalf("matching non-null-constrained overlay ADD must be kept; got %v", out)
 		}

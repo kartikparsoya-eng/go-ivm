@@ -19,7 +19,7 @@ func TestBuildSelectQuery_EmptyStartCursorDoesNotEmitParenParen(t *testing.T) {
 	order := ivm.Ordering{{"createdAt", "asc"}, {"id", "asc"}}
 	start := &ivm.Start{Row: ivm.Row{}, Basis: "after"} // no order columns present
 
-	q := BuildSelectQuery("t", cols, nil, nil, order, false, start)
+	q := BuildSelectQuery("t", cols, nil, nil, order, false, start, nil)
 
 	if strings.Contains(q.SQL, "()") {
 		t.Fatalf("generated SQL contains invalid empty parens %q", q.SQL)

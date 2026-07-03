@@ -593,6 +593,18 @@ func (si *SourceInput) Fetch(req FetchRequest) iter.Seq[Node] {
 		nodes = applyConstraint(nodes, req.Constraint)
 	}
 
+	// Apply multi-constraints (batched IN clauses — FlippedJoin #5928).
+	// TS MemorySource#fetch fans a sub-fetch out per entry of the first
+	// non-empty multi and post-filters the rest (memory-source.ts:381-436);
+	// with unique entries (the documented MultiConstraint invariant) that is
+	// row-for-row equivalent to filtering the ordered scan by "matches every
+	// non-empty multi", which is what we do — including the overlay row,
+	// which TS gates via applyMultiConstraintsToOverlays and we gate by
+	// filtering after the overlay splice above.
+	if len(req.MultiConstraints) > 0 {
+		nodes = applyMultiConstraintsFilter(nodes, req.MultiConstraints)
+	}
+
 	// Apply filter
 	if conn.FilterPredicate != nil {
 		nodes = applyFilter(nodes, conn.FilterPredicate)
@@ -779,6 +791,18 @@ func applyConstraint(nodes []Node, constraint *Constraint) []Node {
 	var result []Node
 	for _, node := range nodes {
 		if ConstraintMatchesRow(constraint, node.Row) {
+			result = append(result, node)
+		}
+	}
+	return result
+}
+
+// applyMultiConstraintsFilter keeps nodes satisfying every non-empty
+// MultiConstraint (see RowMatchesMultiConstraints).
+func applyMultiConstraintsFilter(nodes []Node, multis []MultiConstraint) []Node {
+	var result []Node
+	for _, node := range nodes {
+		if RowMatchesMultiConstraints(multis, node.Row) {
 			result = append(result, node)
 		}
 	}

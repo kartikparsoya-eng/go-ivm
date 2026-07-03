@@ -1344,6 +1344,7 @@ func (s *Source) fetchForConn(req ivm.FetchRequest, conn *connection) []ivm.Node
 		order,
 		req.Reverse,
 		req.Start,
+		req.MultiConstraints,
 	)
 	ctx := context.Background()
 	// Reuse a prepared statement for this (conn, SQL) instead of letting
@@ -1422,7 +1423,7 @@ func (s *Source) fetchForConn(req ivm.FetchRequest, conn *connection) []ivm.Node
 		// MakeComparator for insertSorted (which compares two COMPLETE rows), so
 		// overlay placement order is unchanged.
 		effCmp := ivm.MakePartialBoundComparator(order, req.Reverse)
-		out = applyOverlay(out, s.overlay.Change, effCmp, req.Constraint, req.Start, s.primaryKey)
+		out = applyOverlay(out, s.overlay.Change, effCmp, req.Constraint, req.MultiConstraints, req.Start, s.primaryKey)
 		if conn.filterPredicate != nil {
 			filtered := out[:0]
 			for _, n := range out {
@@ -1532,6 +1533,7 @@ func (s *Source) fetchDuringPushStream(req ivm.FetchRequest, conn *connection) i
 				order,
 				req.Reverse,
 				req.Start,
+				req.MultiConstraints,
 			)
 			qSQL, qParams = q.SQL, q.Params
 			// Snapshot the splice plan under the lock. Same comparator + gate as
@@ -1541,7 +1543,7 @@ func (s *Source) fetchDuringPushStream(req ivm.FetchRequest, conn *connection) i
 			// poison values — deliberately placed BEFORE the stmt checkout.
 			effCmp = ivm.MakePartialBoundComparator(order, req.Reverse)
 			if conn.lastPushedEpoch >= s.overlay.Epoch {
-				pendingAdd, pendingRemove = overlaySplicePlan(s.overlay.Change, effCmp, req.Constraint, req.Start)
+				pendingAdd, pendingRemove = overlaySplicePlan(s.overlay.Change, effCmp, req.Constraint, req.MultiConstraints, req.Start)
 				if pendingAdd != nil && conn.filterPredicate != nil && !conn.filterPredicate(pendingAdd) {
 					pendingAdd = nil
 				}
@@ -1728,6 +1730,7 @@ func (s *Source) fetchViaPoolStream(req ivm.FetchRequest, conn *connection, pool
 			order,
 			req.Reverse,
 			req.Start,
+			req.MultiConstraints,
 		)
 		r, err := pool.acquire(s.ctx)
 		if err != nil {
@@ -1807,6 +1810,7 @@ func (s *Source) fetchViaPool(req ivm.FetchRequest, conn *connection, pool *Read
 		order,
 		req.Reverse,
 		req.Start,
+		req.MultiConstraints,
 	)
 	r, err := pool.acquire(s.ctx)
 	if err != nil {

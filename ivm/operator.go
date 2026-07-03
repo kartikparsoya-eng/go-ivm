@@ -16,6 +16,45 @@ var emptyNodeSeq iter.Seq[Node] = func(yield func(Node) bool) {}
 
 type Constraint map[string]Value
 
+// MultiConstraint is a single multi-row IN clause: a non-empty list of
+// Constraints all sharing the same column shape. Sources treat it as
+// `(col_a, col_b, …) IN VALUES (…)`. Mirrors operator.ts MultiConstraint
+// (zero 1.7.0, #5928).
+//
+// Caller invariants (sources rely on these — they are not re-checked):
+//   - Unique entries. TableSource gets set semantics for free from SQL
+//     `IN`; MemorySource/post-filters would otherwise duplicate rows.
+//     FlippedJoin dedupes by canonical parent-key before adding entries.
+//   - Key-compatible with FetchRequest.Constraint. Entries contradicting
+//     the scalar constraint should be dropped upstream (FlippedJoin
+//     filters via constraintsAreCompatible).
+type MultiConstraint []Constraint
+
+// RowMatchesMultiConstraints reports whether row satisfies every
+// MultiConstraint in multis: within one MultiConstraint the entries are
+// OR'd (`IN` semantics — any entry may match); across the list they are
+// AND'd. Empty MultiConstraint entries are IGNORED (no filtering), matching
+// TS: buildSelectQuery skips `mc.length === 0` and MemorySource#fetch only
+// takes the batched path when some mc is non-empty.
+func RowMatchesMultiConstraints(multis []MultiConstraint, row Row) bool {
+	for _, mc := range multis {
+		if len(mc) == 0 {
+			continue
+		}
+		any := false
+		for i := range mc {
+			if ConstraintMatchesRow(&mc[i], row) {
+				any = true
+				break
+			}
+		}
+		if !any {
+			return false
+		}
+	}
+	return true
+}
+
 type Start struct {
 	Row   Row
 	Basis string // "at" | "after"
@@ -23,8 +62,21 @@ type Start struct {
 
 type FetchRequest struct {
 	Constraint *Constraint
-	Start      *Start
-	Reverse    bool
+
+	// MultiConstraints is a list of multi-row IN clauses, all ANDed together
+	// (and ANDed with Constraint if both are provided). Each entry is a
+	// MultiConstraint over its own set of columns.
+	//
+	// Used by FlippedJoin (zero 1.7.0 #5928) to push child→parent fetches
+	// into a single batched statement, and to AND together constraints
+	// contributed by chained FlippedJoins (e.g. `assigneeID IN (…) AND
+	// creatorID IN (…)`). Operators that forward a FetchRequest downstream
+	// must preserve it (TS spreads `...req`; Go struct copies carry it —
+	// only field-by-field literal construction can drop it).
+	MultiConstraints []MultiConstraint
+
+	Start   *Start
+	Reverse bool
 
 	// Limit is an OPTIONAL hint: when > 0, a leaf source may stop after
 	// producing this many rows (in the request's effective order, AFTER its
