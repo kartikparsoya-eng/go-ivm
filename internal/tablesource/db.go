@@ -53,12 +53,49 @@ var registerGoivmDriver = sync.OnceValue(func() string {
 	return goivmDriverName
 })
 
-// unicodeLowerSQL mirrors ICU lower() / JS toLowerCase(): full Unicode case
-// mapping including context-sensitive rules (e.g. Greek final sigma
-// "ΟΔΟΣ"→"οδος"), locale-independent. strings.ToLower applies only simple
-// unconditional mappings and would diverge from TS on those.
-func unicodeLowerSQL(s string) string {
-	return cases.Lower(language.Und).String(s)
+// unicodeLowerSQL mirrors the full ICU lower() contract, not just its case
+// mapping — the argument is `any` so mattn uses callbackArgGeneric, which
+// accepts every SQLite type. The previous func(string) string registration
+// routed through callbackArgString, which REJECTS SQLITE_NULL/INTEGER/FLOAT
+// ("argument must be BLOB or TEXT") — so the query_builder ILIKE shape
+// `lower(col) LIKE lower(?)` errored mid-scan on the first NULL in any
+// nullable column, and Source.Fetch panicked on rows.Err() → a
+// deterministic hydrate-failure loop (napi hostile review C1).
+//
+// Per-type contract (matches ext/icu icuCaseFunc16 + sqlite3_value_text):
+//   - NULL → NULL (ICU returns without setting a result). mattn delivers
+//     SQLITE_NULL as a nil []byte; a genuine empty BLOB arrives as a
+//     non-nil empty slice, so X'' still lowers to ''.
+//   - TEXT/BLOB → full Unicode case mapping including context-sensitive
+//     rules (Greek final sigma "ΟΔΟΣ"→"οδος"), locale-independent.
+//     strings.ToLower applies only simple unconditional mappings and would
+//     diverge from TS on those. BLOBs are bytes-as-text, like value_text.
+//   - INTEGER/FLOAT → SQLite's own text coercion (Int64ToText / %!.17g via
+//     sqliteRealText), then lowercase is a no-op on digits.
+//
+// Known residual: integral REALs in [1e17, 2^63) stored int-serial-encoded
+// surface inside SQLite as MEM_IntReal and stringify as "…000.0", but mattn
+// collapses the arg to a plain double before we see it, so those render
+// exponential ("1.0e+17"). zql only ILIKEs string columns; unreachable via
+// replication.
+func unicodeLowerSQL(v any) any {
+	switch x := v.(type) {
+	case nil: // defensive; mattn encodes NULL as []byte(nil), not nil any
+		return nil
+	case []byte:
+		if x == nil {
+			return nil // SQLITE_NULL
+		}
+		return cases.Lower(language.Und).String(string(x))
+	case string:
+		return cases.Lower(language.Und).String(x)
+	case int64:
+		return strconv.FormatInt(x, 10)
+	case float64:
+		return sqliteRealText(x)
+	default: // unreachable: callbackArgGeneric yields only the above
+		return nil
+	}
 }
 
 // Defaults chosen to match the design doc (parallelization is a hard
