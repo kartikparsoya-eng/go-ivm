@@ -69,11 +69,81 @@ func conditionToPredicate(cond *Condition) Predicate {
 }
 
 func simpleConditionPredicate(cond *Condition) Predicate {
+	// LIKE family with a literal pattern (the only shape the zql AST
+	// produces — TS filter.ts:52-61 asserts non-static and reads
+	// right.value directly): compile the pattern NOW, mirroring TS
+	// createPredicateImpl → getLikePredicate → patternToRegExp, which all
+	// run at predicate BUILD. An invalid pattern (trailing escape) must
+	// fail the query at build inside addQuery's recover — exactly where TS
+	// throws — NOT per-row at match time, where a panic lands mid-advance
+	// and tears down the whole CG (napi hostile review H1).
+	switch cond.Op {
+	case "LIKE", "NOT LIKE", "ILIKE", "NOT ILIKE":
+		if p, ok := eagerLikePredicate(cond); ok {
+			return p
+		}
+	}
 	return func(row ivm.Row) bool {
 		left := resolveValue(cond.Left, row)
 		right := resolveValue(cond.Right, row)
 		return evalOp(cond.Op, left, right)
 	}
+}
+
+// eagerLikePredicate builds the LIKE-family predicate with the pattern
+// compiled at construction, following like.ts getLikeOp:
+//   - nil literal RHS → constant false (TS filter.ts:75 returns before
+//     compiling anything).
+//   - non-wildcard pattern → plain (or Unicode-lowercased) string equality.
+//   - wildcard pattern → compiled regex; a trailing escape panics a
+//     DataError HERE, at build.
+//
+// Returns ok=false for non-literal RHS (not producible by the zql AST);
+// those keep the lazy evalOp path unchanged.
+func eagerLikePredicate(cond *Condition) (Predicate, bool) {
+	if cond.Right == nil || cond.Right.Type != "literal" {
+		return nil, false
+	}
+	if cond.Right.Value == nil {
+		// TS: null/undefined RHS short-circuits to constant false before
+		// the pattern is ever compiled.
+		return func(ivm.Row) bool { return false }, true
+	}
+	// RHS coercion via String(pattern) is TS behavior (like.ts:8); %v is
+	// the Go mirror used by the lazy path too.
+	pattern := fmt.Sprintf("%v", cond.Right.Value)
+	negate := cond.Op == "NOT LIKE" || cond.Op == "NOT ILIKE"
+	ci := cond.Op == "ILIKE" || cond.Op == "NOT ILIKE"
+
+	var match func(string) bool
+	if !strings.ContainsAny(pattern, "%_\\") {
+		// like.ts fast path: no wildcards, no escapes — string comparison.
+		if ci {
+			rhsLower := unicodeLower(pattern)
+			match = func(s string) bool { return unicodeLower(s) == rhsLower }
+		} else {
+			match = func(s string) bool { return s == pattern }
+		}
+	} else {
+		re := likeRegexpFor(pattern, ci)
+		if re == nil {
+			// TS patternToRegExp throw, at the same (build) time.
+			panic(ivm.NewDataError("LIKE pattern must not end with escape character"))
+		}
+		match = re.MatchString
+	}
+
+	left := cond.Left
+	return func(row ivm.Row) bool {
+		lv := resolveValue(left, row)
+		if lv == nil {
+			// Null LHS is false for the whole family — including the NOT
+			// variants — matching evalOp's (and TS's) null short-circuit
+			// BEFORE negation.
+			return false
+		}
+		return match(fmt.Sprintf("%v", lv)) != negate
+	}, true
 }
 
 func resolveValue(vp *ValuePos, row ivm.Row) ivm.Value {

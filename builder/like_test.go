@@ -1,6 +1,11 @@
 package builder
 
-import "testing"
+import (
+	"strings"
+	"testing"
+
+	"github.com/kartikparsoya-eng/go-ivm/ivm"
+)
 
 // TestMatchLike pins matchLike to TS's in-memory matcher contract
 // (zql/src/builder/like.ts @ v1.7.0), which zero 1.7.0 made authoritative on
@@ -83,4 +88,82 @@ func TestMatchLikeTrailingEscapePanics(t *testing.T) {
 		}
 	}()
 	matchLike(`x\`, `x\`, false)
+}
+
+// TestBuildPredicateTrailingEscapeFailsAtBuild pins H1 from the napi-path
+// hostile review: TS compiles the LIKE pattern at predicate BUILD
+// (filter.ts:79 createPredicateImpl → like.ts patternToRegExp) and throws
+// "LIKE pattern must not end with escape character" there — surfacing as a
+// clean per-query error from addQuery. Pre-fix, Go deferred compilation to
+// the first matchLike call, so a bad pattern installed a LIVE pipeline that
+// panicked per-row mid-advance — tearing down the whole CG, and the
+// orphaned pipeline re-panicked on every subsequent push. BuildPredicate
+// must panic a DataError WITHOUT the predicate ever being invoked.
+func TestBuildPredicateTrailingEscapeFailsAtBuild(t *testing.T) {
+	for _, op := range []string{"LIKE", "NOT LIKE", "ILIKE", "NOT ILIKE"} {
+		t.Run(op, func(t *testing.T) {
+			defer func() {
+				r := recover()
+				if r == nil {
+					t.Fatalf("BuildPredicate(%s, trailing escape) returned; "+
+						"want DataError panic at build (pre-H1 it panicked "+
+						"per-row mid-advance instead)", op)
+				}
+				de, ok := r.(*ivm.DataError)
+				if !ok {
+					t.Fatalf("panic value = %T (%v); want *ivm.DataError", r, r)
+				}
+				if !strings.Contains(de.Error(), "must not end with escape character") {
+					t.Fatalf("DataError message = %q; want the like.ts message", de.Error())
+				}
+			}()
+			BuildPredicate(&Condition{
+				Type:  "simple",
+				Op:    op,
+				Left:  &ValuePos{Type: "column", Name: "s"},
+				Right: &ValuePos{Type: "literal", Value: `x\`},
+			})
+		})
+	}
+}
+
+// TestBuildPredicateLikeEagerSemantics: the eager-compile path must
+// reproduce the lazy evalOp semantics exactly — including the null
+// short-circuits that fire BEFORE negation (NULL NOT LIKE p is false, not
+// true), the nil-RHS constant-false without compiling (TS filter.ts:75),
+// and the Unicode fast path.
+func TestBuildPredicateLikeEagerSemantics(t *testing.T) {
+	col := func(name string) *ValuePos { return &ValuePos{Type: "column", Name: name} }
+	lit := func(v any) *ValuePos { return &ValuePos{Type: "literal", Value: v} }
+	cases := []struct {
+		name string
+		op   string
+		rhs  *ValuePos
+		row  ivm.Row
+		want bool
+	}{
+		{"LIKE wildcard match", "LIKE", lit("Al%"), ivm.Row{"s": "Alice"}, true},
+		{"LIKE wildcard non-match", "LIKE", lit("Al%"), ivm.Row{"s": "Bob"}, false},
+		{"NOT LIKE non-match negates", "NOT LIKE", lit("Al%"), ivm.Row{"s": "Bob"}, true},
+		{"NOT LIKE match negates", "NOT LIKE", lit("Al%"), ivm.Row{"s": "Alice"}, false},
+		{"NULL lhs LIKE is false", "LIKE", lit("Al%"), ivm.Row{"s": nil}, false},
+		{"NULL lhs NOT LIKE is false too", "NOT LIKE", lit("Al%"), ivm.Row{"s": nil}, false},
+		{"nil literal rhs LIKE is false", "LIKE", lit(nil), ivm.Row{"s": "x"}, false},
+		{"nil literal rhs NOT LIKE is false", "NOT LIKE", lit(nil), ivm.Row{"s": "x"}, false},
+		{"ILIKE fast path unicode", "ILIKE", lit("οδος"), ivm.Row{"s": "ΟΔΟΣ"}, true},
+		{"ILIKE wildcard folds", "ILIKE", lit("caf_"), ivm.Row{"s": "CAFÉ"}, true},
+		{"NOT ILIKE non-match", "NOT ILIKE", lit("caf_"), ivm.Row{"s": "tea"}, true},
+		{"LIKE fast path equality", "LIKE", lit("plain"), ivm.Row{"s": "plain"}, true},
+		{"LIKE fast path case-sensitive", "LIKE", lit("plain"), ivm.Row{"s": "PLAIN"}, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			pred := BuildPredicate(&Condition{
+				Type: "simple", Op: c.op, Left: col("s"), Right: c.rhs,
+			})
+			if got := pred(c.row); got != c.want {
+				t.Fatalf("%s %v on %v = %v, want %v", c.op, c.rhs.Value, c.row, got, c.want)
+			}
+		})
+	}
 }
