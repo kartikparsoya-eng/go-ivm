@@ -114,44 +114,59 @@ func (s *Snapshotter) Current() (*Snapshot, error) {
 // full set of replicated table names (used to distinguish "non-syncable, skip"
 // from "unknown table, error"). The returned Diff is only valid until the next
 // Advance (the prev connection is reused).
+//
+// FAILURE-ATOMIC: the prev/curr swap commits only after BOTH the new head pin
+// and the diff construction succeed. On any error s.curr — the snapshot the
+// engine's sources are bound to and whose version matches the engine's applied
+// content — is untouched, so the caller may retry Advance in place. Without
+// this ordering a newDiff failure (e.g. a transient changelog read error)
+// stranded the swap: the next Advance diffed (old-curr → head] while the
+// engine still held old-prev content, silently skipping the
+// (old-prev → old-curr] window — drift. TS never needed the guarantee (its
+// snapshotter.advance is infallible in practice and a failed advance resets
+// the world); Go surfaces the retry contract via rpcCodeAdvanceCleanRetryable.
 func (s *Snapshotter) Advance(
 	syncable map[string]*TableSpec,
 	allNames map[string]bool,
 ) (*Diff, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	prev, curr, err := s.advanceWithoutDiffLocked()
-	if err != nil {
-		return nil, err
-	}
-	return newDiff(s.appID, syncable, allNames, prev, curr)
-}
-
-// advanceWithoutDiffLocked is the leapfrog core (snapshotter.ts:183-196).
-// MUST hold s.mu.
-func (s *Snapshotter) advanceWithoutDiffLocked() (prev, curr *Snapshot, err error) {
 	if s.curr == nil {
-		return nil, nil, fmt.Errorf("snapshotter: not initialized")
+		return nil, fmt.Errorf("snapshotter: not initialized")
 	}
+	// Prepare the head pin WITHOUT touching s.prev/s.curr (leapfrog core,
+	// snapshotter.ts:183-196). Connection reuse is load-bearing — avoids a
+	// per-advance conn + statement-prep cost (snapshotter.ts:77-89). Note
+	// resetToHead re-pins the reused prev conn even if we later fail — safe:
+	// a Diff is only valid until the next Advance, so nothing reads prev's
+	// old frame after this point, and a retry simply re-pins again.
 	var next *Snapshot
-	if s.prev != nil {
-		// Reuse the old prev connection: rollback its tx and re-pin at head.
-		// Connection reuse is load-bearing — avoids a per-advance conn +
-		// statement-prep cost (snapshotter.ts:77-89).
+	freshConn := s.prev == nil
+	if !freshConn {
 		if err := s.prev.resetToHead(s.beginStmt); err != nil {
-			return nil, nil, err
+			return nil, err
 		}
 		next = s.prev
 	} else {
 		// First advance: no prev yet, so open a fresh second connection.
+		var err error
 		next, err = s.newSnapshot()
 		if err != nil {
-			return nil, nil, err
+			return nil, err
 		}
+	}
+	// Build the diff BEFORE committing the swap: its NumChangesSince read is
+	// the only remaining fallible step.
+	diff, err := newDiff(s.appID, syncable, allNames, s.curr, next)
+	if err != nil {
+		if freshConn {
+			next.close() // don't leak the just-acquired pool conn
+		}
+		return nil, err
 	}
 	s.prev = s.curr
 	s.curr = next
-	return s.prev, s.curr, nil
+	return diff, nil
 }
 
 // RefreshCurrentToHead re-pins the current snapshot at the latest replica head

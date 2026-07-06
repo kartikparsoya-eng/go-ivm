@@ -42,6 +42,19 @@ type advanceToHeadParams struct {
 	// degrades to the ordinary frame path. Ignored by the non-streaming
 	// advanceToHead (its payload is the derived diff, not RowChanges).
 	RowMode bool `json:"rowMode,omitempty"`
+	// TotalHydrationTimeMs arms TS's economic advancement-abort for this
+	// call (see advance_abort.go): the measured cost of re-hydrating every
+	// pipeline in the CG, i.e. the price of the reset an abort triggers.
+	// TS computes it (PipelineDriver.totalHydrationTimeMs() — for Go-owned
+	// pipelines those entries ARE Go's own hydrate timingMs, stored back by
+	// TS at registration) and ships it per request so the decision inputs
+	// are identical to TS's own #shouldAdvanceYieldMaybeAbortAdvance.
+	// Absent (nil — old TS, shadow paths, tests) → abort disarmed; the
+	// legacy GO_IVM_ADVANCE_BUDGET_MS env deadline still applies if set.
+	TotalHydrationTimeMs *float64 `json:"totalHydrationTimeMs,omitempty"`
+	// SuppressAbort mirrors TS #advance's suppressAbort flag (:5863):
+	// evaluate nothing even when TotalHydrationTimeMs is present.
+	SuppressAbort bool `json:"suppressAbort,omitempty"`
 }
 
 // snapshotChangeWire is the on-wire form of a snapshotter.Change. It carries
@@ -578,7 +591,10 @@ func (s *Server) handleAdvanceToHead(req RPCRequest) RPCResponse {
 
 	diff, err := group.snap.Advance(group.snapSpecs, group.snapAllNames)
 	if err != nil {
-		return rpcError(req.ID, -32000, "advanceToHead advance: "+err.Error())
+		// Same clean-retryable contract as the streaming handler: the
+		// snapshotter's failure-atomic Advance left nothing moved.
+		return rpcError(req.ID, rpcCodeAdvanceCleanRetryable,
+			"advanceToHead advance: "+err.Error())
 	}
 	version := diff.Curr().Version()
 	drive := s.advanceDriveEnabled
@@ -793,13 +809,25 @@ func (s *Server) handleAdvanceToHeadStream(req RPCRequest, streamW streamWriter)
 	// TS classifier's reset bucket).
 	budgetDeadline, budgetOn := advanceDeadline()
 
+	// TS economic abort (advance_abort.go): armed only when the request
+	// carries totalHydrationTimeMs — the production drive path. Clock starts
+	// here, mirroring TS's timer covering the whole advance.
+	abort := newAdvanceAbort(p.TotalHydrationTimeMs, p.SuppressAbort)
+
 	// First advance ends the cold-start hydrate window; drop the reader pool
 	// before curr rotates off its pinned frame.
 	s.tearDownReaderPool(group)
 
 	diff, err := group.snap.Advance(group.snapSpecs, group.snapAllNames)
 	if err != nil {
-		return rpcError(req.ID, -32000, "advanceToHeadStream advance: "+err.Error())
+		// CLEAN failure: snapshotter.Advance is failure-atomic (the prev/curr
+		// swap commits only after the diff exists) and the engine applied
+		// nothing — this call is idempotent to retry in place. The retryable
+		// code lets TS retry with bounded backoff instead of resetting (the
+		// TS-native path has no transient-advance-failure class at all; the
+		// retry keeps that divergence invisible).
+		return rpcError(req.ID, rpcCodeAdvanceCleanRetryable,
+			"advanceToHeadStream advance: "+err.Error())
 	}
 	version := diff.Curr().Version()
 
@@ -839,6 +867,14 @@ func (s *Server) handleAdvanceToHeadStream(req RPCRequest, streamW streamWriter)
 	//     discards the half-advanced engine.
 	changesSeq := func(yield func(engine.SnapshotChange, error) bool) {
 		err := diff.Each(func(c snapshotter.Change) error {
+			// TS checkpoint 1 (pipeline-driver.ts:5883-5890): "Check progress
+			// here before processing the next change." The abort error rides
+			// the seq's error slot — the same in-band path as cursor errors —
+			// so the engine stops, skips its Final flush, and unwinds its
+			// cursors cleanly.
+			if aerr := abort.check(); aerr != nil {
+				return aerr
+			}
 			if !yield(engine.SnapshotChange{
 				Table:      c.Table,
 				PrevValues: c.PrevValues,
@@ -846,6 +882,10 @@ func (s *Server) handleAdvanceToHeadStream(req RPCRequest, streamW streamWriter)
 			}, nil) {
 				return errSeqConsumerStopped
 			}
+			// TS increments pos in the per-change finally (:5941): by the
+			// time yield returns, the engine has fully processed this change
+			// (the lazy feed runs inside the engine's range).
+			abort.pos++
 			return nil
 		})
 		if err != nil && !errors.Is(err, errSeqConsumerStopped) {
@@ -862,6 +902,7 @@ func (s *Server) handleAdvanceToHeadStream(req RPCRequest, streamW streamWriter)
 	// DriftError. diff.Changes is the changelog COUNT (known before any
 	// row values are read), so it still rides the Final frame.
 	numChanges := diff.Changes
+	abort.setNumChanges(numChanges) // same count TS's formula uses (SnapshotDiff.changes)
 	var emittedPartial bool
 
 	// finishStream maps the engine's returned error to the wire per the
@@ -869,6 +910,16 @@ func (s *Server) handleAdvanceToHeadStream(req RPCRequest, streamW streamWriter)
 	finishStream := func(streamErr error) RPCResponse {
 		if streamErr == nil {
 			return RPCResponse{JSONRPC: "2.0", Result: "done", ID: req.ID}
+		}
+		var aerr *advanceAbortedError
+		if errors.As(streamErr, &aerr) {
+			// TS 'advancement-timeout' twin. State is half-advanced (like
+			// TS's own mid-apply abort); the caller maps this code to
+			// ResetPipelinesSignal('advancement-timeout') — reset+re-hydrate,
+			// identical recovery to TS's own abort.
+			fmt.Fprintf(os.Stderr, "[GO-IVM] advanceToHeadStream cg=%s economic abort: %s\n",
+				cgID, aerr.Error())
+			return rpcError(req.ID, rpcCodeAdvanceAborted, aerr.Error())
 		}
 		if rs, ok := snapshotter.IsReset(streamErr); ok && !emittedPartial {
 			// Clean pre-stream reset: single Final frame carrying reset +
@@ -901,6 +952,13 @@ func (s *Server) handleAdvanceToHeadStream(req RPCRequest, streamW streamWriter)
 			// TestAdvanceStream_PanickingSink_NoDeadlockAndEngineReusable)
 			// and handleStreamWithRecover converts it to an RPC error.
 			checkAdvanceBudget(budgetDeadline, budgetOn, "apply", cgID)
+			// TS checkpoint 2 ("whenever a row is fetched during push"):
+			// rowMode emits per RowChange, so this is per-row granularity.
+			// The typed panic maps to rpcCodeAdvanceAborted with the exact
+			// message (panicErrorCode/panicErrorMessage).
+			if aerr := abort.check(); aerr != nil {
+				panic(aerr)
+			}
 			emittedPartial = true
 			rp.emitAdvanceToHeadPartial(r, version, numChanges)
 			if r.Drift != nil {
@@ -920,6 +978,9 @@ func (s *Server) handleAdvanceToHeadStream(req RPCRequest, streamW streamWriter)
 
 	streamErr := group.eng.AdvanceStreamChunkedSeq(changesSeq, 0, func(r engine.AdvanceStreamPartial) {
 		checkAdvanceBudget(budgetDeadline, budgetOn, "apply", cgID)
+		if aerr := abort.check(); aerr != nil {
+			panic(aerr) // TS checkpoint 2 — see the rowMode branch
+		}
 		emittedPartial = true
 		pc := toPositional(r.Changes)
 		part := advanceToHeadStreamPartial{

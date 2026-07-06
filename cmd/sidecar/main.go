@@ -1613,12 +1613,28 @@ func (s *Server) closeAll() {
 const rpcCodeDataError = -32102
 
 // panicErrorCode returns the RPC error code for a recovered panic value:
-// rpcCodeDataError for an *ivm.DataError, -32000 otherwise.
+// rpcCodeDataError for an *ivm.DataError, rpcCodeAdvanceAborted for the
+// economic advancement-abort (advance_abort.go — sink-site aborts panic
+// because the engine sink has no error return), -32000 otherwise.
 func panicErrorCode(r any) int {
 	if _, ok := r.(*ivm.DataError); ok {
 		return rpcCodeDataError
 	}
+	if _, ok := r.(*advanceAbortedError); ok {
+		return rpcCodeAdvanceAborted
+	}
 	return -32000
+}
+
+// panicErrorMessage renders a recovered panic for the wire. The economic
+// abort must arrive byte-identical to TS's advancement-timeout message (the
+// TS side surfaces it as the ResetPipelinesSignal message), so it must NOT
+// get the "panic: " prefix diagnostics use.
+func panicErrorMessage(r any) string {
+	if e, ok := r.(*advanceAbortedError); ok {
+		return e.Error()
+	}
+	return fmt.Sprintf("panic: %v", r)
 }
 
 // hydrateErrorResponse maps a RETURNED hydrate error to the right RPC code —
@@ -1655,7 +1671,7 @@ func (s *Server) handleStreamWithRecover(
 			fmt.Fprintf(os.Stderr, "[GO-IVM] PANIC in %s (stream): %v\n%s\n", req.Method, r, stack[:n])
 			resp = RPCResponse{
 				JSONRPC: "2.0",
-				Error:   &RPCError{Code: panicErrorCode(r), Message: fmt.Sprintf("panic: %v", r)},
+				Error:   &RPCError{Code: panicErrorCode(r), Message: panicErrorMessage(r)},
 				ID:      req.ID,
 			}
 		}
