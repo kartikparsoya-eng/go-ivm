@@ -861,6 +861,14 @@ type Server struct {
 	// receiver copies), so encoders may reuse their buffers.
 	abiDeliver func(kind int32, payload []byte)
 
+	// streamGates is the pull-hydration (ABI v3) demand-gate registry: one
+	// gate per in-flight pullMode addQueriesStream RPC, keyed by the f64
+	// reqID. Grant/cancel arrive as DIRECT JS-thread calls through the
+	// goivm_stream_credit/goivm_stream_cancel exports (napi_lib.go) — a
+	// leaf-locked registry, deliberately independent of s.mu (see
+	// streamgate.go). Zero-value ready.
+	streamGates streamGateRegistry
+
 	// Leaf-source mode for this sidecar process. ModeMemory uses the
 	// classic loadRows-populated MemorySource; ModeTable constructs a
 	// tablesource.Source per (cg, table) over replicaDB and treats
@@ -1178,6 +1186,55 @@ func coldPoolTTL() time.Duration {
 		}
 	}
 	return 5 * time.Minute
+}
+
+// pullIdleTimeout bounds how long a pull-hydrate producer may stay parked
+// at zero credit with no grants before its gate is auto-cancelled (ABI v3,
+// DESIGN-duplex-streaming D7). This is the pull lane's analogue of
+// GO_IVM_ADVANCE_BUDGET_MS: it bounds the WAL-frame pin (a parked hydrate
+// holds its read snapshot) and the group.mu hold (same-CG advances queue
+// behind a parked hydrate — TS-faithful, but TS never parks on a vanished
+// client). Auto-cancel takes the exact same unwind as a client cancel; the
+// client receives a terminal error frame and re-hydrates. Env-tunable via
+// GO_IVM_PULL_IDLE_TIMEOUT_SEC; default 60s.
+func pullIdleTimeout() time.Duration {
+	if v := os.Getenv("GO_IVM_PULL_IDLE_TIMEOUT_SEC"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return time.Duration(n) * time.Second
+		}
+	}
+	return 60 * time.Second
+}
+
+// runPullIdleSweeper cancels pull gates whose producers have been parked
+// past pullIdleTimeout (D7). Started by BOTH transports next to runReaper.
+// The sweep is O(registered gates) over a leaf-locked registry — it never
+// touches s.mu or group.mu, so it can never wedge behind a slow handler.
+// Covers the crashed-client-no-cancel case together with shutdownGroup's
+// teardown broadcast. Blocking call; run in its own goroutine.
+func (s *Server) runPullIdleSweeper(ctx context.Context) {
+	idle := pullIdleTimeout()
+	tick := idle / 4
+	if tick > 5*time.Second {
+		tick = 5 * time.Second
+	}
+	if tick < 50*time.Millisecond {
+		tick = 50 * time.Millisecond
+	}
+	ticker := time.NewTicker(tick)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-ticker.C:
+			if n := s.streamGates.sweepIdle(now, idle); n > 0 {
+				fmt.Fprintf(os.Stderr,
+					"[GO-IVM] pull idle-timeout: cancelled %d parked stream(s) (no credit for > %v)\n",
+					n, idle)
+			}
+		}
+	}
 }
 
 // runReaper periodically reaps idle client groups until ctx is cancelled.
@@ -1508,6 +1565,14 @@ func (s *Server) shutdownGroup(g *ClientGroup) {
 	g.closeOnce.Do(func() {
 		close(g.done)
 	})
+	// Pull gates FIRST (ABI v3, D6): a pull-hydrate producer parked at zero
+	// credit holds group.mu via its RPC handler — taking g.mu below would
+	// wait on the client's think-time (or forever, for a vanished client).
+	// Cancelling the group's gates unparks those producers; they unwind
+	// (ErrStreamCancelled), their handler returns and releases group.mu,
+	// and the teardown proceeds. Owner is the group POINTER, so this can
+	// never touch a re-created generation of the same cgID.
+	s.streamGates.cancelOwner(g)
 	// Engine cleanup needs g.mu because handlers also take it (and we may
 	// race with a handler that just dequeued before done was closed; the
 	// handler will finish and respCh-send before re-entering the worker
@@ -1997,6 +2062,13 @@ type addQueriesParams struct {
 	InitEpoch uint64 `json:"initEpoch"`
 	// RowMode: see advanceParams.RowMode — same contract for hydrate.
 	RowMode bool `json:"rowMode,omitempty"`
+	// PullMode (ABI v3, DESIGN-duplex-streaming): opt this hydrate into
+	// credit-gated (pull) row delivery. Only honored when the row plane
+	// engages (in-process transport + RowMode + numeric reqID); otherwise
+	// silently degrades to today's push behavior — old-client/new-server
+	// and new-client/old-server pairs are both safe (unknown msgpack
+	// fields are ignored on decode).
+	PullMode bool `json:"pullMode,omitempty"`
 }
 
 type addQueriesResult struct {
@@ -2150,11 +2222,50 @@ func (s *Server) handleAddQueriesStream(req RPCRequest, streamW streamWriter) RP
 	// (per-query TimingMs + completion signal). onResult runs concurrently
 	// from hydrate lanes — rowPlane's mutex serializes the encoder.
 	if rp := newRowPlane(s, req.ID, p.RowMode); rp != nil {
-		err := group.eng.AddQueriesStreamChunked(specs, 1, func(r engine.QueryResult) {
+		// Pull mode (ABI v3): register the per-RPC demand gate. Row-BEARING
+		// deliveries acquire one credit each; group defs, Final frames, and
+		// error frames ride free (D3 — gating them deadlocks: the client is
+		// waiting for exactly those to decide whether to grant). The gate's
+		// touch keeps the group reaper-proof while the client actively
+		// pulls. gate==nil (NaN reqID / duplicate) degrades to ungated.
+		if p.PullMode {
+			rid, _ := numericReqID(req.ID) // non-numeric already refused by newRowPlane
+			if gate := s.streamGates.register(rid, group, func() {
+				group.lastUsedNs.Store(time.Now().UnixNano())
+			}); gate != nil {
+				defer s.streamGates.unregister(rid)
+				err := group.eng.AddQueriesStreamPull(specs, 1, func(r engine.QueryResult) bool {
+					if len(r.Changes) > 0 && !gate.acquire() {
+						// Cancelled (client .return(), teardown, or idle
+						// timeout): refuse — the engine breaks the fetch
+						// range and unwinds (D4). Nothing more is emitted
+						// for this RPC except the terminal error frame.
+						return false
+					}
+					rp.emitHydratePartial(r)
+					if r.Final {
+						metrics.recordHydrateChunks(r.ChunkIndex + 1)
+					}
+					return true
+				})
+				if err != nil {
+					// ErrStreamCancelled lands here too: a plain -32000
+					// terminal error frame (I9 — client-initiated, never
+					// reset-classified; hydrateErrorResponse only special-
+					// cases DataError). The client already left; the frame
+					// is bookkeeping symmetry and rides the ungated path.
+					fmt.Fprintf(os.Stderr, "[GO-IVM] addQueriesStream(pullMode) ERROR cg=%s: %v\n", cgID, err)
+					return hydrateErrorResponse(req.ID, "addQueriesStream: ", err)
+				}
+				return RPCResponse{JSONRPC: "2.0", Result: "done", ID: req.ID}
+			}
+		}
+		err := group.eng.AddQueriesStreamChunked(specs, 1, func(r engine.QueryResult) bool {
 			rp.emitHydratePartial(r)
 			if r.Final {
 				metrics.recordHydrateChunks(r.ChunkIndex + 1)
 			}
+			return true
 		})
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "[GO-IVM] addQueriesStream(rowMode) ERROR cg=%s: %v\n", cgID, err)
@@ -2924,6 +3035,11 @@ func main() {
 	// goroutine + MemorySource data resident. Reaps groups untouched for
 	// groupIdleTimeout. REVIEW-final HIGH-CROSS-2 / HIGH-CROSS-3.
 	go server.runReaper(shutdownCtx)
+	// Pull idle sweeper (ABI v3, D7). The socket transport can't run pull
+	// mode (no abiDeliver → no row plane → pullMode ignored), so this is a
+	// no-op ticker here — started anyway so both transports share one
+	// lifecycle shape and a future socket-side pull can't silently miss it.
+	go server.runPullIdleSweeper(shutdownCtx)
 
 	// Graceful shutdown
 	sig := make(chan os.Signal, 1)

@@ -19,6 +19,8 @@ package main
 //	int32_t goivm_send(const void* data, int32_t len);
 //	void    goivm_shutdown(void);
 //	int32_t goivm_abi_version(void);
+//	void    goivm_stream_credit(double req_id, int32_t n);   // ABI v3
+//	void    goivm_stream_cancel(double req_id);              // ABI v3
 //
 // Threading & memory contract:
 //   - The deliver callback is invoked from Go-runtime goroutines (NOT the
@@ -65,7 +67,14 @@ import (
 //	v2: added delivery kind 4 (host death — abi.go's death watcher; the
 //	    client must fatal the worker on receipt, so a v1 addon that would
 //	    silently warn-and-drop it must not pair with a v2 library).
-const goivmABIVersion = 2
+//	v3: added goivm_stream_credit / goivm_stream_cancel (pull-hydration
+//	    demand gate, DESIGN-duplex-streaming). Pull is a per-request
+//	    opt-in (params.pullMode) so a v3 addon on a v3 library with pull
+//	    disabled behaves exactly like v2; the version gates the SYMBOLS —
+//	    a v3 addon dlsym-ing the credit exports must never pair with a
+//	    library that silently lacks them (grants would vanish and every
+//	    pull hydrate would park to idle-timeout).
+const goivmABIVersion = 3
 
 var (
 	abiMu   sync.Mutex
@@ -154,4 +163,46 @@ func goivm_shutdown() {
 	if h != nil {
 		h.Shutdown()
 	}
+}
+
+// goivm_stream_credit grants n credits to the pull gate of the in-flight
+// pullMode RPC identified by reqID (ABI v3, DESIGN-duplex-streaming D8).
+//
+// Called DIRECTLY on the JS thread (dlsym'd, no TSFN round-trip): the JS
+// iterator grants at its low-water mark as the app consumes rows. Safe
+// because the whole path is a leaf-mutex registry lookup + cond broadcast —
+// O(1), allocation-free, never blocks on engine or server state, never
+// touches N-API. reqID rides the C `double` type because that is what a JS
+// number is — bit-exact with the f64 reqID the row plane keys records by
+// (rowrecord.go numericReqID). Unknown reqID is a silent no-op (the RPC
+// already settled — same benign race as a late TSFN frame).
+//
+//export goivm_stream_credit
+func goivm_stream_credit(reqID C.double, n C.int32_t) {
+	abiMu.Lock()
+	h := abiHst
+	abiMu.Unlock()
+	if h == nil {
+		return
+	}
+	h.server.streamGates.grant(float64(reqID), int64(n))
+}
+
+// goivm_stream_cancel cancels the pull gate of the in-flight pullMode RPC
+// identified by reqID — the JS iterator's .return()/.throw() crossing the
+// boundary (ABI v3, D4). The parked producer unparks, the engine breaks
+// its fetch range (operator chain unwinds, cursor closes, pool reader
+// returns), and the RPC settles with a terminal error frame. Same direct-
+// call constraints as goivm_stream_credit; idempotent; unknown reqID is a
+// silent no-op.
+//
+//export goivm_stream_cancel
+func goivm_stream_cancel(reqID C.double) {
+	abiMu.Lock()
+	h := abiHst
+	abiMu.Unlock()
+	if h == nil {
+		return
+	}
+	h.server.streamGates.cancel(float64(reqID))
 }

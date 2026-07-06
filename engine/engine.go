@@ -42,6 +42,19 @@ func envChunkSize(name string, def int) int {
 // nil pipelines/sources map.
 var ErrEngineClosed = errors.New("engine is closed")
 
+// ErrStreamCancelled is returned by AddQueriesStreamPull when the consumer
+// aborted the stream: the pull gate was cancelled (client .return()/.throw(),
+// group teardown, or the pull idle timeout) and onResult returned false, so
+// the producer broke its fetch range and unwound (cursor closed, pool reader
+// released). DESIGN-duplex-streaming D4.
+//
+// I9 (reset-classification pin): this error is CLIENT-INITIATED and must
+// never join the reset ladder — a storm of tab-closes must not become a
+// reset storm. The sidecar maps it to a plain -32000 terminal error frame
+// for bookkeeping symmetry (the client already left); it must not map to
+// rpcCodeDataError or any reset-triggering class.
+var ErrStreamCancelled = errors.New("hydrate stream cancelled by consumer")
+
 // Source is the interface that engine sources must implement.
 //
 // Close releases any external resource the leaf holds (the tablesource leaf's
@@ -182,6 +195,17 @@ type Engine struct {
 	streamer  *Streamer
 	storage   *sqlite.DatabaseStorage
 	closed    bool // set true by Close; guards against post-Close calls
+
+	// activeDrains counts streaming-hydrate drain phases currently running
+	// OUTSIDE e.mu (DESIGN-duplex-streaming D5: build under e.mu, drain
+	// released so a pull producer parked on client demand cannot freeze the
+	// engine). Guarded by e.mu (incremented before the build phase unlocks,
+	// decremented after the post phase re-locks). RefreshAllSources checks
+	// it because the drift audit deliberately bypasses the per-CG FIFO
+	// (sidecar handleRefreshSnapshot releases group.mu before calling) —
+	// with e.mu no longer held across the drain, TryLock alone would let a
+	// RefreshSnapshot ROLLBACK the prev tx under a live hydrate cursor.
+	activeDrains int
 
 	// tableUniqueKeys: per-table list of unique key column sets. Used by the
 	// scalar-subquery resolver to detect "simple" subqueries — those whose
@@ -443,6 +467,18 @@ func (e *Engine) RefreshAllSources() {
 		return
 	}
 	defer e.mu.Unlock()
+	if e.activeDrains > 0 {
+		// D5: a streaming-hydrate drain is running OUTSIDE e.mu (build/post
+		// phases hold it; the fetch loops don't, so a pull producer parked
+		// on client demand can't freeze the engine). TryLock therefore no
+		// longer proves quiescence — without this check the audit's refresh
+		// would ROLLBACK+re-pin the prev tx UNDER the drain's live cursors:
+		// the exact mid-flight corruption described above, reintroduced via
+		// the FIFO-bypass. Skip identically to the TryLock failure.
+		fmt.Fprintln(os.Stderr,
+			"[GO-IVM] refreshSnapshot skipped: engine busy (hydrate drain in flight)")
+		return
+	}
 	for _, src := range e.sourcesView() {
 		if r, ok := src.(interface{ RefreshSnapshot() }); ok {
 			r.RefreshSnapshot()
@@ -842,13 +878,17 @@ func (e *Engine) AddQueries(queries []QuerySpec) ([]QueryResult, error) {
 // its writeMu).
 //
 // Returns after all goroutines have finished. Engine.mu is held for the
-// duration (consistent with AddQueries' lock discipline so source state
-// stays read-only across the hydration window).
+// BUILD and POST phases only; the drain runs outside it (D5,
+// DESIGN-duplex-streaming). "Source state stays read-only across the
+// hydration window" is now the CALLER's per-group serialization invariant
+// (worker FIFO + group.mu in the sidecar — TS's per-CG model), plus the
+// activeDrains guard for the one FIFO-bypassing caller (RefreshAllSources).
 func (e *Engine) AddQueriesStream(
 	queries []QuerySpec,
 	onResult func(QueryResult),
 ) error {
-	return e.addQueriesStreamChunked(queries, hydrateChunkSize, onResult)
+	return e.addQueriesStreamChunked(queries, hydrateChunkSize, false,
+		func(r QueryResult) bool { onResult(r); return true })
 }
 
 // AddQueriesStreamChunked is AddQueriesStream with a per-call chunk-size
@@ -856,158 +896,274 @@ func (e *Engine) AddQueriesStream(
 // row plane uses this so each row crosses the Go↔JS boundary the moment
 // the (lazy) fetch produces it, instead of being re-batched into
 // hydrateChunkSize frames. chunkSize<=0 falls back to hydrateChunkSize.
+//
+// onResult returns whether the consumer wants MORE results (D4): false
+// means "consumer gone — stop producing". The producer breaks its fetch
+// range, which unwinds the operator chain via the iter.Seq defers (cursor
+// close, pool-reader release — the Go dual of TS generator .return()), and
+// the call returns ErrStreamCancelled. Callers that never cancel pass a
+// closure returning true unconditionally — zero behavior change.
 func (e *Engine) AddQueriesStreamChunked(
 	queries []QuerySpec,
 	chunkSize int,
-	onResult func(QueryResult),
+	onResult func(QueryResult) bool,
 ) error {
 	if chunkSize <= 0 {
 		chunkSize = hydrateChunkSize
 	}
-	return e.addQueriesStreamChunked(queries, chunkSize, onResult)
+	return e.addQueriesStreamChunked(queries, chunkSize, false, onResult)
+}
+
+// AddQueriesStreamPull is AddQueriesStreamChunked for pull-mode (ABI v3)
+// hydrates. Two differences (DESIGN-duplex-streaming D5/D6):
+//
+//   - Each query drains on its OWN goroutine instead of the shared
+//     hydrate-lane pool. A pull producer parks on client demand (the
+//     sidecar's onResult blocks in streamGate.acquire); parking a shared
+//     lane would starve sibling queries for client-think-time. Pull
+//     concurrency is client-bounded by credits, so the P-lane bound is
+//     redundant here; non-pull hydrates keep the pool (K = P × Cmax).
+//   - The reader-demand bound shifts accordingly: a pull batch can demand
+//     up to len(queries) concurrent readers instead of P. The sidecar's
+//     warm-pool sizing already uses ConservativeHydrateCmaxForSpecs which
+//     is per-spec, and pool acquisition falls back to serial when
+//     exhausted — bounded degradation, not failure.
+func (e *Engine) AddQueriesStreamPull(
+	queries []QuerySpec,
+	chunkSize int,
+	onResult func(QueryResult) bool,
+) error {
+	if chunkSize <= 0 {
+		chunkSize = hydrateChunkSize
+	}
+	return e.addQueriesStreamChunked(queries, chunkSize, true, onResult)
 }
 
 func (e *Engine) addQueriesStreamChunked(
 	queries []QuerySpec,
 	chunkSize int,
-	onResult func(QueryResult),
+	pull bool,
+	onResult func(QueryResult) bool,
 ) error {
+	// D5 lock structure (DESIGN-duplex-streaming): build under e.mu, drain
+	// OUTSIDE e.mu, post-wiring under e.mu again. The drain phase only
+	// READS source state; every source-mutating entry point is serialized
+	// against this call at the sidecar level (per-CG worker FIFO +
+	// group.mu held across the whole RPC — main.go handleAddQueriesStream)
+	// — the same per-CG serialization TS's view-syncer provides. The one
+	// caller that deliberately bypasses that serialization
+	// (handleRefreshSnapshot → RefreshAllSources) checks activeDrains.
+	// Rationale: a pull producer parked on client demand while holding
+	// e.mu would freeze the engine (advances, PipelineCount, Close) for
+	// client-think-time.
 	e.mu.Lock()
-	defer e.mu.Unlock()
 
 	// Bail explicitly on closed engine. Without this, the loop below
 	// would iterate a nil pipelines/sources map and silently return
 	// success with no callbacks fired — caller sees "0 queries
 	// hydrated" with no error.
 	if e.closed {
+		e.mu.Unlock()
 		return ErrEngineClosed
 	}
 
-	// Phase 1: Build all pipelines sequentially (mutates shared state).
-	// Scalar-subquery resolution + companion wiring happens here too —
-	// see buildAndRegisterLocked.
-	built := e.buildBatchLocked(queries)
+	// Phase 1 (build, under e.mu): Build all pipelines sequentially
+	// (mutates shared state). Scalar-subquery resolution + companion
+	// wiring happens here too — see buildAndRegisterLocked. The closure's
+	// deferred unlock covers build-phase PANICS (unknown table → DataError
+	// panic, addqueries_build_unwind_test.go): the panic must escape to
+	// the caller with e.mu released, exactly as the pre-D5 whole-function
+	// defer provided. activeDrains++ is the closure's last statement, so a
+	// build panic never leaves a phantom drain registered.
+	var built []*pipelineEntry
+	var mrv map[string]string
+	func() {
+		defer e.mu.Unlock()
+		built = e.buildBatchLocked(queries)
+		mrv = e.minRowVersions
+		e.activeDrains++
+	}()
 
-	// Phase 2: Hydrate via P worker lanes, streaming per-query results in
-	// chunks as each query's fetch progresses. Each query may emit multiple
-	// chunks (one per hydrateChunkSize RowChanges); the last chunk has
-	// Final=true. P bounds both goroutine count and connection demand (K =
-	// P × Cmax; see DESIGN-streaming-hydrate.md §3a/§3d).
+	// Phase 2 (drain, OUTSIDE e.mu): Hydrate via P worker lanes (or one
+	// goroutine per query in pull mode — see AddQueriesStreamPull),
+	// streaming per-query results in chunks as each query's fetch
+	// progresses. Each query may emit multiple chunks (one per
+	// hydrateChunkSize RowChanges); the last chunk has Final=true. P
+	// bounds both goroutine count and connection demand (K = P × Cmax;
+	// see DESIGN-streaming-hydrate.md §3a/§3d).
 	//
 	// The consumer streams each node as Fetch yields it — no intermediate
 	// slices.Collect materialization. Go-side peak memory is bounded by the
 	// current chunk (hydrateChunkSize RowChanges), not the full result set.
-	// (True row-at-a-time DB streaming also requires a lazy leaf — Step 4.)
-	mrv := e.minRowVersions
+	//
 	// C1: capture per-lane panics (see AddQueries) so a nil-PK panic in one
 	// query's hydrate becomes a returned error instead of a process abort.
 	// The query may have already emitted partial (Final=false) frames; the
 	// handler turns the returned error into an rpcError, which rejects the
 	// whole addQueriesStream call on the TS side — a clean failure, not a crash.
 	hydratePanics := make([]any, len(built))
-	p := hydrateLanes
-	if p > len(built) {
-		p = len(built)
-	}
-	if p < 1 {
-		p = 1
-	}
-	type hydrateJob struct {
-		idx   int
-		entry *pipelineEntry
-	}
-	jobs := make(chan hydrateJob, len(built))
-	for i, entry := range built {
-		jobs <- hydrateJob{i, entry}
-	}
-	close(jobs)
-	var wg sync.WaitGroup
-	for w := 0; w < p; w++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for job := range jobs {
-				func() {
-					defer func() {
-						if r := recover(); r != nil {
-							hydratePanics[job.idx] = r
-						}
-					}()
-					entry := job.entry
-					start := time.Now()
-					var chunk []RowChange
-					chunkBytes := 0
-					chunkIndex := 0
-					flush := func(final bool) {
-						// TimingMs only on the final chunk (TS accumulator uses it
-						// for per-query attribution). Avoids leaking incremental
-						// fetch-time noise into the histogram.
-						var timingMs float64
-						if final {
-							timingMs = float64(time.Since(start).Microseconds()) / 1000.0
-						}
-						onResult(QueryResult{
-							QueryID:    entry.queryID,
-							Changes:    bumpRowVersions(chunk, mrv),
-							ChunkIndex: chunkIndex,
-							Final:      final,
-							TimingMs:   timingMs,
-						})
-						// T1-5: reuse the backing array (see the matching note in
-						// AdvanceStream's flush). onResult encodes Changes
-						// synchronously via the sidecar's streamW before returning, so
-						// the array is free to reuse. Revert to `chunk = nil` if any
-						// caller retains Changes asynchronously.
-						chunk = chunk[:0]
-						chunkBytes = 0
-						chunkIndex++
-					}
+	// cancelled flips when any onResult returns false (one gate serves the
+	// whole RPC, so one refusal means the client abandoned the whole call);
+	// other producers notice at their next flush or job pickup and stop.
+	var cancelled atomic.Bool
 
-					for node := range entry.pipeline.Input.Fetch(ivm.FetchRequest{}) {
-						nodeChanges := streamNodes(entry.queryID, entry.schema, RowChangeAdd, node)
-						chunk = append(chunk, nodeChanges...)
-						chunkBytes += estimateRowChangesBytes(nodeChanges)
-						if len(chunk) >= chunkSize || chunkBytes >= softChunkBytes {
-							flush(false)
-						}
-					}
-					// Emit companion rows after the main pipeline's nodes so the
-					// client receives all rows for one queryID in one logical run.
-					// They're tagged with the same queryID + each companion's own
-					// schema (table name), so the streamer/client demultiplex
-					// correctly. Chunk-bounded so a query with many companions
-					// still respects hydrateChunkSize.
-					for _, ce := range entry.companions {
-						if ce.matchedRow == nil {
-							continue
-						}
-						node := ivm.Node{Row: ce.matchedRow}
-						nodeChanges := streamNodes(entry.queryID, ce.schema, RowChangeAdd, node)
-						chunk = append(chunk, nodeChanges...)
-						chunkBytes += estimateRowChangesBytes(nodeChanges)
-						if len(chunk) >= chunkSize || chunkBytes >= softChunkBytes {
-							flush(false)
-						}
-					}
-					// Always emit a terminal frame with Final=true, even if empty —
-					// the TS accumulator uses it as the per-query completion signal.
-					// For queries whose total RowChanges hit an exact multiple of
-					// hydrateChunkSize, the terminal frame carries zero rows; one
-					// extra small frame per such query is the tradeoff for a simple
-					// invariant ("every query ends with Final=true").
-					flush(true)
-				}()
+	hydrateOne := func(idx int, entry *pipelineEntry) {
+		defer func() {
+			if r := recover(); r != nil {
+				hydratePanics[idx] = r
 			}
 		}()
+		start := time.Now()
+		var chunk []RowChange
+		chunkBytes := 0
+		chunkIndex := 0
+		flush := func(final bool) bool {
+			// TimingMs only on the final chunk (TS accumulator uses it
+			// for per-query attribution). Avoids leaking incremental
+			// fetch-time noise into the histogram.
+			var timingMs float64
+			if final {
+				timingMs = float64(time.Since(start).Microseconds()) / 1000.0
+			}
+			if !onResult(QueryResult{
+				QueryID:    entry.queryID,
+				Changes:    bumpRowVersions(chunk, mrv),
+				ChunkIndex: chunkIndex,
+				Final:      final,
+				TimingMs:   timingMs,
+			}) {
+				cancelled.Store(true)
+				return false
+			}
+			// T1-5: reuse the backing array (see the matching note in
+			// AdvanceStream's flush). onResult encodes Changes
+			// synchronously via the sidecar's streamW before returning, so
+			// the array is free to reuse. Revert to `chunk = nil` if any
+			// caller retains Changes asynchronously.
+			chunk = chunk[:0]
+			chunkBytes = 0
+			chunkIndex++
+			return true
+		}
+
+		for node := range entry.pipeline.Input.Fetch(ivm.FetchRequest{}) {
+			nodeChanges := streamNodes(entry.queryID, entry.schema, RowChangeAdd, node)
+			chunk = append(chunk, nodeChanges...)
+			chunkBytes += estimateRowChangesBytes(nodeChanges)
+			if len(chunk) >= chunkSize || chunkBytes >= softChunkBytes {
+				if !flush(false) {
+					// Returning breaks the range mid-iteration: iter.Seq
+					// yield sees false, every operator frame's defers run,
+					// the SQLite cursor closes, the pool reader returns to
+					// the warm pool (D4 — the .return() dual).
+					return
+				}
+			}
+		}
+		if cancelled.Load() {
+			// Another producer's consumer refusal (or this RPC's gate
+			// cancel between flushes) — stop before companion emit; the
+			// RPC is settling as cancelled, nothing may be delivered.
+			return
+		}
+		// Emit companion rows after the main pipeline's nodes so the
+		// client receives all rows for one queryID in one logical run.
+		// They're tagged with the same queryID + each companion's own
+		// schema (table name), so the streamer/client demultiplex
+		// correctly. Chunk-bounded so a query with many companions
+		// still respects hydrateChunkSize.
+		for _, ce := range entry.companions {
+			if ce.matchedRow == nil {
+				continue
+			}
+			node := ivm.Node{Row: ce.matchedRow}
+			nodeChanges := streamNodes(entry.queryID, ce.schema, RowChangeAdd, node)
+			chunk = append(chunk, nodeChanges...)
+			chunkBytes += estimateRowChangesBytes(nodeChanges)
+			if len(chunk) >= chunkSize || chunkBytes >= softChunkBytes {
+				if !flush(false) {
+					return
+				}
+			}
+		}
+		// Always emit a terminal frame with Final=true, even if empty —
+		// the TS accumulator uses it as the per-query completion signal.
+		// For queries whose total RowChanges hit an exact multiple of
+		// hydrateChunkSize, the terminal frame carries zero rows; one
+		// extra small frame per such query is the tradeoff for a simple
+		// invariant ("every query ends with Final=true").
+		flush(true)
+	}
+
+	var wg sync.WaitGroup
+	if pull {
+		// D6: one goroutine per query — a parked pull producer must not
+		// occupy a shared lane (see AddQueriesStreamPull).
+		for i, entry := range built {
+			wg.Add(1)
+			go func(idx int, entry *pipelineEntry) {
+				defer wg.Done()
+				if cancelled.Load() {
+					return
+				}
+				hydrateOne(idx, entry)
+			}(i, entry)
+		}
+	} else {
+		p := hydrateLanes
+		if p > len(built) {
+			p = len(built)
+		}
+		if p < 1 {
+			p = 1
+		}
+		type hydrateJob struct {
+			idx   int
+			entry *pipelineEntry
+		}
+		jobs := make(chan hydrateJob, len(built))
+		for i, entry := range built {
+			jobs <- hydrateJob{i, entry}
+		}
+		close(jobs)
+		for w := 0; w < p; w++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for job := range jobs {
+					if cancelled.Load() {
+						continue // cancelled RPC: skip queued queries entirely
+					}
+					hydrateOne(job.idx, job.entry)
+				}
+			}()
+		}
 	}
 	wg.Wait()
+
+	// Phase 3 (post, under e.mu again).
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.activeDrains--
 	if err := firstHydratePanic(built, hydratePanics); err != nil {
 		return err
 	}
+	if cancelled.Load() {
+		// Pipelines stay registered, exactly like the panic path: the TS
+		// side rejects the whole addQueriesStream (I3 all-or-nothing) and
+		// a retry re-adds the queries (buildAndRegisterLocked removes the
+		// stale entry first).
+		return ErrStreamCancelled
+	}
 
-	// HIGH-11: wire companion outputs after all hydrates complete.
-	for _, entry := range built {
-		e.wireCompanionOutputsLocked(entry)
+	// HIGH-11: wire companion outputs after all hydrates complete. Skipped
+	// if the engine closed mid-drain (Close contract says callers prevent
+	// that, but the check is cheap and the wiring would touch destroyed
+	// pipelines).
+	if !e.closed {
+		for _, entry := range built {
+			e.wireCompanionOutputsLocked(entry)
+		}
 	}
 	return nil
 }

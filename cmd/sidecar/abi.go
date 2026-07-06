@@ -227,6 +227,9 @@ func startABIHostWithServer(server *Server, deliver func(kind int32, payload []b
 	reaperCtx, reaperCancel := context.WithCancel(context.Background())
 	h.reaperCancel = reaperCancel
 	go server.runReaper(reaperCtx)
+	// Pull idle sweeper (ABI v3, D7): auto-cancels pull gates parked past
+	// GO_IVM_PULL_IDLE_TIMEOUT_SEC. Same lifecycle as the reaper.
+	go server.runPullIdleSweeper(reaperCtx)
 
 	// Observability parity with the socket path (REVIEW-napi-transport O1):
 	// the 10s [GO-IVM][PERF] reporter (what every soak greps) + the pprof
