@@ -2069,6 +2069,13 @@ type addQueriesParams struct {
 	// and new-client/old-server pairs are both safe (unknown msgpack
 	// fields are ignored on decode).
 	PullMode bool `json:"pullMode,omitempty"`
+	// PullWindow is the OPENING credit for the pull gate (the client's
+	// window W). It rides the request — not a first goivm_stream_credit
+	// call — because a grant racing ahead of gate registration is a silent
+	// no-op: the opening window would be lost and the producer would park
+	// until the idle sweep. 0/absent = zero opening credit (every row waits
+	// for an explicit grant — the lockstep test mode).
+	PullWindow int `json:"pullWindow,omitempty"`
 }
 
 type addQueriesResult struct {
@@ -2230,7 +2237,7 @@ func (s *Server) handleAddQueriesStream(req RPCRequest, streamW streamWriter) RP
 		// pulls. gate==nil (NaN reqID / duplicate) degrades to ungated.
 		if p.PullMode {
 			rid, _ := numericReqID(req.ID) // non-numeric already refused by newRowPlane
-			if gate := s.streamGates.register(rid, group, func() {
+			if gate := s.streamGates.register(rid, group, int64(p.PullWindow), func() {
 				group.lastUsedNs.Store(time.Now().UnixNano())
 			}); gate != nil {
 				defer s.streamGates.unregister(rid)

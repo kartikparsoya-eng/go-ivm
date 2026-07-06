@@ -162,6 +162,34 @@ func frameFor(col *sinkCollector, t *testing.T, id float64, pred func(RPCRespons
 	return RPCResponse{}, false
 }
 
+// TestPullMode_OpeningWindowViaRequest pins the race-free opening window
+// (I6 at W>1): pullWindow rides the REQUEST, so exactly W rows flow with no
+// grant call ever made — produced ≤ consumed + W — and top-ups extend the
+// window from there. This is the production shape (the JS client always
+// sends pullWindow ≥ 1; grant calls are top-ups only).
+func TestPullMode_OpeningWindowViaRequest(t *testing.T) {
+	const nRows = 30
+	srv, col, _, send := startPullHost(t, nRows)
+
+	params := pullQueryParams(true, true)
+	params["pullWindow"] = 4
+	send(3, "addQueriesStream", params)
+	waitGateRegistered(t, srv, 5*time.Second)
+
+	// Exactly the opening window flows; the producer parks at W.
+	waitRows(t, col, 4, 5*time.Second)
+	assertRowsStable(t, col, 4, 150*time.Millisecond)
+
+	// A top-up extends it.
+	srv.streamGates.grant(3, 4)
+	waitRows(t, col, 8, 5*time.Second)
+	assertRowsStable(t, col, 8, 100*time.Millisecond)
+
+	// Drain the rest.
+	srv.streamGates.grant(3, int64(nRows-8))
+	waitRows(t, col, nRows, 5*time.Second)
+}
+
 // TestPullMode_LockstepDemandGate is the I6 lockstep pin at W=1: no
 // row-bearing delivery may cross the boundary until the client grants, and
 // deliveries track grants exactly.

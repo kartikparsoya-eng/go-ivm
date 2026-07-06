@@ -143,16 +143,26 @@ type streamGateRegistry struct {
 	gates map[float64]*gateEntry
 }
 
-// register creates and registers a gate for reqID. Returns nil (pull
-// refused) for NaN reqIDs — see the file header. Re-registering a live
-// reqID returns nil too: reqID collisions mean a client bug; refusing the
-// gate degrades that RPC to ungated (correct, just not pull-bounded)
-// instead of cross-wiring two RPCs' credits.
-func (r *streamGateRegistry) register(reqID float64, owner any, touch func()) *streamGate {
+// register creates and registers a gate for reqID with `initial` opening
+// credits. Returns nil (pull refused) for NaN reqIDs — see the file header.
+// Re-registering a live reqID returns nil too: reqID collisions mean a
+// client bug; refusing the gate degrades that RPC to ungated (correct, just
+// not pull-bounded) instead of cross-wiring two RPCs' credits.
+//
+// The opening credit rides REGISTRATION (not a first grant call) because a
+// grant that races ahead of the handler is a silent no-op — the client's
+// opening window would vanish and the producer would park until the idle
+// sweep. Carrying it in the request (params.pullWindow → initial) makes
+// gate-exists ⇒ window-armed atomic; every later grant is a top-up
+// triggered by a delivery, which itself proves the gate existed.
+func (r *streamGateRegistry) register(reqID float64, owner any, initial int64, touch func()) *streamGate {
 	if math.IsNaN(reqID) {
 		return nil
 	}
 	g := newStreamGate(touch)
+	if initial > 0 {
+		g.credit = initial
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.gates == nil {

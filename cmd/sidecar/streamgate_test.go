@@ -236,13 +236,13 @@ func waitForWaiters(t *testing.T, g *streamGate, want int) {
 
 func TestStreamGateRegistryRegisterRefusals(t *testing.T) {
 	var r streamGateRegistry
-	if g := r.register(math.NaN(), "cg", nil); g != nil {
+	if g := r.register(math.NaN(), "cg", 0, nil); g != nil {
 		t.Fatal("register accepted a NaN reqID")
 	}
-	if g := r.register(1, "cg", nil); g == nil {
+	if g := r.register(1, "cg", 0, nil); g == nil {
 		t.Fatal("register refused a valid reqID")
 	}
-	if g := r.register(1, "cg", nil); g != nil {
+	if g := r.register(1, "cg", 0, nil); g != nil {
 		t.Fatal("register accepted a duplicate live reqID")
 	}
 	if r.size() != 1 {
@@ -259,9 +259,33 @@ func TestStreamGateRegistryGrantCancelUnknownNoop(t *testing.T) {
 	}
 }
 
+// TestStreamGateRegistryOpeningCredit pins the race-free opening window:
+// the initial credit rides registration atomically, so a producer's first
+// acquires succeed with NO grant call ever made (the client's opening
+// window cannot be lost to the grant-before-registration race).
+func TestStreamGateRegistryOpeningCredit(t *testing.T) {
+	var r streamGateRegistry
+	g := r.register(9, "cg", 3, nil)
+	for i := 0; i < 3; i++ {
+		if !g.acquire() {
+			t.Fatalf("acquire %d failed despite opening credit 3", i)
+		}
+	}
+	ch := acquireAsync(g) // 4th must park
+	select {
+	case <-ch:
+		t.Fatal("4th acquire proceeded past the opening window")
+	case <-time.After(50 * time.Millisecond):
+	}
+	r.grant(9, 1) // top-up releases it
+	if !<-ch {
+		t.Fatal("acquire failed after top-up grant")
+	}
+}
+
 func TestStreamGateRegistryGrantAndCancelRoute(t *testing.T) {
 	var r streamGateRegistry
-	g := r.register(7, "cg", nil)
+	g := r.register(7, "cg", 0, nil)
 	ch := acquireAsync(g)
 	waitForWaiters(t, g, 1)
 	r.grant(7, 1)
@@ -282,7 +306,7 @@ func TestStreamGateRegistryGrantAndCancelRoute(t *testing.T) {
 
 func TestStreamGateRegistryUnregisterCancelsParked(t *testing.T) {
 	var r streamGateRegistry
-	g := r.register(3, "cg", nil)
+	g := r.register(3, "cg", 0, nil)
 	ch := acquireAsync(g)
 	waitForWaiters(t, g, 1)
 	r.unregister(3)
@@ -293,16 +317,16 @@ func TestStreamGateRegistryUnregisterCancelsParked(t *testing.T) {
 		t.Fatalf("size = %d after unregister, want 0", r.size())
 	}
 	// reqID is reusable after unregister (fresh RPC, same counter cycle).
-	if g2 := r.register(3, "cg", nil); g2 == nil {
+	if g2 := r.register(3, "cg", 0, nil); g2 == nil {
 		t.Fatal("register refused a reqID freed by unregister")
 	}
 }
 
 func TestStreamGateRegistryCancelOwnerScoped(t *testing.T) {
 	var r streamGateRegistry
-	gA1 := r.register(1, "cgA", nil)
-	gA2 := r.register(2, "cgA", nil)
-	gB := r.register(3, "cgB", nil)
+	gA1 := r.register(1, "cgA", 0, nil)
+	gA2 := r.register(2, "cgA", 0, nil)
+	gB := r.register(3, "cgB", 0, nil)
 
 	chA1 := acquireAsync(gA1)
 	chA2 := acquireAsync(gA2)
@@ -337,7 +361,7 @@ func TestStreamGateRegistryCancelOwnerIdentity(t *testing.T) {
 	newGen := &fakeGroup{id: "cg"} // same id, different generation
 
 	var r streamGateRegistry
-	gNew := r.register(1, newGen, nil)
+	gNew := r.register(1, newGen, 0, nil)
 	ch := acquireAsync(gNew)
 	waitForWaiters(t, gNew, 1)
 
@@ -355,8 +379,8 @@ func TestStreamGateRegistryCancelOwnerIdentity(t *testing.T) {
 
 func TestStreamGateRegistrySweepIdle(t *testing.T) {
 	var r streamGateRegistry
-	idle := r.register(1, "cg", nil)
-	fresh := r.register(2, "cg", nil)
+	idle := r.register(1, "cg", 0, nil)
+	fresh := r.register(2, "cg", 0, nil)
 
 	chIdle := acquireAsync(idle)
 	chFresh := acquireAsync(fresh)
