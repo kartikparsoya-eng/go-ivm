@@ -51,7 +51,15 @@ COPY . .
 # This matters because the consuming zero-cache Dockerfile copies our
 # binary over via COPY --from=...; any dynamic .so would have to be
 # copied separately and put on the loader path.
-RUN gcc -O2 -fPIC -c c/sqlite3/sqlite3.c -o /tmp/sqlite3.o \
+# -ffp-contract=off: the vendored fork (≤3.51) renders REAL→TEXT through
+# dekkerMul2 double-double arithmetic whose results shift at the last ulp
+# if the compiler fuses mul+add into FMA (baseline ISA on arm64, so the
+# amd64 and arm64 images would even disagree with EACH OTHER under
+# -ffp-contract=fast, gcc's -O2 default). internal/tablesource/realtext.go
+# ports the unfused arithmetic bit-for-bit and TestLowerCoercionParity
+# pins Go == linked-library; the flag makes that contract hold on every
+# arch. Keep in lockstep with the test-wal2 CI job and build-wal2.sh.
+RUN gcc -O2 -ffp-contract=off -fPIC -c c/sqlite3/sqlite3.c -o /tmp/sqlite3.o \
         -DSQLITE_THREADSAFE=2 \
         -DSQLITE_ENABLE_FTS5 \
         -DSQLITE_ENABLE_JSON1 \
@@ -89,7 +97,9 @@ RUN go mod download
 
 COPY . .
 
-RUN gcc -O2 -fPIC -c c/sqlite3/sqlite3.c -o /tmp/sqlite3.o \
+# -ffp-contract=off: same REAL→TEXT bit-parity requirement as the stage
+# above — see that comment.
+RUN gcc -O2 -ffp-contract=off -fPIC -c c/sqlite3/sqlite3.c -o /tmp/sqlite3.o \
         -DSQLITE_THREADSAFE=2 \
         -DSQLITE_ENABLE_FTS5 \
         -DSQLITE_ENABLE_JSON1 \

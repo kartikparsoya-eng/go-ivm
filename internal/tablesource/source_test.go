@@ -816,23 +816,21 @@ func TestOverlayVisibleDuringPush(t *testing.T) {
 	src, db := newUserSource(t)
 	defer db.Close()
 
-	// Overlay is gated on readViaSnapshot (source.go): only applied when
-	// the Fetch read from a pinned pre-Push snapshot. Without snapshot
-	// capability the pool returns post-replicator-commit state directly,
-	// so applying overlay would double-count. This test mimics the
-	// MemorySource-equivalence path that only holds for the snapshot
-	// production build.
-	if !snapshotAvailable(t) {
-		t.Skip("requires libsqlite3 build with SQLITE_ENABLE_SNAPSHOT — fallback path skips overlay by design")
-	}
+	// No snapshot-capability skip: the overlay mechanism is unconditional
+	// in the prev-tx architecture (the epoch gate at fetchForConn decides
+	// visibility, not snapshot capability — the old `readViaSnapshot`
+	// gate this test used to describe no longer exists). Behavior is
+	// identical under mattn's bundled build (plain BEGIN fallback) and
+	// the wal2 fork (BEGIN CONCURRENT): proven by running this test's
+	// body under both tag sets.
 
 	in := src.Connect(nil, nil, nil, nil)
 	probe := &overlayProbingOutput{in: in}
 	in.SetOutput(probe)
 
 	// Before push: SQLite has 3 rows. Push an Add via overlay (no SQLite
-	// write). The probe's re-fetch during Push should see 4 (SQL's 3 +
-	// the overlay's add).
+	// write yet — writeChange runs only AFTER fanout). The probe's
+	// re-fetch during Push must see 4 (SQL's 3 + the overlay's splice).
 	row := ivm.Row{"id": float64(99), "name": "dave", "score": float64(50), "active": true}
 	src.Push(ivm.MakeSourceChangeAdd(row))
 
@@ -841,9 +839,32 @@ func TestOverlayVisibleDuringPush(t *testing.T) {
 			probe.observedAfter)
 	}
 
-	// After push completes, overlay clears; re-fetch should be back to 3.
+	// After push completes the OVERLAY must be gone (genPushAndWrite
+	// clears it after writeChange) …
+	src.mu.Lock()
+	overlayAfter := src.overlay
+	src.mu.Unlock()
+	if overlayAfter != nil {
+		t.Fatalf("overlay should be nil post-Push, still set (epoch %d)", overlayAfter.Epoch)
+	}
+
+	// … but the ROW stays visible: writeChange applied it to the prev tx,
+	// so the SQL read carries it without any overlay (source.go
+	// fetchForConn: "Once writeChange runs (after fanout) and overlay
+	// clears, the SQL query above naturally reflects the change"). This
+	// matches TS MemorySource (the row is in the btree after push) and is
+	// pinned independently by TestPrevTxAppliesWritesAndRollback. The
+	// pre-prev-tx architecture expected 3 here — that expectation only
+	// described the retired snapshot+batchDelta design.
+	if got := len(slices.Collect(in.Fetch(ivm.FetchRequest{}))); got != 4 {
+		t.Fatalf("post-Push fetch = %d nodes, want 4 (writeChange row via prev tx)", got)
+	}
+
+	// Batch end: OnAdvanceEnd rolls the prev tx back (this Push was never
+	// committed to the file by a replicator) and re-pins at head → 3.
+	src.OnAdvanceEnd()
 	if got := len(slices.Collect(in.Fetch(ivm.FetchRequest{}))); got != 3 {
-		t.Fatalf("overlay should clear post-Push: got %d nodes, want 3", got)
+		t.Fatalf("post-OnAdvanceEnd fetch = %d nodes, want 3 (rollback discards the write)", got)
 	}
 }
 

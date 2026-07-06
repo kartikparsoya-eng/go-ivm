@@ -77,11 +77,15 @@ func TestLowerNullILIKEShape(t *testing.T) {
 
 // TestLowerCoercionParity pins the non-TEXT coercion contract: SQLite's
 // built-in and ICU lower() coerce INTEGER/FLOAT/BLOB args through
-// sqlite3_value_text (vdbeMemStringify: Int64ToText for ints, %!.17g for
-// reals, bytes-as-text for blobs). Our override receives the typed Go value
-// from mattn and must produce byte-identical text. Oracle: CAST(?1 AS TEXT)
+// sqlite3_value_text (vdbeMemStringify: Int64ToText for ints, the
+// library's REAL→TEXT rendering for reals — 15-digit `%!.15g` on ≤3.51
+// (the production wal2 fork), 17-digit `%!.*g` on ≥3.53 (mattn bundled) —
+// bytes-as-text for blobs). Our override receives the typed Go value from
+// mattn and must produce byte-identical text. Oracle: CAST(?1 AS TEXT)
 // runs the very MemStringify the ICU lower would — digits never case-fold,
-// so lower(?1) must equal it exactly.
+// so lower(?1) must equal it exactly. Because the oracle is the LINKED
+// library, this test pins whichever fpDecode mode the probe selected —
+// run it under BOTH tag sets to cover both ports.
 //
 // Known residual (documented, untestable through binds): integral REALs in
 // [1e17, 2^63) read from int-serial-encoded records surface as MEM_IntReal

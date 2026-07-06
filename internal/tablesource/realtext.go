@@ -1,23 +1,44 @@
 package tablesource
 
 // sqliteRealText: byte-exact Go port of SQLite's REAL→TEXT coercion, i.e.
-// what sqlite3_value_text() yields for a MEM_Real argument. That is
-// vdbeMemStringify's `sqlite3_str_appendf("%!.*g", nFpDigit /* =17 */, r)`
-// → printf.c etGENERIC with the '!' (altform2) flag → sqlite3FpDecode(&s,
-// r, 17, 20). Needed by the lower() override: TS's ICU lower() coerces
-// non-TEXT args through sqlite3_value_text16, so our UDF must render
-// numerics with the exact same text or ILIKE-over-numeric diverges from TS.
+// what sqlite3_value_text() yields for a MEM_Real argument. Needed by the
+// lower() override: TS's ICU lower() coerces non-TEXT args through
+// sqlite3_value_text16, so our UDF must render numerics with the exact
+// same text or ILIKE-over-numeric diverges from TS.
 //
-// Ported against mattn/go-sqlite3 v1.14.44's amalgamation (SQLite 3.49):
-// sqlite3FpDecode, sqlite3Fp2Convert10, sqlite3Fp10Convert2, powerOfTen,
-// and the printf.c etFLOAT/etEXP/etGENERIC assembly. The binary↔decimal
-// conversions MUST be these exact routines, not strconv: SQLite's dtoa is
-// deliberately approximate (its 18th digit is sometimes not correctly
-// rounded — e.g. 1.307737638532754e-177 decodes to …539 where the correctly
-// rounded digits end …540), and the %!.17g shortening heuristics compare
-// against Fp10Convert2's rounding, so substituting strconv changes output.
-// Behavior is pinned by TestLowerCoercionParity's fuzz against
-// `CAST(?1 AS TEXT)` on the linked library itself, so an SQLite bump that
+// TWO libraries, TWO algorithms (SQLite 3.53.0 changed the default from 15
+// to 17 significant digits — "as was the case for all prior versions";
+// 3.52.0 was withdrawn, its features shipped in 3.53.0):
+//
+//   17-digit (realTextDigits == 17): SQLite ≥ 3.53 = mattn's bundled
+//   amalgamation (plain-tag builds; v1.14.44 bundles 3.53.0).
+//   vdbeMemRenderNum → `"%!.*g"` with db->nFpDigit (default 17) →
+//   sqlite3FpDecode(&s, r, 17, 20) on the Fp2Convert10 pipeline with the
+//   iRound==17 round-trip shortening heuristics. Ported here as fpDecode17:
+//   sqlite3Fp2Convert10, sqlite3Fp10Convert2, powerOfTen, plus the printf.c
+//   etFLOAT/etEXP/etGENERIC assembly.
+//
+//   15-digit (realTextDigits == 15): SQLite ≤ 3.51 = the vendored wal2
+//   fork (`-tags libsqlite3`, c/sqlite3/sqlite3.c, 3.51.0) — the SAME
+//   fork base @rocicorp/zero-sqlite3 1.1.2 ships, i.e. WHAT PRODUCTION TS
+//   RUNS. vdbeMemRenderNum → `"%!.15g"` → sqlite3FpDecode(&s, r, 15, 26)
+//   on the Dekker double-double pipeline, NO shortening heuristics (they
+//   are gated `iRound==17` upstream). Ported here as fpDecode15/dekkerMul2.
+//
+// The mode is probed from the linked library at driver registration
+// (probeRealTextDigits in db.go) — behavior, not version numbers, so a
+// fork backport or SQLITE_DBCONFIG_FP_DIGITS default change fails loudly
+// instead of guessing wrong.
+//
+// The binary↔decimal conversions MUST be these exact routines, not
+// strconv: SQLite's dtoa is deliberately approximate (fpDecode17's 18th
+// digit is sometimes not correctly rounded — e.g. 1.307737638532754e-177
+// decodes to …539 where the correctly rounded digits end …540; fpDecode15
+// inherits Dekker scaling error in the 18th/19th digit), and the %!.17g
+// shortening heuristics compare against Fp10Convert2's rounding, so
+// substituting strconv changes output. Behavior is pinned by
+// TestLowerCoercionParity's fuzz against `CAST(?1 AS TEXT)` on the linked
+// library itself — run under BOTH tag sets — so an SQLite bump that
 // changes rendering fails loudly in CI rather than drifting silently.
 
 import (
@@ -26,7 +47,22 @@ import (
 	"strconv"
 )
 
+// realTextDigits is the probed REAL→TEXT mode of the linked SQLite — 15
+// (≤3.51: production wal2 fork) or 17 (≥3.53: mattn bundled). Written
+// exactly once by registerGoivmDriver's sync.OnceValues before any pool
+// connection (and therefore any lower() callback) can exist; read-only
+// afterwards, so unsynchronized reads are race-free.
+var realTextDigits int
+
 func sqliteRealText(r float64) string {
+	nDigits := realTextDigits
+	if nDigits != 15 && nDigits != 17 {
+		// Unreachable via the public API: Open/OpenWritable run the probe
+		// before any connection exists. Loud failure beats silently
+		// rendering with the wrong library's algorithm.
+		panic("tablesource: sqliteRealText called before probeRealTextDigits")
+	}
+
 	// FpDecode specials (NaN unreachable via column values — SQLite stores
 	// NaN as NULL — but bound params can carry it; keep the exact text).
 	if math.IsNaN(r) {
@@ -42,15 +78,18 @@ func sqliteRealText(r float64) string {
 	neg := r < 0 // C `if( r<0.0 )`: -0.0 keeps sign '+' and renders "0.0".
 	var digits []byte
 	var iDP int
-	if r == 0 {
+	switch {
+	case r == 0:
 		digits, iDP = []byte{'0'}, 1
-	} else {
+	case nDigits == 15:
+		digits, iDP = fpDecode15(math.Abs(r))
+	default:
 		digits, iDP = fpDecode17(math.Abs(r))
 	}
 
-	// ---- printf.c etGENERIC assembly; precision=17, flags: '!' only ----
+	// ---- printf.c etGENERIC assembly; precision=nDigits, '!' only ----
 	exp10 := iDP - 1
-	precision := 17 - 1 // etGENERIC does precision--
+	precision := nDigits - 1 // etGENERIC does precision--
 	useExp := exp10 < -4 || exp10 > precision
 	var e2 int
 	if useExp {
@@ -218,6 +257,122 @@ func fpDecode17(a float64) (digits []byte, iDP int) {
 	}
 	return d[:n], iDP
 }
+
+// fpDecode15 mirrors SQLite ≤3.51's sqlite3FpDecode(&s, a, iRound=15,
+// mxRound=26) for finite a > 0 — the `%!.15g` CAST path of the production
+// wal2 fork (3.51.0, c/sqlite3/sqlite3.c:37131). Unlike fpDecode17 there
+// are NO round-trip shortening heuristics (upstream gates them on
+// iRound==17, and 3.51 never passes 17): scale a into (9.2e17, 9.2e18]
+// with Dekker double-double multiplies, take the integer's digits, round
+// half-up at 15, strip trailing zeros. mxRound=26 (printf.c
+// `flag_altform2 ? 26 : 16`) never binds: the scaled integer has 18-19
+// digits, so iRound=15 < n and 15 < 26. Scaling-loop constants are copied
+// verbatim — including the one-digit-shorter 9.22337203685477478e+17 exit
+// bound (sic, upstream).
+func fpDecode15(a float64) (digits []byte, iDP int) {
+	rr0, rr1 := a, 0.0
+	exp := 0
+	if rr0 > 9.223372036854774784e+18 {
+		for rr0 > 9.223372036854774784e+118 {
+			exp += 100
+			rr0, rr1 = dekkerMul2(rr0, rr1, 1.0e-100, -1.99918998026028836196e-117)
+		}
+		for rr0 > 9.223372036854774784e+28 {
+			exp += 10
+			rr0, rr1 = dekkerMul2(rr0, rr1, 1.0e-10, -3.6432197315497741579e-27)
+		}
+		for rr0 > 9.223372036854774784e+18 {
+			exp++
+			rr0, rr1 = dekkerMul2(rr0, rr1, 1.0e-01, -5.5511151231257827021e-18)
+		}
+	} else {
+		for rr0 < 9.223372036854774784e-83 {
+			exp -= 100
+			rr0, rr1 = dekkerMul2(rr0, rr1, 1.0e+100, -1.5902891109759918046e+83)
+		}
+		for rr0 < 9.223372036854774784e+07 {
+			exp -= 10
+			rr0, rr1 = dekkerMul2(rr0, rr1, 1.0e+10, 0.0)
+		}
+		for rr0 < 9.22337203685477478e+17 {
+			exp--
+			rr0, rr1 = dekkerMul2(rr0, rr1, 1.0e+01, 0.0)
+		}
+	}
+	// v = rr[1]<0 ? (u64)rr[0]-(u64)(-rr[1]) : (u64)rr[0]+(u64)rr[1]
+	// (C double→u64 truncates toward zero; Go uint64(float64) matches for
+	// these in-range values).
+	var v uint64
+	if rr1 < 0.0 {
+		v = uint64(rr0) - uint64(-rr1)
+	} else {
+		v = uint64(rr0) + uint64(rr1)
+	}
+
+	d := strconv.AppendUint(make([]byte, 0, 24), v, 10)
+	n := len(d)
+	iDP = n + exp
+
+	// `if( iRound>0 && (iRound<p->n || p->n>mxRound) )` — always fires
+	// here (n is 18-19 > 15); kept in shape for auditability.
+	const iRound = 15
+	if iRound < n || n > 26 {
+		n = iRound
+		if d[n] >= '5' { // round half-up, carrying leftward
+			j := n - 1
+			for {
+				d[j]++
+				if d[j] <= '9' {
+					break
+				}
+				d[j] = '0'
+				if j == 0 {
+					d = append([]byte{'1'}, d...)
+					n++
+					iDP++
+					break
+				}
+				j--
+			}
+		}
+	}
+	for d[n-1] == '0' {
+		n--
+	}
+	return d[:n], iDP
+}
+
+// dekkerMul2 mirrors SQLite ≤3.51's dekkerMul2 (double-double
+// (x0,x1) *= (y,yy), Dekker 1971). The C original marks every
+// intermediate `volatile`, forcing each store to round to binary64 and
+// (with -ffp-contract=off) forbidding mul+add FMA fusion. Go's compiler
+// fuses automatically on arm64/ppc64/s390x, and — measured empirically on
+// darwin/arm64, bit-diffing against clang -ffp-contract=off — same-type
+// float64(expr) conversions do NOT survive as rounding barriers into the
+// SSA FMA rewrite. The only guaranteed materialization barrier is an
+// integer bit round-trip (f64 below), so every C volatile store gets one.
+// Cost is two register moves per barrier on a 3-13-call-per-render path.
+func dekkerMul2(x0, x1, y, yy float64) (float64, float64) {
+	hx := math.Float64frombits(math.Float64bits(x0) & 0xfffffffffc000000)
+	tx := f64(x0 - hx)
+	hy := math.Float64frombits(math.Float64bits(y) & 0xfffffffffc000000)
+	ty := f64(y - hy)
+	p := f64(hx * hy)
+	q := f64(f64(hx*ty) + f64(tx*hy))
+	c := f64(p + q)
+	cc := f64(f64(f64(p-c)+q) + f64(tx*ty))
+	cc = f64(f64(f64(x0*yy)+f64(x1*y)) + cc)
+	r0 := f64(c + cc)
+	r1 := f64(f64(c-r0) + cc)
+	return r0, r1
+}
+
+// f64 is a floating-point materialization barrier: the value crosses into
+// integer registers and back, which no floating-point rewrite (FMA
+// contraction included) can cross. Equivalent to C's volatile double
+// store+load in dekkerMul2. Deliberately NOT float64(v) — the compiler
+// erases same-type conversions before the arm64 FMA fusion pass runs.
+func f64(v float64) float64 { return math.Float64frombits(math.Float64bits(v)) }
 
 // digitsVal parses a short ASCII digit run (≤14 digits here) as uint64.
 func digitsVal(ds []byte) uint64 {

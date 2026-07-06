@@ -44,14 +44,59 @@ import (
 // so every conn the pools open behaves like TS's replica connection.
 const goivmDriverName = "sqlite3_goivm"
 
-var registerGoivmDriver = sync.OnceValue(func() string {
+var registerGoivmDriver = sync.OnceValues(func() (string, error) {
+	// Resolve the REAL→TEXT rendering mode of the linked SQLite before any
+	// connection (and therefore any lower() UDF call) can exist. Probed by
+	// behavior, not sqlite3_libversion_number(): what matters is what THIS
+	// library prints, whatever fork or FP_DIGITS default it carries.
+	digits, err := probeRealTextDigits()
+	if err != nil {
+		return "", err
+	}
+	realTextDigits = digits
 	sql.Register(goivmDriverName, &sqlite3.SQLiteDriver{
 		ConnectHook: func(conn *sqlite3.SQLiteConn) error {
 			return conn.RegisterFunc("lower", unicodeLowerSQL, true)
 		},
 	})
-	return goivmDriverName
+	return goivmDriverName, nil
 })
+
+// probeRealTextDigits asks the linked SQLite how it renders REAL→TEXT and
+// maps the answer to the sqliteRealText mode (see realtext.go). CAST runs
+// the very vdbeMemRenderNum the ICU-style lower() coercion would:
+//
+//	"0.333333333333333"   → 15  (≤3.51 `%!.15g`; the production wal2 fork
+//	                             AND @rocicorp/zero-sqlite3 are 3.51.0)
+//	"0.33333333333333332" → 17  (≥3.53 `%!.*g` nFpDigit=17; mattn bundled)
+//
+// Anything else fails Open loudly: a library whose rendering we have not
+// ported must not silently coerce through the wrong algorithm (that is
+// exactly the hydrate-vs-advance drift this probe exists to prevent).
+func probeRealTextDigits() (int, error) {
+	// "sqlite3" is mattn's own driver registration — same linked library,
+	// no ConnectHook, so the probe cannot recurse into lower().
+	db, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		return 0, fmt.Errorf("tablesource: realtext probe open: %w", err)
+	}
+	defer db.Close()
+	var got string
+	if err := db.QueryRow(`SELECT CAST(1.0/3.0 AS TEXT)`).Scan(&got); err != nil {
+		return 0, fmt.Errorf("tablesource: realtext probe query: %w", err)
+	}
+	switch got {
+	case "0.333333333333333":
+		return 15, nil
+	case "0.33333333333333332":
+		return 17, nil
+	}
+	return 0, fmt.Errorf(
+		"tablesource: linked SQLite renders CAST(1.0/3.0 AS TEXT) = %q — "+
+			"neither the ≤3.51 15-digit nor the ≥3.53 17-digit form; "+
+			"realtext.go needs a port of this library's REAL→TEXT algorithm",
+		got)
+}
 
 // sqlLowerCaserPool amortizes cases.Lower(language.Und) construction (napi
 // review M5 twin): the lower() override runs PER VALUE PER ROW during every
@@ -89,8 +134,10 @@ func sqlUnicodeLower(s string) string {
 //     rules (Greek final sigma "ΟΔΟΣ"→"οδος"), locale-independent.
 //     strings.ToLower applies only simple unconditional mappings and would
 //     diverge from TS on those. BLOBs are bytes-as-text, like value_text.
-//   - INTEGER/FLOAT → SQLite's own text coercion (Int64ToText / %!.17g via
-//     sqliteRealText), then lowercase is a no-op on digits.
+//   - INTEGER/FLOAT → SQLite's own text coercion (Int64ToText for ints;
+//     for reals, the linked library's algorithm — 15- or 17-digit, probed
+//     at driver registration — via sqliteRealText), then lowercase is a
+//     no-op on digits.
 //
 // Known residual: integral REALs in [1e17, 2^63) stored int-serial-encoded
 // surface inside SQLite as MEM_IntReal and stringify as "…000.0", but mattn
@@ -210,7 +257,11 @@ func Open(path string, opts OpenOptions) (*sql.DB, error) {
 		dsn += "&_cache_size=-" + strconv.Itoa(opts.CacheSizeKB)
 	}
 
-	db, err := sql.Open(registerGoivmDriver(), dsn)
+	driverName, err := registerGoivmDriver()
+	if err != nil {
+		return nil, fmt.Errorf("tablesource.Open: %w", err)
+	}
+	db, err := sql.Open(driverName, dsn)
 	if err != nil {
 		return nil, fmt.Errorf("tablesource.Open: sql.Open: %w", err)
 	}
@@ -308,7 +359,11 @@ func OpenWritable(path string, opts OpenOptions) (*sql.DB, error) {
 		dsn += "&_cache_size=-" + strconv.Itoa(opts.CacheSizeKB)
 	}
 
-	db, err := sql.Open(registerGoivmDriver(), dsn)
+	driverName, err := registerGoivmDriver()
+	if err != nil {
+		return nil, fmt.Errorf("tablesource.OpenWritable: %w", err)
+	}
+	db, err := sql.Open(driverName, dsn)
 	if err != nil {
 		return nil, fmt.Errorf("tablesource.OpenWritable: sql.Open: %w", err)
 	}
