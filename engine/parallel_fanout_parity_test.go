@@ -208,9 +208,6 @@ func runFanoutParityAdvance(t *testing.T) map[string][]RowChange {
 	}
 
 	r := eng.Advance(batch)
-	if r.Drift != nil {
-		t.Fatalf("advance drifted: %+v", r.Drift)
-	}
 
 	byQuery := make(map[string][]RowChange)
 	for _, c := range r.Changes {

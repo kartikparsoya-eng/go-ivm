@@ -1,22 +1,25 @@
 package engine
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/kartikparsoya-eng/go-ivm/ivm"
 )
 
-// Edge: drift raised MID-BATCH, after earlier source-changes in the same
-// advance already flushed partial frames to the wire. TestAdvanceStream_
-// DriftRecovery only covers drift on the FIRST change (no frames flushed
-// yet); this pins the harder contract:
-//   - the stream still terminates with exactly one Final frame,
-//   - Drift rides ONLY the Final frame,
+// Edge: the source-drift assert fires MID-BATCH, after earlier
+// source-changes in the same advance already flushed partial frames to the
+// wire. This pins the follow-TS disposition on the streaming path:
+//   - the stream still terminates with exactly one Final frame (the C5
+//     clean-wire invariant: a missing Final would trip the TS accumulator's
+//     protocol-violation path, masking the real failure),
+//   - the Final frame carries EMPTY changes (partial output is dropped —
+//     the CG is being torn down; emitting a partial diff would desync the
+//     CVR from Go's half-advanced state),
 //   - chunkIndex stays contiguous across the pre-drift partials and the
-//     terminal drift frame (the TS accumulator throws on gaps/reorders),
-//   - output produced by the successful pre-drift pushes is emitted (TS
-//     emits its partial computation before the reset; go-ivm matches — the
-//     drift signal then triggers a full re-hydrate which supersedes it),
+//     terminal frame (the TS accumulator throws on gaps/reorders),
+//   - the drift panic re-raises AFTER the Final flush so the sidecar
+//     handler converts it to the RPC error TS classifies → teardown,
 //   - the engine advances cleanly afterwards with no residue.
 func TestAdvanceStream_DriftAfterFlushedChunks(t *testing.T) {
 	saved := advanceChunkSize
@@ -26,23 +29,31 @@ func TestAdvanceStream_DriftAfterFlushedChunks(t *testing.T) {
 	eng, _ := setupSimpleEngine(t)
 
 	var frames []AdvanceStreamPartial
-	err := eng.AdvanceStream([]SnapshotChange{
-		{Table: "users", NextValue: ivm.Row{"id": "u1", "name": "A"}}, // ok → frame
-		{Table: "users", NextValue: ivm.Row{"id": "u2", "name": "B"}}, // ok → frame
-		{ // Edit of a row that doesn't exist → *ivm.DriftError
-			Table:      "users",
-			PrevValues: []ivm.Row{{"id": "u9", "name": "ghost"}},
-			NextValue:  ivm.Row{"id": "u9", "name": "boo"},
-		},
-	}, func(p AdvanceStreamPartial) {
-		frames = append(frames, p)
-	})
-	if err != nil {
-		t.Fatalf("drift must be reported in-band on the Final frame, not as error: %v", err)
+	var recovered any
+	func() {
+		defer func() { recovered = recover() }()
+		_ = eng.AdvanceStream([]SnapshotChange{
+			{Table: "users", NextValue: ivm.Row{"id": "u1", "name": "A"}}, // ok → frame
+			{Table: "users", NextValue: ivm.Row{"id": "u2", "name": "B"}}, // ok → frame
+			{ // Edit of a row that doesn't exist → source-drift panic
+				Table:      "users",
+				PrevValues: []ivm.Row{{"id": "u9", "name": "ghost"}},
+				NextValue:  ivm.Row{"id": "u9", "name": "boo"},
+			},
+		}, func(p AdvanceStreamPartial) {
+			frames = append(frames, p)
+		})
+	}()
+	if recovered == nil {
+		t.Fatal("mid-batch drift must re-raise out of AdvanceStream after the Final flush")
+	}
+	err, ok := recovered.(error)
+	if !ok || !strings.Contains(err.Error(), "source drift: table=users op=Edit") {
+		t.Fatalf("expected the users/Edit source-drift panic, got %T: %v", recovered, recovered)
 	}
 
-	if len(frames) < 3 {
-		t.Fatalf("want >=3 frames (2 flushed partials + terminal drift), got %d: %+v", len(frames), frames)
+	if len(frames) != 3 {
+		t.Fatalf("want 3 frames (2 flushed partials + empty terminal), got %d: %+v", len(frames), frames)
 	}
 	finals := 0
 	total := 0
@@ -52,14 +63,9 @@ func TestAdvanceStream_DriftAfterFlushedChunks(t *testing.T) {
 		}
 		if f.Final {
 			finals++
-			if f.Drift == nil {
-				t.Fatal("terminal frame must carry the Drift signal")
+			if len(f.Changes) != 0 {
+				t.Fatalf("terminal frame after a drift panic must carry EMPTY changes, got %+v", f.Changes)
 			}
-			if f.Drift.Table != "users" || f.Drift.Op != "Edit" {
-				t.Fatalf("unexpected drift payload: %+v", f.Drift)
-			}
-		} else if f.Drift != nil {
-			t.Fatalf("Drift leaked onto a non-Final frame: %+v", f)
 		}
 		total += len(f.Changes)
 	}
@@ -69,15 +75,14 @@ func TestAdvanceStream_DriftAfterFlushedChunks(t *testing.T) {
 	if last := frames[len(frames)-1]; !last.Final {
 		t.Fatal("Final frame must be the LAST frame")
 	}
-	// u1 + u2 adds were flushed before the drift; the ghost edit contributes
-	// nothing. (TS discards + re-hydrates on drift, so over-emission here is
-	// harmless — but under-emission would diverge from TS's partial-emit.)
+	// u1 + u2 adds were flushed BEFORE the drift point (already on the
+	// wire — nothing can recall them); the terminal frame adds nothing.
 	if total != 2 {
-		t.Fatalf("want the 2 pre-drift adds across frames, got %d changes", total)
+		t.Fatalf("want exactly the 2 pre-drift adds across frames, got %d changes", total)
 	}
 
 	// Engine self-heals: the failed batch's dedup/batch state was cleared
-	// via signalAdvanceEnd on the drift path, so a fresh advance is clean.
+	// via signalAdvanceEnd on the panic path, so a fresh advance is clean.
 	var after []AdvanceStreamPartial
 	if err := eng.AdvanceStream(
 		[]SnapshotChange{{Table: "users", NextValue: ivm.Row{"id": "u3", "name": "C"}}},
@@ -86,9 +91,6 @@ func TestAdvanceStream_DriftAfterFlushedChunks(t *testing.T) {
 		t.Fatalf("follow-up advance failed: %v", err)
 	}
 	for _, f := range after {
-		if f.Drift != nil {
-			t.Fatalf("drift state leaked into the next advance: %v", f.Drift)
-		}
 		for _, rc := range f.Changes {
 			if id, _ := rc.RowKey["id"].(string); id != "u3" {
 				t.Fatalf("stale row leaked into the next advance: %+v", rc)

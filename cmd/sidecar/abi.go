@@ -43,39 +43,34 @@ import (
 	"github.com/kartikparsoya-eng/go-ivm/sqlite"
 )
 
-// newServerFromEnv builds and configures a *Server from the same GO_IVM_*
-// environment contract main() uses. Extracted so the NAPI host constructs an
-// identical server in-process. Returns an error instead of os.Exit-ing —
-// inside a host process, exiting would take the embedder down.
+// newServerFromEnv builds and configures a *Server from the GO_IVM_*
+// environment contract. Called by the NAPI host (goivm_start) — the only
+// transport. Returns an error instead of os.Exit-ing — inside a host
+// process, exiting would take the embedder down.
+//
+// Hard-wired prod path (removal sweep): the replica-backed table source is
+// the ONLY leaf source and drive-mode advanceToHeadStream is the ONLY
+// advance — the GO_IVM_SOURCE_MODE / GO_IVM_ADVANCE_TO_HEAD /
+// GO_IVM_ADVANCE_DRIVE gates are gone, so a replica path is required.
 func newServerFromEnv() (*Server, error) {
 	if err := sqlite.SelfCheckCoercion(); err != nil {
 		return nil, fmt.Errorf("coercion self-check: %w", err)
 	}
 
-	sourceMode := tablesource.ParseMode()
-	var replicaPath string
-	if sourceMode == tablesource.ModeTable {
-		replicaPath = os.Getenv("GO_IVM_REPLICA_DB_PATH")
-		if replicaPath == "" {
-			replicaPath = os.Getenv("ZERO_REPLICA_FILE")
-		}
-		if replicaPath == "" {
-			return nil, errors.New(
-				"GO_IVM_SOURCE_MODE=table but neither GO_IVM_REPLICA_DB_PATH nor ZERO_REPLICA_FILE is set")
-		}
-		fmt.Fprintf(os.Stderr,
-			"[GO-IVM] table mode armed; replica %s will open lazily on first init\n",
-			replicaPath)
+	replicaPath := os.Getenv("GO_IVM_REPLICA_DB_PATH")
+	if replicaPath == "" {
+		replicaPath = os.Getenv("ZERO_REPLICA_FILE")
 	}
+	if replicaPath == "" {
+		return nil, errors.New(
+			"neither GO_IVM_REPLICA_DB_PATH nor ZERO_REPLICA_FILE is set (the replica-backed table source is the only leaf source)")
+	}
+	fmt.Fprintf(os.Stderr,
+		"[GO-IVM] replica %s will open lazily on first init\n",
+		replicaPath)
 
-	server := NewServer(sourceMode, replicaPath)
+	server := NewServer(replicaPath)
 	server.appID = os.Getenv("GO_IVM_APP_ID")
-	server.advanceToHeadEnabled = os.Getenv("GO_IVM_ADVANCE_TO_HEAD") == "true"
-	// GO_IVM_ADVANCE_DRIVE implies advanceToHead (P2 self-consistent advance).
-	server.advanceDriveEnabled = os.Getenv("GO_IVM_ADVANCE_DRIVE") == "true"
-	if server.advanceDriveEnabled {
-		server.advanceToHeadEnabled = true
-	}
 	// ONE parallelism knob: GO_IVM_PARALLELISM (default 4) sets the hydrate
 	// lane count (P — the engine package reads the SAME env for its lane
 	// workers, so the two stay in lockstep) and the reader-pool floor
@@ -106,23 +101,8 @@ func newServerFromEnv() (*Server, error) {
 	// GO_IVM_WARM_HYDRATE_POOL=false disables.
 	server.warmHydratePoolEnabled = os.Getenv("GO_IVM_WARM_HYDRATE_POOL") != "false"
 	fmt.Fprintf(os.Stderr,
-		"[GO-IVM] hydrate config: streaming=%v (default-on under drive) readers=%d(floor) lanes=%d advanceDrive=%v\n",
-		server.advanceDriveEnabled, server.hydrateReaders, server.hydrateLanes, server.advanceDriveEnabled)
-	if server.advanceToHeadEnabled {
-		if sourceMode != tablesource.ModeTable {
-			fmt.Fprintln(os.Stderr,
-				"[GO-IVM] GO_IVM_ADVANCE_TO_HEAD=true ignored: requires GO_IVM_SOURCE_MODE=table")
-			server.advanceToHeadEnabled = false
-			server.advanceDriveEnabled = false
-		} else {
-			mode := "derive-only (P1 shadow)"
-			if server.advanceDriveEnabled {
-				mode = "DRIVE (P2 frame-coordinated self-consistent advance)"
-			}
-			fmt.Fprintf(os.Stderr,
-				"[GO-IVM] advanceToHead ARMED [%s] (appID=%q)\n", mode, server.appID)
-		}
-	}
+		"[GO-IVM] hydrate config: readers=%d(floor) lanes=%d (drive advance, streaming hydrate, appID=%q)\n",
+		server.hydrateReaders, server.hydrateLanes, server.appID)
 	// Startup-time non-default engine-knob markers (see PROD-PATH.md): a
 	// default-path deployment prints NONE of these. Each gates an alternate
 	// implementation kept as a rollback/experiment — code that is off the
@@ -191,6 +171,12 @@ type abiHost struct {
 	// GO_IVM_PPROF_ADDR is set). Same O1 rationale as the reaper: pprof and
 	// the PERF reporter lived only in main(), leaving napi mode blind.
 	pprofServer *http.Server
+
+	// otelShutdown flushes + tears down the OTLP trace exporter (otel.go).
+	// nil when tracing is off or the host was built without env wiring
+	// (startABIHostWithServer test path). Same O1 parity rationale as
+	// pprof/PERF: otelInit used to live only in the socket main().
+	otelShutdown func(context.Context) error
 }
 
 // errHostClosed is returned by Send after Shutdown (or pipe teardown).
@@ -206,7 +192,15 @@ func startABIHost(deliver func(kind int32, payload []byte)) (*abiHost, error) {
 	if err != nil {
 		return nil, err
 	}
-	return startABIHostWithServer(server, deliver, nil), nil
+	h := startABIHostWithServer(server, deliver, nil)
+	// OTLP trace exporter (env-gated noop without OTEL_EXPORTER_OTLP_*).
+	// Telemetry must never take the host down — log and continue noop.
+	if otelShutdown, oerr := otelInit(context.Background()); oerr != nil {
+		fmt.Fprintf(os.Stderr, "[GO-IVM] OTel init failed (continuing without traces): %v\n", oerr)
+	} else {
+		h.otelShutdown = otelShutdown
+	}
+	return h, nil
 }
 
 // startABIHostWithServer is the injectable core (tests pass their own
@@ -249,7 +243,7 @@ func startABIHostWithServer(server *Server, deliver func(kind int32, payload []b
 	// endpoint. Both were main()-only; the host never runs main(). pprof is
 	// per-worker-port-derived (napi workers are separate processes).
 	go server.runPerfReporter(reaperCtx)
-	h.pprofServer = startPprofServer(true)
+	h.pprofServer = startPprofServer()
 
 	// The production connection handler, verbatim. When either pipe end
 	// closes, its read loop errors out and it tears down exactly as it
@@ -402,4 +396,9 @@ func (h *abiHost) Shutdown() {
 	// drains the workers' respCh sends. Waiting before closeAll would
 	// deadlock; waiting after guarantees no goroutine outlives Shutdown.
 	h.hcWg.Wait()
+	if h.otelShutdown != nil {
+		if err := h.otelShutdown(context.Background()); err != nil {
+			fmt.Fprintf(os.Stderr, "[GO-IVM] OTel shutdown error: %v\n", err)
+		}
+	}
 }

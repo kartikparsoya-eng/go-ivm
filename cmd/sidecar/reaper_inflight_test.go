@@ -59,16 +59,18 @@ func TestReaper_DoesNotReapGroupWithInFlightHandler(t *testing.T) {
 		entMu.Unlock()
 	}
 
-	h := startABIHostWithServer(NewServer(0, ""), sink, nil)
+	path, db := makeReplica(t)
+	mustExec(t, db, `CREATE TABLE "t" ("id" TEXT PRIMARY KEY, "_0_version" TEXT)`)
+
+	h := startABIHostWithServer(NewServer(path), sink, nil)
 	defer h.Shutdown()
 
 	const cgID = "cg-reap-inflight"
 	if err := h.Send(encodeReq(t, "init", 1, initParams{
 		ClientGroupID: cgID,
-		Storage:       t.TempDir() + "/s.db",
 		Tables: map[string]tableSchemaParams{
 			"t": {
-				Columns:    map[string]sqlite.ColumnSchema{"id": {Type: "string"}},
+				Columns:    map[string]sqlite.ColumnSchema{"id": {Type: "string"}, "_0_version": {Type: "string"}},
 				PrimaryKey: []string{"id"},
 			},
 		},
@@ -187,7 +189,7 @@ func TestReaper_DoesNotReapGroupWithInFlightHandler(t *testing.T) {
 // unit level: an in-flight group with an ancient lastUsedNs is skipped by
 // BOTH the scan and the double-check; clearing the flag makes it reapable.
 func TestReapIdleGroups_InFlightFlagContract(t *testing.T) {
-	s := NewServer(0, "")
+	s := NewServer(makeReplicaPathOnly(t))
 	g := s.getGroup("cg-contract", true)
 	g.lastUsedNs.Store(1)
 

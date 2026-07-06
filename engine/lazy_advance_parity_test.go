@@ -151,9 +151,6 @@ func runLazyParityAdvance(t *testing.T, seedCP bool, batch []SnapshotChange) []R
 	}
 
 	r := eng.Advance(batch)
-	if r.Drift != nil {
-		t.Fatalf("advance drifted (batch %+v): %+v", batch, r.Drift)
-	}
 	return r.Changes
 }
 

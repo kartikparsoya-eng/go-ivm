@@ -2,7 +2,7 @@ package main
 
 // D2: destroy epoch guard tests.
 //
-// handleDestroy now checks initEpoch like every other mutating RPC.
+// handleDestroy checks initEpoch like every other mutating RPC.
 // A stale destroy from a torn-down view-syncer whose RPC raced past a
 // fresh init for the same cgID must be rejected with rpcCodeStaleInitEpoch
 // instead of tearing down the live successor's engine.
@@ -12,44 +12,15 @@ import (
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
-
-	"github.com/kartikparsoya-eng/go-ivm/internal/tablesource"
-	"github.com/kartikparsoya-eng/go-ivm/ivm"
-	"github.com/kartikparsoya-eng/go-ivm/sqlite"
 )
 
-// initTestServer is a helper that creates a Memory-mode server, calls
-// handleInit for a single empty-table CG, and returns the server + the
-// post-init epoch.
+// initTestServer creates a replica-backed server, calls handleInit for a
+// single issue-table CG, and returns the server + the post-init epoch.
 func initTestServer(t *testing.T) (*Server, string, uint64) {
 	t.Helper()
-	srv := NewServer(tablesource.ModeMemory, "")
-	t.Cleanup(srv.closeAll)
-
+	srv, _ := newIssueServer(t)
 	cgID := "cg-destroy-test"
-	initReq := RPCRequest{Method: "init", ID: 1, Params: mustMarshal(t, initParams{
-		ClientGroupID: cgID,
-		Tables: map[string]tableSchemaParams{
-			"t": {
-				Columns:    map[string]sqlite.ColumnSchema{"id": {Type: "string"}},
-				PrimaryKey: []string{"id"},
-				UniqueKeys: [][]string{{"id"}},
-			},
-		},
-	})}
-	resp := srv.handleInit(initReq)
-	if resp.Error != nil {
-		t.Fatalf("init error: %+v", resp.Error)
-	}
-
-	g := srv.getGroup(cgID, false)
-	if g == nil {
-		t.Fatal("group not found after init")
-	}
-	g.mu.Lock()
-	epoch := g.initEpoch.Load()
-	g.mu.Unlock()
-
+	epoch := initIssueCG(t, srv, cgID)
 	return srv, cgID, epoch
 }
 
@@ -126,8 +97,7 @@ func TestDestroy_ZeroEpochRejected(t *testing.T) {
 // that doesn't exist returns ok (no-op) rather than an error. There's
 // nothing to guard — the epoch check is skipped when the group is absent.
 func TestDestroy_NonExistentGroupSucceeds(t *testing.T) {
-	srv := NewServer(tablesource.ModeMemory, "")
-	t.Cleanup(srv.closeAll)
+	srv, _ := newIssueServer(t)
 
 	resp := srv.handleDestroy(RPCRequest{
 		Method: "destroy", ID: 1,
@@ -141,20 +111,11 @@ func TestDestroy_NonExistentGroupSucceeds(t *testing.T) {
 // TestDestroy_DefaultClientGroupID verifies that an empty clientGroupID
 // defaults to "default" and the epoch guard works for that group.
 func TestDestroy_DefaultClientGroupID(t *testing.T) {
-	srv := NewServer(tablesource.ModeMemory, "")
-	t.Cleanup(srv.closeAll)
+	srv, _ := newIssueServer(t)
 
 	// Init with empty cgID (defaults to "default").
-	initReq := RPCRequest{Method: "init", ID: 1, Params: mustMarshal(t, initParams{
-		ClientGroupID: "",
-		Tables: map[string]tableSchemaParams{
-			"t": {
-				Columns:    map[string]sqlite.ColumnSchema{"id": {Type: "string"}},
-				PrimaryKey: []string{"id"},
-				UniqueKeys: [][]string{{"id"}},
-			},
-		},
-	})}
+	params := issueInitParams("")
+	initReq := RPCRequest{Method: "init", ID: 1, Params: mustMarshal(t, params)}
 	if resp := srv.handleInit(initReq); resp.Error != nil {
 		t.Fatalf("init error: %+v", resp.Error)
 	}
@@ -163,9 +124,7 @@ func TestDestroy_DefaultClientGroupID(t *testing.T) {
 	if g == nil {
 		t.Fatal("default group not found after init")
 	}
-	g.mu.Lock()
 	epoch := g.initEpoch.Load()
-	g.mu.Unlock()
 
 	// Destroy with empty cgID + correct epoch should succeed.
 	resp := srv.handleDestroy(RPCRequest{
@@ -185,10 +144,10 @@ func TestDestroy_DefaultClientGroupID(t *testing.T) {
 // Pre-fix, removeGroup deleted the ClientGroup and the next handleInit for
 // the same cgID created a FRESH one whose epoch restarted at 0 → first init
 // of generation 2 handed out epoch 1 == generation 1's epoch 1. A late
-// mutating RPC from the torn-down generation-1 instance (loadRows is the
-// canonical case) then PASSED checkInitEpoch and wrote old-snapshot rows
-// into generation 2's freshly-hydrated engine — the exact cross-instance
-// corruption the epoch guard's own doc comment claims to prevent.
+// mutating RPC from the torn-down generation-1 instance then PASSED
+// checkInitEpoch and mutated generation 2's freshly-hydrated engine — the
+// exact cross-instance corruption the epoch guard's own doc comment claims
+// to prevent.
 //
 // Post-fix, Server.lastEpochs (the graveyard) survives removeGroup and
 // seeds the re-created group, so gen-2 epochs are strictly greater than
@@ -209,16 +168,7 @@ func TestInitEpoch_SurvivesDestroyReinit(t *testing.T) {
 	}
 
 	// Generation 2: a new view-syncer instance re-inits the SAME cgID.
-	initReq := RPCRequest{Method: "init", ID: 3, Params: mustMarshal(t, initParams{
-		ClientGroupID: cgID,
-		Tables: map[string]tableSchemaParams{
-			"t": {
-				Columns:    map[string]sqlite.ColumnSchema{"id": {Type: "string"}},
-				PrimaryKey: []string{"id"},
-				UniqueKeys: [][]string{{"id"}},
-			},
-		},
-	})}
+	initReq := RPCRequest{Method: "init", ID: 3, Params: mustMarshal(t, issueInitParams(cgID))}
 	if resp := srv.handleInit(initReq); resp.Error != nil {
 		t.Fatalf("re-init error: %+v", resp.Error)
 	}
@@ -235,26 +185,26 @@ func TestInitEpoch_SurvivesDestroyReinit(t *testing.T) {
 			epochGen1, epochGen2)
 	}
 
-	// End-to-end: generation 1's late loadRows (stale epoch) must be
-	// rejected, not applied to generation 2's engine.
-	lr := srv.handleLoadRows(RPCRequest{
-		Method: "loadRows", ID: 4,
-		Params: mustMarshal(t, loadRowsParams{
+	// End-to-end: generation 1's late mutating RPC (stale epoch;
+	// removeQuery is the canonical surviving case) must be rejected, not
+	// applied to generation 2's engine.
+	rq := srv.handleRemoveQuery(RPCRequest{
+		Method: "removeQuery", ID: 4,
+		Params: mustMarshal(t, removeQueryParams{
 			ClientGroupID: cgID,
-			Table:         "t",
-			Rows:          []ivm.Row{{"id": "stale-row-from-gen1"}},
+			QueryID:       "q-from-gen1",
 			InitEpoch:     epochGen1,
 		}),
 	})
-	if lr.Error == nil {
-		t.Fatal("stale-epoch loadRows from the torn-down generation was ACCEPTED — " +
-			"old-snapshot rows written into the new engine")
+	if rq.Error == nil {
+		t.Fatal("stale-epoch removeQuery from the torn-down generation was ACCEPTED — " +
+			"the old instance mutated the new engine")
 	}
-	if lr.Error.Code != rpcCodeStaleInitEpoch {
+	if rq.Error.Code != rpcCodeStaleInitEpoch {
 		t.Fatalf("expected rpcCodeStaleInitEpoch (%d), got %d: %s",
-			rpcCodeStaleInitEpoch, lr.Error.Code, lr.Error.Message)
+			rpcCodeStaleInitEpoch, rq.Error.Code, rq.Error.Message)
 	}
-	t.Logf("epochs: gen1=%d gen2=%d; stale gen1 loadRows rejected", epochGen1, epochGen2)
+	t.Logf("epochs: gen1=%d gen2=%d; stale gen1 removeQuery rejected", epochGen1, epochGen2)
 }
 
 // TestInitEpoch_GraveyardSurvivesReaper verifies the reaper's deletion path
@@ -274,16 +224,7 @@ func TestInitEpoch_GraveyardSurvivesReaper(t *testing.T) {
 	}
 
 	// Re-init the same cgID.
-	initReq := RPCRequest{Method: "init", ID: 3, Params: mustMarshal(t, initParams{
-		ClientGroupID: cgID,
-		Tables: map[string]tableSchemaParams{
-			"t": {
-				Columns:    map[string]sqlite.ColumnSchema{"id": {Type: "string"}},
-				PrimaryKey: []string{"id"},
-				UniqueKeys: [][]string{{"id"}},
-			},
-		},
-	})}
+	initReq := RPCRequest{Method: "init", ID: 3, Params: mustMarshal(t, issueInitParams(cgID))}
 	if resp := srv.handleInit(initReq); resp.Error != nil {
 		t.Fatalf("re-init error: %+v", resp.Error)
 	}

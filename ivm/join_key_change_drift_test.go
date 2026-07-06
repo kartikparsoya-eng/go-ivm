@@ -1,8 +1,11 @@
 package ivm
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
-// buildTestJoin wires a minimal parent⋈child Join for the key-change drift
+// buildTestJoin wires a minimal parent⋈child Join for the key-change assert
 // tests. Parent "tickets" PK=id, child "assignments" joined on ticketId.
 func buildTestJoin(t *testing.T) *Join {
 	t.Helper()
@@ -21,10 +24,11 @@ func buildTestJoin(t *testing.T) *Join {
 	return j
 }
 
-// A parent Edit that changes the join key must surface as a recoverable
-// *DriftError (drop the advance + re-init), NOT a raw string panic that would
-// crash the shared sidecar. Mirrors the Take stale-bound contract.
-func TestJoin_ParentKeyChange_RaisesDriftError(t *testing.T) {
+// A parent Edit that changes the join key must panic with the plain
+// source-drift error (joinKeyChangeError) — TS asserts (throws) here and the
+// view-syncer tears the client group down; the panic must be an `error`
+// carrying the table + old row's PK so the teardown log is attributable.
+func TestJoin_ParentKeyChange_PanicsPlainError(t *testing.T) {
 	j := buildTestJoin(t)
 	edit := MakeEditChange(
 		Node{Row: Row{"id": "t2", "title": "x"}},
@@ -35,22 +39,26 @@ func TestJoin_ParentKeyChange_RaisesDriftError(t *testing.T) {
 		if r == nil {
 			t.Fatal("expected panic on parent join-key change, got none")
 		}
-		d, ok := r.(*DriftError)
+		err, ok := r.(error)
 		if !ok {
-			t.Fatalf("expected *DriftError, got %T: %v", r, r)
+			t.Fatalf("expected error panic, got %T: %v", r, r)
 		}
-		if d.Table != "tickets" {
-			t.Errorf("DriftError.Table = %q, want tickets", d.Table)
+		msg := err.Error()
+		if !strings.Contains(msg, "source drift: table=tickets") {
+			t.Errorf("panic message = %q, want table=tickets", msg)
 		}
-		if d.PK["id"] != "t1" {
-			t.Errorf("DriftError.PK[id] = %v, want t1 (old row's key)", d.PK["id"])
+		if !strings.Contains(msg, "Join-parent-key-change") {
+			t.Errorf("panic message = %q, want Join-parent-key-change op", msg)
+		}
+		if !strings.Contains(msg, "t1") {
+			t.Errorf("panic message = %q, want old row's key t1", msg)
 		}
 	}()
 	j.pushParent(edit)
 }
 
-// A child Edit that changes the join key likewise raises *DriftError.
-func TestJoin_ChildKeyChange_RaisesDriftError(t *testing.T) {
+// A child Edit that changes the join key likewise panics with the plain error.
+func TestJoin_ChildKeyChange_PanicsPlainError(t *testing.T) {
 	j := buildTestJoin(t)
 	edit := MakeEditChange(
 		Node{Row: Row{"id": "a1", "ticketId": "t2"}},
@@ -61,17 +69,19 @@ func TestJoin_ChildKeyChange_RaisesDriftError(t *testing.T) {
 		if r == nil {
 			t.Fatal("expected panic on child join-key change, got none")
 		}
-		if d, ok := r.(*DriftError); !ok {
-			t.Fatalf("expected *DriftError, got %T: %v", r, r)
-		} else if d.Table != "assignments" {
-			t.Errorf("DriftError.Table = %q, want assignments", d.Table)
+		err, ok := r.(error)
+		if !ok {
+			t.Fatalf("expected error panic, got %T: %v", r, r)
+		}
+		if !strings.Contains(err.Error(), "source drift: table=assignments") {
+			t.Errorf("panic message = %q, want table=assignments", err.Error())
 		}
 	}()
 	j.pushChild(edit)
 }
 
-// A FlippedJoin parent Edit that changes the join key raises *DriftError.
-func TestFlippedJoin_ParentKeyChange_RaisesDriftError(t *testing.T) {
+// A FlippedJoin parent Edit that changes the join key panics with the plain error.
+func TestFlippedJoin_ParentKeyChange_PanicsPlainError(t *testing.T) {
 	parent := NewMemorySource("tickets", map[string]string{"id": "string"}, []string{"id"})
 	child := NewMemorySource("assignments", map[string]string{"id": "string", "ticketId": "string"}, []string{"id"})
 	pConn := parent.Connect(Ordering{{"id", "asc"}}, nil, nil)
@@ -97,8 +107,12 @@ func TestFlippedJoin_ParentKeyChange_RaisesDriftError(t *testing.T) {
 		if r == nil {
 			t.Fatal("expected panic on flipped-join parent key change, got none")
 		}
-		if _, ok := r.(*DriftError); !ok {
-			t.Fatalf("expected *DriftError, got %T: %v", r, r)
+		err, ok := r.(error)
+		if !ok {
+			t.Fatalf("expected error panic, got %T: %v", r, r)
+		}
+		if !strings.Contains(err.Error(), "FlippedJoin-parent-key-change") {
+			t.Errorf("panic message = %q, want FlippedJoin-parent-key-change op", err.Error())
 		}
 	}()
 	fj.pushParent(edit)

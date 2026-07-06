@@ -72,9 +72,9 @@ func TestRowPlane_MixedPartialAllOrNothing(t *testing.T) {
 	rp := rowPlaneForTest(t, col, 5)
 
 	// Partial 1: an ordinary add interns group (q1,t) with cols {id,n}.
-	rp.emitAdvancePartial(engine.AdvanceStreamPartial{
+	rp.emitAdvanceToHeadPartial(engine.AdvanceStreamPartial{
 		Changes: []engine.RowChange{rcAdd("q1", "seed")}, ChunkIndex: 0,
-	})
+	}, "", 0)
 	defs, rows, frames := countKinds(col)
 	if defs != 1 || rows != 1 || frames != 0 {
 		t.Fatalf("after partial1: defs=%d rows=%d frames=%d, want 1/1/0", defs, rows, frames)
@@ -87,10 +87,10 @@ func TestRowPlane_MixedPartialAllOrNothing(t *testing.T) {
 	// carrying both changes in original order.
 	heteroAdd := rcAdd("q1", "x")
 	heteroAdd.Row = ivm.Row{"id": "x", "zz": float64(9)} // zz ∉ {id,n}
-	rp.emitAdvancePartial(engine.AdvanceStreamPartial{
+	rp.emitAdvanceToHeadPartial(engine.AdvanceStreamPartial{
 		Changes:    []engine.RowChange{heteroAdd, rcRemove("q1", "x")},
 		ChunkIndex: 1,
-	})
+	}, "", 0)
 	defs, rows, frames = countKinds(col)
 	if rows != 1 {
 		t.Fatalf("mixed partial leaked %d row record(s) — must be all-or-nothing", rows-1+1)
@@ -138,18 +138,18 @@ func TestRowPlane_AllEncodablePartialStaysOnRecordPlane(t *testing.T) {
 	col := newSinkCollector()
 	rp := rowPlaneForTest(t, col, 7)
 
-	rp.emitAdvancePartial(engine.AdvanceStreamPartial{
+	rp.emitAdvanceToHeadPartial(engine.AdvanceStreamPartial{
 		Changes: []engine.RowChange{rcAdd("q1", "a"), rcAdd("q1", "b"), rcRemove("q1", "a")},
-	})
+	}, "", 0)
 	defs, rows, frames := countKinds(col)
 	if defs != 1 || rows != 3 || frames != 0 {
 		t.Fatalf("defs=%d rows=%d frames=%d, want 1/3/0", defs, rows, frames)
 	}
 
 	// Same group again — def must NOT re-deliver; rows keep flowing.
-	rp.emitAdvancePartial(engine.AdvanceStreamPartial{
+	rp.emitAdvanceToHeadPartial(engine.AdvanceStreamPartial{
 		Changes: []engine.RowChange{rcAdd("q1", "c")}, ChunkIndex: 1,
-	})
+	}, "", 0)
 	defs, rows, frames = countKinds(col)
 	if defs != 1 || rows != 4 || frames != 0 {
 		t.Fatalf("after partial2: defs=%d rows=%d frames=%d, want 1/4/0", defs, rows, frames)
@@ -165,16 +165,16 @@ func TestRowPlane_MixedFinalPartialCarriesEverything(t *testing.T) {
 
 	// Ordinary group, then a final partial mixing a heterogeneous
 	// (unencodable) add with an encodable remove.
-	rp.emitAdvancePartial(engine.AdvanceStreamPartial{
+	rp.emitAdvanceToHeadPartial(engine.AdvanceStreamPartial{
 		Changes: []engine.RowChange{rcAdd("q2", "seed")},
-	})
+	}, "", 0)
 	heteroAdd := rcAdd("q2", "y")
 	heteroAdd.Row = ivm.Row{"id": "y", "zz": float64(1)} // zz ∉ canonical cols
-	rp.emitAdvancePartial(engine.AdvanceStreamPartial{
+	rp.emitAdvanceToHeadPartial(engine.AdvanceStreamPartial{
 		Changes:    []engine.RowChange{heteroAdd, rcRemove("q2", "z")},
 		ChunkIndex: 1,
 		Final:      true,
-	})
+	}, "v1", 2)
 	_, rows, frames := countKinds(col)
 	if rows != 1 || frames != 1 {
 		t.Fatalf("rows=%d frames=%d, want 1 (seed only) / 1 (final)", rows, frames)

@@ -19,14 +19,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kartikparsoya-eng/go-ivm/internal/tablesource"
 )
 
 // TestGetReplicaDB_NoCacheMissBlock confirms that when no replica path is
 // configured, the error path returns quickly under the cache-miss branch
 // without entering the retry loop.
 func TestGetReplicaDB_NoCacheMissBlock(t *testing.T) {
-	s := &Server{sourceMode: tablesource.ModeTable}
+	s := &Server{}
 	// replicaPath is empty — should fail fast, not enter the 60s loop.
 	start := time.Now()
 	_, err := s.getReplicaDB()
@@ -65,7 +64,6 @@ func TestGetReplicaDB_ConcurrentCallersShareProbe(t *testing.T) {
 	// start probing, give the second a head start to join via
 	// replicaProbe wait, then check that they finish nearly together.
 	s := &Server{
-		sourceMode:  tablesource.ModeTable,
 		replicaPath: "/nonexistent/path/that/will/fail.db",
 	}
 
@@ -125,7 +123,6 @@ func TestGetReplicaDB_NextCallerAfterFailureCanProbe(t *testing.T) {
 		t.Skip("skipping ~120s singleflight cleanup test under -short")
 	}
 	s := &Server{
-		sourceMode:  tablesource.ModeTable,
 		replicaPath: "/nonexistent/will/fail.db",
 	}
 

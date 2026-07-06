@@ -16,7 +16,6 @@ import (
 	"time"
 
 	"github.com/kartikparsoya-eng/go-ivm/engine"
-	"github.com/kartikparsoya-eng/go-ivm/internal/tablesource"
 	"github.com/kartikparsoya-eng/go-ivm/ivm"
 )
 
@@ -30,15 +29,15 @@ func TestRowPlaneRemoveFirstGroupRegainsRecords(t *testing.T) {
 	rp := rowPlaneForTest(t, col, 77)
 
 	// chunkSize=1 partials, exactly like the production rowMode path.
-	rp.emitAdvancePartial(engine.AdvanceStreamPartial{
+	rp.emitAdvanceToHeadPartial(engine.AdvanceStreamPartial{
 		Changes: []engine.RowChange{rcRemove("q1", "a")},
-	})
-	rp.emitAdvancePartial(engine.AdvanceStreamPartial{
+	}, "0000000002", 1)
+	rp.emitAdvanceToHeadPartial(engine.AdvanceStreamPartial{
 		Changes: []engine.RowChange{rcAdd("q1", "b")},
-	})
-	rp.emitAdvancePartial(engine.AdvanceStreamPartial{
+	}, "0000000002", 1)
+	rp.emitAdvanceToHeadPartial(engine.AdvanceStreamPartial{
 		Changes: []engine.RowChange{rcAdd("q1", "c")},
-	})
+	}, "0000000002", 1)
 
 	defs, rows, frames := countKinds(col)
 	// def#1 (PK-only, remove-first) + def#2 (full columns, minted by the
@@ -63,12 +62,12 @@ func TestRowPlaneRemoveFirstGroupRegainsRecords(t *testing.T) {
 func TestRowPlaneRemoveOnlyGroupStaysOnRecords(t *testing.T) {
 	col := newSinkCollector()
 	rp := rowPlaneForTest(t, col, 78)
-	rp.emitAdvancePartial(engine.AdvanceStreamPartial{
+	rp.emitAdvanceToHeadPartial(engine.AdvanceStreamPartial{
 		Changes: []engine.RowChange{rcRemove("q1", "a")},
-	})
-	rp.emitAdvancePartial(engine.AdvanceStreamPartial{
+	}, "0000000002", 1)
+	rp.emitAdvanceToHeadPartial(engine.AdvanceStreamPartial{
 		Changes: []engine.RowChange{rcRemove("q1", "b")},
-	})
+	}, "0000000002", 1)
 	defs, rows, frames := countKinds(col)
 	if defs != 1 || rows != 2 || frames != 0 {
 		t.Fatalf("remove-only group: defs=%d rows=%d frames=%d, want 1/2/0", defs, rows, frames)
@@ -125,10 +124,8 @@ func TestAdvanceToHeadStreamBudgetExceeded(t *testing.T) {
 	defer func() { advanceBudgetMs = saved }()
 
 	path, db := makeReplica(t)
-	srv := NewServer(tablesource.ModeTable, path)
+	srv := NewServer(path)
 	srv.appID = "myapp"
-	srv.advanceToHeadEnabled = true
-	srv.advanceDriveEnabled = true
 	t.Cleanup(srv.closeAll)
 
 	initReq := RPCRequest{Method: "init", ID: 1, Params: mustMarshal(t, issueInitParams("cg1"))}

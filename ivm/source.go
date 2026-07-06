@@ -24,6 +24,23 @@ type SourceChange struct {
 	OldRow Row // only for Edit
 }
 
+// SourceDriftError builds the plain error a source-state divergence panics
+// with: an Edit/Remove against a missing row, or a duplicate Add — the direct
+// port of TS's genPush asserts (memory-source.ts:529-550) and TableSource's
+// push asserts. TS throws an Error here and the view-syncer tears the client
+// group down; the Go panic gets the identical disposition (propagates out of
+// the engine → RPC error → 'unclassified' → rethrow → teardown). The message
+// format is the old *DriftError.Error() text, kept byte-identical so log
+// greps survive the type change. Shared by MemorySource (test fixture),
+// tablesource.Source (prod leaf), Take's stale-bound asserts, join key-change
+// asserts, and operator-storage failures.
+func SourceDriftError(table, op string, pk map[string]Value, hasCount int) error {
+	return fmt.Errorf(
+		"source drift: table=%s op=%s pk=%v has_count=%d",
+		table, op, pk, hasCount,
+	)
+}
+
 func MakeSourceChangeAdd(row Row) SourceChange {
 	return SourceChange{Type: ChangeTypeAdd, Row: row}
 }
@@ -276,7 +293,10 @@ func (ms *MemorySource) genPushAndWrite(change SourceChange) []Change {
 // genPush — Source: memory-source.ts line 522-578
 // THIS IS WHERE PARALLELISM WILL BE INJECTED (goroutine fan-out across connections)
 func (ms *MemorySource) genPush(change SourceChange) []Change {
-	// Validate
+	// Validate — direct port of TS MemorySource genPush's asserts
+	// (memory-source.ts:529-550). TS throws; the Go panic propagates out of
+	// the engine unrecovered → RPC error → 'unclassified' → CG teardown —
+	// the same disposition TS's throw gets from the view-syncer.
 	switch change.Type {
 	case ChangeTypeAdd:
 		if ms.has(change.Row) {
@@ -284,10 +304,7 @@ func (ms *MemorySource) genPush(change SourceChange) []Change {
 			for _, c := range ms.primaryKey {
 				pk[c] = change.Row[c]
 			}
-			// Duplicate Add — Go's in-memory copy already has this row but
-			// an upstream advance is re-adding it. Same drift class as the
-			// missing-row case; recover via re-init from SQLite truth.
-			panic(&DriftError{Table: ms.tableName, Op: "Add", PK: pk, HasCount: len(ms.data)})
+			panic(SourceDriftError(ms.tableName, "Add", pk, len(ms.data)))
 		}
 	case ChangeTypeRemove:
 		if !ms.has(change.Row) {
@@ -295,7 +312,7 @@ func (ms *MemorySource) genPush(change SourceChange) []Change {
 			for _, c := range ms.primaryKey {
 				pk[c] = change.Row[c]
 			}
-			panic(&DriftError{Table: ms.tableName, Op: "Remove", PK: pk, HasCount: len(ms.data)})
+			panic(SourceDriftError(ms.tableName, "Remove", pk, len(ms.data)))
 		}
 	case ChangeTypeEdit:
 		if !ms.has(change.OldRow) {
@@ -303,7 +320,7 @@ func (ms *MemorySource) genPush(change SourceChange) []Change {
 			for _, c := range ms.primaryKey {
 				pk[c] = change.OldRow[c]
 			}
-			panic(&DriftError{Table: ms.tableName, Op: "Edit", PK: pk, HasCount: len(ms.data)})
+			panic(SourceDriftError(ms.tableName, "Edit", pk, len(ms.data)))
 		}
 	}
 

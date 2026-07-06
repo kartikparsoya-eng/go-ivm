@@ -4,16 +4,16 @@ package tablesource
 // absent" (scale review). Pre-fix, existsLocked collapsed EVERY error to
 // false, so under I/O pressure (SQLITE_BUSY, closed conn, disk fault):
 //
-//   - driftCheckLocked fabricated a missing-row DriftError for every
-//     Remove/Edit — spurious pipeline resets exactly when the system was
+//   - driftCheckLocked fabricated a missing-row drift error for every
+//     Remove/Edit — spurious teardowns exactly when the system was
 //     already struggling (drift storm), and
 //   - a dup-Add sailed PAST the drift check into writeChange's UNIQUE
-//     violation — the crash-grade panic the drift check exists to prevent.
+//     violation — a panic far from the cause.
 //
 // TS's exists closure (table-source.ts:399-413, better-sqlite3) THROWS on
 // statement error. The port now propagates the error and Push panics with
-// a plain (transient, -32000 → reset) error AFTER releasing s.mu — never a
-// DriftError, never a silent wrong answer.
+// the probe error AFTER releasing s.mu — never a fabricated missing-row
+// drift message, never a silent wrong answer.
 
 import (
 	"strings"
@@ -40,7 +40,7 @@ func TestExistsProbeErrorIsNotDrift(t *testing.T) {
 	src.mu.Unlock()
 
 	// Remove of a row that REALLY exists (id=1 is seeded). Pre-fix: the
-	// probe error read as "absent" → fabricated missing-row DriftError.
+	// probe error read as "absent" → fabricated missing-row drift.
 	var recovered any
 	func() {
 		defer func() { recovered = recover() }()
@@ -52,8 +52,8 @@ func TestExistsProbeErrorIsNotDrift(t *testing.T) {
 	if recovered == nil {
 		t.Fatal("Push with a failing exists probe must panic (matching TS's throwing exists closure)")
 	}
-	if _, isDrift := recovered.(*ivm.DriftError); isDrift {
-		t.Fatalf("probe failure surfaced as a DriftError (spurious drift → reset storm): %v", recovered)
+	if err, isErr := recovered.(error); isErr && strings.Contains(err.Error(), "source drift:") {
+		t.Fatalf("probe failure surfaced as a fabricated missing-row drift: %v", recovered)
 	}
 	msg, ok := recovered.(string)
 	if !ok || !strings.Contains(msg, "checkExists") {

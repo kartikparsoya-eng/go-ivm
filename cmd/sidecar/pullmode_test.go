@@ -28,15 +28,18 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kartikparsoya-eng/go-ivm/ivm"
 	"github.com/kartikparsoya-eng/go-ivm/sqlite"
 )
 
-// startPullHost boots a memory-mode host with `users` seeded with nRows and
-// returns the server, collector, host, and a send helper.
+// startPullHost boots a table-mode host over a replica whose `users` table
+// is seeded with nRows and returns the server, collector, host, and a send
+// helper. (Port of the old memory-mode fixture: init used to carry schema +
+// loadRows the rows; the replica file is now authoritative.)
 func startPullHost(t *testing.T, nRows int) (*Server, *sinkCollector, *abiHost, func(id float64, method string, params interface{})) {
 	t.Helper()
-	srv := NewServer(0, "")
+	path := makeUsersReplica(t, nRows)
+	srv := NewServer(path)
+	srv.appID = "myapp"
 	col := newSinkCollector()
 	h := startABIHostWithServer(srv, col.sink, nil)
 	t.Cleanup(h.Shutdown)
@@ -50,28 +53,32 @@ func startPullHost(t *testing.T, nRows int) (*Server, *sinkCollector, *abiHost, 
 
 	send(1, "init", initParams{
 		ClientGroupID: "cg-pull",
-		Storage:       t.TempDir() + "/storage.db",
 		Tables: map[string]tableSchemaParams{
 			"users": {
 				Columns: map[string]sqlite.ColumnSchema{
-					"id":   {Type: "string"},
-					"name": {Type: "string"},
+					"id":         {Type: "string"},
+					"name":       {Type: "string"},
+					"_0_version": {Type: "string"},
 				},
 				PrimaryKey: []string{"id"},
+				UniqueKeys: [][]string{{"id"}},
 			},
 		},
 	})
-	rows := make([]ivm.Row, nRows)
-	for i := range rows {
-		rows[i] = ivm.Row{"id": fmt.Sprintf("u%04d", i), "name": fmt.Sprintf("User-%d", i)}
-	}
-	send(2, "loadRows", loadRowsParams{
-		ClientGroupID: "cg-pull",
-		Table:         "users",
-		InitEpoch:     1,
-		Rows:          rows,
-	})
 	return srv, col, h, send
+}
+
+// makeUsersReplica builds a temp WAL replica with the _zero metadata tables
+// + a users table seeded with nRows at version v1.
+func makeUsersReplica(t *testing.T, nRows int) string {
+	t.Helper()
+	path, db := makeReplica(t)
+	mustExec(t, db, `CREATE TABLE "users" ("id" TEXT PRIMARY KEY,"name" TEXT,"_0_version" TEXT)`)
+	for i := 0; i < nRows; i++ {
+		mustExec(t, db, `INSERT INTO "users" VALUES (?,?,'0000000001')`,
+			fmt.Sprintf("u%04d", i), fmt.Sprintf("User-%d", i))
+	}
+	return path
 }
 
 func pullQueryParams(pull bool, rowMode bool) map[string]interface{} {

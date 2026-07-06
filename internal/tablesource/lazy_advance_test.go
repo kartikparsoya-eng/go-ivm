@@ -425,7 +425,7 @@ func TestLazyAdvanceConcurrentRefreshSnapshot(t *testing.T) {
 			case <-stop:
 				return
 			default:
-				src.RefreshSnapshot()
+				src.OnAdvanceEnd()
 			}
 		}
 	}()

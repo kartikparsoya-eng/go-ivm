@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/kartikparsoya-eng/go-ivm/ivm"
@@ -481,11 +482,11 @@ func TestPushFanoutAddToConnection(t *testing.T) {
 }
 
 // TestPushDriftOnDuplicateAdd verifies that an ADD for a row already
-// present in the source raises a *ivm.DriftError BEFORE any fanout —
-// matching TS TableSource.genPush's `assert(!exists(row))`
+// present in the source panics with the source-drift error BEFORE any
+// fanout — matching TS TableSource.genPush's `assert(!exists(row))`
 // (table-source.ts:399-413 + memory-source.ts:531). The prev-tx
-// writeChange would otherwise raw-panic "UNIQUE constraint failed",
-// which is NOT recoverable by engine.Advance and crashes the cg/sidecar.
+// writeChange would otherwise panic "UNIQUE constraint failed", far from
+// the cause.
 func TestPushDriftOnDuplicateAdd(t *testing.T) {
 	// Seed already has users id=1,2,3 (see seedTypedReplica).
 	src, db := newUserSource(t)
@@ -498,17 +499,17 @@ func TestPushDriftOnDuplicateAdd(t *testing.T) {
 	defer func() {
 		r := recover()
 		if r == nil {
-			t.Fatalf("dup-Add should panic with *DriftError; no panic")
+			t.Fatalf("dup-Add should panic with the source-drift error; no panic")
 		}
-		d, ok := r.(*ivm.DriftError)
+		err, ok := r.(error)
 		if !ok {
-			t.Fatalf("dup-Add panic type = %T, want *ivm.DriftError (raw panic crashes the sidecar)", r)
+			t.Fatalf("dup-Add panic type = %T, want error", r)
 		}
-		if d.Op != "Add" {
-			t.Errorf("DriftError.Op = %q, want \"Add\"", d.Op)
+		if !strings.Contains(err.Error(), "op=Add") {
+			t.Errorf("panic message = %q, want op=Add", err.Error())
 		}
 		if len(rec.pushed) != 0 {
-			t.Errorf("DriftError must be raised BEFORE fanout; got %d pushed changes", len(rec.pushed))
+			t.Errorf("drift must be raised BEFORE fanout; got %d pushed changes", len(rec.pushed))
 		}
 	}()
 
@@ -517,8 +518,8 @@ func TestPushDriftOnDuplicateAdd(t *testing.T) {
 	src.Push(ivm.MakeSourceChangeAdd(row))
 }
 
-// TestPushDriftOnRemoveMissing verifies a REMOVE of an absent row raises a
-// *ivm.DriftError before fanout (TS: assert(exists(row))).
+// TestPushDriftOnRemoveMissing verifies a REMOVE of an absent row panics
+// with the source-drift error before fanout (TS: assert(exists(row))).
 func TestPushDriftOnRemoveMissing(t *testing.T) {
 	src, db := newUserSource(t)
 	defer db.Close()
@@ -529,15 +530,15 @@ func TestPushDriftOnRemoveMissing(t *testing.T) {
 
 	defer func() {
 		r := recover()
-		d, ok := r.(*ivm.DriftError)
+		err, ok := r.(error)
 		if !ok {
-			t.Fatalf("missing-Remove panic type = %T, want *ivm.DriftError", r)
+			t.Fatalf("missing-Remove panic type = %T, want error", r)
 		}
-		if d.Op != "Remove" {
-			t.Errorf("DriftError.Op = %q, want \"Remove\"", d.Op)
+		if !strings.Contains(err.Error(), "op=Remove") {
+			t.Errorf("panic message = %q, want op=Remove", err.Error())
 		}
 		if len(rec.pushed) != 0 {
-			t.Errorf("DriftError must be raised BEFORE fanout; got %d pushed", len(rec.pushed))
+			t.Errorf("drift must be raised BEFORE fanout; got %d pushed", len(rec.pushed))
 		}
 	}()
 
@@ -757,23 +758,23 @@ func TestRefreshSnapshotRollsTx(t *testing.T) {
 	if got := len(slices.Collect(in.Fetch(ivm.FetchRequest{}))); got != 3 {
 		t.Fatalf("pre-refresh = %d, want 3 (tx still pinned)", got)
 	}
-	// External caller (drift audit) refreshes.
-	src.RefreshSnapshot()
+	// External roll-to-head between batches.
+	src.OnAdvanceEnd()
 	if got := len(slices.Collect(in.Fetch(ivm.FetchRequest{}))); got != 4 {
 		t.Fatalf("post-refresh = %d, want 4 (tx rolled)", got)
 	}
 }
 
-// TestRefreshSnapshotNoOpDuringPush proves the safety property: rolling
+// TestOnAdvanceEndNoOpDuringPush proves the safety property: rolling
 // the tx mid-Push would break overlay's pre-state assumption. We start
-// a Push, have its downstream call RefreshSnapshot, and verify the
-// snapshot stays pinned for the duration of the Push.
+// a Push, have its downstream call OnAdvanceEnd, and verify the
+// snapshot stays pinned for the duration of the Push (the overlay guard).
 //
 // Requires the snapshot pinning path to be available — the readViaSnapshot
 // gate on overlay (source.go) skips overlay when the pool-fallback is
 // used, so the in-process test must have snapshot capability for this
 // test to exercise the overlay code path at all.
-func TestRefreshSnapshotNoOpDuringPush(t *testing.T) {
+func TestOnAdvanceEndNoOpDuringPush(t *testing.T) {
 	src, db := newUserSource(t)
 	defer db.Close()
 	if !snapshotAvailable(t) {
@@ -789,7 +790,7 @@ func TestRefreshSnapshotNoOpDuringPush(t *testing.T) {
 	}))
 
 	if !probe.observedOverlay {
-		t.Fatalf("RefreshSnapshot during Push should have left overlay visible")
+		t.Fatalf("OnAdvanceEnd during Push should have left overlay visible")
 	}
 }
 
@@ -804,7 +805,7 @@ func (o *refreshDuringPushOutput) Push(_ ivm.Change, _ ivm.InputBase) []ivm.Chan
 	// recognize overlay != nil and skip the bump — otherwise the next
 	// Fetch (this one) would roll the tx, see post-replicator state,
 	// and double-apply the overlay's add.
-	o.src.RefreshSnapshot()
+	o.src.OnAdvanceEnd()
 	// SQLite has 3 rows; overlay adds the 4th. If we double-applied,
 	// we'd see 5.
 	nodes := slices.Collect(o.in.Fetch(ivm.FetchRequest{}))

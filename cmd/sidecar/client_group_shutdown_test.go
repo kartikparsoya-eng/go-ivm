@@ -32,7 +32,7 @@ import (
 // closed channel. With the old close(reqC) approach plus an unprotected
 // send, this scenario panicked the process.
 func TestTrySendReq_ReturnsFalseAfterShutdown(t *testing.T) {
-	s := NewServer(0, "")
+	s := NewServer(makeReplicaPathOnly(t))
 	g := s.getGroup("cg-shutdown-test", true)
 
 	// Pre-shutdown: sends succeed.
@@ -72,7 +72,7 @@ func TestTrySendReq_ReturnsFalseAfterShutdown(t *testing.T) {
 // `closed bool` under g.mu; the new design uses sync.Once around
 // close(done).
 func TestShutdownGroup_Idempotent(t *testing.T) {
-	s := NewServer(0, "")
+	s := NewServer(makeReplicaPathOnly(t))
 	g := s.getGroup("cg-idempotent", true)
 
 	const N = 16
@@ -99,7 +99,7 @@ func TestShutdownGroup_Idempotent(t *testing.T) {
 // `respCh <- resp` (the per-request writer goroutine pattern at
 // line 1503-1507).
 func TestWorker_DrainsBufferedReqsOnShutdown(t *testing.T) {
-	s := NewServer(0, "")
+	s := NewServer(makeReplicaPathOnly(t))
 	g := s.getGroup("cg-drain", true)
 
 	// Fill the channel with several requests faster than the worker
@@ -142,7 +142,7 @@ func TestWorker_DrainsBufferedReqsOnShutdown(t *testing.T) {
 // return immediately (false) without blocking on any mutex. Confirms
 // the data path is decoupled from g.mu.
 func TestTrySendReq_NoMutexContention(t *testing.T) {
-	s := NewServer(0, "")
+	s := NewServer(makeReplicaPathOnly(t))
 	g := s.getGroup("cg-no-contention", true)
 
 	// Pre-fill so the buffer has stuff to drain (gives shutdown some

@@ -2,29 +2,26 @@ package ivm_test
 
 // Regression coverage for the goroutine-panic crash fixed in parallel.go.
 //
-// Background (e9d4946): Take's stale-bound path was converted from a string
-// panic to *DriftError so engine.Advance's outer recover could catch it and
-// return a recoverable drift result instead of crashing the sidecar. That
-// contract was silently broken in the parallel push path: GenPushParallel
-// fans out into goroutines, and a panic on a Go goroutine is fatal — the
-// runtime aborts before any caller's recover can run. With sustained-load
-// Go-primary mode + GO_IVM_PARALLEL_THRESHOLD=2 default, the very workload
-// the e9d4946 commit was supposed to make survivable instead became a
-// guaranteed sidecar crash for every CG.
+// Background: a panic on a Go goroutine is fatal — the runtime aborts
+// before any caller's recover can run. GenPushParallel fans out into
+// goroutines, so any operator assert (Take stale-bound, source drift) or
+// programmer bug panicking inside a fan-out goroutine would crash the whole
+// process (every CG) instead of surfacing through the sidecar handler's
+// recover as an RPC error. With sustained-load Go-primary mode +
+// GO_IVM_PARALLEL_THRESHOLD=2 default, that would be a guaranteed process
+// crash for a single bad row.
 //
 // These tests verify that:
-//   1. *DriftError raised inside a parallel goroutine is recovered locally
-//      and re-raised on the caller's goroutine so engine.Advance's outer
-//      recover catches it.
-//   2. Non-Drift panics (programmer bugs) are ALSO recovered locally and
-//      re-raised — they must abort the process, but on the caller's
-//      goroutine where the abort is intentional, not the spawned one
-//      where it crashes the whole runtime.
-//   3. When multiple goroutines panic in the same fan-out, non-Drift
-//      takes priority over Drift — a real programmer bug must not be
-//      masked by a concurrent drift signal.
+//  1. A panic raised inside a parallel goroutine is recovered locally
+//     and re-raised on the CALLER's goroutine, preserving the panic value.
+//  2. When multiple goroutines panic in the same fan-out, the FIRST in
+//     connection-registration order wins — deterministic, so the surfaced
+//     panic doesn't flap between runs. (All panic classes now share one
+//     disposition — RPC error → CG teardown — so ordering is a
+//     determinism concern, not a masking concern.)
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/kartikparsoya-eng/go-ivm/ivm"
@@ -40,26 +37,22 @@ func (p *panickingOutput) Push(change ivm.Change, pusher ivm.InputBase) []ivm.Ch
 	panic(p.panicWith)
 }
 
-// TestParallelPush_DriftErrorRecovered confirms that a *DriftError panic
-// inside a fan-out goroutine surfaces as a *DriftError on the caller's
-// goroutine. Without recover, this test would terminate the test binary
-// instead of being catchable here.
-func TestParallelPush_DriftErrorRecovered(t *testing.T) {
+// TestParallelPush_ErrorPanicRecovered confirms that an error panic (the
+// source-drift / operator-assert class) inside a fan-out goroutine surfaces
+// on the caller's goroutine with the exact injected value. Without the
+// per-goroutine recover, this test would terminate the test binary instead
+// of being catchable here.
+func TestParallelPush_ErrorPanicRecovered(t *testing.T) {
 	src := newTestSource()
 	src.Push(ivm.MakeSourceChangeAdd(ivm.Row{"id": "1", "name": "a", "age": float64(1)}))
 
 	// Two connections so parallel fan-out triggers (default threshold = 2).
 	// First connection: well-behaved (records the change). Second: panics
-	// with *DriftError, simulating Take's stale-bound condition.
+	// with a source-drift error, simulating Take's stale-bound assert.
 	c1 := src.Connect(nil, nil, nil)
 	c1.SetOutput(&collectOutput{})
 	c2 := src.Connect(nil, nil, nil)
-	driftPanic := &ivm.DriftError{
-		Table:    "test",
-		Op:       "Edit",
-		PK:       map[string]ivm.Value{"id": "1"},
-		HasCount: 1,
-	}
+	driftPanic := ivm.SourceDriftError("test", "Edit", map[string]ivm.Value{"id": "1"}, 1)
 	c2.SetOutput(&panickingOutput{panicWith: driftPanic})
 
 	src.SetParallel(true)
@@ -69,12 +62,15 @@ func TestParallelPush_DriftErrorRecovered(t *testing.T) {
 		if r == nil {
 			t.Fatal("expected panic to propagate to caller's goroutine, got none")
 		}
-		got, ok := r.(*ivm.DriftError)
+		got, ok := r.(error)
 		if !ok {
-			t.Fatalf("expected *DriftError, got %T: %v", r, r)
+			t.Fatalf("expected error panic, got %T: %v", r, r)
 		}
 		if got != driftPanic {
-			t.Errorf("expected the exact DriftError we injected, got different instance: %+v", got)
+			t.Errorf("expected the exact error we injected, got different instance: %+v", got)
+		}
+		if !strings.Contains(got.Error(), "source drift: table=test") {
+			t.Errorf("panic message = %q, want source-drift text", got.Error())
 		}
 	}()
 
@@ -82,12 +78,11 @@ func TestParallelPush_DriftErrorRecovered(t *testing.T) {
 	t.Fatal("expected Push to panic, returned normally")
 }
 
-// TestParallelPush_NonDriftPanicRecovered confirms that a programmer-bug
-// panic (anything other than *DriftError) in a fan-out goroutine also
-// surfaces on the caller's goroutine — preserves the "programmer bugs
-// abort the process" signal while preventing runtime fatal-panic-on-
-// goroutine that would crash before any outer abort logic runs.
-func TestParallelPush_NonDriftPanicRecovered(t *testing.T) {
+// TestParallelPush_StringPanicRecovered confirms that a programmer-bug
+// panic (raw string) in a fan-out goroutine also surfaces on the caller's
+// goroutine as-is — preventing the runtime fatal-panic-on-goroutine that
+// would crash before any outer recovery logic runs.
+func TestParallelPush_StringPanicRecovered(t *testing.T) {
 	src := newTestSource()
 	src.Push(ivm.MakeSourceChangeAdd(ivm.Row{"id": "1", "name": "a", "age": float64(1)}))
 
@@ -103,8 +98,8 @@ func TestParallelPush_NonDriftPanicRecovered(t *testing.T) {
 		if r == nil {
 			t.Fatal("expected programmer-bug panic to propagate, got none")
 		}
-		// Non-Drift panic must arrive on the caller's goroutine as-is so
-		// the process-abort behavior is preserved at the right scope.
+		// The panic must arrive on the caller's goroutine as-is so the
+		// sidecar handler's recover renders it verbatim.
 		if msg, ok := r.(string); !ok || msg != "programmer bug: index out of range" {
 			t.Errorf("expected original string panic, got %T: %v", r, r)
 		}
@@ -114,27 +109,25 @@ func TestParallelPush_NonDriftPanicRecovered(t *testing.T) {
 	t.Fatal("expected Push to panic, returned normally")
 }
 
-// TestParallelPush_NonDriftBeatsDrift confirms the priority rule: when
-// multiple connections panic simultaneously, a real programmer bug
-// (non-Drift) takes precedence over a drift signal. Drift is by design
-// recoverable; programmer bugs are not. Surfacing drift in this case
-// would silently swallow the more dangerous signal.
-func TestParallelPush_NonDriftBeatsDrift(t *testing.T) {
+// TestParallelPush_FirstPanicInOrderWins pins the determinism rule: when
+// multiple connections panic in one fan-out, the panic from the FIRST
+// connection in registration order is the one re-raised. (Every panic class
+// now funnels to the same disposition — RPC error → CG teardown — so the
+// choice is about deterministic logs, not about masking.)
+func TestParallelPush_FirstPanicInOrderWins(t *testing.T) {
 	src := newTestSource()
 	src.Push(ivm.MakeSourceChangeAdd(ivm.Row{"id": "1", "name": "a", "age": float64(1)}))
 
-	// Three connections, two of which panic — one drift, one programmer
-	// bug. Order of activeConns iteration is insertion-order; both panics
-	// will be captured before re-raise.
+	// Three connections, two of which panic. Order of activeConns
+	// iteration is insertion-order; both panics are captured before the
+	// re-raise scan.
 	c1 := src.Connect(nil, nil, nil)
-	c1.SetOutput(&panickingOutput{panicWith: &ivm.DriftError{
-		Table: "test", Op: "Edit",
-		PK: map[string]ivm.Value{"id": "1"}, HasCount: 1,
-	}})
+	c1.SetOutput(&panickingOutput{panicWith: ivm.SourceDriftError(
+		"test", "Edit", map[string]ivm.Value{"id": "1"}, 1)})
 	c2 := src.Connect(nil, nil, nil)
 	c2.SetOutput(&collectOutput{})
 	c3 := src.Connect(nil, nil, nil)
-	c3.SetOutput(&panickingOutput{panicWith: "programmer bug must not be masked"})
+	c3.SetOutput(&panickingOutput{panicWith: "later connection's panic"})
 
 	src.SetParallel(true)
 
@@ -143,14 +136,12 @@ func TestParallelPush_NonDriftBeatsDrift(t *testing.T) {
 		if r == nil {
 			t.Fatal("expected panic, got none")
 		}
-		// Non-Drift must win. If Drift won, the programmer bug would be
-		// silently dropped and the engine would self-heal around it.
-		if _, isDrift := r.(*ivm.DriftError); isDrift {
-			t.Errorf("Drift should NOT win over programmer-bug panic; "+
-				"got Drift: %v", r)
+		err, ok := r.(error)
+		if !ok {
+			t.Fatalf("expected connection 1's error panic to win (first in order), got %T: %v", r, r)
 		}
-		if msg, ok := r.(string); !ok || msg != "programmer bug must not be masked" {
-			t.Errorf("expected programmer-bug string panic, got %T: %v", r, r)
+		if !strings.Contains(err.Error(), "source drift: table=test") {
+			t.Errorf("expected connection 1's source-drift error, got: %v", err)
 		}
 	}()
 

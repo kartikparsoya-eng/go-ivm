@@ -1,6 +1,6 @@
 package main
 
-// Row-plane emit path shared by handleAdvanceStream and
+// Row-plane emit path shared by handleAdvanceToHeadStream and
 // handleAddQueriesStream when a request opts into rowMode on the in-process
 // (NAPI) transport. See rowrecord.go for the record format and kind tags.
 //
@@ -55,9 +55,8 @@ type rowPlane struct {
 // rowPlaneEngagedOnce emits a single operator-facing line the first time any
 // RPC actually opts into the row plane. Answers "is row-by-row delivery ON?"
 // from logs alone — without it the plane engages silently (it only logged on
-// error/drift) and a misconfigured deployment (e.g. napiRowMode=false, or a
-// socket transport silently degrading rowMode) is indistinguishable from a
-// working one.
+// error) and a misconfigured deployment (e.g. a non-numeric reqID degrading
+// rowMode) is indistinguishable from a working one.
 var rowPlaneEngagedOnce sync.Once
 
 // newRowPlane returns nil when row mode cannot be honored (no in-process
@@ -162,32 +161,12 @@ func (rp *rowPlane) deliverFrame(partial interface{}) {
 	rp.deliver(abiKindFrame, data)
 }
 
-// emitAdvancePartial handles one engine partial in row mode: rows →
-// records; fallback rows + every FINAL partial → kind-1 frames. Non-final
-// partials with no fallback rows produce no frame at all (that's the win).
-func (rp *rowPlane) emitAdvancePartial(r engine.AdvanceStreamPartial) {
-	rp.mu.Lock()
-	defer rp.mu.Unlock()
-	fallback := rp.emitChanges(r.Changes)
-	if len(fallback) == 0 && !r.Final {
-		return
-	}
-	pc := toPositional(fallback)
-	rp.deliverFrame(advanceStreamPartial{
-		Dict:       pc.Dict,
-		Rows:       pc.Rows,
-		ChunkIndex: r.ChunkIndex,
-		Final:      r.Final,
-		Timings:    r.Timings,
-		Drift:      r.Drift,
-	})
-}
-
-// emitAdvanceToHeadPartial is the DRIVE-mode (advanceToHeadStream)
-// counterpart of emitAdvancePartial. Identical row routing; the only
-// difference is the fallback/terminal frame shape — advanceToHeadStreamPartial
-// additionally carries Version + NumChanges on the Final frame (the TS
-// accumulator commits the CVR watermark from them). Reset never reaches here:
+// emitAdvanceToHeadPartial handles one engine partial in row mode for the
+// drive advance (advanceToHeadStream): rows → records; fallback rows + every
+// FINAL partial → kind-1 frames. Non-final partials with no fallback rows
+// produce no frame at all (that's the win). The Final frame additionally
+// carries Version + NumChanges (the TS accumulator commits the CVR watermark
+// from them). Reset never reaches here:
 // the reset path aborts before the engine apply and ships its single Final
 // frame via streamW (no records exist, so ordering is trivially preserved).
 func (rp *rowPlane) emitAdvanceToHeadPartial(r engine.AdvanceStreamPartial, version string, numChanges int) {
@@ -204,7 +183,6 @@ func (rp *rowPlane) emitAdvanceToHeadPartial(r engine.AdvanceStreamPartial, vers
 		ChunkIndex: r.ChunkIndex,
 		Final:      r.Final,
 		Timings:    r.Timings,
-		Drift:      r.Drift,
 	}
 	if r.Final {
 		part.Version = version

@@ -360,14 +360,20 @@ func TestEncodeRow_HomogeneityIsMembershipNotLength(t *testing.T) {
 }
 
 // TestABIHost_RowModeHydrateEndToEnd drives the full stack in-process:
-// init (memory mode) → loadRows → addQueriesStream with rowMode → asserts
-// per-row records arrive (kind 2/3), the terminal frame arrives (kind 1,
-// final, timing), rows decode to the loaded content, and the ordering
-// invariant (defs before their rows, rows before the query's final frame,
-// final before done) holds on the single delivery queue.
+// init (table mode) → addQueriesStream with rowMode → asserts per-row
+// records arrive (kind 2/3), the terminal frame arrives (kind 1, final),
+// rows decode to the replica content, and the ordering invariant (defs
+// before their rows, rows before the query's final frame, final before
+// done) holds on the single delivery queue.
 func TestABIHost_RowModeHydrateEndToEnd(t *testing.T) {
 	col := newSinkCollector()
-	h := startABIHostWithServer(NewServer(0, ""), col.sink, nil)
+	path, db := makeReplica(t)
+	mustExec(t, db, `CREATE TABLE "users" ("id" TEXT PRIMARY KEY, "name" TEXT, "age" INTEGER, "_0_version" TEXT)`)
+	mustExec(t, db, `INSERT INTO "users" VALUES ('u1','alice',30,'0000000001')`)
+	mustExec(t, db, `INSERT INTO "users" VALUES ('u2','bob',25,'0000000001')`)
+	mustExec(t, db, `INSERT INTO "users" VALUES ('u3','carol',35,'0000000001')`)
+
+	h := startABIHostWithServer(NewServer(path), col.sink, nil)
 	defer h.Shutdown()
 
 	send := func(id float64, method string, params interface{}) {
@@ -379,29 +385,19 @@ func TestABIHost_RowModeHydrateEndToEnd(t *testing.T) {
 
 	send(1, "init", initParams{
 		ClientGroupID: "cg-rows",
-		Storage:       t.TempDir() + "/storage.db",
 		Tables: map[string]tableSchemaParams{
 			"users": {
 				Columns: map[string]sqlite.ColumnSchema{
-					"id":   {Type: "string"},
-					"name": {Type: "string"},
-					"age":  {Type: "number"},
+					"id":         {Type: "string"},
+					"name":       {Type: "string"},
+					"age":        {Type: "number"},
+					"_0_version": {Type: "string"},
 				},
 				PrimaryKey: []string{"id"},
 			},
 		},
 	})
-	send(2, "loadRows", loadRowsParams{
-		ClientGroupID: "cg-rows",
-		Table:         "users",
-		InitEpoch:     1,
-		Rows: []ivm.Row{
-			{"id": "u1", "name": "alice", "age": float64(30)},
-			{"id": "u2", "name": "bob", "age": float64(25)},
-			{"id": "u3", "name": "carol", "age": float64(35)},
-		},
-	})
-	send(3, "addQueriesStream", map[string]interface{}{
+	send(2, "addQueriesStream", map[string]interface{}{
 		"clientGroupID": "cg-rows",
 		"initEpoch":     1,
 		"rowMode":       true,
@@ -413,15 +409,15 @@ func TestABIHost_RowModeHydrateEndToEnd(t *testing.T) {
 		},
 	})
 
-	// Expected deliveries for req id 3: 1 groupDef + 3 rows + 1 final frame,
-	// then the done frame. Plus the init/loadRows response frames (ids 1,2).
+	// Expected deliveries for req id 2: 1 groupDef + 3 rows + 1 final frame,
+	// then the done frame. Plus the init response frame (id 1).
 	deadline := time.Now().Add(15 * time.Second)
 	var entries []sinkEntry
 	for {
 		col.mu.Lock()
 		entries = append(entries[:0], col.entries...)
 		col.mu.Unlock()
-		var defs, rows, frames3 int
+		var defs, rows, frames2 int
 		for _, e := range entries {
 			switch e.kind {
 			case abiKindGroupDef:
@@ -430,17 +426,17 @@ func TestABIHost_RowModeHydrateEndToEnd(t *testing.T) {
 				rows++
 			case abiKindFrame:
 				resp := decodeResp(t, e.payload)
-				if id, ok := toFloat(resp.ID); ok && id == 3 {
-					frames3++
+				if id, ok := toFloat(resp.ID); ok && id == 2 {
+					frames2++
 				}
 			}
 		}
-		if defs >= 1 && rows >= 3 && frames3 >= 2 { // final partial + done
+		if defs >= 1 && rows >= 3 && frames2 >= 2 { // final partial + done
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("timed out: defs=%d rows=%d frames(id=3)=%d entries=%d",
-				defs, rows, frames3, len(entries))
+			t.Fatalf("timed out: defs=%d rows=%d frames(id=2)=%d entries=%d",
+				defs, rows, frames2, len(entries))
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
@@ -454,7 +450,7 @@ func TestABIHost_RowModeHydrateEndToEnd(t *testing.T) {
 		switch e.kind {
 		case abiKindGroupDef:
 			d := decodeGroupDef(t, e.payload)
-			if d.reqID != 3 {
+			if d.reqID != 2 {
 				t.Fatalf("groupDef for wrong req: %v", d.reqID)
 			}
 			if def != nil {
@@ -472,7 +468,7 @@ func TestABIHost_RowModeHydrateEndToEnd(t *testing.T) {
 				t.Fatal("ORDERING VIOLATION: row record after final frame")
 			}
 			dr := decodeRowRecord(t, e.payload, len(def.cols))
-			if dr.reqID != 3 || dr.changeType != engine.RowChangeAdd {
+			if dr.reqID != 2 || dr.changeType != engine.RowChangeAdd {
 				t.Fatalf("row header: %+v", dr)
 			}
 			for i, c := range def.cols {
@@ -483,23 +479,22 @@ func TestABIHost_RowModeHydrateEndToEnd(t *testing.T) {
 		case abiKindFrame:
 			resp := decodeResp(t, e.payload)
 			id, _ := toFloat(resp.ID)
-			if id != 3 {
+			if id != 2 {
 				continue
 			}
 			if s, ok := resp.Result.(string); ok && s == "done" {
 				if !sawFinalFrame {
 					t.Fatal("ORDERING VIOLATION: done before final partial")
-				}
-				sawDone = true
+			}
+			sawDone = true
 				continue
 			}
-			// The final partial (msgpack map). Assert final=true + timing.
 			m, ok := resp.Result.(map[string]interface{})
 			if !ok {
-				t.Fatalf("unexpected id-3 frame result: %#v", resp.Result)
+				t.Fatalf("unexpected id-2 frame result: %#v", resp.Result)
 			}
 			if fin, _ := m["final"].(bool); !fin {
-				t.Fatalf("non-final id-3 frame in row mode (fallback unexpected here): %#v", m)
+				t.Fatalf("non-final id-2 frame in row mode (fallback unexpected here): %#v", m)
 			}
 			sawFinalFrame = true
 		}
@@ -512,11 +507,19 @@ func TestABIHost_RowModeHydrateEndToEnd(t *testing.T) {
 	}
 }
 
-// TestABIHost_RowModeAdvanceEndToEnd: advanceStream with rowMode ships each
-// RowChange as a record and the terminal frame as kind-1, in order.
+// TestABIHost_RowModeAdvanceEndToEnd: advanceToHeadStream with rowMode ships
+// each RowChange as a record and the terminal frame as kind-1, in order.
+// The advance reads from the replica's changeLog (table mode), not from
+// pushed changes.
 func TestABIHost_RowModeAdvanceEndToEnd(t *testing.T) {
 	col := newSinkCollector()
-	h := startABIHostWithServer(NewServer(0, ""), col.sink, nil)
+	path, db := makeReplica(t)
+	mustExec(t, db, `CREATE TABLE "users" ("id" TEXT PRIMARY KEY, "name" TEXT, "_0_version" TEXT)`)
+	if !beginConcurrentSupported(t, db) {
+		t.Skip("drive mode writes into a past-pinned snapshot — requires BEGIN CONCURRENT (wal2/libsqlite3 build); validated via the rust-test soak")
+	}
+
+	h := startABIHostWithServer(NewServer(path), col.sink, nil)
 	defer h.Shutdown()
 
 	send := func(id float64, method string, params interface{}) {
@@ -527,12 +530,12 @@ func TestABIHost_RowModeAdvanceEndToEnd(t *testing.T) {
 	}
 	send(1, "init", initParams{
 		ClientGroupID: "cg-adv",
-		Storage:       t.TempDir() + "/storage.db",
 		Tables: map[string]tableSchemaParams{
 			"users": {
 				Columns: map[string]sqlite.ColumnSchema{
-					"id":   {Type: "string"},
-					"name": {Type: "string"},
+					"id":         {Type: "string"},
+					"name":       {Type: "string"},
+					"_0_version": {Type: "string"},
 				},
 				PrimaryKey: []string{"id"},
 			},
@@ -548,14 +551,42 @@ func TestABIHost_RowModeAdvanceEndToEnd(t *testing.T) {
 			}},
 		},
 	})
-	// Advance in row mode: one insert → one Add RowChange.
-	send(3, "advanceStream", map[string]interface{}{
-		"clientGroupID": "cg-adv",
-		"initEpoch":     1,
-		"rowMode":       true,
-		"changes": []map[string]interface{}{
-			{"table": "users", "nextValue": map[string]interface{}{"id": "u9", "name": "zed"}, "rowKey": map[string]interface{}{"id": "u9"}},
-		},
+	// Wait for hydrate to finish (0 rows in users table → done for req 2).
+	waitReqDone := func(reqID float64) {
+		t.Helper()
+		deadline := time.Now().Add(15 * time.Second)
+		for {
+			col.mu.Lock()
+			for _, e := range col.entries {
+				if e.kind == abiKindFrame {
+					resp := decodeResp(t, e.payload)
+					if id, ok := toFloat(resp.ID); ok && id == reqID {
+						if s, ok := resp.Result.(string); ok && s == "done" {
+							col.mu.Unlock()
+							return
+						}
+					}
+				}
+			}
+			col.mu.Unlock()
+			if time.Now().After(deadline) {
+				t.Fatalf("timed out waiting for done (req %v)", reqID)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	waitReqDone(2)
+
+	// V2: insert u9/zed into users + changeLog + replicationState.
+	mustExec(t, db, `INSERT INTO "users" VALUES ('u9','zed','0000000002')`)
+	mustExec(t, db, `INSERT OR REPLACE INTO "_zero.changeLog2" ("stateVersion","pos","table","rowKey","op") VALUES ('0000000002',0,'users','{"id":"u9"}','s')`)
+	mustExec(t, db, `INSERT OR REPLACE INTO "_zero.replicationState" (stateVersion, lock) VALUES ('0000000002', 1)`)
+
+	// Advance in row mode: the diff v1→v2 delivers one Add RowChange.
+	send(3, "advanceToHeadStream", advanceToHeadParams{
+		ClientGroupID: "cg-adv",
+		InitEpoch:     1,
+		RowMode:       true,
 	})
 
 	deadline := time.Now().Add(15 * time.Second)
@@ -584,7 +615,7 @@ func TestABIHost_RowModeAdvanceEndToEnd(t *testing.T) {
 			if defs != 1 || rows != 1 {
 				t.Fatalf("advance row mode: defs=%d rows=%d (want 1/1)", defs, rows)
 			}
-			// Verify the row record decodes to the pushed change.
+			// Verify the row record decodes to the advanced change.
 			for _, e := range entriesCopy {
 				if e.kind == abiKindGroupDef {
 					d := decodeGroupDef(t, e.payload)
@@ -593,7 +624,6 @@ func TestABIHost_RowModeAdvanceEndToEnd(t *testing.T) {
 					}
 				}
 				if e.kind == abiKindRow {
-					// cols = sorted keys of the emitted row (incl. _0_version).
 					var def decodedGroupDef
 					for _, e2 := range entriesCopy {
 						if e2.kind == abiKindGroupDef {

@@ -1,3 +1,11 @@
+// Package tablesource is the read-only TableSource port from TS: the
+// SQLite-backed leaf Source reading the zero-cache replica directly,
+// constructed per (cg, table) in cmd/sidecar. It is the ONLY leaf source
+// (the loadRows-fed MemorySource mode was removed in the RPC-surface
+// removal sweep; ivm.MemorySource itself survives as an engine-test
+// fixture).
+//
+// See DESIGN-tablesource-port.md for the original phased plan.
 package tablesource
 
 // Source: TableSource leaf implementing engine.Source against the TS
@@ -144,16 +152,9 @@ type Source struct {
 	// removedInBatch tracks PKs removed by writeChangeLocked in the
 	// current advance batch. Used to distinguish intra-batch duplicate
 	// Removes (skipped, matching TS's no-op filter) from genuine drift
-	// (panics with DriftError). Allocated lazily in trackRemoved and
-	// cleared by ClearBatchState at the end of each advance batch.
-	//
-	// IMPORTANT: it is cleared ONLY via ClearBatchState (engine
-	// signalAdvanceEnd), NOT via OnAdvanceEnd. OnAdvanceEnd is also reached
-	// by the drift audit's RefreshSnapshot, which runs lock-free and
-	// CONCURRENTLY with an in-flight advance batch (engine.RefreshAllSources).
-	// Clearing here would let a concurrent audit wipe the set mid-batch —
-	// between two pushes, when overlay is nil — and resurface the very
-	// false-drift this set exists to suppress.
+	// (panics — see driftCheckLocked). Allocated lazily in trackRemoved and
+	// cleared by ClearBatchState at the end of each advance batch (the
+	// true batch boundary — engine.signalAdvanceEnd).
 	removedInBatch map[string]bool
 	addedInBatch   map[string]ivm.Row
 	// stmtCache memoizes prepared SELECT statements for fetchForConn, keyed by
@@ -643,8 +644,8 @@ func (s *Source) OnAdvanceEnd() {
 	if s.externalConn != nil {
 		return
 	}
-	// Guard against TOCTOU race with RefreshSnapshot: overlay may have been set
-	// between RefreshSnapshot's unlock and this lock acquisition. Rolling back
+	// Guard against a TOCTOU race: overlay may have been set between an
+	// earlier unlock and this lock acquisition. Rolling back
 	// mid-push would violate the snapshot-consistency guarantee that downstream
 	// Fetches inside Output.Push depend on.
 	if s.overlay != nil {
@@ -687,24 +688,6 @@ func (s *Source) OnAdvanceEnd() {
 		// lazy behavior for one batch rather than wedging.
 		_ = err
 	}
-}
-
-// RefreshSnapshot is the legacy API name kept for callers (e.g. the
-// drift audit) that want the prev tx repinned to the current WAL frame
-// outside the engine's normal batch lifecycle. Semantically equivalent
-// to OnAdvanceEnd: rollback + lazy re-BEGIN on next use.
-//
-// No-op while a Push is in progress (overlay != nil) — rolling the tx
-// mid-fanout would invalidate the snapshot-consistency guarantee that
-// downstream Fetches inside Output.Push depend on.
-func (s *Source) RefreshSnapshot() {
-	s.mu.Lock()
-	if s.overlay != nil {
-		s.mu.Unlock()
-		return
-	}
-	s.mu.Unlock()
-	s.OnAdvanceEnd()
 }
 
 // TableName / PrimaryKey / NormalizeRow satisfy engine.Source.
@@ -809,7 +792,7 @@ func (s *Source) Push(change ivm.SourceChange) []ivm.Change {
 	// Acquire mu just long enough to set up the in-flight work:
 	// ensure prev tx, snapshot connections, decide shouldSplitEdit.
 	// Release before fanout — downstream output.Push callbacks may
-	// recursively call back into this Source (Fetch / RefreshSnapshot)
+	// recursively call back into this Source (Fetch)
 	// and would deadlock against a held mu.
 	s.mu.Lock()
 	if err := s.ensurePrevTxLocked(); err != nil {
@@ -844,7 +827,7 @@ func (s *Source) Push(change ivm.SourceChange) []ivm.Change {
 //
 // Locking discipline mirrors TS's MemorySource.genPushAndWriteWithSplitEdit:
 //   - Overlay is set under mu, then mu released. Fanout runs WITHOUT mu
-//     so downstream callbacks can Fetch / RefreshSnapshot recursively.
+//     so downstream callbacks can Fetch recursively.
 //   - After fanout: re-acquire mu, run writeChange against prev tx, clear
 //     overlay, release.
 //
@@ -884,20 +867,19 @@ func (s *Source) genPushAndWrite(change ivm.SourceChange, conns []*connection) [
 	// MemorySource.genPush (memory-source.ts:529-550) and the in-memory
 	// MemorySource port (ivm/source.go genPush). Raising here, before
 	// pushEpoch++/overlay/writeChange and before any Output.Push, keeps the
-	// DriftError recoverability invariant: engine.Advance recovers the panic
-	// and drops the in-flight advance with no half-applied state. This also
-	// replaces the previous raw "UNIQUE constraint failed" panic from
-	// writeChange (a dup-Add) which was NOT a *DriftError and would crash the
-	// cg/sidecar instead of triggering a clean re-hydrate.
+	// failure clean: no half-applied state when the panic unwinds. TS
+	// asserts (throws) at the same point and the view-syncer tears the
+	// client group down; the Go panic propagates to the same disposition.
+	// This also replaces the previous raw "UNIQUE constraint failed" panic
+	// from writeChange (a dup-Add), which surfaced far from the cause.
 	d, derr := s.driftCheckLocked(change)
 	if derr != nil {
 		// A REAL DB error from the exists probe (I/O, SQLITE_BUSY, closed
-		// conn) is NOT drift — raising it as one would spuriously reset the
-		// pipeline; treating it as "absent" (the pre-fix behavior) fabricated
-		// missing-row DriftErrors for every Remove/Edit under I/O pressure
-		// (drift storm). Panic with the plain error: transient (-32000) →
-		// the TS client resets, matching TS where better-sqlite3 THROWS from
-		// the exists closure (table-source.ts:399-413).
+		// conn) is NOT drift — treating it as "absent" (the pre-fix
+		// behavior) fabricated missing-row drift for every Remove/Edit
+		// under I/O pressure. Panic with the plain error, matching TS where
+		// better-sqlite3 THROWS from the exists closure
+		// (table-source.ts:399-413).
 		s.mu.Unlock()
 		panic(fmt.Sprintf("tablesource.Source.Push %s: %v", s.tableName, derr))
 	}
@@ -916,20 +898,19 @@ func (s *Source) genPushAndWrite(change ivm.SourceChange, conns []*connection) [
 	s.mu.Unlock()
 
 	// Panic-safety: clear the overlay on UNWIND too. A panic raised inside
-	// the fanout (operator drift like a Take stale-bound, or a DataError
+	// the fanout (an operator assert like a Take stale-bound, or a DataError
 	// from a poison value hit during a downstream fetch) is recovered
 	// per-goroutine and re-raised on this goroutine (parallel_fanout.go),
 	// unwinding past the success-path clear below. A stuck overlay is
 	// silent staleness, not a crash:
 	//   - OnAdvanceEnd early-returns while overlay != nil, so the engine's
-	//     "signalAdvanceEnd fires on the drift path too" invariant is
+	//     "signalAdvanceEnd fires on the panic path too" invariant is
 	//     defeated for this source — the prev tx (holding this batch's
 	//     earlier writeChanges) is never rolled back or re-pinned;
-	//   - RefreshSnapshot (drift audit) skips for the same reason;
 	//   - every fetch on an epoch-current connection splices the FAILED
 	//     change into results (fetchForConn applyOverlay,
 	//     fetchDuringPushStream) — a phantom row delivered into any
-	//     hydrate that lands before the TS reset, drive mode included.
+	//     hydrate that lands before the teardown completes.
 	// Epoch-guarded so this can only clear ITS OWN overlay (defense —
 	// pushes on one source are serialized, so a mismatch implies a bug).
 	// On the success path the primary clear below already ran and this is
@@ -953,9 +934,9 @@ func (s *Source) genPushAndWrite(change ivm.SourceChange, conns []*connection) [
 	s.overlay = nil
 	s.mu.Unlock()
 	if err != nil {
-		// Stale prev tx is unrecoverable from inside Push; surface
-		// as panic and let the engine's drift-recovery handle it
-		// (engine.Advance catches and re-inits).
+		// Stale prev tx is unrecoverable from inside Push; surface as a
+		// panic — it propagates out of the engine and the client group is
+		// torn down (TS's disposition for a failed write).
 		panic(fmt.Sprintf("tablesource.Source.Push %s: writeChange: %v", s.tableName, err))
 	}
 
@@ -963,21 +944,21 @@ func (s *Source) genPushAndWrite(change ivm.SourceChange, conns []*connection) [
 }
 
 // driftCheckLocked validates the change against current source state,
-// returning a *ivm.DriftError if it diverged (so the caller raises it
+// returning a plain drift error if it diverged (so the caller raises it
 // BEFORE any fanout/mutation). Direct port of TS genPush's pre-fanout
 // asserts (memory-source.ts:529-550) using TS TableSource's `exists`
 // closure (table-source.ts:399-413, backed by the checkExists stmt).
 // Mirrors the in-memory MemorySource Go port (ivm/source.go genPush)
-// switch + DriftError construction exactly.
+// switch + error construction exactly.
 //
 //   - ADD:    assert !exists(row)      → dup-Add drift
 //   - REMOVE: assert  exists(row)      → missing-row drift
 //   - EDIT:   assert  exists(oldRow)   → missing-row drift
 //
 // MUST be called with s.mu held (queries the prev tx via prevConn).
-// A non-nil error means the exists probe itself FAILED (real DB error) —
+// A non-nil probeErr means the exists probe itself FAILED (real DB error) —
 // the caller must abort the push (unlock, panic), never interpret it.
-func (s *Source) driftCheckLocked(change ivm.SourceChange) (*ivm.DriftError, error) {
+func (s *Source) driftCheckLocked(change ivm.SourceChange) (driftErr error, probeErr error) {
 	switch change.Type {
 	case ivm.ChangeTypeAdd:
 		exists, err := s.existsLocked(change.Row)
@@ -985,7 +966,7 @@ func (s *Source) driftCheckLocked(change ivm.SourceChange) (*ivm.DriftError, err
 			return nil, err
 		}
 		if exists {
-			return &ivm.DriftError{Table: s.tableName, Op: "Add", PK: s.pkOf(change.Row), HasCount: s.countLocked()}, nil
+			return ivm.SourceDriftError(s.tableName, "Add", s.pkOf(change.Row), s.countLocked()), nil
 		}
 	case ivm.ChangeTypeRemove:
 		exists, err := s.existsLocked(change.Row)
@@ -993,7 +974,7 @@ func (s *Source) driftCheckLocked(change ivm.SourceChange) (*ivm.DriftError, err
 			return nil, err
 		}
 		if !exists {
-			return &ivm.DriftError{Table: s.tableName, Op: "Remove", PK: s.pkOf(change.Row), HasCount: s.countLocked()}, nil
+			return ivm.SourceDriftError(s.tableName, "Remove", s.pkOf(change.Row), s.countLocked()), nil
 		}
 	case ivm.ChangeTypeEdit:
 		exists, err := s.existsLocked(change.OldRow)
@@ -1001,7 +982,7 @@ func (s *Source) driftCheckLocked(change ivm.SourceChange) (*ivm.DriftError, err
 			return nil, err
 		}
 		if !exists {
-			return &ivm.DriftError{Table: s.tableName, Op: "Edit", PK: s.pkOf(change.OldRow), HasCount: s.countLocked()}, nil
+			return ivm.SourceDriftError(s.tableName, "Edit", s.pkOf(change.OldRow), s.countLocked()), nil
 		}
 	}
 	return nil, nil
@@ -1124,14 +1105,10 @@ func (s *Source) trackAdded(row ivm.Row) {
 
 // ClearBatchState drops the intra-batch removed-PK set. Called by
 // engine.signalAdvanceEnd at the end of every advance batch (success OR
-// drift), so the set never outlives the batch that built it and can never
-// mask genuine cross-batch drift.
-//
-// Deliberately NOT folded into OnAdvanceEnd: OnAdvanceEnd is also reached by
-// the drift audit's RefreshSnapshot (engine.RefreshAllSources), which runs
-// lock-free and concurrently with an in-flight advance. Keeping the clear on
-// the signalAdvanceEnd-only path guarantees it fires at true batch
-// boundaries and never mid-batch. Mirrors ivm.MemorySource.ClearBatchState.
+// panic), so the set never outlives the batch that built it and can never
+// mask genuine cross-batch drift. Kept separate from OnAdvanceEnd so it
+// fires at true batch boundaries only. Mirrors
+// ivm.MemorySource.ClearBatchState.
 func (s *Source) ClearBatchState() {
 	s.mu.Lock()
 	s.removedInBatch = nil
@@ -1470,7 +1447,7 @@ func (s *Source) fetchForConn(req ivm.FetchRequest, conn *connection) []ivm.Node
 // cursor's lifetime: the cursor exists only inside a push fanout, during
 // which s.overlay is set exactly once (genPushAndWrite sets it before any
 // Output.Push and clears it only after the fanout returns), writeChangeLocked
-// runs strictly after fanout, OnAdvanceEnd/RefreshSnapshot refuse to roll
+// runs strictly after fanout, OnAdvanceEnd refuses to roll
 // back while overlay is non-nil, and conn.lastPushedEpoch for THIS conn was
 // bumped before its filterPush. The checked-out stmt makes the cursor
 // private (see checkoutSelectLocked).

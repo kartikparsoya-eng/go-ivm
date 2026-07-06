@@ -23,20 +23,17 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// storageDrift wraps an operator-storage infrastructure failure (failed
-// INSERT/DELETE/COMMIT/BEGIN/prepare) as a *ivm.DriftError so the panic rides
-// the engine's existing drift-recovery path: engine.Advance / the hydrate
-// goroutines recover *DriftError, drop the in-flight work, and TS re-inits
-// from SQLite truth. Before this, Exec errors were silently discarded — a
-// failed Take-bound write corrupted the window state and only surfaced much
-// later as a stale-bound panic in take.go, far from the cause.
-func storageDrift(op string, err error) *ivm.DriftError {
-	return &ivm.DriftError{
-		Table:    "_operator_storage",
-		Op:       op + ": " + err.Error(),
-		PK:       map[string]ivm.Value{},
-		HasCount: -1,
-	}
+// storageError wraps an operator-storage infrastructure failure (failed
+// INSERT/DELETE/COMMIT/BEGIN/prepare) as a plain error for the panic sites
+// below. TS's database-storage twin THROWS from better-sqlite3 on the same
+// failures and the view-syncer tears the client group down; the Go panic
+// propagates to the identical disposition. Before this, Exec errors were
+// silently discarded — a failed Take-bound write corrupted the window state
+// and only surfaced much later as a stale-bound panic in take.go, far from
+// the cause. Message keeps the old *ivm.DriftError text so log greps
+// survive the type change.
+func storageError(op string, err error) error {
+	return ivm.SourceDriftError("_operator_storage", op+": "+err.Error(), map[string]ivm.Value{}, -1)
 }
 
 const createStorageTable = `
@@ -178,11 +175,11 @@ func (ds *DatabaseStorage) checkpoint() {
 	if ds.tx != nil {
 		if err := ds.tx.Commit(); err != nil {
 			ds.tx = nil
-			panic(storageDrift("storage-checkpoint-commit", err))
+			panic(storageError("storage-checkpoint-commit", err))
 		}
 	}
 	if err := ds.beginTx(); err != nil {
-		panic(storageDrift("storage-checkpoint-begin", err))
+		panic(storageError("storage-checkpoint-begin", err))
 	}
 	ds.numWrites = 0
 }
@@ -209,7 +206,7 @@ func (ds *DatabaseStorage) get(cgID string, opID int, key string) (json.RawMessa
 		// Infra failure (busy, I/O, closed conn) is NOT "key absent" — treating
 		// it as absent makes Take re-run initialFetch against live state with a
 		// stale window, silently corrupting the bound.
-		panic(storageDrift("storage-get", err))
+		panic(storageError("storage-get", err))
 	}
 	return json.RawMessage(val), true
 }
@@ -217,14 +214,14 @@ func (ds *DatabaseStorage) get(cgID string, opID int, key string) (json.RawMessa
 func (ds *DatabaseStorage) set(cgID string, opID int, key string, val json.RawMessage) {
 	ds.maybeCheckpoint()
 	if _, err := ds.stmtSet.Exec(cgID, opID, key, string(val)); err != nil {
-		panic(storageDrift("storage-set", err))
+		panic(storageError("storage-set", err))
 	}
 }
 
 func (ds *DatabaseStorage) del(cgID string, opID int, key string) {
 	ds.maybeCheckpoint()
 	if _, err := ds.stmtDel.Exec(cgID, opID, key); err != nil {
-		panic(storageDrift("storage-del", err))
+		panic(storageError("storage-del", err))
 	}
 }
 
@@ -232,7 +229,7 @@ func (ds *DatabaseStorage) scan(cgID string, opID int, prefix string) [][2]strin
 	ds.maybeCheckpoint()
 	rows, err := ds.stmtScan.Query(cgID, opID, prefix)
 	if err != nil {
-		panic(storageDrift("storage-scan", err))
+		panic(storageError("storage-scan", err))
 	}
 	defer rows.Close()
 
@@ -240,7 +237,7 @@ func (ds *DatabaseStorage) scan(cgID string, opID int, prefix string) [][2]strin
 	for rows.Next() {
 		var key, val string
 		if err := rows.Scan(&key, &val); err != nil {
-			panic(storageDrift("storage-scan-row", err))
+			panic(storageError("storage-scan-row", err))
 		}
 		if !strings.HasPrefix(key, prefix) {
 			break
@@ -248,7 +245,7 @@ func (ds *DatabaseStorage) scan(cgID string, opID int, prefix string) [][2]strin
 		results = append(results, [2]string{key, val})
 	}
 	if err := rows.Err(); err != nil {
-		panic(storageDrift("storage-scan-rows", err))
+		panic(storageError("storage-scan-rows", err))
 	}
 	return results
 }
@@ -259,7 +256,7 @@ func (ds *DatabaseStorage) CreateClientGroupStorage(cgID string) *ClientGroupSto
 	defer ds.mu.Unlock()
 	// Clear existing storage for this client group
 	if _, err := ds.tx.Exec("DELETE FROM storage WHERE clientGroupID = ?", cgID); err != nil {
-		panic(storageDrift("storage-cg-clear", err))
+		panic(storageError("storage-cg-clear", err))
 	}
 	ds.checkpoint()
 
@@ -297,7 +294,7 @@ func (cgs *ClientGroupStorage) Destroy() {
 	cgs.ds.mu.Lock()
 	defer cgs.ds.mu.Unlock()
 	if _, err := cgs.ds.tx.Exec("DELETE FROM storage WHERE clientGroupID = ?", cgs.cgID); err != nil {
-		panic(storageDrift("storage-cg-destroy", err))
+		panic(storageError("storage-cg-destroy", err))
 	}
 	cgs.ds.checkpoint()
 }
@@ -343,7 +340,7 @@ func (s *OperatorStorage) Scan(prefix string) [][2]string {
 // profile for Take-heavy dashboards. With write-through, reads are map hits
 // (including negative hits for the very common "no state yet → drop push"
 // probe) and SQLite is only touched on writes. SQLite stays authoritative:
-// writes land there FIRST (and panic via storageDrift on failure, leaving the
+// writes land there FIRST (and panic via storageError on failure, leaving the
 // cache unchanged), then update the cache — so cache and DB can't diverge.
 //
 // Why bounded: the cache key varies over the Take's distinct partition values,
@@ -408,7 +405,7 @@ func (s *SQLiteTakeStorage) GetTakeState(key string) *ivm.TakeState {
 	var state ivm.TakeState
 	if err := json.Unmarshal(raw, &state); err != nil {
 		// A row we wrote that no longer parses is corrupted state, not "absent".
-		panic(storageDrift("take-state-unmarshal "+key, err))
+		panic(storageError("take-state-unmarshal "+key, err))
 	}
 	s.cacheState(key, &state)
 	c := state
@@ -450,7 +447,7 @@ func (s *SQLiteTakeStorage) GetMaxBound() ivm.Row {
 	}
 	var row ivm.Row
 	if err := json.Unmarshal(raw, &row); err != nil {
-		panic(storageDrift("take-maxBound-unmarshal", err))
+		panic(storageError("take-maxBound-unmarshal", err))
 	}
 	s.maxBound = row
 	s.maxBoundLoaded = true

@@ -1,24 +1,27 @@
 package main
 
-// Review item #2: the timed-out / abandoned-RPC divergence window.
+// Review item #2: the abandoned-RPC divergence window, ported to the
+// surviving advance (advanceToHeadStream).
 //
-// When the TS client's RPC budget expires it classifies the advance
-// 'unclassified' → ResetPipelinesSignal → re-registration — but it CANNOT
-// cancel the RPC: the Go side has no cancellation on the wire, so the
-// abandoned advanceStream keeps running and its frames keep arriving with
+// Under the follow-TS failure model the client has no in-process RPC
+// timeout, but an in-flight advance can still be ABANDONED: a CG teardown
+// (unclassified error elsewhere, client disconnect) queues removeQuery /
+// re-registration / destroy behind it, and the Go side has no cancellation
+// on the wire — the advance keeps running and its frames keep arriving with
 // the old request ID (the TS demux drops frames for unknown IDs).
 //
-// The contract that keeps this safe, pinned here end-to-end over one socket:
-//   1. FIFO isolation — the re-registration (removeQuery + addQuery) queued
-//      behind the abandoned call executes strictly AFTER it completes; no
-//      interleaving of its frames into the re-registration's responses.
-//   2. Convergence — the re-hydrate reads post-advance engine state, i.e.
-//      the world INCLUDING the advance TS gave up on. (TS's CVR reconcile
-//      takes min(V_ts, V_go); a Go re-hydrate that missed the abandoned
-//      advance's writes would under-claim and permanently stale the client.)
-//   3. ID hygiene — every frame of the abandoned call carries the abandoned
-//      call's ID, never the re-registration's (a cross-ID frame would make
-//      the TS accumulator adopt rows into the wrong query result).
+// The contract that keeps this safe, pinned here end-to-end over one pipe
+// (handleConnection — the exact code the NAPI host pumps through):
+//  1. FIFO isolation — the re-registration (removeQuery + addQueriesStream)
+//     queued behind the abandoned call executes strictly AFTER it completes;
+//     no interleaving of its frames into the re-registration's responses.
+//  2. Convergence — the re-hydrate reads post-advance engine state, i.e.
+//     the world INCLUDING the advance TS gave up on. (TS's CVR reconcile
+//     takes min(V_ts, V_go); a Go re-hydrate that missed the abandoned
+//     advance's writes would under-claim and permanently stale the client.)
+//  3. ID hygiene — every frame of the abandoned call carries the abandoned
+//     call's ID, never the re-registration's (a cross-ID frame would make
+//     the TS accumulator adopt rows into the wrong query result).
 //
 // Wire-order finding (documented, not a bug): STREAM partials are enqueued
 // to flushCh directly from the worker goroutine, while non-streaming/done
@@ -31,19 +34,23 @@ package main
 
 import (
 	"bufio"
-	"fmt"
 	"net"
 	"testing"
 	"time"
 
 	"github.com/kartikparsoya-eng/go-ivm/builder"
-	"github.com/kartikparsoya-eng/go-ivm/engine"
 	"github.com/kartikparsoya-eng/go-ivm/ivm"
-	"github.com/kartikparsoya-eng/go-ivm/sqlite"
 )
 
-func TestAbandonedAdvanceStream_FIFOIsolationAndConvergence(t *testing.T) {
-	server := NewServer(0, "") // memory mode: loadRows-backed sources persist across advances
+func TestAbandonedAdvanceToHeadStream_FIFOIsolationAndConvergence(t *testing.T) {
+	path, db := makeReplica(t)
+	if !beginConcurrentSupported(t, db) {
+		t.Skip("the abandoned advance COMPLETES its drive apply — requires BEGIN CONCURRENT (wal2/libsqlite3 build)")
+	}
+	server := NewServer(path)
+	server.appID = "myapp"
+	t.Cleanup(server.closeAll)
+
 	cliConn, srvConn := net.Pipe()
 	connDone := make(chan struct{})
 	go func() {
@@ -87,64 +94,47 @@ func TestAbandonedAdvanceStream_FIFOIsolationAndConvergence(t *testing.T) {
 		return resp
 	}
 
-	// --- Setup: init + loadRows + a live query. ---
-	send("init", 1, initParams{
-		ClientGroupID: "cg-T",
-		Storage:       t.TempDir() + "/storage.db",
-		Tables: map[string]tableSchemaParams{
-			"tickets": {
-				Columns: map[string]sqlite.ColumnSchema{
-					"id":        {Type: "string"},
-					"updatedAt": {Type: "number"},
-				},
-				PrimaryKey: []string{"id"},
-			},
-		},
-	})
+	// --- Setup: init + a live query (the replica seeds 1 issue row). ---
+	send("init", 1, issueInitParams("cg-T"))
 	readOK(1)
+	const seed = 1
 
-	const seed = 10
-	seedRows := make([]ivm.Row, seed)
-	for i := range seedRows {
-		seedRows[i] = ivm.Row{"id": fmt.Sprintf("t-%03d", i), "updatedAt": float64(1000 + i)}
-	}
-	send("loadRows", 2, loadRowsParams{ClientGroupID: "cg-T", Table: "tickets", Rows: seedRows, InitEpoch: 1})
-	readOK(2)
-
-	ast := builder.AST{Table: "tickets", OrderBy: ivm.Ordering{{"id", "asc"}}}
+	ast := builder.AST{Table: "issue", OrderBy: ivm.Ordering{{"id", "asc"}}}
 	send("addQueriesStream", 3, oneQueryStreamParams("cg-T", "q1", ast, 1))
 	readOK(3) // final partial (all rows)
 	readOK(3) // terminal "done"
 
+	// --- Stage v2 (the bulk the abandoned advance consumes) and v3 (one
+	// more row) up-front. advanceToHead consumes the changelog to HEAD, so
+	// the abandoned call applies BOTH versions; the post-reset advance then
+	// settles cleanly on an already-at-head replica. ---
+	const advanced = 300
+	mustExec(t, db, `INSERT INTO issue (id, title, number, _0_version)
+		SELECT 'n-'||printf('%04d', value), 't', value, '0000000002'
+		FROM (WITH RECURSIVE c(value) AS (SELECT 1 UNION ALL SELECT value+1 FROM c WHERE value < ?1+1) SELECT value FROM c WHERE value <= ?1)`, advanced)
+	mustExec(t, db, `INSERT OR REPLACE INTO "_zero.changeLog2" ("stateVersion","pos","table","rowKey","op")
+		SELECT '0000000002', value, 'issue', '{"id":"n-'||printf('%04d', value)||'"}', 's'
+		FROM (WITH RECURSIVE c(value) AS (SELECT 1 UNION ALL SELECT value+1 FROM c WHERE value < ?1+1) SELECT value FROM c WHERE value <= ?1)`, advanced)
+	mustExec(t, db, `INSERT INTO issue (id, title, number, _0_version) VALUES ('post-reset','t',9999,'0000000003')`)
+	mustExec(t, db, `INSERT OR REPLACE INTO "_zero.changeLog2" ("stateVersion","pos","table","rowKey","op") VALUES ('0000000003',0,'issue','{"id":"post-reset"}','s')`)
+	mustExec(t, db, `INSERT OR REPLACE INTO "_zero.replicationState" (stateVersion, lock) VALUES ('0000000003', 1)`)
+
 	// --- The abandoned call + everything TS queues behind it, written
 	// back-to-back so all four sit in the CG FIFO together. ---
 	const (
-		abandonedID = 50.0 // advanceStream TS will "time out" on
+		abandonedID = 50.0 // advanceToHeadStream TS abandons mid-teardown
 		removeID    = 51.0
 		readdID     = 52.0
 		afterID     = 53.0
 	)
-	const advanced = 300
-	changes := make([]engine.SnapshotChange, advanced)
-	for i := range changes {
-		changes[i] = engine.SnapshotChange{
-			Table:     "tickets",
-			NextValue: ivm.Row{"id": fmt.Sprintf("n-%04d", i), "updatedAt": float64(5000 + i)},
-		}
-	}
-	send("advanceStream", abandonedID, advanceParams{ClientGroupID: "cg-T", InitEpoch: 1, Changes: changes})
+	send("advanceToHeadStream", abandonedID, advanceToHeadParams{ClientGroupID: "cg-T", InitEpoch: 1})
 	// TS gives up NOW (does not await) and resets: remove + re-add (re-add
 	// through the streaming hydrate — the unary addQuery RPC is gone).
 	send("removeQuery", removeID, removeQueryParams{ClientGroupID: "cg-T", QueryID: "q1", InitEpoch: 1})
 	send("addQueriesStream", readdID, oneQueryStreamParams("cg-T", "q1", ast, 1))
-	// And one more advance AFTER the reset — the re-wired world keeps moving.
-	send("advanceStream", afterID, advanceParams{
-		ClientGroupID: "cg-T", InitEpoch: 1,
-		Changes: []engine.SnapshotChange{{
-			Table:     "tickets",
-			NextValue: ivm.Row{"id": "post-reset", "updatedAt": float64(9999)},
-		}},
-	})
+	// And one more advance AFTER the reset — already at head, so it settles
+	// with an empty Final (proves the FIFO drained cleanly post-reset).
+	send("advanceToHeadStream", afterID, advanceToHeadParams{ClientGroupID: "cg-T", InitEpoch: 1})
 
 	// --- Read until every call has resolved; verify isolation + convergence. ---
 	var (
@@ -208,30 +198,31 @@ func TestAbandonedAdvanceStream_FIFOIsolationAndConvergence(t *testing.T) {
 		}
 	}
 
-	// 1. The abandoned advance fully computed (TS just ignores the frames).
-	if abandonedRows != advanced {
-		t.Fatalf("abandoned advance emitted %d rows, want %d", abandonedRows, advanced)
+	// 1. The abandoned advance fully computed (TS just ignores the frames):
+	// the v2 bulk + the v3 row — advanceToHead consumes the changelog to head.
+	if abandonedRows != advanced+1 {
+		t.Fatalf("abandoned advance emitted %d rows, want %d", abandonedRows, advanced+1)
 	}
 
 	// 2. Convergence: the reset re-hydrate sees the world INCLUDING the
 	// abandoned advance — the FIFO forced it to run after. Missing rows here
 	// = the permanent-staleness bug class.
-	if rehydrateRows != seed+advanced {
+	if rehydrateRows != seed+advanced+1 {
 		t.Fatalf("re-hydrate returned %d rows, want %d (abandoned advance's writes missing → permanent staleness)",
-			rehydrateRows, seed+advanced)
+			rehydrateRows, seed+advanced+1)
 	}
 
-	// 3. Post-reset advance flows to the re-wired query — exactly one row,
+	// 3. Post-reset advance settles with zero rows (already at head) —
 	// which also proves the remove+re-add executed between the two advances
 	// (processing order), whatever the wire order of their responses.
-	if afterRows != 1 {
-		t.Fatalf("post-reset advance emitted %d rows, want 1", afterRows)
+	if afterRows != 0 {
+		t.Fatalf("post-reset advance emitted %d rows, want 0 (replica already at head)", afterRows)
 	}
 }
 
 // countPositionalRows extracts the row count from a decoded streaming
 // partial (positional rev-9 wire keys: "d" = dict, "r" = rows — both the
-// advanceStream and addQueriesStream partial shapes).
+// advanceToHeadStream and addQueriesStream partial shapes).
 func countPositionalRows(t *testing.T, result interface{}) int {
 	t.Helper()
 	m, ok := result.(map[string]interface{})

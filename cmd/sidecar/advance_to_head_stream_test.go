@@ -11,12 +11,10 @@ package main
 
 import (
 	"fmt"
-	"strings"
 	"testing"
 	"time"
 
 	"github.com/kartikparsoya-eng/go-ivm/builder"
-	"github.com/kartikparsoya-eng/go-ivm/internal/tablesource"
 	"github.com/kartikparsoya-eng/go-ivm/ivm"
 	"github.com/kartikparsoya-eng/go-ivm/sqlite"
 )
@@ -81,17 +79,17 @@ func issueInitParams(cg string) initParams {
 	}
 }
 
-// F5 drive-only contract: the streaming variant carries the engine's
-// RowChanges, which only exist when driving. In non-drive mode it must REFUSE
-// rather than silently drop the derived diff. Runs everywhere (no engine write
-// → no BEGIN CONCURRENT needed).
-func TestAdvanceToHeadStream_RequiresDriveMode(t *testing.T) {
-	path, _ := makeReplica(t)
+// A change for a replicated-but-non-syncable table is skipped (not an
+// error), thanks to allTableNames being read from sqlite_master. NumChanges
+// (the raw changelog count) still reports it on the Final frame. No engine
+// write happens (the only change is skipped), so it runs everywhere.
+func TestAdvanceToHeadStream_SkipsNonSyncableTable(t *testing.T) {
+	path, db := makeReplica(t)
+	// A replicated table the sidecar does NOT serve.
+	mustExec(t, db, `CREATE TABLE "lmids" ("clientID" TEXT PRIMARY KEY, "lmid" INTEGER, "_0_version" TEXT)`)
 
-	srv := NewServer(tablesource.ModeTable, path)
+	srv := NewServer(path)
 	srv.appID = "myapp"
-	srv.advanceToHeadEnabled = true
-	srv.advanceDriveEnabled = false // snapshotter armed, but NOT driving
 	t.Cleanup(srv.closeAll)
 
 	initReq := RPCRequest{Method: "init", ID: 1, Params: mustMarshal(t, issueInitParams("cg1"))}
@@ -103,20 +101,31 @@ func TestAdvanceToHeadStream_RequiresDriveMode(t *testing.T) {
 		t.Fatalf("snapshotter not armed after init (group=%v)", group)
 	}
 
+	// V2: a change ONLY to the non-syncable lmids table.
+	mustExec(t, db, `INSERT INTO "lmids" VALUES ('client-a',7,'0000000002')`)
+	mustExec(t, db, `INSERT OR REPLACE INTO "_zero.changeLog2" ("stateVersion","pos","table","rowKey","op") VALUES ('0000000002',0,'lmids','{"clientID":"client-a"}','s')`)
+	mustExec(t, db, `INSERT OR REPLACE INTO "_zero.replicationState" (stateVersion, lock) VALUES ('0000000002', 1)`)
+
 	w, frames := collectAdvanceToHeadStreamFrames()
 	req := RPCRequest{Method: "advanceToHeadStream", ID: 2, Params: mustMarshal(t, advanceToHeadParams{
 		ClientGroupID: "cg1", InitEpoch: group.initEpoch.Load(),
 	})}
 	resp := srv.handleAdvanceToHeadStream(req, w)
-
-	if resp.Error == nil {
-		t.Fatalf("expected an error in non-drive mode, got result %+v", resp.Result)
+	if resp.Error != nil {
+		t.Fatalf("advanceToHeadStream error (non-syncable should be skipped, not errored): %+v", resp.Error)
 	}
-	if !strings.Contains(resp.Error.Message, "drive mode") {
-		t.Errorf("error message = %q, want it to mention drive mode", resp.Error.Message)
+	if len(*frames) != 1 {
+		t.Fatalf("want exactly 1 (empty Final) frame, got %d: %+v", len(*frames), *frames)
 	}
-	if len(*frames) != 0 {
-		t.Errorf("expected no partial frames on rejection, got %d", len(*frames))
+	f := (*frames)[0]
+	if !f.Final || len(f.Rows) != 0 {
+		t.Fatalf("want an empty Final frame (lmids skipped), got %+v", f)
+	}
+	if f.Version != "0000000002" {
+		t.Errorf("version = %q, want 0000000002", f.Version)
+	}
+	if f.NumChanges != 1 {
+		t.Errorf("NumChanges (raw changelog count) = %d, want 1", f.NumChanges)
 	}
 }
 
@@ -127,10 +136,8 @@ func TestAdvanceToHeadStream_RequiresDriveMode(t *testing.T) {
 func TestAdvanceToHeadStream_DriveTruncateEmitsResetFrame(t *testing.T) {
 	path, db := makeReplica(t)
 
-	srv := NewServer(tablesource.ModeTable, path)
+	srv := NewServer(path)
 	srv.appID = "myapp"
-	srv.advanceToHeadEnabled = true
-	srv.advanceDriveEnabled = true
 	t.Cleanup(srv.closeAll)
 
 	initReq := RPCRequest{Method: "init", ID: 1, Params: mustMarshal(t, issueInitParams("cg1"))}
@@ -190,10 +197,8 @@ func TestAdvanceToHeadStream_DriveReassembles(t *testing.T) {
 		t.Skip("drive mode writes into a past-pinned snapshot — requires BEGIN CONCURRENT (wal2/libsqlite3 build); validated via the rust-test soak")
 	}
 
-	srv := NewServer(tablesource.ModeTable, path)
+	srv := NewServer(path)
 	srv.appID = "myapp"
-	srv.advanceToHeadEnabled = true
-	srv.advanceDriveEnabled = true
 	t.Cleanup(srv.closeAll)
 
 	initReq := RPCRequest{Method: "init", ID: 1, Params: mustMarshal(t, issueInitParams("cg1"))}
@@ -236,9 +241,6 @@ func TestAdvanceToHeadStream_DriveReassembles(t *testing.T) {
 	if final.Reset != nil {
 		t.Errorf("unexpected reset: %+v", final.Reset)
 	}
-	if final.Drift != nil {
-		t.Errorf("unexpected drift: %+v", final.Drift)
-	}
 
 	// Reassemble: concatenating every frame's Changes reproduces the
 	// non-streaming RowChanges (one add of id=2 for q1).
@@ -278,10 +280,8 @@ func TestAdvanceToHeadStream_RowMode(t *testing.T) {
 		t.Skip("drive mode writes into a past-pinned snapshot — requires BEGIN CONCURRENT (wal2/libsqlite3 build); validated via the rust-test soak")
 	}
 
-	srv := NewServer(tablesource.ModeTable, path)
+	srv := NewServer(path)
 	srv.appID = "myapp"
-	srv.advanceToHeadEnabled = true
-	srv.advanceDriveEnabled = true
 	t.Cleanup(srv.closeAll)
 
 	// Arm the row plane exactly as the NAPI host does (abi.go wires
@@ -395,10 +395,8 @@ func TestAdvanceToHeadStream_RowMode(t *testing.T) {
 func TestAdvanceToHeadStream_RowModeTruncateResetViaStreamW(t *testing.T) {
 	path, db := makeReplica(t)
 
-	srv := NewServer(tablesource.ModeTable, path)
+	srv := NewServer(path)
 	srv.appID = "myapp"
-	srv.advanceToHeadEnabled = true
-	srv.advanceDriveEnabled = true
 	t.Cleanup(srv.closeAll)
 
 	col := newSinkCollector()
@@ -450,10 +448,8 @@ func TestAdvanceToHeadStream_RowModeTruncateResetViaStreamW(t *testing.T) {
 func TestAdvanceToHeadStream_RowModeStaleEpochNoRecords(t *testing.T) {
 	path, _ := makeReplica(t)
 
-	srv := NewServer(tablesource.ModeTable, path)
+	srv := NewServer(path)
 	srv.appID = "myapp"
-	srv.advanceToHeadEnabled = true
-	srv.advanceDriveEnabled = true
 	t.Cleanup(srv.closeAll)
 
 	col := newSinkCollector()
@@ -499,7 +495,7 @@ func TestAdvanceToHeadStream_RowModeStaleEpochNoRecords(t *testing.T) {
 // advanceStream, an errored advance still records into the count/latency
 // metrics, because the metric is dispatch-level, not success-level.
 func TestPerfMetrics_AdvanceToHeadStreamCountsAsAdvance(t *testing.T) {
-	s := NewServer(0, "")
+	s := NewServer(makeReplicaPathOnly(t))
 	t.Cleanup(s.closeAll)
 	g := s.getGroup("cg-perf-a2h", true)
 
@@ -544,28 +540,21 @@ func TestPerfMetrics_AdvanceToHeadStreamCountsAsAdvance(t *testing.T) {
 }
 
 // D9 (DESIGN-duplex-streaming): the streaming handler feeds the engine from
-// the changelog cursor LAZILY — the GO_IVM_MAX_DIFF_CHANGES cap no longer
-// applies to it (only the non-streaming advanceToHead, which must
-// materialize its single-frame response, keeps the cap). A diff bigger than
-// the cap must stream to completion instead of erroring into the caller's
-// reset path. Fails pre-D9 ("exceeds GO_IVM_MAX_DIFF_CHANGES"). Skips
-// without BEGIN CONCURRENT (drive apply writes into a past-pinned
-// snapshot) — same constraint as TestAdvanceToHeadStream_DriveReassembles.
+// the changelog cursor LAZILY — no diff materialization, no size cap (the
+// old GO_IVM_MAX_DIFF_CHANGES guard belonged to the deleted unary
+// advanceToHead, which had to materialize its single-frame response). A
+// large diff must stream to completion instead of erroring into the
+// caller's reset path. Skips without BEGIN CONCURRENT (drive apply writes
+// into a past-pinned snapshot) — same constraint as
+// TestAdvanceToHeadStream_DriveReassembles.
 func TestAdvanceToHeadStream_OversizedDiffStreamsWithoutCap(t *testing.T) {
 	path, db := makeReplica(t)
 	if !beginConcurrentSupported(t, db) {
 		t.Skip("drive mode writes into a past-pinned snapshot — requires BEGIN CONCURRENT (wal2/libsqlite3 build)")
 	}
 
-	// Cap far below the diff size: pre-D9 the stream handler refused this.
-	prevCap := maxDiffChanges
-	maxDiffChanges = 5
-	t.Cleanup(func() { maxDiffChanges = prevCap })
-
-	srv := NewServer(tablesource.ModeTable, path)
+	srv := NewServer(path)
 	srv.appID = "myapp"
-	srv.advanceToHeadEnabled = true
-	srv.advanceDriveEnabled = true
 	t.Cleanup(srv.closeAll)
 
 	initReq := RPCRequest{Method: "init", ID: 1, Params: mustMarshal(t, issueInitParams("cg1"))}

@@ -31,7 +31,7 @@ import (
 
 func TestABIHost_RowModeHandlerPanicSurvivesAndClassifies(t *testing.T) {
 	col := newSinkCollector()
-	h := startABIHostWithServer(NewServer(0, ""), col.sink, nil)
+	h := startABIHostWithServer(NewServer(makeReplicaPathOnly(t)), col.sink, nil)
 	defer h.Shutdown()
 
 	send := func(id float64, method string, params interface{}) {

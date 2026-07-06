@@ -29,7 +29,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kartikparsoya-eng/go-ivm/internal/tablesource"
 	"github.com/kartikparsoya-eng/go-ivm/sqlite"
 )
 
@@ -112,7 +111,7 @@ func TestABIHost_RowModeTableModeCoercion(t *testing.T) {
 	const nRows = 60
 	path := makeTypedReplica(t, nRows)
 
-	srv := NewServer(tablesource.ModeTable, path)
+	srv := NewServer(path)
 	srv.hydrateLanes = 4
 	srv.hydrateReaders = 8
 

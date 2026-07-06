@@ -53,11 +53,11 @@ func encodeReq(t *testing.T, method string, id float64, params interface{}) []by
 
 // TestBackpressure_StalledReader_HeadOfLineThenLosslessDrain drives the full
 // chain end-to-end over a net.Pipe (zero kernel buffering — the harshest
-// "slow reader"): init one CG, stop reading, fire a burst of advanceStream
-// calls. The burst must WEDGE (current behavior) and, once the client reads
+// "slow reader"): init one CG, stop reading, fire a burst of
+// advanceToHeadStream calls (each settles at head: 1 final partial + done). The burst must WEDGE (current behavior) and, once the client reads
 // again, drain completely with exactly one "done" response per request.
 func TestBackpressure_StalledReader_HeadOfLineThenLosslessDrain(t *testing.T) {
-	server := NewServer(0, "")
+	server := NewServer(makeReplicaPathOnly(t))
 	cliConn, srvConn := net.Pipe()
 	connDone := make(chan struct{})
 	go func() {
@@ -72,11 +72,7 @@ func TestBackpressure_StalledReader_HeadOfLineThenLosslessDrain(t *testing.T) {
 	cli := bufio.NewReaderSize(cliConn, 64*1024)
 
 	// --- Phase 0: init cg-A (reader active). ---
-	if err := writeFrame(cliConn, encodeReq(t, "init", 1, initParams{
-		ClientGroupID: "cg-A",
-		Storage:       t.TempDir() + "/storage.db",
-		Tables:        map[string]tableSchemaParams{},
-	})); err != nil {
+	if err := writeFrame(cliConn, encodeReq(t, "init", 1, issueInitParams("cg-A"))); err != nil {
 		t.Fatalf("write init: %v", err)
 	}
 	frame, err := readFrame(cli)
@@ -92,7 +88,7 @@ func TestBackpressure_StalledReader_HeadOfLineThenLosslessDrain(t *testing.T) {
 	}
 
 	// --- Phase 1: stall the reader, fire the burst. ---
-	// Each advanceStream on the empty engine emits 1 partial (final) via the
+	// Each at-head advanceToHeadStream emits 1 partial (final) via the
 	// WORKER's streamW + 1 "done" via respCh — ~2 flushCh entries per call.
 	// flushCh(256)+flusher(1) saturate around call ~130; the worker then
 	// blocks mid-stream, reqC(64) fills, and the read loop wedges in
@@ -102,10 +98,9 @@ func TestBackpressure_StalledReader_HeadOfLineThenLosslessDrain(t *testing.T) {
 	writerDone := make(chan error, 1)
 	go func() {
 		for i := 0; i < burst; i++ {
-			data := encodeReq(t, "advanceStream", float64(100+i), advanceParams{
+			data := encodeReq(t, "advanceToHeadStream", float64(100+i), advanceToHeadParams{
 				ClientGroupID: "cg-A",
 				InitEpoch:     1,
-				Changes:       nil,
 			})
 			if err := writeFrame(cliConn, data); err != nil {
 				writerDone <- fmt.Errorf("write %d: %w", i, err)
@@ -199,7 +194,7 @@ func TestBackpressure_StalledReader_HeadOfLineThenLosslessDrain(t *testing.T) {
 // production that caller is the connection read loop shared by every CG.
 // Unblocking the worker drains everything in FIFO order with no loss.
 func TestBackpressure_WorkerStall_FIFOFillsAndTrySendReqBlocks(t *testing.T) {
-	s := NewServer(0, "")
+	s := NewServer(makeReplicaPathOnly(t))
 	g := s.getGroup("cg-fifo", true)
 
 	// Request 0: respCh is UNBUFFERED and unread → the worker blocks at its

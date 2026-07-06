@@ -108,9 +108,6 @@ func TestStaleBound_SequentialAdvanceNoReplicator(t *testing.T) {
 			},
 		},
 	})
-	if r1.Drift != nil {
-		t.Fatalf("advance 1 drift: %v", r1.Drift)
-	}
 	logChanges(t, "advance 1 (ADD conv-new1)", r1.Changes)
 	if len(r1.Changes) != 2 {
 		t.Fatalf("advance 1: expected 2 changes, got %d", len(r1.Changes))
@@ -135,9 +132,6 @@ func TestStaleBound_SequentialAdvanceNoReplicator(t *testing.T) {
 			},
 		},
 	})
-	if r2.Drift != nil {
-		t.Fatalf("advance 2 drift: %v", r2.Drift)
-	}
 	logChanges(t, "advance 2 (ADD a383a3b1)", r2.Changes)
 	if len(r2.Changes) != 2 {
 		t.Fatalf("advance 2: expected 2 changes, got %d", len(r2.Changes))
@@ -249,9 +243,6 @@ func TestStaleBound_SequentialAdvanceWithReplicator(t *testing.T) {
 			},
 		},
 	})
-	if r1.Drift != nil {
-		t.Fatalf("advance 1 drift: %v", r1.Drift)
-	}
 	logChanges(t, "advance 1 (ADD conv-new1)", r1.Changes)
 
 	// SIMULATE REPLICATOR: write conv-new1 to the SQLite file.
@@ -281,9 +272,6 @@ func TestStaleBound_SequentialAdvanceWithReplicator(t *testing.T) {
 			},
 		},
 	})
-	if r2.Drift != nil {
-		t.Fatalf("advance 2 drift: %v", r2.Drift)
-	}
 	logChanges(t, "advance 2 (ADD a383a3b1, with replicator)", r2.Changes)
 	if len(r2.Changes) != 2 {
 		t.Fatalf("advance 2: expected 2 changes, got %d", len(r2.Changes))
@@ -391,9 +379,6 @@ func TestStaleBound_FourQueriesSameChannel(t *testing.T) {
 			},
 		},
 	})
-	if r1.Drift != nil {
-		t.Fatalf("advance 1 drift: %v", r1.Drift)
-	}
 	logChanges(t, "advance 1 (4 queries, ADD conv-new1)", r1.Changes)
 	t.Logf("advance 1: %d total changes (expected 8 = 4 queries × 2)", len(r1.Changes))
 
@@ -417,9 +402,6 @@ func TestStaleBound_FourQueriesSameChannel(t *testing.T) {
 			},
 		},
 	})
-	if r2.Drift != nil {
-		t.Fatalf("advance 2 drift: %v", r2.Drift)
-	}
 	logChanges(t, "advance 2 (4 queries, ADD a383a3b1)", r2.Changes)
 	t.Logf("advance 2: %d total changes (expected 8 = 4 queries × 2)", len(r2.Changes))
 

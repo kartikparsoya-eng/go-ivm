@@ -13,6 +13,7 @@ package ivm
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 )
 
@@ -46,8 +47,8 @@ func TestTake_BulkUpdate_AllSortKeysBumpedToSame(t *testing.T) {
 			t.Logf("no panic — Take handled bulk update cleanly with %d emitted changes", len(collector.Changes))
 			return
 		}
-		if d, ok := r.(*DriftError); ok {
-			t.Logf("EXPECTED ROOT CAUSE REPRO — DriftError: %v", d.Error())
+		if err, ok := r.(error); ok && strings.Contains(err.Error(), "source drift:") {
+			t.Logf("EXPECTED ROOT CAUSE REPRO — stale-bound drift: %v", err)
 			return
 		}
 		// String panic — re-raise so the test fails with the panic.
@@ -81,8 +82,8 @@ func TestTake_BulkUpdate_BoundRowAmongUpdated(t *testing.T) {
 			t.Logf("no panic — Take handled bound-among-bulk cleanly with %d emitted changes", len(collector.Changes))
 			return
 		}
-		if d, ok := r.(*DriftError); ok {
-			t.Logf("EXPECTED ROOT CAUSE REPRO — DriftError: %v", d.Error())
+		if err, ok := r.(error); ok && strings.Contains(err.Error(), "source drift:") {
+			t.Logf("EXPECTED ROOT CAUSE REPRO — stale-bound drift: %v", err)
 			return
 		}
 		panic(r)
@@ -118,8 +119,8 @@ func TestTake_BulkUpdate_BoundRowEditedTwice(t *testing.T) {
 			t.Logf("no panic — back-to-back edits handled cleanly with %d emitted changes", len(collector.Changes))
 			return
 		}
-		if d, ok := r.(*DriftError); ok {
-			t.Logf("EXPECTED ROOT CAUSE REPRO — DriftError: %v", d.Error())
+		if err, ok := r.(error); ok && strings.Contains(err.Error(), "source drift:") {
+			t.Logf("EXPECTED ROOT CAUSE REPRO — stale-bound drift: %v", err)
 			return
 		}
 		panic(r)

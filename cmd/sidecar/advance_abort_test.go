@@ -13,7 +13,6 @@ import (
 	"testing"
 
 	"github.com/kartikparsoya-eng/go-ivm/builder"
-	"github.com/kartikparsoya-eng/go-ivm/internal/tablesource"
 	"github.com/kartikparsoya-eng/go-ivm/ivm"
 )
 
@@ -26,10 +25,8 @@ import (
 func abortTestSetup(t *testing.T, nChanges int) (*Server, uint64, *sql.DB) {
 	t.Helper()
 	path, db := makeReplica(t)
-	srv := NewServer(tablesource.ModeTable, path)
+	srv := NewServer(path)
 	srv.appID = "myapp"
-	srv.advanceToHeadEnabled = true
-	srv.advanceDriveEnabled = true
 	t.Cleanup(srv.closeAll)
 
 	initReq := RPCRequest{Method: "init", ID: 1, Params: mustMarshal(t, issueInitParams("cg1"))}

@@ -1,15 +1,12 @@
 package main
 
-// advanceToHead: the Go-derived-diff advance trigger (design §4, P1).
+// advanceToHeadStream: the Go-derived-diff advance (design §4, P2 drive).
 //
 // Instead of TS computing the snapshot Diff and shipping a SnapshotChange[]
-// over the wire (the legacy `advance`/`advanceStream` path), the Go sidecar
-// derives its OWN diff from the replica's changeLog2 via internal/snapshotter.
-// In P1 this is a pure derivation: advanceToHead leapfrogs the Snapshotter and
-// returns the derived changes + Go's new stateVersion WITHOUT driving the
-// engine — so the TS side can compare Go's diff against the one it computed for
-// the same advance (a Go-vs-TS diff shadow that proves §3.1 fidelity before any
-// CVR version authority moves to Go in P2).
+// over the wire, the Go sidecar derives its OWN diff from the replica's
+// changeLog2 via internal/snapshotter and applies it to its engine — a
+// fully self-consistent advance, frame-coordinated against the Snapshotter's
+// prev frame. The resulting RowChanges stream back to TS per row.
 
 import (
 	"context"
@@ -22,7 +19,6 @@ import (
 	"github.com/kartikparsoya-eng/go-ivm/engine"
 	"github.com/kartikparsoya-eng/go-ivm/internal/snapshotter"
 	"github.com/kartikparsoya-eng/go-ivm/internal/tablesource"
-	"github.com/kartikparsoya-eng/go-ivm/ivm"
 )
 
 // errSeqConsumerStopped aborts diff.Each when the engine stops consuming
@@ -34,13 +30,11 @@ var errSeqConsumerStopped = errors.New("advance seq consumer stopped")
 type advanceToHeadParams struct {
 	ClientGroupID string `json:"clientGroupID"`
 	InitEpoch     uint64 `json:"initEpoch"`
-	// RowMode opts the STREAMING variant into the NAPI row plane: the
-	// engine's RowChanges cross the Go↔JS boundary as per-row flat records
-	// (kind 2/3 deliveries) instead of msgpack partial frames. Same
-	// contract as advanceParams.RowMode — honored only when the in-process
-	// transport is active AND the request ID is numeric; otherwise silently
-	// degrades to the ordinary frame path. Ignored by the non-streaming
-	// advanceToHead (its payload is the derived diff, not RowChanges).
+	// RowMode opts the stream into the NAPI row plane: the engine's
+	// RowChanges cross the Go↔JS boundary as per-row flat records
+	// (kind 2/3 deliveries) instead of msgpack partial frames. Honored only
+	// when the in-process transport is active AND the request ID is numeric;
+	// otherwise silently degrades to the ordinary frame path.
 	RowMode bool `json:"rowMode,omitempty"`
 	// TotalHydrationTimeMs arms TS's economic advancement-abort for this
 	// call (see advance_abort.go): the measured cost of re-hydrating every
@@ -55,16 +49,6 @@ type advanceToHeadParams struct {
 	// SuppressAbort mirrors TS #advance's suppressAbort flag (:5863):
 	// evaluate nothing even when TotalHydrationTimeMs is present.
 	SuppressAbort bool `json:"suppressAbort,omitempty"`
-}
-
-// snapshotChangeWire is the on-wire form of a snapshotter.Change. It carries
-// the same {prevValues, nextValue} as engine.SnapshotChange plus the rowKey TS
-// uses to align Go's derived changes with its own.
-type snapshotChangeWire struct {
-	Table      string    `json:"table"`
-	PrevValues []ivm.Row `json:"prevValues"`
-	NextValue  ivm.Row   `json:"nextValue,omitempty"`
-	RowKey     ivm.Row   `json:"rowKey"`
 }
 
 // resetWire reports a ResetPipelinesSignal-equivalent: the diff aborted and the
@@ -98,23 +82,6 @@ func checkAdvanceBudget(deadline time.Time, on bool, phase, cgID string) {
 				"caller should reset/re-hydrate; a slow advance pins the WAL frame "+
 				"the diff was derived against", advanceBudgetMs, phase, cgID)})
 	}
-}
-
-type advanceToHeadResult struct {
-	// Changes is the Go-derived diff (P1 pure-derivation / shadow compare).
-	// Populated when NOT in drive mode; omitted in drive mode.
-	Changes    []snapshotChangeWire `json:"changes,omitempty"`
-	Version    string               `json:"version"`
-	NumChanges int                  `json:"numChanges"`
-	// RowChanges + Timings are the engine output, populated only in drive mode
-	// (P2): the deltas the view-syncer emits to clients, stamped at Version,
-	// produced by applying Go's OWN derived diff to Go's engine — frame-
-	// coordinated against the Snapshotter's prev frame (no drift).
-	RowChanges []engine.RowChange   `json:"rowChanges,omitempty"`
-	Timings    []engine.TableTiming `json:"timings,omitempty"`
-	// Reset is non-nil when the diff hit a reset/truncate/permissions-change;
-	// Changes is then empty and the caller re-hydrates at Version.
-	Reset *resetWire `json:"reset,omitempty"`
 }
 
 // buildSnapshotterLocked constructs and pins this group's Snapshotter. MUST be
@@ -162,21 +129,19 @@ func (s *Server) buildSnapshotterLocked(group *ClientGroup, p *initParams) error
 	group.snapSpecs = buildSnapshotterSpecs(p.Tables)
 	group.snapAllNames = allNames
 
-	// Drive mode (P2): the engine's tablesource leaves read from the
+	// Drive: the engine's tablesource leaves read from the
 	// Snapshotter's frame, not their own per-Source tx. Sticky-bind them to
 	// curr now so the initial hydrate (addQuery) reads the same frame the
-	// Snapshotter is pinned at. Each advanceToHead flips the binding to prev for
-	// the apply, then back to curr. (Non-drive P1 leaves binding untouched.)
-	if s.advanceDriveEnabled {
-		if cur, cerr := snap.Current(); cerr == nil {
-			group.eng.BindTableSourcesToConn(cur.Conn())
-			// NOTE: the cold-start reader pool is built later, at the first-hydrate
-			// refresh seam (refreshSnapForInitialHydrateLocked), NOT here. Building
-			// it at init pinned a stateVersion the drive-mode replicator advanced
-			// past before hydrate arrived, so the pin failed and every cold batch
-			// fell back to serial single-conn reads. Building it together with the
-			// curr-refresh, on the same fresh frame, is what lets the pin land.
-		}
+	// Snapshotter is pinned at. Each advance flips the binding to prev for
+	// the apply, then back to curr.
+	if cur, cerr := snap.Current(); cerr == nil {
+		group.eng.BindTableSourcesToConn(cur.Conn())
+		// NOTE: the cold-start reader pool is built later, at the first-hydrate
+		// refresh seam (refreshSnapForInitialHydrateLocked), NOT here. Building
+		// it at init pinned a stateVersion the drive-mode replicator advanced
+		// past before hydrate arrived, so the pin failed and every cold batch
+		// fell back to serial single-conn reads. Building it together with the
+		// curr-refresh, on the same fresh frame, is what lets the pin land.
 	}
 	return nil
 }
@@ -282,10 +247,9 @@ func (s *Server) buildWarmReaderPoolLocked(group *ClientGroup, cmax int) (*table
 	// the 2026-07-02 flag consolidation then documented the env knob while
 	// it was consumed nowhere — a dead kill switch (REVIEW-napi-transport
 	// B1; TestBuildWarmReaderPool_Guards/feature_off pins it now).
-	// advanceDrive is still required (the pool pins to curr's drive-mode
-	// frame); k<=1 is unreachable with the default lanes but kept as a
-	// defensive floor.
-	if !s.warmHydratePoolEnabled || !s.advanceDriveEnabled || k <= 1 {
+	// k<=1 is unreachable with the default lanes but kept as a defensive
+	// floor.
+	if !s.warmHydratePoolEnabled || k <= 1 {
 		return nil, nil
 	}
 	if group.snap == nil || group.eng == nil {
@@ -492,7 +456,7 @@ func readAllTableNames(db *sql.DB) (map[string]bool, error) {
 // No-op once any pipeline exists: re-pinning curr would desync hydrated
 // pipelines. MUST hold group.mu.
 func (s *Server) refreshSnapForInitialHydrateLocked(cgID string, group *ClientGroup, specs []engine.QuerySpec) {
-	if !s.advanceDriveEnabled || group.snap == nil || group.eng == nil {
+	if group.snap == nil || group.eng == nil {
 		return
 	}
 	if group.eng.PipelineCount() > 0 {
@@ -557,182 +521,9 @@ func (s *Server) refreshSnapForInitialHydrateLocked(cgID string, group *ClientGr
 	metrics.recordReaderPoolBind(poolBindSerial, 1)
 }
 
-func (s *Server) handleAdvanceToHead(req RPCRequest) RPCResponse {
-	tripwire("rpc advanceToHead (unary; shadow-only caller set)")
-	var p advanceToHeadParams
-	if err := mpUnmarshal(req.Params, &p); err != nil {
-		return rpcError(req.ID, -32602, err.Error())
-	}
-
-	cgID := p.ClientGroupID
-	if cgID == "" {
-		cgID = "default"
-	}
-
-	group := s.getGroup(cgID, false)
-	if group == nil {
-		return rpcError(req.ID, -32000, "engine not initialized (call init first)")
-	}
-	group.mu.Lock()
-	defer group.mu.Unlock()
-
-	if group.eng == nil {
-		return rpcError(req.ID, -32000, "engine not initialized")
-	}
-	if group.snap == nil {
-		return rpcError(req.ID, -32000,
-			"advanceToHead unavailable (snapshotter not armed; needs GO_IVM_ADVANCE_TO_HEAD=true + table mode)")
-	}
-	if resp, stale := checkInitEpoch(group, req.ID, p.InitEpoch); stale {
-		return resp
-	}
-
-	// The cold-start hydrate window ends at the first advance: curr is about to
-	// rotate off the pinned frame, so the reader pool's frame goes stale. Drop
-	// it (reads revert to the single bound-conn path).
-	s.tearDownReaderPool(group)
-
-	diff, err := group.snap.Advance(group.snapSpecs, group.snapAllNames)
-	if err != nil {
-		// Same clean-retryable contract as the streaming handler: the
-		// snapshotter's failure-atomic Advance left nothing moved.
-		return rpcError(req.ID, rpcCodeAdvanceCleanRetryable,
-			"advanceToHead advance: "+err.Error())
-	}
-	version := diff.Curr().Version()
-	drive := s.advanceDriveEnabled
-	// Advance-time budget (user's-audit item): starts at the leapfrog — from
-	// here the diff pins prev's WAL frame until the apply finishes.
-	budgetDeadline, budgetOn := advanceDeadline()
-
-	// After the leapfrog, the sources (sticky-bound to the old curr) ARE bound
-	// to diff.Prev() — the exact frame the diff was derived against. Make it
-	// explicit, and arrange to rebind to the new curr on every exit so the next
-	// hydrate/fetch reads head.
-	if drive {
-		group.eng.BindTableSourcesToConn(diff.Prev().Conn())
-	}
-	rebindCurr := func() {
-		if drive {
-			group.eng.BindTableSourcesToConn(diff.Curr().Conn())
-		}
-	}
-	// P1 (REVIEW-napi-transport): rebind on EVERY exit, including a PANIC
-	// unwind. engine.Advance re-raises non-drift panics (DataError, bugs)
-	// after recovering drift; that unwind skips the success-path rebindCurr()
-	// below and leaves the sources bound to diff.Prev() — which the next
-	// leapfrog turns into the rolled-back frame, so any hydrate/drift-audit
-	// read in the window sees one frame behind head (silent staleness).
-	// Double-bind is idempotent (just a pointer set), so the explicit
-	// error-path calls below stay correct and keep their ordering.
-	defer rebindCurr()
-
-	// Memory guard: diff.Collect materializes the FULL catch-up diff —
-	// every change-log entry WITH row values — before the engine applies
-	// it. TS iterates its diff lazily, so Go is strictly more exposed: a
-	// bulk backfill against a behind CG can be 100k+ fat rows = GBs,
-	// multiplied by CGs advancing concurrently. Refuse oversized diffs and
-	// surface an error instead — the TS side's documented handling for an
-	// advanceToHead error is its own fallback/reset path, which re-hydrates
-	// with bounded memory.
-	if diff.Changes > maxDiffChanges {
-		rebindCurr()
-		// Typed abort code: a bounded-MEMORY refusal wants the same
-		// disposition as the bounded-TIME aborts — reset/re-hydrate via
-		// ResetPipelinesSignal('advancement-timeout') — never the
-		// 'unclassified' bucket, which RETHROWS (CG teardown) under the
-		// follow-TS failure model.
-		return rpcError(req.ID, rpcCodeAdvanceAborted, fmt.Sprintf(
-			"advanceToHead diff: %d changes exceeds GO_IVM_MAX_DIFF_CHANGES=%d — "+
-				"caller should reset/re-hydrate instead of replaying this diff",
-			diff.Changes, maxDiffChanges))
-	}
-
-	changes, err := diff.Collect()
-	if err != nil {
-		rebindCurr()
-		// A reset/truncate/permissions-change is a normal outcome: report it so
-		// the caller re-hydrates at `version`.
-		if rs, ok := snapshotter.IsReset(err); ok {
-			return RPCResponse{JSONRPC: "2.0", ID: req.ID, Result: advanceToHeadResult{
-				Version: version,
-				Reset:   &resetWire{Reason: rs.Reason, Msg: rs.Msg},
-			}}
-		}
-		// InvalidDiffError or a hard error (unknown table / SQL failure):
-		// surface to TS, which falls back to its own advance path.
-		return rpcError(req.ID, -32000, "advanceToHead diff: "+err.Error())
-	}
-
-	// P2 drive mode: apply Go's own derived diff to Go's engine (frame-
-	// coordinated against diff.Prev()) and return the resulting RowChanges +
-	// version — a fully self-consistent advance with no TS-shipped diff.
-	if drive {
-		// Budget check between derive and apply: Collect of a near-cap diff
-		// can alone consume the budget; refuse before pinning prev through a
-		// long engine apply too. The non-streaming call has no per-chunk
-		// checkpoint, so this is its only cut point.
-		if budgetOn && time.Now().After(budgetDeadline) {
-			rebindCurr()
-			return rpcError(req.ID, -32000, fmt.Sprintf(
-				"advanceToHead exceeded GO_IVM_ADVANCE_BUDGET_MS=%d before apply (cg=%s) — "+
-					"caller should reset/re-hydrate", advanceBudgetMs, cgID))
-		}
-		snapChanges := make([]engine.SnapshotChange, len(changes))
-		for i, c := range changes {
-			snapChanges[i] = engine.SnapshotChange{
-				Table:      c.Table,
-				PrevValues: c.PrevValues,
-				NextValue:  c.NextValue,
-			}
-		}
-		result := group.eng.Advance(snapChanges)
-		rebindCurr()
-		if result.Drift != nil {
-			fmt.Fprintf(os.Stderr, "[GO-IVM][drift] advanceToHead(drive) cg=%s %s\n",
-				cgID, result.Drift.Error())
-			return RPCResponse{JSONRPC: "2.0", ID: req.ID, Error: &RPCError{
-				Code:    rpcCodeDrift,
-				Message: result.Drift.Error(),
-				Data: driftRPCData{
-					Table:          result.Drift.Table,
-					Op:             result.Drift.Op,
-					PK:             result.Drift.PK,
-					HasCount:       result.Drift.HasCount,
-					PartialChanges: result.Changes,
-					PartialTimings: result.Timings,
-				},
-			}}
-		}
-		return RPCResponse{JSONRPC: "2.0", ID: req.ID, Result: advanceToHeadResult{
-			Version:    version,
-			NumChanges: diff.Changes,
-			RowChanges: result.Changes,
-			Timings:    result.Timings,
-		}}
-	}
-
-	// P1 pure derivation: return the derived diff (no engine mutation).
-	wire := make([]snapshotChangeWire, len(changes))
-	for i, c := range changes {
-		wire[i] = snapshotChangeWire{
-			Table:      c.Table,
-			PrevValues: c.PrevValues,
-			NextValue:  c.NextValue,
-			RowKey:     c.RowKey,
-		}
-	}
-	return RPCResponse{JSONRPC: "2.0", ID: req.ID, Result: advanceToHeadResult{
-		Changes:    wire,
-		Version:    version,
-		NumChanges: diff.Changes,
-	}}
-}
-
 // advanceToHeadStreamPartial is the on-wire partial frame for
-// advanceToHeadStream. It mirrors advanceStreamPartial (chunked RowChanges +
-// chunkIndex + final + per-final timings/drift) and adds the advanceToHead-
-// specific Version + NumChanges, which the engine's AdvanceStream doesn't know
+// advanceToHeadStream: chunked RowChanges + chunkIndex + final + per-final
+// timings, plus the Version + NumChanges the engine's stream doesn't know
 // about — those ride the Final frame only. The TS accumulator reassembles the
 // frames into one AdvanceToHeadResult.
 //
@@ -747,31 +538,23 @@ type advanceToHeadStreamPartial struct {
 	ChunkIndex int                  `json:"chunkIndex"`
 	Final      bool                 `json:"final"`
 	Timings    []engine.TableTiming `json:"timings,omitempty"`
-	Drift      *ivm.DriftError      `json:"drift,omitempty"`
 	// Final-frame-only metadata (omitted on non-final partials):
 	Version    string     `json:"version,omitempty"`
 	NumChanges int        `json:"numChanges,omitempty"`
 	Reset      *resetWire `json:"reset,omitempty"`
 }
 
-// handleAdvanceToHeadStream is the streaming variant of handleAdvanceToHead for
-// DRIVE mode (P2 / Go-primary trigger). It derives Go's own diff exactly like
-// handleAdvanceToHead, then applies it to the engine via Engine.AdvanceStream —
+// handleAdvanceToHeadStream is THE advance (Go-primary drive). It derives
+// Go's own diff from the changelog cursor, then applies it to the engine —
 // emitting the resulting RowChanges as chunked partial frames instead of one
 // 64MB-capped msgpack frame. This removes the single-frame cap that a bulk
 // backfill / mass UPDATE would otherwise blow on the deployed Go-primary path
 // (finding F5): a frame over the cap is SKIPPED by the TS receive loop,
 // orphaning the RPC until it times out.
 //
-// Drive-mode only: the streamed payload is the engine's RowChanges, which exist
-// only when driving. In non-drive (P1 derive-only) mode there are no RowChanges
-// to stream, so the handler errors loudly rather than silently dropping the
-// derived diff — the derive-only shadow path uses the non-streaming
-// advanceToHead.
-//
-// Wire shape (mirrors advanceStream): one OR MORE partial frames with the same
+// Wire shape: one OR MORE partial frames with the same
 // id in monotonic chunkIndex order, exactly one Final=true (the last). Only the
-// Final frame carries Timings, Drift, Version, NumChanges. After the Final
+// Final frame carries Timings, Version, NumChanges. After the Final
 // partial, a terminal frame whose Result is the literal "done" resolves the
 // call promise on the TS client.
 func (s *Server) handleAdvanceToHeadStream(req RPCRequest, streamW streamWriter) RPCResponse {
@@ -796,15 +579,11 @@ func (s *Server) handleAdvanceToHeadStream(req RPCRequest, streamW streamWriter)
 		return rpcError(req.ID, -32000, "engine not initialized")
 	}
 	if group.snap == nil {
+		// Defensive: handleInit fails loudly when the snapshotter can't
+		// build, so a live group always has one — unless this advance raced
+		// a re-init teardown.
 		return rpcError(req.ID, -32000,
-			"advanceToHeadStream unavailable (snapshotter not armed; needs GO_IVM_ADVANCE_TO_HEAD=true + table mode)")
-	}
-	if !s.advanceDriveEnabled {
-		// The streamed payload carries engine RowChanges, which only exist in
-		// drive mode. Refuse rather than silently drop the derived diff — the
-		// derive-only shadow path uses the non-streaming advanceToHead.
-		return rpcError(req.ID, -32000,
-			"advanceToHeadStream requires drive mode (GO_IVM_ADVANCE_DRIVE=true)")
+			"advanceToHeadStream unavailable (snapshotter not armed)")
 	}
 	if resp, stale := checkInitEpoch(group, req.ID, p.InitEpoch); stale {
 		return resp
@@ -841,14 +620,13 @@ func (s *Server) handleAdvanceToHeadStream(req RPCRequest, streamW streamWriter)
 
 	// After the leapfrog the sources (sticky-bound to the old curr) ARE bound to
 	// diff.Prev(). Make it explicit for the apply, and rebind to the new curr on
-	// every exit so the next hydrate/fetch reads head. (Same discipline as
-	// handleAdvanceToHead's drive branch.)
+	// every exit so the next hydrate/fetch reads head.
 	group.eng.BindTableSourcesToConn(diff.Prev().Conn())
 	rebindCurr := func() {
 		group.eng.BindTableSourcesToConn(diff.Curr().Conn())
 	}
 	// P1 (REVIEW-napi-transport): rebind on EVERY exit including a panic
-	// unwind — AdvanceStream re-raises non-drift panics after its terminal
+	// unwind — the engine re-raises panics after its terminal
 	// flush, which would otherwise skip the success-path rebindCurr() and
 	// strand the sources on diff.Prev() (one-frame-behind staleness).
 	// Idempotent, so the explicit reset/error-path calls below keep their
@@ -904,10 +682,8 @@ func (s *Server) handleAdvanceToHeadStream(req RPCRequest, streamW streamWriter)
 	// itself is checked per emitted partial below).
 	checkAdvanceBudget(budgetDeadline, budgetOn, "collect", cgID)
 
-	// Version + NumChanges ride the Final frame only. Drift (if any) is
-	// carried on the Final frame by AdvanceStream itself (it recovers the
-	// drift panic and returns nil) — the TS accumulator re-throws it as a
-	// DriftError. diff.Changes is the changelog COUNT (known before any
+	// Version + NumChanges ride the Final frame only.
+	// diff.Changes is the changelog COUNT (known before any
 	// row values are read), so it still rides the Final frame.
 	numChanges := diff.Changes
 	abort.setNumChanges(numChanges) // same count TS's formula uses (SnapshotDiff.changes)
@@ -948,9 +724,9 @@ func (s *Server) handleAdvanceToHeadStream(req RPCRequest, streamW streamWriter)
 
 	// Row mode (NAPI transport only): per-row records via abiDeliver with
 	// chunkSize=1 so each RowChange crosses the boundary as the engine
-	// produces it — the deployed Go-primary trigger path gets the same
-	// row-by-row delivery advanceStream (push mode) has. Fallback rows and
-	// the terminal Final (carrying Version/NumChanges/Timings/Drift) ship
+	// produces it — the deployed Go-primary trigger path gets
+	// row-by-row delivery. Fallback rows and
+	// the terminal Final (carrying Version/NumChanges/Timings) ship
 	// as kind-1 frames on the same ordered queue; "done" follows via the
 	// pipe (see rowplane.go's ordering invariant).
 	if rp := newRowPlane(s, req.ID, p.RowMode); rp != nil {
@@ -969,10 +745,6 @@ func (s *Server) handleAdvanceToHeadStream(req RPCRequest, streamW streamWriter)
 			}
 			emittedPartial = true
 			rp.emitAdvanceToHeadPartial(r, version, numChanges)
-			if r.Drift != nil {
-				fmt.Fprintf(os.Stderr, "[GO-IVM][drift] advanceToHeadStream(rowMode) cg=%s %s\n",
-					cgID, r.Drift.Error())
-			}
 			if r.Final {
 				// rowMode: chunkSize=1, so ChunkIndex+1 is the per-row
 				// DELIVERY count, not a chunk count — record it as rows so the
@@ -997,7 +769,6 @@ func (s *Server) handleAdvanceToHeadStream(req RPCRequest, streamW streamWriter)
 			ChunkIndex: r.ChunkIndex,
 			Final:      r.Final,
 			Timings:    r.Timings,
-			Drift:      r.Drift,
 		}
 		if r.Final {
 			part.Version = version
@@ -1007,10 +778,6 @@ func (s *Server) handleAdvanceToHeadStream(req RPCRequest, streamW streamWriter)
 			metrics.recordAdvanceChunks(r.ChunkIndex + 1)
 		}
 		streamW(req.ID, part)
-		if r.Drift != nil {
-			fmt.Fprintf(os.Stderr, "[GO-IVM][drift] advanceToHeadStream(drive) cg=%s %s\n",
-				cgID, r.Drift.Error())
-		}
 	})
 	rebindCurr()
 	return finishStream(streamErr)

@@ -13,9 +13,8 @@ import "sync"
 // Each connection's pipeline runs in its own goroutine.
 // Results are collected and returned in connection order (deterministic).
 func (ms *MemorySource) GenPushParallel(change SourceChange) []Change {
-	// Validate (same as sequential). Typed *DriftError panics so
-	// engine.Advance can recover them without conflating with programmer
-	// bugs (which still abort the process). See ivm/drift.go.
+	// Validate (same as sequential) — the panic propagates out of the
+	// engine unrecovered (TS assert-throw → teardown disposition).
 	switch change.Type {
 	case ChangeTypeAdd:
 		if ms.has(change.Row) {
@@ -23,7 +22,7 @@ func (ms *MemorySource) GenPushParallel(change SourceChange) []Change {
 			for _, c := range ms.primaryKey {
 				pk[c] = change.Row[c]
 			}
-			panic(&DriftError{Table: ms.tableName, Op: "Add", PK: pk, HasCount: len(ms.data)})
+			panic(SourceDriftError(ms.tableName, "Add", pk, len(ms.data)))
 		}
 	case ChangeTypeRemove:
 		if !ms.has(change.Row) {
@@ -31,7 +30,7 @@ func (ms *MemorySource) GenPushParallel(change SourceChange) []Change {
 			for _, c := range ms.primaryKey {
 				pk[c] = change.Row[c]
 			}
-			panic(&DriftError{Table: ms.tableName, Op: "Remove", PK: pk, HasCount: len(ms.data)})
+			panic(SourceDriftError(ms.tableName, "Remove", pk, len(ms.data)))
 		}
 	case ChangeTypeEdit:
 		if !ms.has(change.OldRow) {
@@ -39,7 +38,7 @@ func (ms *MemorySource) GenPushParallel(change SourceChange) []Change {
 			for _, c := range ms.primaryKey {
 				pk[c] = change.OldRow[c]
 			}
-			panic(&DriftError{Table: ms.tableName, Op: "Edit", PK: pk, HasCount: len(ms.data)})
+			panic(SourceDriftError(ms.tableName, "Edit", pk, len(ms.data)))
 		}
 	}
 
@@ -80,22 +79,11 @@ func (ms *MemorySource) GenPushParallel(change SourceChange) []Change {
 	//
 	// Per-goroutine recover is load-bearing: a panic on a spawned goroutine
 	// terminates the entire Go runtime (panic-on-goroutine is fatal — no
-	// outer caller's recover can catch it). Without this, a Take stale-bound
-	// *DriftError panic — which engine.Advance's outer recover is designed
-	// to catch and translate into a drift result — would crash the shared
-	// sidecar process instead, taking down every CG. See e9d4946 (Take
-	// stale-bound → DriftError) which introduced the recoverable panic
-	// contract that this site has to honor.
-	//
-	// We split captured panics by type:
-	//   - *DriftError → routed to engine.Advance's recover (self-healable)
-	//   - everything else → re-raised so programmer-bug signals still abort
-	//
-	// Priority on re-raise: non-Drift > Drift. If any connection saw a real
-	// programmer bug it must surface, even if other connections concurrently
-	// raised drift on the same change.
+	// outer caller's recover can catch it). Capture per slot and re-raise
+	// the first (connection order) on the caller's goroutine so the panic
+	// unwinds through the engine in the ordinary single-goroutine scope.
 	ordered := make([][]Change, len(activeConns))
-	panics := make([]goroutinePanic, len(activeConns))
+	panics := make([]any, len(activeConns))
 	var wg sync.WaitGroup
 	for i, conn := range activeConns {
 		wg.Add(1)
@@ -103,11 +91,7 @@ func (ms *MemorySource) GenPushParallel(change SourceChange) []Change {
 			defer wg.Done()
 			defer func() {
 				if r := recover(); r != nil {
-					if d, ok := r.(*DriftError); ok {
-						panics[idx].drift = d
-					} else {
-						panics[idx].other = r
-					}
+					panics[idx] = r
 				}
 			}()
 			outputChange := ms.sourceChangeToChange(change)
@@ -116,17 +100,12 @@ func (ms *MemorySource) GenPushParallel(change SourceChange) []Change {
 	}
 	wg.Wait()
 
-	// Re-raise on the caller's goroutine so engine.Advance's recover (or the
-	// process-abort path for programmer bugs) sees the panic in the right
-	// scope. defer ms.overlay.Store(nil) above still runs.
+	// Re-raise on the caller's goroutine so the caller's (or the sidecar
+	// handler's) recover sees the panic in the right scope.
+	// defer ms.overlay.Store(nil) above still runs.
 	for _, p := range panics {
-		if p.other != nil {
-			panic(p.other)
-		}
-	}
-	for _, p := range panics {
-		if p.drift != nil {
-			panic(p.drift)
+		if p != nil {
+			panic(p)
 		}
 	}
 
@@ -135,14 +114,6 @@ func (ms *MemorySource) GenPushParallel(change SourceChange) []Change {
 		allResults = append(allResults, changes...)
 	}
 	return allResults
-}
-
-// goroutinePanic stores a recovered panic from a fan-out goroutine so the
-// caller can re-raise it in its own scope after wg.Wait. drift and other
-// are mutually exclusive per goroutine.
-type goroutinePanic struct {
-	drift *DriftError
-	other any
 }
 
 // SetParallel enables or disables parallel push on this source.

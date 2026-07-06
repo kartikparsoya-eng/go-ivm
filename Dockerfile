@@ -1,28 +1,21 @@
-# Multi-stage build for the Go IVM sidecar binary.
+# Build for the Go IVM in-process engine library (libgoivm.so).
 #
-# The published image (ghcr.io/kartikparsoya-eng/go-ivm-:<tag>) is
-# consumed by the zero-cache Dockerfile via `COPY --from=...`; it is
-# not normally run on its own. The binary itself lives at
-# /usr/local/bin/go-ivm-sidecar and takes one positional arg: the
-# Unix socket path to listen on.
+# The published image (ghcr.io/kartikparsoya-eng/go-ivm-:<tag>) is an
+# ARTIFACT CARRIER consumed by mono's Dockerfile.go-ivm via
+# `COPY --from=...` / bind-mount: it carries /usr/local/lib/libgoivm.so,
+# the c-shared library each zero-cache syncer worker dlopens (the NAPI
+# in-process transport). The socket-transport sidecar binary was removed
+# in the RPC-surface removal sweep (protocolRev 10) — cmd/sidecar's main()
+# is a stub and no runnable binary ships here.
 
-FROM golang:1.25-alpine AS builder
-
-# Build deps: musl-dev + gcc for CGO; the vendored sqlite3.c compiles
-# into the binary so it understands rocicorp's wal2 journal mode (which
-# upstream SQLite — and therefore modernc.org/sqlite — does not).
-RUN apk add --no-cache build-base
-
-WORKDIR /src
-
-# Cache module deps separately so source-only edits don't re-download.
-COPY go.mod go.sum ./
-RUN go mod download
-
-COPY . .
-
-# CGO_ENABLED=1: we now use mattn/go-sqlite3 (CGO) so internal/tablesource
-# can link against rocicorp's patched SQLite.
+# Stage: libgoivm.so — the c-shared library for the in-process (NAPI)
+# transport. Built on BOOKWORM (glibc), NOT alpine: the consumer is the
+# zero-cache image (node:22-slim, Debian/glibc) whose goivm_napi addon
+# dlopen()s this .so — a musl-linked shared object will not load there.
+# c-shared also cannot be fully static (-extldflags '-static' conflicts
+# with -buildmode=c-shared), so glibc-matching the consumer is the whole
+# game. Recipe smoke-tested 2026-07-02 against the exact node:22-slim
+# runtime (dlopen + goivm_start + ping round-trip).
 #
 # Build tags:
 #   sqlite_omit_load_extension — drop the runtime extension loader
@@ -32,25 +25,24 @@ COPY . .
 #                                make that "system" SQLite be rocicorp's
 #                                amalgamation by compiling c/sqlite3/
 #                                into a static library installed below.
-#                                KEEP THIS: it is what gives the binary
-#                                wal2-journal awareness. The manual amd64
-#                                cross-compile (sandbox) links mattn's
-#                                vendored sqlite instead — a deliberate
-#                                local convenience, NOT the production path.
+#                                KEEP THIS: it is what gives the library
+#                                wal2-journal awareness.
 #   osusergo netgo             — force the pure-Go os/user + net resolvers
-#                                instead of cgo getpwnam/getaddrinfo. On a
-#                                fully static (-extldflags '-static') musl
-#                                build the cgo resolvers can fail at runtime;
-#                                the pure-Go ones don't. Matches the manual
-#                                amd64 cross-compile so the CI image and the
-#                                locally-tested binary share net/user
-#                                resolution semantics.
-#
-# Static linking: -extldflags '-static' produces a self-contained binary
-# that runs in alpine or scratch without dragging libsqlite3.so along.
-# This matters because the consuming zero-cache Dockerfile copies our
-# binary over via COPY --from=...; any dynamic .so would have to be
-# copied separately and put on the loader path.
+#                                instead of cgo getpwnam/getaddrinfo, so the
+#                                CI image and locally-tested builds share
+#                                net/user resolution semantics.
+#   napilib                    — compile the cgo //export ABI shims
+#                                (cmd/sidecar/napi_lib.go).
+FROM golang:1.25-bookworm AS libgoivm-builder
+
+WORKDIR /src
+
+# Cache module deps separately so source-only edits don't re-download.
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+
 # -ffp-contract=off: the vendored fork (≤3.51) renders REAL→TEXT through
 # dekkerMul2 double-double arithmetic whose results shift at the last ulp
 # if the compiler fuses mul+add into FMA (baseline ISA on arm64, so the
@@ -72,46 +64,6 @@ RUN gcc -O2 -ffp-contract=off -fPIC -c c/sqlite3/sqlite3.c -o /tmp/sqlite3.o \
     && cp c/sqlite3/sqlite3ext.h /usr/include/sqlite3ext.h
 
 RUN CGO_ENABLED=1 GOOS=linux go build \
-    -tags "libsqlite3 sqlite_omit_load_extension osusergo netgo" \
-    -ldflags="-s -w -extldflags '-static'" \
-    -trimpath \
-    -o /go-ivm-sidecar \
-    ./cmd/sidecar
-
-# Stage: libgoivm.so — the c-shared library for the in-process (NAPI)
-# transport (feat/napi-transport). Built on BOOKWORM (glibc), NOT alpine:
-# the consumer is the zero-cache image (node:22-slim, Debian/glibc) whose
-# goivm_napi addon dlopen()s this .so — a musl-linked shared object will
-# not load there. c-shared also cannot be fully static (-extldflags
-# '-static' conflicts with -buildmode=c-shared), so glibc-matching the
-# consumer is the whole game. Same wal2 sqlite amalgamation + tags as the
-# binary above, plus `napilib` to compile the cgo //export shims
-# (cmd/sidecar/napi_lib.go). Recipe smoke-tested 2026-07-02 against the
-# exact node:22-slim runtime (dlopen + goivm_start + ping round-trip).
-FROM golang:1.25-bookworm AS libgoivm-builder
-
-WORKDIR /src
-
-COPY go.mod go.sum ./
-RUN go mod download
-
-COPY . .
-
-# -ffp-contract=off: same REAL→TEXT bit-parity requirement as the stage
-# above — see that comment.
-RUN gcc -O2 -ffp-contract=off -fPIC -c c/sqlite3/sqlite3.c -o /tmp/sqlite3.o \
-        -DSQLITE_THREADSAFE=2 \
-        -DSQLITE_ENABLE_FTS5 \
-        -DSQLITE_ENABLE_JSON1 \
-        -DSQLITE_ENABLE_RTREE \
-        -DSQLITE_OMIT_LOAD_EXTENSION \
-        -DSQLITE_ENABLE_SNAPSHOT \
-        -DSQLITE_ENABLE_WAL2_COREAD \
-    && ar rcs /usr/lib/libsqlite3.a /tmp/sqlite3.o \
-    && cp c/sqlite3/sqlite3.h /usr/include/sqlite3.h \
-    && cp c/sqlite3/sqlite3ext.h /usr/include/sqlite3ext.h
-
-RUN CGO_ENABLED=1 GOOS=linux go build \
     -tags "libsqlite3 sqlite_omit_load_extension osusergo netgo napilib" \
     -ldflags="-s -w" \
     -trimpath \
@@ -119,17 +71,10 @@ RUN CGO_ENABLED=1 GOOS=linux go build \
     -o /libgoivm.so \
     ./cmd/sidecar
 
-# Minimal runtime image. alpine gives us a shell + apk for debugging
-# and ca-certificates for OTLP/HTTPS when tracing is enabled.
+# Minimal artifact-carrier image. alpine keeps a shell for inspection;
+# nothing here is meant to run — the .so is glibc-linked for the
+# node:22-slim consumer, which pulls it via COPY --from / bind-mount in
+# mono's Dockerfile.go-ivm.
 FROM alpine:3.20
 
-RUN apk add --no-cache ca-certificates
-
-COPY --from=builder /go-ivm-sidecar /usr/local/bin/go-ivm-sidecar
-
-# libgoivm.so rides along as an ARTIFACT (this alpine image never dlopens
-# it — it's glibc-linked for the node:22-slim consumer, which pulls it via
-# COPY --from=go-ivm in mono's Dockerfile.go-ivm napi variant).
 COPY --from=libgoivm-builder /libgoivm.so /usr/local/lib/libgoivm.so
-
-ENTRYPOINT ["/usr/local/bin/go-ivm-sidecar"]

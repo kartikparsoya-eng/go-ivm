@@ -75,9 +75,6 @@ func TestAdvanceStream_PanickingSink_NoDeadlockAndEngineReusable(t *testing.T) {
 			finals++
 		}
 		total += len(f.Changes)
-		if f.Drift != nil {
-			t.Fatalf("unexpected drift on the follow-up advance: %v", f.Drift)
-		}
 		for _, rc := range f.Changes {
 			if id, _ := rc.RowKey["id"].(string); id != "u3" {
 				t.Fatalf("stale row from the aborted advance leaked into the next one: %+v", rc)

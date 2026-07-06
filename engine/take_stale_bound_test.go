@@ -20,15 +20,15 @@ package engine
 //      sort < bound sort in DESC) and newCmp==0 (new equals bound). This
 //      is the stale-bound trap.
 //
-// Recovery contract: Take must raise *ivm.DriftError (not a raw panic)
-// so engine.Advance recovers, drops the in-flight advance, and the TS
-// caller re-inits from SQLite truth. This test verifies the contract
-// holds — a non-DriftError panic would crash the shared sidecar and take
-// down every cg.
+// Disposition contract: Take must raise the plain source-drift error (TS
+// asserts → throw → the view-syncer tears the client group down). This
+// test verifies the panic value is an error with the source-drift message
+// — a raw string panic would lose the diagnostic attribution.
 
 import (
 	"database/sql"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/kartikparsoya-eng/go-ivm/builder"
@@ -150,20 +150,16 @@ func TestTableSourceTake_StaleBoundOnTieAtLimit1(t *testing.T) {
 		if r == nil {
 			return // no panic — Take handled the tie cleanly. Good.
 		}
-		// Must be *DriftError so engine.Advance's recover catches it and
-		// the sidecar continues. Any other panic type crashes the shared
-		// sidecar process.
-		if _, ok := r.(*ivm.DriftError); !ok {
-			t.Fatalf("stale-bound panic must be *DriftError for recovery, got %T: %v", r, r)
+		// Must be the plain source-drift error (attributable teardown);
+		// any other panic value loses the diagnostic context.
+		err, ok := r.(error)
+		if !ok || !strings.Contains(err.Error(), "source drift:") {
+			t.Fatalf("stale-bound panic must be the source-drift error, got %T: %v", r, r)
 		}
-		t.Logf("stale-bound triggered DriftError as expected — recovery contract honored: %v", r)
+		t.Logf("stale-bound raised the source-drift panic as expected: %v", r)
 	}()
 
 	result := eng.Advance(changes)
-	if result.Drift != nil {
-		t.Logf("advance returned drift=%v (recovery via DriftError path)", result.Drift)
-		return
-	}
 	t.Logf("advance returned %d changes without drift", len(result.Changes))
 	// Optional: validate the post-advance state is consistent.
 	// The Take window must contain ONE row, and it must be one of the

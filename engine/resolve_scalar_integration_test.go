@@ -103,10 +103,11 @@ func TestAddQuery_ResolvesScalarAndEmitsCompanion(t *testing.T) {
 // Verifies the companion's live scalar-value-changed reset: the resolver
 // baked users.name="Alice" into the issues query as a literal. Editing the
 // resolved user row's child field (name: Alice -> Alicia) makes that
-// literal stale, so the advance must RESET (raise a scalar-subquery
-// DriftError that TS turns into a re-hydrate), NOT emit a companion EDIT.
-// Direct port of TS's CompanionPipeline ResetPipelinesSignal('scalar-
-// subquery') behavior (pipeline-driver.ts:2017-2047).
+// literal stale, so the advance must RESET (panic with *ScalarResetError,
+// which the sidecar maps to the scalar-reset RPC code and TS turns into a
+// re-hydrate), NOT emit a companion EDIT. Direct port of TS's
+// CompanionPipeline ResetPipelinesSignal('scalar-subquery') behavior
+// (pipeline-driver.ts:1468).
 func TestAddQuery_CompanionLiveTracking(t *testing.T) {
 	users := ivm.NewMemorySource("users",
 		map[string]string{"id": "string", "name": "string"},
@@ -155,33 +156,22 @@ func TestAddQuery_CompanionLiveTracking(t *testing.T) {
 
 	// Edit the resolved companion row's child field (the baked scalar). The
 	// source's Push fans out to the companion's connection; its output runs
-	// the scalar-value-changed check and raises a reset.
-	res := eng.Advance([]SnapshotChange{
+	// the scalar-value-changed check and panics with the reset. The panic
+	// escapes Advance (no partial output returns), so no companion EDIT can
+	// leak — TS's throw has the same effect.
+	sre := advanceScalarResetPanic(t, eng, []SnapshotChange{
 		{
 			Table:      "users",
 			PrevValues: []ivm.Row{{"id": "u1", "name": "Alice"}},
 			NextValue:  ivm.Row{"id": "u1", "name": "Alicia"},
 		},
 	})
-
-	// The advance must signal a scalar-subquery reset (Op="ScalarSubquery")
-	// so the sidecar/TS re-hydrates the query with the new value baked in.
-	if res.Drift == nil {
-		t.Fatalf("expected scalar-subquery reset (Drift set), got Drift=nil changes=%+v", res.Changes)
+	if sre.Table != "users" {
+		t.Fatalf("expected ScalarResetError.Table=users, got %q", sre.Table)
 	}
-	if res.Drift.Op != "ScalarSubquery" {
-		t.Fatalf("expected Drift.Op=ScalarSubquery, got %q", res.Drift.Op)
-	}
-	if res.Drift.Table != "users" {
-		t.Fatalf("expected Drift.Table=users, got %q", res.Drift.Table)
-	}
-
-	// And it must NOT emit a companion EDIT row (the reset replaces the
-	// incremental emission; the stale literal can't be incrementally fixed).
-	for _, c := range res.Changes {
-		if c.Table == "users" && c.Type == RowChangeEdit && c.Row["name"] == "Alicia" {
-			t.Fatalf("expected no companion EDIT on scalar change (should reset), got %+v", res.Changes)
-		}
+	// Message mirrors TS: `Scalar subquery value changed for users: Alice -> Alicia`
+	if got := sre.Error(); got != "Scalar subquery value changed for users: Alice -> Alicia" {
+		t.Fatalf("unexpected reset message: %q", got)
 	}
 }
 
@@ -246,9 +236,6 @@ func TestAddQuery_CompanionEditNonScalarFieldNoReset(t *testing.T) {
 		},
 	})
 
-	if res.Drift != nil {
-		t.Fatalf("expected no reset for non-scalar-field edit, got Drift=%+v", res.Drift)
-	}
 	found := false
 	for _, c := range res.Changes {
 		if c.Table == "users" && c.Type == RowChangeEdit && c.QueryID == "q" &&
@@ -400,9 +387,6 @@ func TestAddQuery_ScalarNoMatchToMatchedNullThenValue(t *testing.T) {
 	res := eng.Advance([]SnapshotChange{
 		{Table: "users", NextValue: ivm.Row{"id": "u1", "name": nil}},
 	})
-	if res.Drift != nil {
-		t.Fatalf("no-match→matched-NULL must NOT reset (nil==nil); got Drift=%+v", res.Drift)
-	}
 	for _, c := range res.Changes {
 		if c.Table == "issues" {
 			t.Fatalf("matched-NULL must not surface an issue row (ALWAYS_FALSE still holds); got %+v", c)
@@ -411,17 +395,15 @@ func TestAddQuery_ScalarNoMatchToMatchedNullThenValue(t *testing.T) {
 
 	// Transition 2: EDIT users{id:u1} name NULL→"Zoe" — now the baked literal
 	// is genuinely stale, so a scalar-subquery reset MUST fire.
-	res = eng.Advance([]SnapshotChange{
+	sre := advanceScalarResetPanic(t, eng, []SnapshotChange{
 		{
 			Table:      "users",
 			PrevValues: []ivm.Row{{"id": "u1", "name": nil}},
 			NextValue:  ivm.Row{"id": "u1", "name": "Zoe"},
 		},
 	})
-	if res.Drift == nil {
-		t.Fatalf("matched-NULL→matched-value must reset (Drift set); got nil, changes=%+v", res.Changes)
-	}
-	if res.Drift.Op != "ScalarSubquery" {
-		t.Fatalf("expected Drift.Op=ScalarSubquery, got %q", res.Drift.Op)
+	// null renders as JS String(null) in the TS-mirrored message.
+	if got := sre.Error(); got != "Scalar subquery value changed for users: null -> Zoe" {
+		t.Fatalf("unexpected reset message: %q", got)
 	}
 }

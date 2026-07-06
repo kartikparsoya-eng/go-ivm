@@ -164,9 +164,6 @@ func TestAdvanceDrift_PureAddNewConversation(t *testing.T) {
 			},
 		},
 	})
-	if result.Drift != nil {
-		t.Fatalf("unexpected drift: %v", result.Drift)
-	}
 	logChanges(t, "advance (pure ADD)", result.Changes)
 
 	// Expected: REMOVE(9d3f1b99) + ADD(a383a3b1) = 2 changes.
@@ -219,9 +216,6 @@ func TestAdvanceDrift_EditNonSortKeyThenAdd(t *testing.T) {
 			},
 		},
 	})
-	if result.Drift != nil {
-		t.Fatalf("unexpected drift: %v", result.Drift)
-	}
 	logChanges(t, "advance (EDIT non-sort + ADD)", result.Changes)
 
 	// Expected: EDIT(9d3f1b99) + REMOVE(9d3f1b99) + ADD(a383a3b1) = 3
@@ -275,9 +269,6 @@ func TestAdvanceDrift_EditSortKeyThenAdd(t *testing.T) {
 			},
 		},
 	})
-	if result.Drift != nil {
-		t.Fatalf("unexpected drift: %v", result.Drift)
-	}
 	logChanges(t, "advance (EDIT sort-key + ADD)", result.Changes)
 }
 
@@ -320,9 +311,6 @@ func TestAdvanceDrift_PrevValuesWithAdd(t *testing.T) {
 			},
 		},
 	})
-	if result.Drift != nil {
-		t.Fatalf("unexpected drift: %v", result.Drift)
-	}
 	logChanges(t, "advance (PrevValues + Add)", result.Changes)
 }
 
@@ -372,9 +360,6 @@ func TestAdvanceDrift_EditSortKeyRaiseThenAdd(t *testing.T) {
 			},
 		},
 	})
-	if result.Drift != nil {
-		t.Fatalf("unexpected drift: %v", result.Drift)
-	}
 	logChanges(t, "advance (EDIT raise + ADD)", result.Changes)
 }
 
@@ -407,9 +392,6 @@ func TestAdvanceDrift_MultipleAddsSameBatch(t *testing.T) {
 			"conversationId": "a383a3b1", "channelId": "ch1", "createdAt": int64(2000), "doNotPostToChannel": int64(0),
 		}},
 	})
-	if result.Drift != nil {
-		t.Fatalf("unexpected drift: %v", result.Drift)
-	}
 	logChanges(t, "advance (3 ADDs)", result.Changes)
 
 	// Expected: each ADD displaces the current bound.
@@ -469,9 +451,6 @@ func TestAdvanceDrift_EditSameSortThenAdd(t *testing.T) {
 			},
 		},
 	})
-	if result.Drift != nil {
-		t.Logf("advance returned drift=%v", result.Drift)
-	}
 	logChanges(t, "advance (EDIT to same sort + ADD tie)", result.Changes)
 }
 
@@ -504,9 +483,6 @@ func TestAdvanceDrift_AddWithSameSortTie(t *testing.T) {
 			},
 		},
 	})
-	if result.Drift != nil {
-		t.Fatalf("unexpected drift: %v", result.Drift)
-	}
 	logChanges(t, "advance (ADD with sort tie)", result.Changes)
 
 	// Expected: a383a3b1 sorts first at the tie → displaces 9d3f1b99
@@ -544,9 +520,6 @@ func TestAdvanceDrift_AddFromDifferentChannel(t *testing.T) {
 			},
 		},
 	})
-	if result.Drift != nil {
-		t.Fatalf("unexpected drift: %v", result.Drift)
-	}
 	logChanges(t, "advance (ADD from different channel)", result.Changes)
 
 	if len(result.Changes) != 0 {

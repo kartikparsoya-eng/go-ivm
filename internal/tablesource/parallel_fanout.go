@@ -42,15 +42,14 @@ package tablesource
 // Panic discipline mirrors ivm/parallel.go: a panic on a spawned goroutine
 // is FATAL to the process (no outer recover can catch it), so each group
 // goroutine recovers into a slot and the caller re-raises on its own
-// goroutine after the join — non-drift (programmer bug) prioritized over
-// *ivm.DriftError (self-healing re-init), scanning slots in group
-// registration order so the surfaced panic is deterministic. Note one
-// intentional divergence from the serial path on drift: serially,
-// pipelines after the panicking one never ran; in parallel they (and their
-// operator-storage writes) may have completed. Both cases funnel into the
-// same recovery — the engine emits the partial output and TS re-inits the
-// whole client group, discarding all pipeline+storage state — so the
-// difference is unobservable past the recovery boundary.
+// goroutine after the join, scanning slots in group registration order so
+// the surfaced panic is deterministic. Note one intentional divergence from
+// the serial path on a mid-fanout panic: serially, pipelines after the
+// panicking one never ran; in parallel they (and their operator-storage
+// writes) may have completed. Both cases funnel into the same disposition —
+// the RPC errors and TS tears the whole client group down, discarding all
+// pipeline+storage state — so the difference is unobservable past that
+// boundary.
 //
 // The single-group / knob-off path falls back to the exact serial loop.
 
@@ -94,13 +93,6 @@ func (s *Source) SetNextConnectGroup(group string) {
 	s.mu.Unlock()
 }
 
-// fanoutPanic captures a recovered panic from one group's goroutine.
-// drift and other are mutually exclusive per slot.
-type fanoutPanic struct {
-	drift *ivm.DriftError
-	other any
-}
-
 // fanOut pushes one source-level change through every connection, in
 // parallel across pipeline groups when enabled. Returns the concatenated
 // outputs in GROUP-MAJOR order: groups in first-seen registration order,
@@ -110,7 +102,7 @@ type fanoutPanic struct {
 // Push's return value anyway — the real output rides the Streamer — but
 // the determinism keeps direct Push callers stable either way.
 //
-// Called WITHOUT s.mu (fanout must allow recursive Fetch/RefreshSnapshot
+// Called WITHOUT s.mu (fanout must allow recursive Fetch
 // callbacks), after the overlay is set; the caller re-acquires s.mu for
 // writeChange after this returns.
 func (s *Source) fanOut(change ivm.SourceChange, epoch int, conns []*connection) []ivm.Change {
@@ -162,7 +154,7 @@ func (s *Source) fanOut(change ivm.SourceChange, epoch int, conns []*connection)
 	}
 
 	ordered := make([][]ivm.Change, len(groups))
-	panics := make([]fanoutPanic, len(groups))
+	panics := make([]any, len(groups))
 	sem := make(chan struct{}, workers)
 	var wg sync.WaitGroup
 	for i := range groups {
@@ -172,11 +164,7 @@ func (s *Source) fanOut(change ivm.SourceChange, epoch int, conns []*connection)
 			defer wg.Done()
 			defer func() {
 				if r := recover(); r != nil {
-					if d, ok := r.(*ivm.DriftError); ok {
-						panics[idx].drift = d
-					} else {
-						panics[idx].other = r
-					}
+					panics[idx] = r
 				}
 				<-sem
 			}()
@@ -185,18 +173,13 @@ func (s *Source) fanOut(change ivm.SourceChange, epoch int, conns []*connection)
 	}
 	wg.Wait()
 
-	// Re-raise on the caller's goroutine so the engine's recover (drift →
-	// re-init) or the process-abort path (programmer bug) sees the panic in
-	// the right scope. Deterministic: scan in group registration order,
-	// non-drift first.
+	// Re-raise on the caller's goroutine so the sidecar handler's recover
+	// sees the panic in the right scope (a panic on a spawned goroutine
+	// would kill the whole process). Deterministic: scan in group
+	// registration order.
 	for i := range panics {
-		if panics[i].other != nil {
-			panic(panics[i].other)
-		}
-	}
-	for i := range panics {
-		if panics[i].drift != nil {
-			panic(panics[i].drift)
+		if panics[i] != nil {
+			panic(panics[i])
 		}
 	}
 

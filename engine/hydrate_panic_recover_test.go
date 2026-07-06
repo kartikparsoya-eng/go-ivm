@@ -78,12 +78,13 @@ func TestFirstHydratePanic(t *testing.T) {
 		t.Fatalf("want error naming query qB, got %v", err)
 	}
 
-	// A *DriftError is preserved as-is so the caller's drift path can detect it.
-	d := &ivm.DriftError{}
-	got := firstHydratePanic(built, []any{d, nil})
-	var de *ivm.DriftError
-	if !errors.As(got, &de) {
-		t.Fatalf("DriftError panic should be returned unwrapped, got %T (%v)", got, got)
+	// A plain error panic (e.g. a source-drift assert firing during the
+	// hydrate scan) is wrapped with its query ID via %w — the message keeps
+	// the drift text and the chain keeps the original error.
+	driftErr := ivm.SourceDriftError("users", "Edit", nil, -1)
+	got := firstHydratePanic(built, []any{driftErr, nil})
+	if got == nil || !strings.Contains(got.Error(), "qA") || !errors.Is(got, driftErr) {
+		t.Fatalf("error panic should wrap with query ID and keep the chain, got %v", got)
 	}
 
 	// A *ivm.DataError must survive the %w wrap so the sidecar maps it to

@@ -164,10 +164,10 @@ func (j *Join) pushParent(change Change) []Change {
 	case ChangeTypeEdit:
 		// Assert the edit could not change the relationship. A key-changing edit
 		// should have been split into Remove(old)+Add(new) at the source; if it
-		// wasn't, recover via *DriftError (drop this advance + re-init) instead
-		// of crashing the shared sidecar. See joinKeyChangeDrift.
+		// wasn't, panic — TS asserts (throws) here (join.ts) and the view-syncer
+		// tears the client group down. See joinKeyChangeError.
 		if !RowEqualsForCompoundKey(change.OldNode.Row, change.Node.Row, j.parentKey) {
-			panic(joinKeyChangeDrift(j.parent.GetSchema(), change.OldNode.Row, "Join-parent-key-change"))
+			panic(joinKeyChangeError(j.parent.GetSchema(), change.OldNode.Row, "Join-parent-key-change"))
 		}
 		return j.output.Push(
 			MakeEditChange(
@@ -189,11 +189,32 @@ func (j *Join) pushChild(change Change) []Change {
 		return j.pushChildChange(change.Node.Row, change)
 	case ChangeTypeEdit:
 		if !RowEqualsForCompoundKey(change.OldNode.Row, change.Node.Row, j.childKey) {
-			panic(joinKeyChangeDrift(j.child.GetSchema(), change.OldNode.Row, "Join-child-key-change"))
+			panic(joinKeyChangeError(j.child.GetSchema(), change.OldNode.Row, "Join-child-key-change"))
 		}
 		return j.pushChildChange(change.Node.Row, change)
 	}
 	panic("unreachable")
+}
+
+// joinKeyChangeError builds the plain error for a Join/FlippedJoin invariant
+// violation: an Edit reached the join with a CHANGED join key. TS asserts
+// (throws) here on the premise that the upstream source split-edits any
+// key-crossing edit into Remove(old)+Add(new) before it reaches the join — so
+// reaching this point means either the split-edit keys weren't registered or
+// the source state diverged. The panic propagates out of the engine → RPC
+// error → 'unclassified' → CG teardown, exactly TS's disposition for the
+// assert. `op` distinguishes the four call sites (parent vs child, Join vs
+// FlippedJoin) for diagnostics.
+func joinKeyChangeError(schema *SourceSchema, oldRow Row, op string) error {
+	pk := map[string]Value{}
+	table := ""
+	if schema != nil {
+		table = schema.TableName
+		for _, c := range schema.PrimaryKey {
+			pk[c] = oldRow[c]
+		}
+	}
+	return SourceDriftError(table, op, pk, -1)
 }
 
 // pushChildChange — finds matching parents and pushes ChildChanges downstream.

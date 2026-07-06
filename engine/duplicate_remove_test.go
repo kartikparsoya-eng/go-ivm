@@ -21,6 +21,7 @@ package engine
 import (
 	"database/sql"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/kartikparsoya-eng/go-ivm/builder"
@@ -59,12 +60,9 @@ func TestAdvance_DuplicateRemoveNoDrift_MemorySource(t *testing.T) {
 	rowA := ivm.Row{"id": "A", "stage_id": "s2", "transition_id": "X"}
 
 	// Hydrate: add rowB so the source has it.
-	hydrateResult := eng.Advance([]SnapshotChange{
+	eng.Advance([]SnapshotChange{
 		{Table: "stage_transitions", NextValue: rowB},
 	})
-	if hydrateResult.Drift != nil {
-		t.Fatalf("hydrate drift: %v", hydrateResult.Drift)
-	}
 
 	// Advance with two changes that produce duplicate Removes for rowB:
 	//   Change 1 (opSet of rowA, unique-conflict with rowB):
@@ -77,7 +75,7 @@ func TestAdvance_DuplicateRemoveNoDrift_MemorySource(t *testing.T) {
 	// The engine pushes Remove(rowB), Add(rowA), Remove(rowB).
 	// The first Remove(rowB) succeeds and writeChange deletes rowB.
 	// The second Remove(rowB) must be skipped (not panic with DriftError).
-	result := eng.Advance([]SnapshotChange{
+	eng.Advance([]SnapshotChange{
 		{
 			Table:      "stage_transitions",
 			PrevValues: []ivm.Row{rowB},
@@ -90,12 +88,6 @@ func TestAdvance_DuplicateRemoveNoDrift_MemorySource(t *testing.T) {
 		},
 	})
 
-	if result.Drift != nil {
-		t.Fatalf("expected no drift for duplicate Remove, got DriftError: %s "+
-			"(table=%s op=%s pk=%v has_count=%d)",
-			result.Drift.Error(), result.Drift.Table, result.Drift.Op,
-			result.Drift.PK, result.Drift.HasCount)
-	}
 }
 
 // TestAdvance_DuplicateRemoveNoDrift_TableSource is the same scenario but
@@ -155,7 +147,7 @@ func TestAdvance_DuplicateRemoveNoDrift_TableSource(t *testing.T) {
 	// Same duplicate-Remove scenario as the MemorySource test.
 	// Change 1: opSet of rowA with prevValues=[rowB] (unique-conflict removal).
 	// Change 2: opDel of rowB with prevValues=[rowB].
-	result := eng.Advance([]SnapshotChange{
+	eng.Advance([]SnapshotChange{
 		{
 			Table:      "stage_transitions",
 			PrevValues: []ivm.Row{rowB},
@@ -168,12 +160,6 @@ func TestAdvance_DuplicateRemoveNoDrift_TableSource(t *testing.T) {
 		},
 	})
 
-	if result.Drift != nil {
-		t.Fatalf("expected no drift for duplicate Remove (TableSource), got DriftError: %s "+
-			"(table=%s op=%s pk=%v has_count=%d)",
-			result.Drift.Error(), result.Drift.Table, result.Drift.Op,
-			result.Drift.PK, result.Drift.HasCount)
-	}
 }
 
 // TestAdvance_DuplicateRemoveThreeRows verifies the fix handles multiple
@@ -202,9 +188,7 @@ func TestAdvance_DuplicateRemoveThreeRows(t *testing.T) {
 		{Table: "items", NextValue: ivm.Row{"id": "C", "sku": "X"}},
 		{Table: "items", NextValue: ivm.Row{"id": "D", "sku": "X"}},
 	}
-	if r := eng.Advance(hydrate); r.Drift != nil {
-		t.Fatalf("hydrate drift: %v", r.Drift)
-	}
+	eng.Advance(hydrate)
 
 	rowA := ivm.Row{"id": "A", "sku": "X"}
 	rowB := ivm.Row{"id": "B", "sku": "X"}
@@ -215,7 +199,7 @@ func TestAdvance_DuplicateRemoveThreeRows(t *testing.T) {
 	// Change 2: opDel of B.
 	// Change 3: opDel of C.
 	// Change 4: opDel of D.
-	result := eng.Advance([]SnapshotChange{
+	eng.Advance([]SnapshotChange{
 		{
 			Table:      "items",
 			PrevValues: []ivm.Row{rowB, rowC, rowD},
@@ -226,12 +210,6 @@ func TestAdvance_DuplicateRemoveThreeRows(t *testing.T) {
 		{Table: "items", PrevValues: []ivm.Row{rowD}, NextValue: nil},
 	})
 
-	if result.Drift != nil {
-		t.Fatalf("expected no drift for 3 duplicate Removes, got: %s "+
-			"(table=%s op=%s pk=%v)",
-			result.Drift.Error(), result.Drift.Table,
-			result.Drift.Op, result.Drift.PK)
-	}
 }
 
 // TestAdvance_GenuineRemoveDrift_StillDetected verifies the fix does NOT
@@ -266,24 +244,20 @@ func TestAdvance_GenuineRemoveDrift_StillDetected(t *testing.T) {
 	}
 
 	// No hydration — the source is empty. A Remove for a row that was never
-	// added should still raise DriftError (genuine drift, not intra-batch
-	// duplicate). The fix must not mask this case.
-	result := eng.Advance([]SnapshotChange{
+	// added must still panic (genuine drift, not intra-batch duplicate).
+	// The fix must not mask this case.
+	msg := advanceDriftPanic(t, eng, []SnapshotChange{
 		{
 			Table:      "tasks",
 			PrevValues: []ivm.Row{{"id": "ghost", "title": "never existed"}},
 			NextValue:  nil,
 		},
 	})
-
-	if result.Drift == nil {
-		t.Fatalf("expected DriftError for genuine missing-row Remove, got nil drift")
+	if !strings.Contains(msg, "op=Remove") {
+		t.Errorf("expected op=Remove in drift panic, got %q", msg)
 	}
-	if result.Drift.Op != "Remove" {
-		t.Errorf("expected drift.Op=Remove, got %q", result.Drift.Op)
-	}
-	if result.Drift.Table != "tasks" {
-		t.Errorf("expected drift.Table=tasks, got %q", result.Drift.Table)
+	if !strings.Contains(msg, "table=tasks") {
+		t.Errorf("expected table=tasks in drift panic, got %q", msg)
 	}
 }
 
@@ -322,13 +296,11 @@ func TestAdvance_EditAfterBatchRemoveNoDrift_MemorySource(t *testing.T) {
 	rowA := ivm.Row{"id": "A", "stage_id": "s2", "transition_id": "X"}
 	rowBUpdated := ivm.Row{"id": "B", "stage_id": "s3", "transition_id": "X"}
 
-	if r := eng.Advance([]SnapshotChange{
+	eng.Advance([]SnapshotChange{
 		{Table: "stage_transitions", NextValue: rowB},
-	}); r.Drift != nil {
-		t.Fatalf("hydrate drift: %v", r.Drift)
-	}
+	})
 
-	result := eng.Advance([]SnapshotChange{
+	eng.Advance([]SnapshotChange{
 		{
 			Table:      "stage_transitions",
 			PrevValues: []ivm.Row{rowB},
@@ -341,12 +313,6 @@ func TestAdvance_EditAfterBatchRemoveNoDrift_MemorySource(t *testing.T) {
 		},
 	})
 
-	if result.Drift != nil {
-		t.Fatalf("expected no drift for Edit after batch Remove (MemorySource), got: %s "+
-			"(table=%s op=%s pk=%v has_count=%d)",
-			result.Drift.Error(), result.Drift.Table, result.Drift.Op,
-			result.Drift.PK, result.Drift.HasCount)
-	}
 }
 
 func TestAdvance_EditAfterBatchRemoveNoDrift_TableSource(t *testing.T) {
@@ -399,7 +365,7 @@ func TestAdvance_EditAfterBatchRemoveNoDrift_TableSource(t *testing.T) {
 	rowA := ivm.Row{"id": "A", "stage_id": "s2", "transition_id": "X"}
 	rowBUpdated := ivm.Row{"id": "B", "stage_id": "s3", "transition_id": "X"}
 
-	result := eng.Advance([]SnapshotChange{
+	eng.Advance([]SnapshotChange{
 		{
 			Table:      "stage_transitions",
 			PrevValues: []ivm.Row{rowB},
@@ -412,12 +378,6 @@ func TestAdvance_EditAfterBatchRemoveNoDrift_TableSource(t *testing.T) {
 		},
 	})
 
-	if result.Drift != nil {
-		t.Fatalf("expected no drift for Edit after batch Remove (TableSource), got: %s "+
-			"(table=%s op=%s pk=%v has_count=%d)",
-			result.Drift.Error(), result.Drift.Table, result.Drift.Op,
-			result.Drift.PK, result.Drift.HasCount)
-	}
 }
 
 // ---------------------------------------------------------------------------
@@ -453,17 +413,11 @@ func TestAdvance_DuplicateAddNoDrift_MemorySource(t *testing.T) {
 	itemV1 := ivm.Row{"id": "1", "name": "widget", "sku": "A"}
 	itemV2 := ivm.Row{"id": "1", "name": "widget", "sku": "B"}
 
-	result := eng.Advance([]SnapshotChange{
+	eng.Advance([]SnapshotChange{
 		{Table: "items", NextValue: itemV1},
 		{Table: "items", NextValue: itemV2},
 	})
 
-	if result.Drift != nil {
-		t.Fatalf("expected no drift for duplicate Add (MemorySource), got: %s "+
-			"(table=%s op=%s pk=%v has_count=%d)",
-			result.Drift.Error(), result.Drift.Table, result.Drift.Op,
-			result.Drift.PK, result.Drift.HasCount)
-	}
 }
 
 func TestAdvance_DuplicateAddNoDrift_TableSource(t *testing.T) {
@@ -509,17 +463,11 @@ func TestAdvance_DuplicateAddNoDrift_TableSource(t *testing.T) {
 	itemV1 := ivm.Row{"id": "1", "name": "widget", "sku": "A"}
 	itemV2 := ivm.Row{"id": "1", "name": "widget", "sku": "B"}
 
-	result := eng.Advance([]SnapshotChange{
+	eng.Advance([]SnapshotChange{
 		{Table: "items", NextValue: itemV1},
 		{Table: "items", NextValue: itemV2},
 	})
 
-	if result.Drift != nil {
-		t.Fatalf("expected no drift for duplicate Add (TableSource), got: %s "+
-			"(table=%s op=%s pk=%v has_count=%d)",
-			result.Drift.Error(), result.Drift.Table, result.Drift.Op,
-			result.Drift.PK, result.Drift.HasCount)
-	}
 }
 
 // ---------------------------------------------------------------------------
@@ -543,22 +491,18 @@ func TestAdvance_GenuineEditDrift_StillDetected(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	result := eng.Advance([]SnapshotChange{
+	msg := advanceDriftPanic(t, eng, []SnapshotChange{
 		{
 			Table:      "tasks",
 			PrevValues: []ivm.Row{{"id": "ghost", "title": "old"}},
 			NextValue:  ivm.Row{"id": "ghost", "title": "new"},
 		},
 	})
-
-	if result.Drift == nil {
-		t.Fatalf("expected DriftError for genuine missing-row Edit, got nil drift")
+	if !strings.Contains(msg, "op=Edit") {
+		t.Errorf("expected op=Edit in drift panic, got %q", msg)
 	}
-	if result.Drift.Op != "Edit" {
-		t.Errorf("expected drift.Op=Edit, got %q", result.Drift.Op)
-	}
-	if result.Drift.Table != "tasks" {
-		t.Errorf("expected drift.Table=tasks, got %q", result.Drift.Table)
+	if !strings.Contains(msg, "table=tasks") {
+		t.Errorf("expected table=tasks in drift panic, got %q", msg)
 	}
 }
 
@@ -580,21 +524,15 @@ func TestAdvance_GenuineAddDrift_StillDetected(t *testing.T) {
 	}
 
 	existing := ivm.Row{"id": "P1", "name": "gadget"}
-	if r := eng.Advance([]SnapshotChange{
+	eng.Advance([]SnapshotChange{
 		{Table: "products", NextValue: existing},
-	}); r.Drift != nil {
-		t.Fatalf("hydrate drift: %v", r.Drift)
-	}
-
-	result := eng.Advance([]SnapshotChange{
-		{Table: "products", NextValue: ivm.Row{"id": "P1", "name": "gadget-v2"}},
 	})
 
-	if result.Drift == nil {
-		t.Fatalf("expected DriftError for genuine cross-batch duplicate Add, got nil drift")
-	}
-	if result.Drift.Op != "Add" {
-		t.Errorf("expected drift.Op=Add, got %q", result.Drift.Op)
+	msg := advanceDriftPanic(t, eng, []SnapshotChange{
+		{Table: "products", NextValue: ivm.Row{"id": "P1", "name": "gadget-v2"}},
+	})
+	if !strings.Contains(msg, "op=Add") {
+		t.Errorf("expected op=Add in drift panic, got %q", msg)
 	}
 }
 
@@ -615,18 +553,11 @@ func TestAdvance_DuplicateAddThreeVersions(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	result := eng.Advance([]SnapshotChange{
+	eng.Advance([]SnapshotChange{
 		{Table: "metrics", NextValue: ivm.Row{"id": "M", "val": "1"}},
 		{Table: "metrics", NextValue: ivm.Row{"id": "M", "val": "2"}},
 		{Table: "metrics", NextValue: ivm.Row{"id": "M", "val": "3"}},
 	})
-
-	if result.Drift != nil {
-		t.Fatalf("expected no drift for 3 duplicate Adds, got: %s "+
-			"(table=%s op=%s pk=%v)",
-			result.Drift.Error(), result.Drift.Table,
-			result.Drift.Op, result.Drift.PK)
-	}
 
 	data := src.Data()
 	if len(data) != 1 {

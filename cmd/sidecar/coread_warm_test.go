@@ -4,7 +4,6 @@ import (
 	"testing"
 
 	"github.com/kartikparsoya-eng/go-ivm/builder"
-	"github.com/kartikparsoya-eng/go-ivm/internal/tablesource"
 	"github.com/kartikparsoya-eng/go-ivm/ivm"
 	"github.com/kartikparsoya-eng/go-ivm/sqlite"
 )
@@ -21,10 +20,8 @@ func warmTestServer(t *testing.T) (*Server, *ClientGroup) {
 	t.Helper()
 	path, _ := makeReplica(t)
 
-	srv := NewServer(tablesource.ModeTable, path)
+	srv := NewServer(path)
 	srv.appID = "myapp"
-	srv.advanceToHeadEnabled = true
-	srv.advanceDriveEnabled = true
 	srv.hydrateReaders = 8
 	srv.warmHydratePoolEnabled = true
 	t.Cleanup(srv.closeAll)
@@ -108,13 +105,6 @@ func TestBuildWarmReaderPool_Guards(t *testing.T) {
 		srv, group := warmTestServer(t)
 		srv.tearDownReaderPool(group)
 		srv.warmHydratePoolEnabled = false
-		assertWarmNoop(t, srv, group)
-	})
-
-	t.Run("not drive mode", func(t *testing.T) {
-		srv, group := warmTestServer(t)
-		srv.tearDownReaderPool(group)
-		srv.advanceDriveEnabled = false
 		assertWarmNoop(t, srv, group)
 	})
 

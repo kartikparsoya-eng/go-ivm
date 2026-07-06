@@ -101,12 +101,8 @@ func benchAdvanceFanout(b *testing.B, childCount int) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if r := eng.Advance(addU1); r.Drift != nil {
-			b.Fatalf("add drift: %v", r.Drift)
-		}
-		if r := eng.Advance(removeU1); r.Drift != nil {
-			b.Fatalf("remove drift: %v", r.Drift)
-		}
+		eng.Advance(addU1)
+		eng.Advance(removeU1)
 	}
 }
 
@@ -124,9 +120,6 @@ func TestAdvanceFanout_RowCount(t *testing.T) {
 	for _, childCount := range []int{100, 1000, 5000} {
 		eng := newFanoutEngine(t, childCount)
 		r := eng.Advance([]SnapshotChange{{Table: "users", NextValue: u1Row}})
-		if r.Drift != nil {
-			t.Fatalf("childCount=%d: unexpected drift: %v", childCount, r.Drift)
-		}
 		t.Logf("childCount=%5d → single-ADD emits %d RowChanges (advanceChunkSize=%d, splits=%d)",
 			childCount, len(r.Changes), advanceChunkSize,
 			len(r.Changes)/advanceChunkSize)

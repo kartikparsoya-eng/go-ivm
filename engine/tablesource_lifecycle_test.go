@@ -112,9 +112,6 @@ func advanceStream(t *testing.T, eng *Engine, changes []SnapshotChange) int {
 	t.Helper()
 	total := 0
 	err := eng.AdvanceStream(changes, func(p AdvanceStreamPartial) {
-		if p.Drift != nil {
-			t.Fatalf("unexpected drift: %v", p.Drift)
-		}
 		total += len(p.Changes)
 	})
 	if err != nil {
@@ -409,12 +406,18 @@ func TestTableSourceLifecycle_ConcurrentAdvanceAndQueryChurn(t *testing.T) {
 		defer wg.Done()
 		for i := 0; i < advances; i++ {
 			groupMu.Lock()
-			_ = eng.AdvanceStream([]SnapshotChange{ticketAdd(200 + i)},
-				func(p AdvanceStreamPartial) {
-					if p.Drift != nil {
-						driftSeen <- p.Drift.Error()
+			// A source-drift assert now PANICS out of AdvanceStream;
+			// capture it as a churn failure instead of crashing the
+			// test binary (panic on a spawned goroutine is fatal).
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						driftSeen <- fmt.Sprintf("%v", r)
 					}
-				})
+				}()
+				_ = eng.AdvanceStream([]SnapshotChange{ticketAdd(200 + i)},
+					func(AdvanceStreamPartial) {})
+			}()
 			groupMu.Unlock()
 		}
 	}()

@@ -193,16 +193,16 @@ func TestFanOutSerialPaths(t *testing.T) {
 	}
 }
 
-// Panic discipline: with one group panicking a *ivm.DriftError, another
-// panicking a plain value, and a third succeeding — every group still runs
-// to completion (no early abort), the re-raise happens on the CALLER's
-// goroutine, and the non-drift panic wins regardless of group position.
-func TestFanOutPanicPriorityAndCompleteness(t *testing.T) {
+// Panic discipline: with one group panicking an error, another panicking a
+// plain value, and a third succeeding — every group still runs to
+// completion (no early abort), the re-raise happens on the CALLER's
+// goroutine, and the FIRST group in registration order wins (determinism).
+func TestFanOutPanicOrderAndCompleteness(t *testing.T) {
 	withFanoutKnobs(t, true, 4)
 	s := &Source{}
 
 	var ranC atomic.Bool
-	drift := &ivm.DriftError{Table: "t", Op: "Add"}
+	drift := ivm.SourceDriftError("t", "Add", nil, -1)
 	conns := []*connection{
 		fanOutConn("qa", nil, func() { panic(drift) }),
 		fanOutConn("qb", nil, func() { panic("programmer bug") }),
@@ -215,16 +215,16 @@ func TestFanOutPanicPriorityAndCompleteness(t *testing.T) {
 		s.fanOut(addChange(), 1, conns)
 	}()
 
-	if recovered != "programmer bug" {
-		t.Fatalf("recovered = %v, want the non-drift panic to win over drift", recovered)
+	if recovered != drift {
+		t.Fatalf("recovered = %v, want the FIRST registered group's panic (drift)", recovered)
 	}
 	if !ranC.Load() {
 		t.Fatal("group qc did not run — fanout must complete all groups before re-raising")
 	}
 
-	// Drift-only: the drift re-raises, and with TWO drifts the FIRST group
-	// in registration order is the one surfaced (determinism).
-	drift2 := &ivm.DriftError{Table: "t2", Op: "Remove"}
+	// Two error panics: the FIRST group in registration order is the one
+	// surfaced (determinism).
+	drift2 := ivm.SourceDriftError("t2", "Remove", nil, -1)
 	conns = []*connection{
 		fanOutConn("q1", nil, func() { panic(drift) }),
 		fanOutConn("q2", nil, func() { panic(drift2) }),
@@ -235,7 +235,7 @@ func TestFanOutPanicPriorityAndCompleteness(t *testing.T) {
 		s.fanOut(addChange(), 2, conns)
 	}()
 	if recovered != drift {
-		t.Fatalf("recovered = %v, want the FIRST registered group's drift", recovered)
+		t.Fatalf("recovered = %v, want the FIRST registered group's panic", recovered)
 	}
 }
 

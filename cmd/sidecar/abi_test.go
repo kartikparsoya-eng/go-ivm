@@ -76,19 +76,15 @@ func decodeResp(t *testing.T, payload []byte) RPCResponse {
 	return resp
 }
 
-// TestABIHost_InitAdvanceRoundTrip drives a real init + advanceStream through
-// the pump and asserts the full response set arrives via the sink: init
-// response, advanceStream terminal partial (final=true), and its "done".
+// TestABIHost_InitAdvanceRoundTrip drives a real init + advanceToHeadStream
+// through the pump and asserts the full response set arrives via the sink:
+// init response, advance terminal partial (final=true), and its "done".
 func TestABIHost_InitAdvanceRoundTrip(t *testing.T) {
 	col := newSinkCollector()
-	h := startABIHostWithServer(NewServer(0, ""), col.sink, nil)
+	h := startABIHostWithServer(NewServer(makeReplicaPathOnly(t)), col.sink, nil)
 	defer h.Shutdown()
 
-	if err := h.Send(encodeReq(t, "init", 1, initParams{
-		ClientGroupID: "cg-abi",
-		Storage:       t.TempDir() + "/storage.db",
-		Tables:        map[string]tableSchemaParams{},
-	})); err != nil {
+	if err := h.Send(encodeReq(t, "init", 1, issueInitParams("cg-abi"))); err != nil {
 		t.Fatalf("send init: %v", err)
 	}
 	frames := col.waitFrames(t, 1, 10*time.Second)
@@ -97,16 +93,15 @@ func TestABIHost_InitAdvanceRoundTrip(t *testing.T) {
 		t.Fatalf("init failed: %+v", initResp.Error)
 	}
 
-	if err := h.Send(encodeReq(t, "advanceStream", 2, advanceParams{
+	if err := h.Send(encodeReq(t, "advanceToHeadStream", 2, advanceToHeadParams{
 		ClientGroupID: "cg-abi",
 		InitEpoch:     1,
-		Changes:       nil,
 	})); err != nil {
-		t.Fatalf("send advanceStream: %v", err)
+		t.Fatalf("send advanceToHeadStream: %v", err)
 	}
-	// Empty advance emits exactly: 1 terminal partial (final=true, empty
-	// changes) + 1 "done" response — both must arrive through the pump in
-	// order (single flusher FIFO).
+	// The replica is already at head, so the advance emits exactly: 1
+	// terminal partial (final=true, empty changes) + 1 "done" response —
+	// both must arrive through the pump in order (single flusher FIFO).
 	frames = col.waitFrames(t, 3, 10*time.Second)
 	partial := decodeResp(t, frames[1])
 	if partial.Error != nil {
@@ -131,7 +126,7 @@ func TestABIHost_InitAdvanceRoundTrip(t *testing.T) {
 // done via the single-flusher FIFO).
 func TestABIHost_LosslessDeliveryUnderBurst(t *testing.T) {
 	col := newSinkCollector()
-	h := startABIHostWithServer(NewServer(0, ""), col.sink, nil)
+	h := startABIHostWithServer(NewServer(makeReplicaPathOnly(t)), col.sink, nil)
 	defer h.Shutdown()
 
 	const n = 200
@@ -207,7 +202,7 @@ func TestABIHost_SlowSinkBackpressureLossless(t *testing.T) {
 			mu.Unlock()
 		}
 	}
-	h := startABIHostWithServer(NewServer(0, ""), slowSink, nil)
+	h := startABIHostWithServer(NewServer(makeReplicaPathOnly(t)), slowSink, nil)
 	defer h.Shutdown()
 
 	const n = 300
@@ -245,7 +240,7 @@ func TestABIHost_SlowSinkBackpressureLossless(t *testing.T) {
 // errHostClosed; Shutdown is idempotent and does not hang.
 func TestABIHost_ShutdownSemantics(t *testing.T) {
 	col := newSinkCollector()
-	h := startABIHostWithServer(NewServer(0, ""), col.sink, nil)
+	h := startABIHostWithServer(NewServer(makeReplicaPathOnly(t)), col.sink, nil)
 
 	if err := h.Send(encodeReq(t, "ping", 1, nil)); err != nil {
 		t.Fatalf("send before shutdown: %v", err)
@@ -282,7 +277,7 @@ func TestABIHost_ShutdownSemantics(t *testing.T) {
 // both pumps exit, and the death watcher fires.
 func TestABIHost_DeathDeliversHostDeathRecord(t *testing.T) {
 	col := newSinkCollector()
-	h := startABIHostWithServer(NewServer(0, ""), col.sink, nil)
+	h := startABIHostWithServer(NewServer(makeReplicaPathOnly(t)), col.sink, nil)
 	defer h.Shutdown()
 
 	// Prove liveness first so the death is unambiguous.
@@ -328,7 +323,7 @@ func TestABIHost_DeathDeliversHostDeathRecord(t *testing.T) {
 // would trigger a spurious worker fatal during graceful exit.
 func TestABIHost_ShutdownDoesNotDeliverDeathRecord(t *testing.T) {
 	col := newSinkCollector()
-	h := startABIHostWithServer(NewServer(0, ""), col.sink, nil)
+	h := startABIHostWithServer(NewServer(makeReplicaPathOnly(t)), col.sink, nil)
 
 	if err := h.Send(encodeReq(t, "ping", 1, nil)); err != nil {
 		t.Fatalf("send ping: %v", err)
@@ -352,9 +347,11 @@ func TestABIHost_ShutdownDoesNotDeliverDeathRecord(t *testing.T) {
 // readers=2×P), warm-hydrate pool defaults ON, and the per-facet legacy
 // vars still override individually.
 func TestNewServerFromEnv_ParallelismKnob(t *testing.T) {
+	replicaPath := makeReplicaPathOnly(t)
 	clearEnv := func(t *testing.T) {
+		t.Setenv("GO_IVM_REPLICA_DB_PATH", replicaPath)
 		for _, k := range []string{
-			"GO_IVM_SOURCE_MODE", "GO_IVM_PARALLELISM",
+			"GO_IVM_PARALLELISM",
 			"GO_IVM_HYDRATE_READERS", "GO_IVM_HYDRATE_LANES",
 			"GO_IVM_WARM_HYDRATE_POOL",
 		} {
@@ -426,7 +423,7 @@ func TestABIHostReapsIdleGroups(t *testing.T) {
 	t.Setenv("GO_IVM_REAPER_IDLE_SEC", "1")
 
 	col := newSinkCollector()
-	h := startABIHostWithServer(NewServer(0, ""), col.sink, nil)
+	h := startABIHostWithServer(NewServer(makeReplicaPathOnly(t)), col.sink, nil)
 	defer h.Shutdown()
 
 	// Create a group via a real init RPC so it has an engine + worker.

@@ -175,8 +175,7 @@ func (t *Take) initialFetch(req FetchRequest) iter.Seq[Node] {
 		defer func() {
 			if r := recover(); r != nil {
 				// take.ts exceptionThrown branch: do not persist a partial
-				// takeState when iteration aborted via panic; re-raise as-is so
-				// a *DriftError still reaches engine.Advance's recover.
+				// takeState when iteration aborted via panic; re-raise as-is.
 				panic(r)
 			}
 			t.setTakeState(takeStateKey, size, bound, t.storage.GetMaxBound())
@@ -454,13 +453,11 @@ func (t *Take) pushEditChange(change Change) []Change {
 				"stale-bound (oldCmp>0, newCmp==0): edit row.id=%v sort=%v→%v bound.id=%v boundSort=%v size=%d",
 				change.Node.Row["id"], change.OldNode.Row[t.sortColName()], change.Node.Row[t.sortColName()],
 				takeState.Bound["id"], takeState.Bound[t.sortColName()], takeState.Size))
-			// Self-heal: engine.Advance recovers *DriftError, drops the advance,
-			// and TS re-inits the engine from current SQLite truth — bound is
-			// repopulated by the fresh hydrate. Replaces the prior crash-the-
-			// sidecar behavior that turned a recoverable state corruption into
-			// a total outage. Flight recorder above carries the leading-up
-			// event sequence for offline root-cause work.
-			panic(t.staleBoundDriftError(change, "oldCmp>0, newCmp==0"))
+			// TS asserts (throws) at the equivalent take.ts site — the
+			// view-syncer tears the client group down and the fresh hydrate
+			// repopulates the bound. Flight recorder above carries the
+			// leading-up event sequence for offline root-cause work.
+			panic(t.staleBoundError(change, "oldCmp>0, newCmp==0"))
 		}
 		if newCmp > 0 {
 			t.debugf("pushEdit DROPPED (both outside) row=%v bound=%v", change.Node.Row["id"], takeState.Bound["id"])
@@ -486,23 +483,18 @@ func (t *Take) pushEditChange(change Change) []Change {
 		// and new is inside, the fetch (reverse from bound 'at') MUST return
 		// at least 2 nodes (the bound itself + the row before it that becomes
 		// the new bound). If only 1 node is returned, the source state is
-		// inconsistent — TS asserts (throws), Go panics with DriftError so
-		// the engine recovers via re-init.
+		// inconsistent — TS asserts (throws) → teardown; Go panics with the
+		// same plain-error disposition.
 		// Pre-fix audit C had a Go-only fallback that silently bumped Size+1
 		// while keeping the stale Bound. That diverged the partition's state
 		// from TS, causing subsequent pushes to operate on a wrong baseline.
-		// Match TS take.ts:594-600 assertions but signal as DriftError so
-		// engine.Advance's recover catches it and triggers re-init from
-		// SQLite truth (the same pattern as the other stale-bound sites in
-		// pushEditChange). A raw panic here would crash the sidecar and
-		// every cg on it; DriftError lets just THIS advance be dropped.
 		if oldBoundNode == nil {
 			t.dumpFlightRecorder("oldBoundNode missing in pushEditChange oldCmp>0,newCmp<0 fetch")
-			panic(t.staleBoundDriftError(change, "oldBoundNode nil (oldCmp>0, newCmp<0)"))
+			panic(t.staleBoundError(change, "oldBoundNode nil (oldCmp>0, newCmp<0)"))
 		}
 		if newBoundNode == nil {
 			t.dumpFlightRecorder("newBoundNode missing in pushEditChange oldCmp>0,newCmp<0 fetch")
-			panic(t.staleBoundDriftError(change, "newBoundNode nil (oldCmp>0, newCmp<0)"))
+			panic(t.staleBoundError(change, "newBoundNode nil (oldCmp>0, newCmp<0)"))
 		}
 		t.setTakeState(takeStateKey, takeState.Size, newBoundNode.Row, maxBound)
 		var results []Change
@@ -517,7 +509,7 @@ func (t *Take) pushEditChange(change Change) []Change {
 			"stale-bound (oldCmp<0, newCmp==0): edit row.id=%v sort=%v→%v bound.id=%v boundSort=%v size=%d",
 			change.Node.Row["id"], change.OldNode.Row[t.sortColName()], change.Node.Row[t.sortColName()],
 			takeState.Bound["id"], takeState.Bound[t.sortColName()], takeState.Size))
-		panic(t.staleBoundDriftError(change, "oldCmp<0, newCmp==0"))
+		panic(t.staleBoundError(change, "oldCmp<0, newCmp==0"))
 	}
 	if newCmp < 0 {
 		return t.output.Push(change, t)
@@ -633,12 +625,12 @@ func ifNotNil(row Row, col string) interface{} {
 	return row[col]
 }
 
-// staleBoundDriftError constructs a *DriftError that the engine's recover
-// will treat as a recoverable signal (drop in-flight advance, re-init from
-// SQLite truth) rather than a crash-the-sidecar panic. Op="Edit-stale-bound"
-// distinguishes Take's invariant violation from the MemorySource Add/Edit/
-// Remove drift cases.
-func (t *Take) staleBoundDriftError(change Change, marker string) *DriftError {
+// staleBoundError constructs the plain error Take's stale-bound asserts
+// panic with. Op="Edit-stale-bound" distinguishes Take's invariant violation
+// from the source Add/Edit/Remove drift cases. TS asserts (throws) at the
+// equivalent take.ts sites and the view-syncer tears the client group down;
+// the Go panic propagates to the same disposition.
+func (t *Take) staleBoundError(change Change, marker string) error {
 	schema := t.input.GetSchema()
 	pk := map[string]Value{}
 	if schema != nil && change.OldNode != nil {
@@ -650,12 +642,7 @@ func (t *Take) staleBoundDriftError(change Change, marker string) *DriftError {
 	if schema != nil {
 		table = schema.TableName
 	}
-	return &DriftError{
-		Table:    table,
-		Op:       "Edit-stale-bound (" + marker + ")",
-		PK:       pk,
-		HasCount: -1, // not meaningful for Take-level drift
-	}
+	return SourceDriftError(table, "Edit-stale-bound ("+marker+")", pk, -1)
 }
 
 // getStateAndConstraint — Source: take.ts line 218-245

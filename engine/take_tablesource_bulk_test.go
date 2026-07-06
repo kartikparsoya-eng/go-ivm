@@ -13,6 +13,7 @@ import (
 	"database/sql"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/kartikparsoya-eng/go-ivm/builder"
@@ -86,8 +87,8 @@ func TestTableSourceTake_BulkUpdateAcrossBound(t *testing.T) {
 			t.Logf("no panic — TableSource handled bulk-across-bound cleanly")
 			return
 		}
-		if d, ok := r.(*ivm.DriftError); ok {
-			t.Logf("ROOT CAUSE REPRO via TableSource — DriftError: %v", d.Error())
+		if err, ok := r.(error); ok && strings.Contains(err.Error(), "source drift:") {
+			t.Logf("ROOT CAUSE REPRO via TableSource — drift: %v", err)
 			t.Fatalf("(failing the test so the repro is visible in CI)")
 		}
 		panic(r)
@@ -115,7 +116,7 @@ func TestTableSourceTake_BulkUpdateAcrossBound(t *testing.T) {
 		})
 	}
 	result := eng.Advance(changes)
-	t.Logf("advance returned %d changes, drift=%v", len(result.Changes), result.Drift)
+	t.Logf("advance returned %d changes", len(result.Changes))
 }
 
 // TestTableSourceTake_BulkUpdateIncludingBound: same bulk pattern but
@@ -175,8 +176,8 @@ func TestTableSourceTake_BulkUpdateIncludingBound(t *testing.T) {
 			t.Logf("no panic — TableSource handled bound-in-batch cleanly")
 			return
 		}
-		if d, ok := r.(*ivm.DriftError); ok {
-			t.Logf("ROOT CAUSE REPRO via TableSource — DriftError: %v", d.Error())
+		if err, ok := r.(error); ok && strings.Contains(err.Error(), "source drift:") {
+			t.Logf("ROOT CAUSE REPRO via TableSource — drift: %v", err)
 			t.Fatalf("(failing the test so the repro is visible in CI)")
 		}
 		panic(r)
@@ -200,7 +201,7 @@ func TestTableSourceTake_BulkUpdateIncludingBound(t *testing.T) {
 		})
 	}
 	result := eng.Advance(changes)
-	t.Logf("advance returned %d changes, drift=%v", len(result.Changes), result.Drift)
+	t.Logf("advance returned %d changes", len(result.Changes))
 }
 
 // TestTableSourceTake_BatchedAddDisplacesBound is the regression for the
@@ -300,9 +301,6 @@ func TestTableSourceTake_BatchedAddDisplacesBound(t *testing.T) {
 		{Table: "items", NextValue: ivm.Row{"id": "y", "val": int64(90)}},
 		{Table: "items", NextValue: ivm.Row{"id": "z", "val": int64(80)}},
 	})
-	if res.Drift != nil {
-		t.Fatalf("unexpected drift: %v", res.Drift)
-	}
 	apply(res.Changes)
 
 	// True top-3 by val after adding 100,90,80 to {50,40,30,20,10}:

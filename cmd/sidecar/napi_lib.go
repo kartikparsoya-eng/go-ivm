@@ -125,8 +125,8 @@ func goivm_start(cb C.goivm_deliver_cb, ctx unsafe.Pointer) C.int32_t {
 	}
 	abiHst = h
 	started = true
-	fmt.Fprintf(os.Stderr, "[GO-IVM][napi] in-process host started (abi v%d, source=%s)\n",
-		goivmABIVersion, h.server.sourceMode)
+	fmt.Fprintf(os.Stderr, "[GO-IVM][napi] in-process host started (abi v%d)\n",
+		goivmABIVersion)
 	return 0
 }
 

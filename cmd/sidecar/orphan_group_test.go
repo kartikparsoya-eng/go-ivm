@@ -23,7 +23,7 @@ import (
 // createIfMissing=false returns nil instead of spawning a new
 // ClientGroup. Pre-fix this would return a fresh empty group.
 func TestGetGroup_NoCreateWhenAbsent(t *testing.T) {
-	s := NewServer(0, "")
+	s := NewServer(makeReplicaPathOnly(t))
 	g := s.getGroup("never-existed", false)
 	if g != nil {
 		t.Fatalf("expected nil for absent group + createIfMissing=false, got %p", g)
@@ -40,7 +40,7 @@ func TestGetGroup_NoCreateWhenAbsent(t *testing.T) {
 // TestGetGroup_CreateWhenAbsent confirms that createIfMissing=true still
 // works the way handleInit needs (group + worker spawned).
 func TestGetGroup_CreateWhenAbsent(t *testing.T) {
-	s := NewServer(0, "")
+	s := NewServer(makeReplicaPathOnly(t))
 	g := s.getGroup("first-init", true)
 	if g == nil {
 		t.Fatal("expected new group with createIfMissing=true, got nil")
@@ -60,7 +60,7 @@ func TestGetGroup_CreateWhenAbsent(t *testing.T) {
 // removeGroup has deleted the entry. Pre-fix this spawned an orphan;
 // post-fix it cleanly returns nil and the handler can return an error.
 func TestRemoveGroup_NoOrphanAfterConcurrentLookup(t *testing.T) {
-	s := NewServer(0, "")
+	s := NewServer(makeReplicaPathOnly(t))
 
 	// Stage: cgID exists.
 	const id = "cg-race"

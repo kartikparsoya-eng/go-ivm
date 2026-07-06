@@ -461,7 +461,7 @@ func (fj *FlippedJoin) pushChild(change Change) []Change {
 		return fj.pushChildChange(change, false)
 	case ChangeTypeEdit:
 		if !RowEqualsForCompoundKey(change.OldNode.Row, change.Node.Row, fj.childKey) {
-			panic(joinKeyChangeDrift(fj.child.GetSchema(), change.OldNode.Row, "FlippedJoin-child-key-change"))
+			panic(joinKeyChangeError(fj.child.GetSchema(), change.OldNode.Row, "FlippedJoin-child-key-change"))
 		}
 		return fj.pushChildChange(change, true)
 	case ChangeTypeChild:
@@ -599,7 +599,7 @@ func (fj *FlippedJoin) pushParent(change Change) []Change {
 		return fj.output.Push(MakeChildChange(flip(change.Node), *change.Child), fj)
 	case ChangeTypeEdit:
 		if !RowEqualsForCompoundKey(change.OldNode.Row, change.Node.Row, fj.parentKey) {
-			panic(joinKeyChangeDrift(fj.schema, change.OldNode.Row, "FlippedJoin-parent-key-change"))
+			panic(joinKeyChangeError(fj.schema, change.OldNode.Row, "FlippedJoin-parent-key-change"))
 		}
 		return fj.output.Push(MakeEditChange(flip(change.Node), flip(*change.OldNode)), fj)
 	}

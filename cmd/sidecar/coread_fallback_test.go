@@ -6,7 +6,6 @@ import (
 	"testing"
 
 	"github.com/kartikparsoya-eng/go-ivm/internal/snapshotter"
-	"github.com/kartikparsoya-eng/go-ivm/internal/tablesource"
 )
 
 // TestBuildReaderPool_FallsBackOnNonWal2 is the DECISION-level companion to
@@ -39,7 +38,7 @@ func TestBuildReaderPool_FallsBackOnNonWal2(t *testing.T) {
 	// the fallback exists for. The writer handle is unused here.
 	path, _ := makeReplica(t)
 
-	srv := NewServer(tablesource.ModeTable, path)
+	srv := NewServer(path)
 	srv.appID = "myapp"
 	// hydrateReaders MUST be >1, else buildReaderPoolLocked short-circuits to
 	// (nil,nil,nil) "feature off" and never reaches the coread/fallback branch

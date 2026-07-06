@@ -1,7 +1,9 @@
 package main
 
-// MessagePack-RPC server over a Unix socket. One Engine per client group,
-// each running in its own goroutine so different groups execute in parallel.
+// MessagePack-RPC engine host. One Engine per client group, each running in
+// its own goroutine so different groups execute in parallel. Served ONLY via
+// the in-process NAPI transport (abi.go / napi_lib.go), which pumps
+// length-prefixed msgpack frames through handleConnection over a net.Pipe.
 // Wire format: 4-byte big-endian length prefix, then a MessagePack payload.
 
 import (
@@ -18,7 +20,6 @@ import (
 	"net/http"
 	_ "net/http/pprof" // registers /debug/pprof on http.DefaultServeMux when active
 	"os"
-	"os/signal"
 	"reflect"
 	"runtime"
 	"runtime/debug"
@@ -26,7 +27,6 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 
 	"github.com/kartikparsoya-eng/go-ivm/builder"
@@ -230,7 +230,7 @@ func writeFrame(w io.Writer, data []byte) error {
 // MAX_FRAME_SIZE (go-ivm-client.ts), orphaning the RPC into a 60s timeout that
 // freezes the client group. We convert oversize frames into this attributable
 // error so the call rejects immediately instead. The real fix is to chunk large
-// results via the streaming RPCs (addQueriesStream / advanceStream / *Stream);
+// results via the streaming RPCs (addQueriesStream / advanceToHeadStream);
 // this is the defense-in-depth net for any non-streaming path that slips
 // through (e.g. a single node whose subtree exceeds softChunkBytes).
 const errCodeFrameTooLarge = -32011
@@ -325,7 +325,7 @@ func (m *perfMetrics) recordHydrateChunks(n int) {
 	m.mu.Unlock()
 }
 
-// recordAdvanceChunks logs the chunk count for ONE advanceStream call
+// recordAdvanceChunks logs the chunk count for ONE advanceToHeadStream call
 // that just finalized. n=1 means the entire diff fit in one frame; n>1
 // means it crossed advanceChunkSize.
 func (m *perfMetrics) recordAdvanceChunks(n int) {
@@ -344,29 +344,26 @@ func (m *perfMetrics) recordAdvanceRows(n int) {
 }
 
 // startPprofServer opens the pprof + block/mutex profiling endpoint when
-// GO_IVM_PPROF_ADDR is set (nil when unset — off by default). Shared by the
-// socket main() and the in-process NAPI host: napi mode was previously BLIND
-// — pprof + the PERF reporter lived only in main(), which the host never runs
-// (REVIEW-napi-transport O1). pprof pinned the EXISTS N+1, the pin race, and
-// the GC ceiling on this project, so it must exist in-process too.
+// GO_IVM_PPROF_ADDR is set (nil when unset — off by default). Started by the
+// in-process NAPI host (REVIEW-napi-transport O1). pprof pinned the EXISTS
+// N+1, the pin race, and the GC ceiling on this project, so it must exist
+// in-process.
 //
-// napiMode derives a per-WORKER port from the PID for a bare ":port" addr:
-// napi syncer workers are separate PROCESSES that would otherwise all bind
-// the same fixed port and all but one would fail. A fully-qualified
-// host:port is honored verbatim (operator owns per-worker uniqueness). S3
-// bind guard preserved: a hostless addr defaults to loopback — pprof is an
-// RCE-grade surface (reads heap, dumps goroutines, can trigger GC).
-func startPprofServer(napiMode bool) *http.Server {
+// A bare ":port" addr derives a per-WORKER port from the PID: napi syncer
+// workers are separate PROCESSES that would otherwise all bind the same
+// fixed port and all but one would fail. A fully-qualified host:port is
+// honored verbatim (operator owns per-worker uniqueness). S3 bind guard
+// preserved: a hostless addr defaults to loopback — pprof is an RCE-grade
+// surface (reads heap, dumps goroutines, can trigger GC).
+func startPprofServer() *http.Server {
 	addr := os.Getenv("GO_IVM_PPROF_ADDR")
 	if addr == "" {
 		return nil
 	}
 	if strings.HasPrefix(addr, ":") {
-		if napiMode {
-			if p, err := strconv.Atoi(strings.TrimPrefix(addr, ":")); err == nil {
-				// Spread workers across a small band off the base port.
-				addr = fmt.Sprintf(":%d", p+os.Getpid()%1000)
-			}
+		if p, err := strconv.Atoi(strings.TrimPrefix(addr, ":")); err == nil {
+			// Spread workers across a small band off the base port.
+			addr = fmt.Sprintf(":%d", p+os.Getpid()%1000)
 		}
 		addr = "127.0.0.1" + addr
 	}
@@ -383,9 +380,9 @@ func startPprofServer(napiMode bool) *http.Server {
 }
 
 // runPerfReporter runs the 10-second [GO-IVM][PERF] window reporter plus the
-// replica-pool-pressure watch until ctx is cancelled. Shared by main() and
-// the NAPI host (REVIEW-napi-transport O1 — the PERF line is what every soak
-// greps). Blocking; run in a goroutine.
+// replica-pool-pressure watch until ctx is cancelled. Started by the NAPI
+// host (REVIEW-napi-transport O1 — the PERF line is what every soak greps).
+// Blocking; run in a goroutine.
 func (s *Server) runPerfReporter(ctx context.Context) {
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
@@ -594,21 +591,19 @@ func chunkStats(c []int) (p50, p95, max int) {
 	return c[len(c)/2], c[int(float64(len(c))*0.95)], c[len(c)-1]
 }
 
-const defaultSocket = "/tmp/go-ivm.sock"
-
 // Version handshake — bumped when wire format or RPC semantics change so
 // the TS client can refuse to talk to an incompatible sidecar
 // (REVIEW-final MED-CROSS-5).
 const (
 	sidecarVersion     = "0.7.0"
-	sidecarProtocolRev = 9 // bumped: streamed RowChange chunks (addQueriesStream, advanceStream, advanceToHeadStream) now use the positional wire encoding (see positional.go) — keys sent once per (queryID,table) group instead of per row. Rev 8 added advanceToHeadStream. Rev 7 added advanceToHead. Rev 6 added refreshSnapshot.
+	sidecarProtocolRev = 10 // bumped: removal sweep — loadRows/advanceToHead(unary)/advanceStream/refreshSnapshot/pipelineCount deleted; memory mode and the socket transport removed. A rev-9 TS client calling any of them must fail the handshake loudly instead of getting -32601 at runtime. Rev 9 introduced the positional wire encoding (positional.go).
 )
 
 // rpcCodeStaleInitEpoch signals that a mutating RPC arrived with an
 // initEpoch that doesn't match the cgID's current epoch. Caller is from a
 // torn-down view-syncer instance and must not be allowed to mutate engine
 // state. The TS client treats this as a no-op (the live instance will
-// reconcile via its own init+loadRows).
+// reconcile via its own init).
 const rpcCodeStaleInitEpoch = -32101
 
 // parallelThreshold is the min connection count per MemorySource at which
@@ -666,17 +661,6 @@ func connMaxIdleFromEnv() time.Duration {
 	return time.Duration(n) * time.Second
 }
 
-// maxDiffChanges caps how many change-log entries the UNARY advanceToHead
-// will materialize via diff.Collect (full row values per entry — see the
-// guard at its Collect call site). Above the cap the RPC returns an error and
-// the TS caller resets/re-hydrates with bounded memory. 50k fat rows ≈ low
-// hundreds of MB transient per CG — past that, replaying the diff is slower
-// than a re-hydrate anyway. SHADOW-ONLY since D9: the prod handler
-// (advanceToHeadStream) feeds the engine lazily off the changelog cursor and
-// has no Collect and no cap; the unary RPC's only callers are the drive-
-// shadow and P1 go-derived-diff audits (see PROD-PATH.md).
-var maxDiffChanges = envPositiveInt("GO_IVM_MAX_DIFF_CHANGES", 50_000)
-
 // advanceBudgetMs is the wall-clock budget for ONE advanceToHead[Stream]
 // call (derive + Collect + engine apply + emit). User's-audit item: a
 // pathologically slow advance pins the WAL2 frame the diff was derived
@@ -715,9 +699,7 @@ type RPCResponse struct {
 type RPCError struct {
 	Code    int    `json:"code"`
 	Message string `json:"message"`
-	// Data carries an optional structured payload. Used by the drift
-	// signal (code -32100) to ship *ivm.DriftError details — table, op,
-	// PK, has_count — so TS can log specifics before re-init.
+	// Data carries an optional structured payload for typed error codes.
 	Data interface{} `json:"data,omitempty"`
 }
 
@@ -746,11 +728,11 @@ type ClientGroup struct {
 	// calls don't panic on double-close.
 	closeOnce sync.Once
 	// initEpoch monotonically increments on every handleInit (atomic Add
-	// under mu). Mutating RPCs (loadRows / addQuery* / advance*) carry the
+	// under mu). Mutating RPCs (addQuery* / advance* / destroy) carry the
 	// epoch they were issued under; mismatch → rejected with
 	// rpcCodeStaleInitEpoch. This catches a torn-down view-syncer instance
-	// whose late-arriving loadRows would otherwise mix old-snapshot rows
-	// into the freshly init'd engine of a new instance for the same cgID.
+	// whose late-arriving mutation would otherwise corrupt the freshly
+	// init'd engine of a new instance for the same cgID.
 	// Cross-GENERATION protection (destroy→re-init creates a fresh
 	// ClientGroup) comes from Server.lastEpochs: creation seeds this from
 	// the graveyard so epochs never restart at 0 for a cgID the server has
@@ -792,8 +774,8 @@ type ClientGroup struct {
 
 	// snap is this group's Snapshotter — the Go-side leapfrog that derives
 	// its own snapshot diff from the replica's changeLog2 (internal/snapshotter).
-	// Non-nil only when GO_IVM_ADVANCE_TO_HEAD=true AND sourceMode==table; the
-	// advanceToHead RPC uses it instead of TS-shipped SnapshotChange[]. Built
+	// The advanceToHeadStream RPC applies its diff instead of any TS-shipped
+	// SnapshotChange[]. Built
 	// in handleInit (pinned at the then-current head, matching the hydrate
 	// version), torn down in shutdownGroup / re-init. snapSpecs/snapAllNames
 	// are the syncable TableSpecs and the full replicated table-name set,
@@ -850,9 +832,9 @@ type Server struct {
 	// cgID's re-init seeds the fresh ClientGroup from here, so the new
 	// generation's first epoch is strictly greater than anything the old
 	// generation handed out. Without it, destroy→re-init restarted the count
-	// at 0 and old-gen epoch N == new-gen epoch N: a late loadRows from the
-	// torn-down instance passed checkInitEpoch and wrote old-snapshot rows
-	// into the new engine — the exact corruption the epoch exists to stop.
+	// at 0 and old-gen epoch N == new-gen epoch N: a late mutation from the
+	// torn-down instance passed checkInitEpoch and corrupted the new
+	// engine — the exact corruption the epoch exists to stop.
 	// Guarded by mu (same critical sections that create/delete groups).
 	lastEpochs map[string]uint64
 
@@ -860,7 +842,7 @@ type Server struct {
 	// out-of-band delivery callback: (kind, payload) entries land on the
 	// addon's single ordered TSFN queue. Set ONCE by the ABI host before
 	// handleConnection starts (never mutated after) — handlers read it
-	// lock-free. nil on the socket transport, which disables row mode:
+	// lock-free. nil disables row mode (e.g. pipe-only unit fixtures):
 	// rowMode requests then stream ordinary msgpack partials via streamW.
 	// Payload bytes are valid only for the duration of the call (the
 	// receiver copies), so encoders may reuse their buffers.
@@ -874,16 +856,10 @@ type Server struct {
 	// streamgate.go). Zero-value ready.
 	streamGates streamGateRegistry
 
-	// Leaf-source mode for this sidecar process. ModeMemory uses the
-	// classic loadRows-populated MemorySource; ModeTable constructs a
-	// tablesource.Source per (cg, table) over replicaDB and treats
-	// loadRows as a no-op (the SQLite file is already authoritative).
-	sourceMode tablesource.Mode
-
-	// Path-and-lazy-open for the read-side replica pool. In table mode
-	// we keep main()'s accept loop unblocked by deferring the actual
-	// open until the first init RPC — by that time the TS replicator
-	// has finished writing the SQLite header.
+	// Path-and-lazy-open for the read-side replica pool. The replica is
+	// authoritative for every table (tablesource.Source per (cg, table));
+	// the actual open is deferred until the first init RPC — by that time
+	// the TS replicator has finished writing the SQLite header.
 	//
 	// Singleflight design (C13): pre-fix this used a single mutex held
 	// across the entire 60-second retry loop. N concurrent first-init
@@ -904,21 +880,8 @@ type Server struct {
 
 	// appID names the app whose `${appID}.permissions` table the Snapshotter's
 	// Diff watches for permissions-change resets. From GO_IVM_APP_ID (or the
-	// per-init AppID field). Only consulted when advanceToHead is enabled.
+	// per-init AppID field).
 	appID string
-
-	// advanceToHeadEnabled gates the Go-derived-diff path. When true (and
-	// sourceMode==table) handleInit builds a per-CG Snapshotter and the
-	// advanceToHead RPC becomes available. Off by default — the legacy
-	// TS-ships-the-diff advance path is unaffected (design §7 P1: behind a flag).
-	advanceToHeadEnabled bool
-
-	// advanceDriveEnabled (P2) turns advanceToHead from a pure derivation into a
-	// self-consistent driven advance: the engine's tablesource leaves are
-	// frame-bound to the Snapshotter's pinned conn (curr for hydrate, prev for
-	// the apply), so Go's own derived diff drives Go's engine with no TS-shipped
-	// changes and no frame-timing drift. Implies advanceToHeadEnabled.
-	advanceDriveEnabled bool
 
 	// hydrateReaders is GO_IVM_HYDRATE_READERS — the size of the per-CG
 	// frame-pinned reader pool used to parallelize cold-start hydrate (drive
@@ -947,11 +910,10 @@ type Server struct {
 	warmHydratePoolEnabled bool
 }
 
-func NewServer(mode tablesource.Mode, replicaPath string) *Server {
+func NewServer(replicaPath string) *Server {
 	return &Server{
 		groups:         make(map[string]*ClientGroup),
 		lastEpochs:     make(map[string]uint64),
-		sourceMode:     mode,
 		replicaPath:    replicaPath,
 		hydrateReaders: 1,
 		hydrateLanes:   4,
@@ -975,7 +937,7 @@ func (s *Server) getReplicaDB() (*sql.DB, error) {
 	}
 	if s.replicaPath == "" {
 		s.replicaMu.Unlock()
-		return nil, fmt.Errorf("getReplicaDB: replicaPath unset (sourceMode=%s)", s.sourceMode)
+		return nil, fmt.Errorf("getReplicaDB: replicaPath unset")
 	}
 	if s.replicaProbe != nil {
 		// A probe is already in flight. Wait for it to finish, then
@@ -1407,16 +1369,11 @@ func (g *ClientGroup) worker(s *Server) {
 		var start time.Time
 		method := req.req.Method
 
-		// advanceToHeadStream is drive mode's REPLACEMENT for advanceStream
-		// (TS ships no changes; Go derives + applies its own diff). Without it
-		// here, drive deployments report advances=0 in every [GO-IVM][PERF]
-		// line while the real advance traffic shows up only as PERF-CHUNKS row
-		// counts. The non-streaming advanceToHead is deliberately NOT counted:
-		// in derive-only shadow mode TS still applies changes via
-		// advanceStream (counted), so counting the derivation call too would
-		// double-count each logical advance.
+		// advanceToHeadStream is THE advance: TS ships no changes; Go derives
+		// + applies its own diff. Counted here so [GO-IVM][PERF] lines report
+		// real advance traffic (advances=N), not just PERF-CHUNKS row counts.
 		switch method {
-		case "advanceStream", "advanceToHeadStream":
+		case "advanceToHeadStream":
 			start = time.Now()
 			n := metrics.advancesInFlight.Add(1)
 			updatePeak(&metrics.peakAdvConc, n)
@@ -1434,17 +1391,13 @@ func (g *ClientGroup) worker(s *Server) {
 			// Streaming variant: per-query partial frames go through streamW;
 			// the terminal "done" RPCResponse still flows through respCh.
 			// C1: the stream handlers run OUTSIDE handleRequest's recover, and
-			// AdvanceStream deliberately re-raises non-drift panics on this
-			// (worker) goroutine — so without this recover such a panic aborts
+			// the engine deliberately re-raises panics on this (worker)
+			// goroutine — so without this recover such a panic aborts
 			// the whole multi-CG process. Convert it to an error response (the
 			// TS client rejects the call) instead.
 			resp = s.handleStreamWithRecover(req.req, req.streamW, s.handleAddQueriesStream)
-		} else if req.streamW != nil && method == "advanceStream" {
-			// Streaming variant of advance: partial frames go through streamW;
-			// terminal "done" RPCResponse still flows through respCh.
-			resp = s.handleStreamWithRecover(req.req, req.streamW, s.handleAdvanceStream)
 		} else if req.streamW != nil && method == "advanceToHeadStream" {
-			// Streaming variant of advanceToHead (drive mode): chunked RowChanges
+			// Streaming advance (drive): chunked RowChanges
 			// go through streamW; terminal "done" RPCResponse flows through respCh.
 			resp = s.handleStreamWithRecover(req.req, req.streamW, s.handleAdvanceToHeadStream)
 		} else {
@@ -1454,7 +1407,7 @@ func (g *ClientGroup) worker(s *Server) {
 		endSpan(resp.Error)
 
 		switch method {
-		case "advanceStream", "advanceToHeadStream":
+		case "advanceToHeadStream":
 			metrics.advancesInFlight.Add(-1)
 			metrics.recordAdvance(time.Since(start))
 		case "addQueriesStream":
@@ -1614,13 +1567,24 @@ func (s *Server) closeAll() {
 // json column, int beyond MAX_SAFE_INTEGER, cross-type compare). The TS
 // view-syncer (RPC_CODE_DATA_ERROR in go-ivm-client.ts) tears down the CG
 // instead of escalating to a pipeline reset, which would re-read the same bad
-// row and loop forever. Generic panics keep -32000 (transient → reset).
+// row and loop forever. Generic panics keep -32000 ('unclassified' → rethrow
+// → teardown under the follow-TS failure model).
 const rpcCodeDataError = -32102
+
+// rpcCodeScalarReset marks a recovered *engine.ScalarResetError: a resolved
+// scalar subquery's value changed mid-advance, so the main query's baked-in
+// literal is stale. TS's own companion push throws
+// ResetPipelinesSignal('scalar-subquery') here (pipeline-driver.ts:1468) —
+// a RESET + re-hydrate, NOT a teardown — so this must not ride -32000
+// ('unclassified' → teardown). The TS client maps this code back to the
+// same ResetPipelinesSignal('scalar-subquery').
+const rpcCodeScalarReset = -32105
 
 // panicErrorCode returns the RPC error code for a recovered panic value:
 // rpcCodeDataError for an *ivm.DataError, rpcCodeAdvanceAborted for the
 // economic advancement-abort (advance_abort.go — sink-site aborts panic
-// because the engine sink has no error return), -32000 otherwise.
+// because the engine sink has no error return), rpcCodeScalarReset for the
+// companion scalar-subquery reset, -32000 otherwise.
 func panicErrorCode(r any) int {
 	if _, ok := r.(*ivm.DataError); ok {
 		return rpcCodeDataError
@@ -1628,15 +1592,22 @@ func panicErrorCode(r any) int {
 	if _, ok := r.(*advanceAbortedError); ok {
 		return rpcCodeAdvanceAborted
 	}
+	if _, ok := r.(*engine.ScalarResetError); ok {
+		return rpcCodeScalarReset
+	}
 	return -32000
 }
 
 // panicErrorMessage renders a recovered panic for the wire. The economic
 // abort must arrive byte-identical to TS's advancement-timeout message (the
 // TS side surfaces it as the ResetPipelinesSignal message), so it must NOT
-// get the "panic: " prefix diagnostics use.
+// get the "panic: " prefix diagnostics use. Same for the scalar reset,
+// whose message mirrors TS's ResetPipelinesSignal('scalar-subquery') text.
 func panicErrorMessage(r any) string {
 	if e, ok := r.(*advanceAbortedError); ok {
+		return e.Error()
+	}
+	if e, ok := r.(*engine.ScalarResetError); ok {
 		return e.Error()
 	}
 	return fmt.Sprintf("panic: %v", r)
@@ -1649,7 +1620,7 @@ func panicErrorMessage(r any) string {
 // arrives here wrapped, not as a live panic. errors.As unwraps it → the SAME
 // rpcCodeDataError the advance path emits via panicErrorCode, so TS classifies
 // a bad replica value identically whether it surfaces in hydrate or advance.
-// Everything else keeps -32000 (transient → TS reset).
+// Everything else keeps -32000 ('unclassified' → teardown).
 func hydrateErrorResponse(reqID interface{}, prefix string, err error) RPCResponse {
 	var de *ivm.DataError
 	if errors.As(err, &de) {
@@ -1660,7 +1631,7 @@ func hydrateErrorResponse(reqID interface{}, prefix string, err error) RPCRespon
 
 // handleStreamWithRecover runs a streaming handler with a panic recover (C1).
 // The streaming handlers dispatch directly from the worker goroutine, bypassing
-// handleRequest's recover; AdvanceStream also re-raises non-drift panics onto
+// handleRequest's recover; the engine also re-raises panics onto
 // this goroutine. Without this, such a panic would abort the whole process.
 // Any partial frames already written are harmless — the error RPCResponse makes
 // the TS client reject the call rather than awaiting a "done" that never comes.
@@ -1706,28 +1677,15 @@ func (s *Server) handleRequest(req RPCRequest) (resp RPCResponse) {
 			Result: map[string]interface{}{
 				"version":     sidecarVersion,
 				"protocolRev": sidecarProtocolRev,
-				// sourceMode lets TS skip shipping row contents at init when
-				// the sidecar reads SQLite directly (loadRows is a no-op in
-				// table mode). Additive field — clients that don't read it
-				// keep the old ship-everything behavior.
-				"sourceMode": s.sourceMode.String(),
 			},
 			ID: req.ID,
 		}
 	case "init":
 		return s.handleInit(req)
-	case "loadRows":
-		return s.handleLoadRows(req)
 	case "removeQuery":
 		return s.handleRemoveQuery(req)
-	case "advanceToHead":
-		return s.handleAdvanceToHead(req)
 	case "destroy":
 		return s.handleDestroy(req)
-	case "refreshSnapshot":
-		return s.handleRefreshSnapshot(req)
-	case "pipelineCount":
-		return s.handlePipelineCount(req)
 	default:
 		return RPCResponse{
 			JSONRPC: "2.0",
@@ -1762,16 +1720,6 @@ type tableSchemaParams struct {
 	// bump an emitted row's _0_version up to it when below (audit item K, port of
 	// pipeline-driver.ts:3172-3178). Empty/absent means no bump for this table.
 	MinRowVersion string `json:"minRowVersion,omitempty"`
-	// Rows are typed as ivm.Row (not []map[string]interface{}) so the custom
-	// Row.DecodeMsgpack runs at decode time — performing the in-place
-	// int->float64 coercion that the SnapshotChange path already gets via
-	// engine.SnapshotChange.PrevValues being typed as ivm.Row. Without this
-	// the init/loadRows paths produce int* values that survive into
-	// downstream comparisons in MemorySource mode; the FromSQLiteType
-	// coercion below catches schema-mapped columns but the no-schema
-	// fallback (e.g. json columns) leaves the raw decoded type asymmetric
-	// vs the advance path. Audit's latent ModeMemory<->ModeTable divergence.
-	Rows []ivm.Row `json:"rows"`
 }
 
 func (s *Server) handleInit(req RPCRequest) RPCResponse {
@@ -1805,7 +1753,7 @@ func (s *Server) handleInit(req RPCRequest) RPCResponse {
 		group.snapAllNames = nil
 	}
 
-	// Bump epoch BEFORE we create the new engine so any in-flight loadRows
+	// Bump epoch BEFORE we create the new engine so any in-flight mutation
 	// from the prior epoch is rejected even if it races the engine swap.
 	currentEpoch := group.initEpoch.Add(1)
 
@@ -1824,71 +1772,34 @@ func (s *Server) handleInit(req RPCRequest) RPCResponse {
 	}
 	group.eng = eng
 
-	// For each table: register the leaf source. In ModeMemory we build a
-	// MemorySource and bulk-load the rows TS sent in the init payload.
-	// In ModeTable we build a tablesource.Source over the shared replica
-	// pool — schema.Rows is ignored (the SQLite file is authoritative).
+	// For each table: register the tablesource.Source leaf over the shared
+	// replica pool — the SQLite file is authoritative; init carries schema
+	// only.
 	minRowVersions := make(map[string]string)
 	for tableName, schema := range p.Tables {
 		if schema.MinRowVersion != "" {
 			minRowVersions[tableName] = schema.MinRowVersion
 		}
-		columns := make(map[string]string, len(schema.Columns))
-		for col, cs := range schema.Columns {
-			columns[col] = cs.Type
+
+		db, err := s.getReplicaDB()
+		if err != nil {
+			return rpcError(req.ID, -32000,
+				"replica not ready: "+err.Error())
 		}
-
-		if s.sourceMode == tablesource.ModeTable {
-			db, err := s.getReplicaDB()
-			if err != nil {
-				return rpcError(req.ID, -32000,
-					"replica not ready: "+err.Error())
-			}
-			writableDB := s.getReplicaWritableDB()
-			if writableDB == nil {
-				return rpcError(req.ID, -32000,
-					"writable replica pool not ready")
-			}
-			src, err := tablesource.New(db, writableDB, tableName, schema.Columns, schema.PrimaryKey)
-			if err != nil {
-				return rpcError(req.ID, -32000,
-					"tablesource.New for "+tableName+": "+err.Error())
-			}
-			eng.RegisterSource(src)
-		} else {
-			tripwire("init memory-mode source (loadRows-backed MemorySource)")
-			// Inject FromSQLiteType as the column converter so MemorySource.NormalizeRow
-			// (called on every advance / loadRows row) produces the same type shapes
-			// as the init path for ALL column types — including json/string/blob,
-			// which the legacy partial converter missed. REVIEW-ts-integration CRITICAL-3.
-			ms := ivm.NewMemorySourceWithConverter(
-				tableName, columns, schema.PrimaryKey,
-				func(v interface{}, colType string) ivm.Value {
-					return sqlite.FromSQLiteType(v, colType)
-				},
-			)
-
-			// Convert raw JSON rows to typed ivm.Row using column schemas
-			rows := make([]ivm.Row, 0, len(schema.Rows))
-			for _, rawRow := range schema.Rows {
-				row := make(ivm.Row, len(rawRow))
-				for col, val := range rawRow {
-					if cs, ok := schema.Columns[col]; ok {
-						row[col] = sqlite.FromSQLiteType(val, cs.Type)
-					} else {
-						row[col] = val
-					}
-				}
-				rows = append(rows, row)
-			}
-			ms.BulkInsert(rows)
-
-			eng.RegisterMemorySource(ms)
+		writableDB := s.getReplicaWritableDB()
+		if writableDB == nil {
+			return rpcError(req.ID, -32000,
+				"writable replica pool not ready")
 		}
+		src, err := tablesource.New(db, writableDB, tableName, schema.Columns, schema.PrimaryKey)
+		if err != nil {
+			return rpcError(req.ID, -32000,
+				"tablesource.New for "+tableName+": "+err.Error())
+		}
+		eng.RegisterSource(src)
 
-		// Forward unique-key metadata for the scalar-subquery resolver.
-		// Same call for both source modes (scalar resolution is upstream
-		// of the leaf source).
+		// Forward unique-key metadata for the scalar-subquery resolver
+		// (scalar resolution is upstream of the leaf source).
 		if len(schema.UniqueKeys) > 0 {
 			eng.SetTableUniqueKeys(tableName, schema.UniqueKeys)
 		}
@@ -1898,17 +1809,15 @@ func (s *Server) handleInit(req RPCRequest) RPCResponse {
 	// (audit item K). Empty map is fine — bumpRowVersions is a no-op then.
 	eng.SetMinRowVersions(minRowVersions)
 
-	// Build the per-CG Snapshotter when the Go-derived-diff path is armed.
-	// Pinned at the current replica head, which is the same frame the
-	// hydrate (tablesource fetch) reads from, so the first advanceToHead diff
-	// is computed against the version the engine was hydrated at. Failures
-	// here are non-fatal: advanceToHead simply stays unavailable for this CG
-	// and the legacy TS-shipped advance path keeps working.
-	if s.advanceToHeadEnabled && s.sourceMode == tablesource.ModeTable {
-		if err := s.buildSnapshotterLocked(group, &p); err != nil {
-			fmt.Fprintf(os.Stderr,
-				"[GO-IVM] advanceToHead disabled for cg=%s: %v\n", cgID, err)
-		}
+	// Build the per-CG Snapshotter — the advanceToHeadStream drive path's
+	// leapfrog. Pinned at the current replica head, which is the same frame
+	// the hydrate (tablesource fetch) reads from, so the first advance diff
+	// is computed against the version the engine was hydrated at. With the
+	// TS-shipped advance path removed there is no fallback for a CG whose
+	// snapshotter failed to build — fail the init loudly instead (TS's own
+	// Snapshotter constructor throws on failure, tearing the syncer down).
+	if err := s.buildSnapshotterLocked(group, &p); err != nil {
+		return rpcError(req.ID, -32000, "snapshotter init: "+err.Error())
 	}
 
 	return RPCResponse{
@@ -1921,27 +1830,6 @@ func (s *Server) handleInit(req RPCRequest) RPCResponse {
 	}
 }
 
-// --- loadRows: append a chunked batch of rows to a registered MemorySource ---
-//
-// init carries schema only; loadRows streams data in batches sized to fit
-// comfortably under the 64MB frame cap. Each batch is normalized via
-// FromSQLiteType per column before insertion, matching the init path.
-// REVIEW-ts-integration CRITICAL-2.
-
-type loadRowsParams struct {
-	ClientGroupID string `json:"clientGroupID"`
-	Table         string `json:"table"`
-	// Rows typed as ivm.Row so Row.DecodeMsgpack runs uniformly with the
-	// SnapshotChange path; see tableSchemaParams.Rows for full rationale.
-	Rows []ivm.Row `json:"rows"`
-	// InitEpoch must match the cgID's current epoch (returned by handleInit).
-	// Stale callers (torn-down view-syncer whose loadRows raced past the
-	// init from a new instance for the same cgID) are rejected with
-	// rpcCodeStaleInitEpoch instead of corrupting the new engine's state.
-	// 0 = caller didn't send one (pre-protocolRev-5 client) → reject.
-	InitEpoch uint64 `json:"initEpoch"`
-}
-
 // checkInitEpoch verifies the caller's epoch matches the cg's current
 // epoch under group.mu. Caller must already hold group.mu. Returns
 // an RPCResponse with rpcCodeStaleInitEpoch if stale, else (response, false).
@@ -1952,66 +1840,6 @@ func checkInitEpoch(group *ClientGroup, reqID interface{}, callerEpoch uint64) (
 		), true
 	}
 	return RPCResponse{}, false
-}
-
-func (s *Server) handleLoadRows(req RPCRequest) RPCResponse {
-	var p loadRowsParams
-	if err := mpUnmarshal(req.Params, &p); err != nil {
-		return rpcError(req.ID, -32602, err.Error())
-	}
-
-	// In table mode the SQLite replica is authoritative — TS still sends
-	// loadRows for protocol compatibility, but we have nothing to do
-	// with the rows. Return success without touching engine state.
-	if s.sourceMode == tablesource.ModeTable {
-		tripwire("rpc loadRows (table-mode no-op; old zero-cache generation?)")
-		return RPCResponse{
-			JSONRPC: "2.0",
-			Result:  map[string]interface{}{"status": "ok"},
-			ID:      req.ID,
-		}
-	}
-	tripwire("rpc loadRows (memory-mode seeding)")
-
-	cgID := p.ClientGroupID
-	if cgID == "" {
-		cgID = "default"
-	}
-
-	group := s.getGroup(cgID, false)
-	if group == nil {
-		return rpcError(req.ID, -32000, "engine not initialized (call init first)")
-	}
-	group.mu.Lock()
-	defer group.mu.Unlock()
-
-	if group.eng == nil {
-		return rpcError(req.ID, -32000, "engine not initialized (call init first)")
-	}
-	if resp, stale := checkInitEpoch(group, req.ID, p.InitEpoch); stale {
-		return resp
-	}
-
-	ms := group.eng.GetMemorySource(p.Table)
-	if ms == nil {
-		return rpcError(req.ID, -32000, "no MemorySource registered for table: "+p.Table)
-	}
-
-	columns := ms.Columns()
-	rows := make([]ivm.Row, 0, len(p.Rows))
-	for _, rawRow := range p.Rows {
-		row := make(ivm.Row, len(rawRow))
-		for col, val := range rawRow {
-			if colType, ok := columns[col]; ok {
-				row[col] = sqlite.FromSQLiteType(val, colType)
-			} else {
-				row[col] = val
-			}
-		}
-		rows = append(rows, row)
-	}
-	ms.BulkInsert(rows)
-	return RPCResponse{JSONRPC: "2.0", Result: "ok", ID: req.ID}
 }
 
 // --- addQueriesParams: shared by addQueriesStream (push + pull modes) ---
@@ -2226,150 +2054,6 @@ func (s *Server) handleRemoveQuery(req RPCRequest) RPCResponse {
 	return RPCResponse{JSONRPC: "2.0", Result: "ok", ID: req.ID}
 }
 
-// --- advance: push snapshot diffs through all pipelines ---
-
-type advanceParams struct {
-	ClientGroupID string                  `json:"clientGroupID"`
-	Changes       []engine.SnapshotChange `json:"changes"`
-	InitEpoch     uint64                  `json:"initEpoch"`
-	// RowMode opts this call into the NAPI row plane: RowChanges cross the
-	// Go↔JS boundary as per-row flat records (kind 2/3 deliveries) instead
-	// of msgpack partial frames. Honored only when the in-process transport
-	// is active (Server.abiDeliver != nil) AND the request ID is numeric;
-	// otherwise silently degrades to the ordinary frame path.
-	RowMode bool `json:"rowMode,omitempty"`
-}
-
-// rpcCodeDrift is the JSON-RPC error code for source-drift detection.
-// TS-side go-ivm-client recognizes this code and triggers re-init via the
-// existing onRestart pipeline, then emits the partial Changes the drift
-// data carries to clients before re-hydrating (matching TS's view-syncer
-// where assert-and-throw streams pre-throw RowChanges to pokers before
-// snapshot revert).
-const rpcCodeDrift = -32100
-
-// driftRPCData is the JSON shape Go ships in the rpcCodeDrift error's
-// Data field. Carries the standard *ivm.DriftError diagnostic fields
-// PLUS the partial Advance output produced by Pushes that completed
-// successfully BEFORE the panic. TS-side accumulates these into
-// DriftError.partialChanges so GoComputeBackend's drift recovery can
-// forward them to the view-syncer instead of dropping them.
-type driftRPCData struct {
-	Table          string               `json:"table"`
-	Op             string               `json:"op"`
-	PK             map[string]ivm.Value `json:"pk"`
-	HasCount       int                  `json:"hasCount"`
-	PartialChanges []engine.RowChange   `json:"partialChanges,omitempty"`
-	PartialTimings []engine.TableTiming `json:"partialTimings,omitempty"`
-}
-
-// --- advanceStream: streaming variant of the push-mode advance ---
-//
-// Wire shape: one OR MORE "partial" frames with the same id, each carrying
-// `{changes, chunkIndex, final, timings?}`. Frames arrive in monotonic
-// chunkIndex order (the engine's AdvanceStream calls onResult synchronously
-// from one goroutine). Exactly one frame has final=true (the last); only
-// that frame carries timings. After the final partial frame, exactly one
-// terminal frame whose Result is the literal string "done" — TS client
-// uses "done" to resolve the call promise.
-//
-// Reuses `advanceParams` (the {clientGroupID, changes, initEpoch} request
-// shape).
-
-type advanceStreamPartial struct {
-	// Positional (rev 9) RowChange encoding — see positional.go.
-	Dict       []dictEntry          `json:"d,omitempty"`
-	Rows       [][]interface{}      `json:"r,omitempty"`
-	ChunkIndex int                  `json:"chunkIndex"`
-	Final      bool                 `json:"final"`
-	Timings    []engine.TableTiming `json:"timings,omitempty"`
-	// Drift is non-nil only on the Final frame and only when MemorySource
-	// raised *ivm.DriftError mid-advance. TS client treats this as a
-	// signal to discard the whole stream + trigger re-init.
-	Drift *ivm.DriftError `json:"drift,omitempty"`
-}
-
-func (s *Server) handleAdvanceStream(req RPCRequest, streamW streamWriter) RPCResponse {
-	// Push-mode advance: TS computes the diff and ships it. The default
-	// (prod) path is advanceToHeadStream — Go derives its own diff (drive
-	// mode, GO_IVM_ADVANCE_DRIVE=true + goSidecar.goPrimaryTrigger). This
-	// handler is the drive-off rollback path and the shadow harness's
-	// non-drive arm; it is NOT scheduled for removal, but a default-path
-	// deployment must never log this marker.
-	nonDefault("rpc advanceStream (push-mode advance; drive-off rollback / shadow harness)")
-	var p advanceParams
-	if err := mpUnmarshal(req.Params, &p); err != nil {
-		return rpcError(req.ID, -32602, err.Error())
-	}
-
-	cgID := p.ClientGroupID
-	if cgID == "" {
-		cgID = "default"
-	}
-
-	group := s.getGroup(cgID, false)
-	if group == nil {
-		return rpcError(req.ID, -32000, "engine not initialized (call init first)")
-	}
-	group.mu.Lock()
-	defer group.mu.Unlock()
-
-	if group.eng == nil {
-		return rpcError(req.ID, -32000, "engine not initialized")
-	}
-	if resp, stale := checkInitEpoch(group, req.ID, p.InitEpoch); stale {
-		return resp
-	}
-
-	// Row mode (NAPI transport only): per-row records via abiDeliver with
-	// chunkSize=1 so each RowChange crosses the boundary as the engine
-	// produces it. The engine partial's rows are re-routed; the terminal
-	// frame still ships (kind-1) carrying ChunkIndex/Final/Timings/Drift.
-	if rp := newRowPlane(s, req.ID, p.RowMode); rp != nil {
-		err := group.eng.AdvanceStreamChunked(p.Changes, 1, func(r engine.AdvanceStreamPartial) {
-			rp.emitAdvancePartial(r)
-			if r.Drift != nil {
-				fmt.Fprintf(os.Stderr, "[GO-IVM][drift] advanceStream(rowMode) cg=%s %s\n", cgID, r.Drift.Error())
-			}
-			if r.Final {
-				metrics.recordAdvanceChunks(r.ChunkIndex + 1)
-			}
-		})
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "[GO-IVM] advanceStream(rowMode) ERROR cg=%s: %v\n", cgID, err)
-			return rpcError(req.ID, -32000, "advanceStream: "+err.Error())
-		}
-		return RPCResponse{JSONRPC: "2.0", Result: "done", ID: req.ID}
-	}
-
-	err := group.eng.AdvanceStream(p.Changes, func(r engine.AdvanceStreamPartial) {
-		pc := toPositional(r.Changes)
-		streamW(req.ID, advanceStreamPartial{
-			Dict:       pc.Dict,
-			Rows:       pc.Rows,
-			ChunkIndex: r.ChunkIndex,
-			Final:      r.Final,
-			Timings:    r.Timings,
-			Drift:      r.Drift,
-		})
-		if r.Drift != nil {
-			fmt.Fprintf(os.Stderr, "[GO-IVM][drift] advanceStream cg=%s %s\n", cgID, r.Drift.Error())
-		}
-		// One advanceStream call → one record on the terminal frame.
-		// Final's ChunkIndex+1 is the total chunk count for this call.
-		if r.Final {
-			metrics.recordAdvanceChunks(r.ChunkIndex + 1)
-		}
-	})
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "[GO-IVM] advanceStream ERROR cg=%s: %v\n", cgID, err)
-		return rpcError(req.ID, -32000, "advanceStream: "+err.Error())
-	}
-
-	// "done" sentinel — TS client uses this to resolve the call promise.
-	return RPCResponse{JSONRPC: "2.0", Result: "done", ID: req.ID}
-}
-
 // --- destroy: tear down a client group ---
 
 type destroyParams struct {
@@ -2411,104 +2095,6 @@ func (s *Server) handleDestroy(req RPCRequest) RPCResponse {
 	}
 
 	s.removeGroup(cgID)
-	return RPCResponse{JSONRPC: "2.0", Result: "ok", ID: req.ID}
-}
-
-// refreshSnapshotParams shares the clientGroupID-only shape with other
-// per-CG RPCs.
-type refreshSnapshotParams struct {
-	ClientGroupID string `json:"clientGroupID"`
-	InitEpoch     uint64 `json:"initEpoch"`
-}
-
-// pipelineCountParams: cgID-only health probe, no initEpoch (we want this
-// to succeed during/after recovery to detect freeze, not be rejected as
-// stale).
-type pipelineCountParams struct {
-	ClientGroupID string `json:"clientGroupID"`
-}
-
-// handlePipelineCount returns the number of queries currently registered
-// on this CG's engine. Drift audit uses it to detect the C2 freeze: TS
-// believes N queries are active, Go reports 0 → per-CG recovery dropped
-// pipeline state somewhere along the way. Returns 0 (not an error) when
-// the engine isn't initialized — the absence-of-engine is the answer,
-// and forcing the audit to handle an error response would just add noise.
-func (s *Server) handlePipelineCount(req RPCRequest) RPCResponse {
-	var p pipelineCountParams
-	if err := mpUnmarshal(req.Params, &p); err != nil {
-		return rpcError(req.ID, -32602, err.Error())
-	}
-	cgID := p.ClientGroupID
-	if cgID == "" {
-		cgID = "default"
-	}
-	group := s.getGroup(cgID, false)
-	if group == nil {
-		// pipelineCount is a health probe; an absent group is a valid
-		// answer (0 pipelines), not an error. Returning rpcError would
-		// surface as a generic Error in TS and bypass the freeze-
-		// detection path that compares numbers.
-		return RPCResponse{JSONRPC: "2.0", Result: 0, ID: req.ID}
-	}
-	group.mu.Lock()
-	defer group.mu.Unlock()
-	count := 0
-	if group.eng != nil {
-		count = group.eng.PipelineCount()
-	}
-	return RPCResponse{JSONRPC: "2.0", Result: count, ID: req.ID}
-}
-
-// handleRefreshSnapshot rolls each registered Source's pinned snapshot
-// (no-op for MemorySource). Used by the TS drift audit so its
-// comparison reads see Go's view of the current replica state, not the
-// snapshot pinned since the last Push — which would otherwise produce
-// transient set differences during sustained writes.
-//
-// initEpoch guard matches the other mutating RPCs: a stale audit from a
-// torn-down view-syncer must not roll the new instance's tx.
-func (s *Server) handleRefreshSnapshot(req RPCRequest) RPCResponse {
-	var p refreshSnapshotParams
-	if err := mpUnmarshal(req.Params, &p); err != nil {
-		return rpcError(req.ID, -32602, err.Error())
-	}
-	cgID := p.ClientGroupID
-	if cgID == "" {
-		cgID = "default"
-	}
-	group := s.getGroup(cgID, false)
-	if group == nil {
-		return rpcError(req.ID, -32000, "engine not initialized (call init first)")
-	}
-	// Snapshot eng + initEpoch under a brief mu hold, then release before
-	// the (potentially slow) RefreshAllSources call. Pre-fix this held
-	// group.mu for the whole RefreshAllSources duration, serializing with
-	// the per-CG worker's currently-running handler — which defeated the
-	// reader-loop's deliberate decision to route this RPC AROUND the FIFO
-	// (see the routing comment in handleConnection). Holding mu briefly
-	// keeps eng+epoch read race-free; releasing before the call lets
-	// engine.RefreshAllSources execute concurrently with whatever the
-	// worker is doing (advance/hydrate). RefreshAllSources is itself
-	// lock-free against e.mu after the atomic.Pointer COW refactor, so
-	// no contention remains at any level.
-	//
-	// Lifecycle safety: once we hold a non-nil eng pointer locally, Go's
-	// GC keeps the engine alive even if shutdownGroup races and nils
-	// group.eng concurrently. RefreshAllSources called on a closed engine
-	// is a no-op (sources.Load() returns nil after Close).
-	group.mu.Lock()
-	eng := group.eng
-	if eng == nil {
-		group.mu.Unlock()
-		return rpcError(req.ID, -32000, "engine not initialized (call init first)")
-	}
-	resp, stale := checkInitEpoch(group, req.ID, p.InitEpoch)
-	group.mu.Unlock()
-	if stale {
-		return resp
-	}
-	eng.RefreshAllSources()
 	return RPCResponse{JSONRPC: "2.0", Result: "ok", ID: req.ID}
 }
 
@@ -2647,15 +2233,8 @@ func handleConnection(conn net.Conn, server *Server) {
 		// Preserve FIFO ordering per client group: enqueue SYNCHRONOUSLY
 		// (in read-loop order). The writer goroutine drains responses in
 		// the same order.
-		//
-		// refreshSnapshot bypasses the per-CG worker FIFO. It only bumps
-		// per-source mutexes and is a no-op when overlay!=nil, so
-		// running concurrently with the CG's advance/hydrate is safe.
-		// Routing it through the FIFO meant queueing behind multi-second
-		// hydrates, and the audit's 30s/120s RPC budget couldn't absorb
-		// that under sustained multi-CG load.
 		cgID := extractClientGroupID(req)
-		if cgID != "" && req.Method != "refreshSnapshot" {
+		if cgID != "" {
 			// Only init can create a new group. Non-init RPCs for an absent
 			// group are rejected at dispatch time so the reader never spawns
 			// an orphan empty ClientGroup whose only purpose is to fail
@@ -2670,8 +2249,7 @@ func handleConnection(conn net.Conn, server *Server) {
 			// Streaming methods get a streamWriter; non-streaming methods
 			// don't (streamW field stays nil).
 			var sw streamWriter
-			if req.Method == "addQueriesStream" || req.Method == "advanceStream" ||
-				req.Method == "advanceToHeadStream" {
+			if req.Method == "addQueriesStream" || req.Method == "advanceToHeadStream" {
 				sw = streamW
 			}
 			if !group.trySendReq(clientGroupReq{req: req, respCh: respCh, streamW: sw, group: group}) {
@@ -2836,136 +2414,15 @@ func readCgroupMemoryLimit() int64 {
 	return 0
 }
 
+// main is a stub: the socket transport was removed in the RPC-surface
+// removal sweep (protocolRev 10). The ONLY supported deployment is the
+// in-process NAPI transport — build the c-shared library with
+// `-tags napilib -buildmode=c-shared` and dlopen it from the zero-cache
+// syncer worker (see napi_lib.go / abi.go). This package remains `main`
+// so the plain `go build ./cmd/sidecar` compile gate keeps working.
 func main() {
-	socketPath := defaultSocket
-	if len(os.Args) > 1 {
-		socketPath = os.Args[1]
-	}
-
-	// Relax GC before serving — the allocation rate, not the cores, caps
-	// multi-CG parallel scaling (see tuneRuntime).
-	tuneRuntime()
-
-	// Log the per-Take state-cache bound: it caps retained Go heap from
-	// high-cardinality Take partitions (the dominant pre-OOM allocation found
-	// by heap-profiling). 0 = unbounded (the old, OOM-prone behavior).
-	if m := sqlite.TakeStateCacheMax(); m > 0 {
-		fmt.Fprintf(os.Stderr,
-			"[GO-IVM] take-state cache: max %d entries per operator (GO_IVM_TAKE_STATE_CACHE_MAX)\n", m)
-	} else {
-		fmt.Fprintf(os.Stderr,
-			"[GO-IVM] take-state cache: UNBOUNDED (GO_IVM_TAKE_STATE_CACHE_MAX=0)\n")
-	}
-
-	// CRIT-6 (coercion self-check), leaf-source mode resolution, replica-path
-	// validation, and all GO_IVM_* server config live in newServerFromEnv
-	// (abi.go) — shared verbatim with the in-process NAPI host so both
-	// transports construct an identical Server. Exit-on-error stays here:
-	// only the standalone binary may terminate the process.
-	server, err := newServerFromEnv()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "[GO-IVM] FATAL: %v\n", err)
-		os.Exit(1)
-	}
-
-	// Shutdown context for background goroutines (metrics reporter, idle reaper).
-	// Cancelled by the SIGINT/SIGTERM handler so goroutines exit cleanly.
-	shutdownCtx, shutdownCancel := context.WithCancel(context.Background())
-	defer shutdownCancel()
-	// pprof endpoint — off unless GO_IVM_PPROF_ADDR is set. Extracted to
-	// startPprofServer so the NAPI host shares it (O1). Socket mode: no
-	// per-worker port derivation (one process).
-	pprofServer := startPprofServer(false)
-
-	// Remove stale socket — but ONLY if the path is an actual leftover socket,
-	// not a live file or directory someone (or another process) placed there.
-	// Blind os.Remove would clobber a non-socket file and silently mask a
-	// misconfiguration (S2). A missing path is the normal first-run case.
-	if info, err := os.Stat(socketPath); err == nil {
-		if info.Mode()&os.ModeSocket != 0 {
-			if err := os.Remove(socketPath); err != nil {
-				fmt.Fprintf(os.Stderr, "Failed to remove stale socket %s: %v\n", socketPath, err)
-				os.Exit(1)
-			}
-		} else {
-			fmt.Fprintf(os.Stderr, "Socket path %s exists but is not a socket (mode=%v); refusing to remove\n", socketPath, info.Mode())
-			os.Exit(1)
-		}
-	}
-
-	listener, err := net.Listen("unix", socketPath)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to listen: %v\n", err)
-		os.Exit(1)
-	}
-	// Restrict the socket to owner-only access (S1). The sidecar is a local
-	// subprocess of zero-cache, so only the same-uid zero-cache process needs
-	// to connect; 0600 prevents any other local user from talking to it.
-	if err := os.Chmod(socketPath, 0o600); err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to chmod socket %s: %v\n", socketPath, err)
-		_ = listener.Close()
-		os.Exit(1)
-	}
-	defer listener.Close()
-
-	otelShutdown, err := otelInit(context.Background())
-	if err != nil {
-		// Telemetry must never take the sidecar down — log and continue noop.
-		fmt.Fprintf(os.Stderr, "[GO-IVM] OTel init failed (continuing without traces): %v\n", err)
-		otelShutdown = func(context.Context) error { return nil }
-	}
-
-	// Server construction + all GO_IVM_* config happened in newServerFromEnv
-	// above (shared with the NAPI host). Only the listener banner remains
-	// transport-specific. NOTE on table mode: the replica is NOT opened
-	// synchronously here — the TS replicator takes 5-30s to initialize
-	// replica.db on a cold container, and blocking would starve the TS
-	// health ping. The path is stashed on the Server; the first init RPC
-	// opens it with retry (see newServerFromEnv / handleInit).
-	fmt.Printf("Go IVM sidecar listening on %s (multi-engine, source=%s)\n",
-		socketPath, server.sourceMode)
-
-	// Start the 10s PERF reporter + pool-pressure watch (shared with the
-	// NAPI host — see runPerfReporter, O1).
-	go server.runPerfReporter(shutdownCtx)
-
-	// Start idle-group reaper. Without this, ClientGroups that the TS side
-	// fails to explicitly destroy (network partition, process crash, missed
-	// teardown) accumulate indefinitely, with their engine state + worker
-	// goroutine + MemorySource data resident. Reaps groups untouched for
-	// groupIdleTimeout. REVIEW-final HIGH-CROSS-2 / HIGH-CROSS-3.
-	go server.runReaper(shutdownCtx)
-	// Pull idle sweeper (ABI v3, D7). The socket transport can't run pull
-	// mode (no abiDeliver → no row plane → pullMode ignored), so this is a
-	// no-op ticker here — started anyway so both transports share one
-	// lifecycle shape and a future socket-side pull can't silently miss it.
-	go server.runPullIdleSweeper(shutdownCtx)
-
-	// Graceful shutdown
-	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
-	go func() {
-		<-sig
-		fmt.Println("\nShutting down...")
-		shutdownCancel()
-		if pprofServer != nil {
-			pprofServer.Shutdown(context.Background())
-		}
-		server.closeAll()
-		listener.Close()
-		os.Remove(socketPath)
-		if err := otelShutdown(context.Background()); err != nil {
-			fmt.Fprintf(os.Stderr, "[GO-IVM] OTel shutdown error: %v\n", err)
-		}
-		os.Exit(0)
-	}()
-
-	for {
-		conn, err := listener.Accept()
-		if err != nil {
-			break
-		}
-		tripwire("socket transport (unix-listener connection accepted)")
-		go handleConnection(conn, server)
-	}
+	fmt.Fprintln(os.Stderr,
+		"go-ivm-sidecar: the socket transport was removed; "+
+			"build with -tags napilib -buildmode=c-shared and load in-process via NAPI")
+	os.Exit(1)
 }

@@ -10,10 +10,8 @@ package engine
 //        (production of results stops promptly) and tablesource (the source's
 //        conn+tx survive a mid-cursor abandon: a later hydrate re-reads
 //        cleanly and Close() releases everything without error).
-//   D5 — e.mu is released for the drain phase: RefreshAllSources (the one
-//        caller that bypasses the sidecar's per-group serialization) must
-//        skip while a drain is in flight via the activeDrains guard, since
-//        TryLock alone no longer proves quiescence.
+//   D5 — e.mu is released for the drain phase, so unrelated engine work
+//        (advances on other tables) proceeds while a pull producer parks.
 //   D6 — AddQueriesStreamPull runs each query on its own goroutine (no lane
 //        pool) and produces byte-identical results to the lane-pool path.
 //
@@ -201,78 +199,6 @@ func TestStreamPull_MatchesNonPullOutput(t *testing.T) {
 	// And chunk STRUCTURE matches (not just the flattened rows).
 	if len(lane["a1"]) != len(pull["b1"]) {
 		t.Fatalf("chunk counts differ: lane=%d pull=%d", len(lane["a1"]), len(pull["b1"]))
-	}
-}
-
-// refreshCountingSource wraps the users MemorySource adapter with a counted
-// RefreshSnapshot so the test can observe whether RefreshAllSources acted
-// or skipped. Whitebox: lives in package engine to reuse the adapter.
-type refreshCountingSource struct {
-	Source
-	refreshes atomic.Int64
-}
-
-func (s *refreshCountingSource) RefreshSnapshot() { s.refreshes.Add(1) }
-
-// TestRefreshAllSourcesSkipsDuringDrain pins the D5 activeDrains guard:
-// with the drain running OUTSIDE e.mu, TryLock succeeds mid-hydrate, so
-// only the guard stands between the FIFO-bypassing drift audit and a
-// prev-tx ROLLBACK under a live cursor. Fails with the guard removed
-// (refreshes == 1 at the mid-drain checkpoint).
-func TestRefreshAllSourcesSkipsDuringDrain(t *testing.T) {
-	defer verifyNoStreamLeaks(t)
-	eng, ms := newStreamingTestEngine(t, 50)
-
-	src := &refreshCountingSource{Source: &memorySourceAdapter{ms: ms}}
-	eng.mu.Lock()
-	cur := eng.sourcesView()
-	next := make(map[string]Source, len(cur))
-	for k, v := range cur {
-		next[k] = v
-	}
-	next[src.TableName()] = src
-	eng.sources.Store(&next)
-	eng.mu.Unlock()
-
-	parked := make(chan struct{})
-	release := make(chan struct{})
-	var once sync.Once
-
-	done := make(chan error, 1)
-	go func() {
-		done <- eng.AddQueriesStreamChunked(
-			[]QuerySpec{simpleQuery("qd")}, 1,
-			func(r QueryResult) bool {
-				once.Do(func() {
-					close(parked) // drain reached its first delivery
-					<-release     // hold the drain open (simulates a parked pull gate)
-				})
-				return true
-			})
-	}()
-
-	<-parked
-	// Mid-drain: e.mu is free (D5), so pre-guard this would refresh.
-	eng.RefreshAllSources()
-	if got := src.refreshes.Load(); got != 0 {
-		close(release)
-		<-done
-		t.Fatalf("RefreshAllSources acted mid-drain: refreshes = %d, want 0 (guard skip)", got)
-	}
-
-	close(release)
-	if err := <-done; err != nil {
-		t.Fatalf("hydrate: %v", err)
-	}
-
-	// Quiescent: the same call must act — proves the skip above was the
-	// guard, not a broken fake.
-	deadline := time.Now().Add(2 * time.Second)
-	for src.refreshes.Load() == 0 {
-		eng.RefreshAllSources()
-		if time.Now().After(deadline) {
-			t.Fatal("RefreshAllSources never acted after the drain finished")
-		}
 	}
 }
 

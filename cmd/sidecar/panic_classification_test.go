@@ -4,19 +4,23 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/kartikparsoya-eng/go-ivm/engine"
 	"github.com/kartikparsoya-eng/go-ivm/ivm"
 )
 
 // The panic→RPC-error classification is the Go half of the TS recovery
 // ladder (view-syncer.ts run() / #advancePipelines / go-ivm-client.ts
-// RPC_CODE_DATA_ERROR):
-//   -32102 (*ivm.DataError)  → TS tears the CG down (poison input; a reset
-//                              would re-read the same bad row and loop)
-//   -32000 (everything else) → TS classifies 'unclassified' → pipeline reset
-//                              (transient; re-hydrate heals)
-// Getting a DataError misclassified as -32000 recreates the pre-prod reset
-// storm; getting a transient panic misclassified as -32102 tears down CGs
-// needlessly. Nothing covered this seam before.
+// RPC_CODE_DATA_ERROR / RPC_CODE_SCALAR_RESET):
+//   -32102 (*ivm.DataError)         → TS tears the CG down (poison input; a
+//                                     reset would re-read the same bad row
+//                                     and loop)
+//   -32105 (*engine.ScalarResetError) → TS resets + re-hydrates
+//                                     (ResetPipelinesSignal 'scalar-subquery')
+//   -32000 (everything else)        → TS classifies 'unclassified' → rethrow
+//                                     → CG teardown (follow-TS failure model)
+// Getting a DataError misclassified as -32000 loses the poison-row
+// attribution; getting a scalar reset misclassified as -32000 turns TS's
+// reset into a teardown. Nothing covered this seam before.
 
 func TestPanicErrorCode_Classification(t *testing.T) {
 	cases := []struct {
@@ -27,15 +31,25 @@ func TestPanicErrorCode_Classification(t *testing.T) {
 		{"DataError → teardown code", ivm.NewDataError("no source for table %q", "ghosts"), rpcCodeDataError},
 		{"plain string → generic", "boom", -32000},
 		{"error value → generic", errFake{}, -32000},
-		// DriftError normally never reaches the handler recover (AdvanceStream
-		// converts it in-band), but if one ever escapes it must classify as
-		// transient/reset — NOT teardown.
-		{"DriftError → generic (reset, not teardown)", &ivm.DriftError{Table: "users", Op: "Edit"}, -32000},
+		// The source-drift asserts panic with a plain error — 'unclassified'
+		// → rethrow → teardown, exactly TS's disposition for its own asserts.
+		{"source-drift error → generic (teardown)", ivm.SourceDriftError("users", "Edit", nil, -1), -32000},
+		// The companion scalar reset is TS's ResetPipelinesSignal
+		// ('scalar-subquery') — a RESET, so it must NOT ride -32000.
+		{"ScalarResetError → scalar-reset code", &engine.ScalarResetError{Table: "users", Resolved: "Alice", New: "Alicia"}, rpcCodeScalarReset},
 	}
 	for _, c := range cases {
 		if got := panicErrorCode(c.r); got != c.want {
 			t.Errorf("%s: panicErrorCode(%T) = %d, want %d", c.name, c.r, got, c.want)
 		}
+	}
+
+	// The scalar reset's wire message must be the TS signal text VERBATIM
+	// (no "panic: " prefix) — TS surfaces it as the ResetPipelinesSignal
+	// message.
+	sre := &engine.ScalarResetError{Table: "users", Resolved: "Alice", New: "Alicia"}
+	if got := panicErrorMessage(sre); got != "Scalar subquery value changed for users: Alice -> Alicia" {
+		t.Errorf("panicErrorMessage(ScalarResetError) = %q, want the TS signal text", got)
 	}
 }
 
@@ -50,7 +64,7 @@ func (errFake) Error() string { return "fake" }
 // the classification code from panicErrorCode.
 func TestHandleStreamWithRecover_ConvertsPanicToRPCError(t *testing.T) {
 	s := &Server{}
-	req := RPCRequest{JSONRPC: "2.0", Method: "advanceStream", ID: 42}
+	req := RPCRequest{JSONRPC: "2.0", Method: "advanceToHeadStream", ID: 42}
 	noopStream := streamWriter(func(interface{}, interface{}) {})
 
 	t.Run("generic panic → -32000", func(t *testing.T) {

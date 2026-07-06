@@ -291,9 +291,6 @@ func TestMismatch1_ChildAddFanOut(t *testing.T) {
 			},
 		},
 	})
-	if r.Drift != nil {
-		t.Fatalf("advance drift: %v", r.Drift)
-	}
 	logChanges(t, "advance (ADD channel_participants part2)", r.Changes)
 
 	// Go should emit N channel_participants CHILD→ADD (one per matching
@@ -380,9 +377,6 @@ func TestMismatch1_ParentEditNoChildReEmission(t *testing.T) {
 			},
 		},
 	})
-	if r.Drift != nil {
-		t.Fatalf("advance drift: %v", r.Drift)
-	}
 	logChanges(t, "advance (EDIT conversation conv-0)", r.Changes)
 
 	// Go should emit exactly 1 conversation EDIT and 0 channel_participants.
@@ -474,9 +468,6 @@ func TestMismatch1_ScalarExistsSuppressesChild(t *testing.T) {
 			},
 		},
 	})
-	if r.Drift != nil {
-		t.Fatalf("advance drift: %v", r.Drift)
-	}
 	logChanges(t, "advance (ADD channel_participants part2, scalar)", r.Changes)
 
 	// With IsScalar=true, the Join's child relationship emissions are
@@ -657,9 +648,6 @@ func TestMismatch2_EditEmittedInAdvance(t *testing.T) {
 			},
 		},
 	})
-	if r1.Drift != nil {
-		t.Fatalf("advance 1 drift: %v", r1.Drift)
-	}
 	logChanges(t, "advance 1 (EDIT: mark as read)", r1.Changes)
 
 	// Go should emit exactly 1 EDIT for the channel_user_status row.
@@ -743,9 +731,6 @@ func TestMismatch2_EditEmittedAcrossMultipleQueries(t *testing.T) {
 			},
 		},
 	})
-	if r.Drift != nil {
-		t.Fatalf("advance drift: %v", r.Drift)
-	}
 	logChanges(t, "advance (EDIT: mark as read, 6 queries)", r.Changes)
 
 	// Should emit 6 EDITs (one per query).
@@ -808,9 +793,6 @@ func TestMismatch2_SequentialEdits(t *testing.T) {
 			},
 		},
 	})
-	if r1.Drift != nil {
-		t.Fatalf("advance 1 drift: %v", r1.Drift)
-	}
 	logChanges(t, "advance 1 (EDIT: unreadCount 5→0)", r1.Changes)
 	if len(r1.Changes) != 1 || r1.Changes[0].Type != RowChangeEdit {
 		t.Fatalf("advance 1: expected 1 EDIT, got %v", r1.Changes)
@@ -832,9 +814,6 @@ func TestMismatch2_SequentialEdits(t *testing.T) {
 			},
 		},
 	})
-	if r2.Drift != nil {
-		t.Fatalf("advance 2 drift: %v", r2.Drift)
-	}
 	logChanges(t, "advance 2 (EDIT: unreadCount 0→3)", r2.Changes)
 	if len(r2.Changes) != 1 || r2.Changes[0].Type != RowChangeEdit {
 		t.Fatalf("advance 2: expected 1 EDIT, got %v", r2.Changes)

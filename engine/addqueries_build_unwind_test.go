@@ -70,9 +70,6 @@ func assertBatchBuildUnwound(t *testing.T, eng *Engine, recovered any) {
 	result := eng.Advance([]SnapshotChange{
 		{Table: "users", NextValue: ivm.Row{"id": "u2", "name": "Bob"}},
 	})
-	if result.Drift != nil {
-		t.Fatalf("unexpected drift on post-unwind advance: %v", result.Drift)
-	}
 	if len(result.Changes) != 0 {
 		t.Fatalf("orphan pipeline leaked output after failed batch build: %+v", result.Changes)
 	}

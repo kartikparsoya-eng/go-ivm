@@ -1,6 +1,8 @@
 package engine
 
-// Additional advance drift tests with more complex scenarios:
+// Additional advance tests with more complex scenarios (a source-state
+// divergence now PANICS out of Advance — failing these tests loudly —
+// instead of returning a Drift result):
 // - Multiple queries on the same source (production has 10 clients)
 // - Larger seed (3+ conversations in channel)
 // - Mixed advance batches (conversations + other tables)
@@ -79,9 +81,6 @@ func TestAdvanceDrift_MultiQuerySameSource(t *testing.T) {
 			},
 		},
 	})
-	if result.Drift != nil {
-		t.Fatalf("unexpected drift: %v", result.Drift)
-	}
 	logChanges(t, "advance (2 queries, pure ADD)", result.Changes)
 
 	// Each query should produce REMOVE(9d3f1b99) + ADD(a383a3b1) = 2 changes.
@@ -133,9 +132,6 @@ func TestAdvanceDrift_ThreeRowSeed(t *testing.T) {
 			},
 		},
 	})
-	if result.Drift != nil {
-		t.Fatalf("unexpected drift: %v", result.Drift)
-	}
 	logChanges(t, "advance (3-row seed, ADD newest)", result.Changes)
 	if len(result.Changes) != 2 {
 		t.Errorf("expected 2 changes, got %d", len(result.Changes))
@@ -270,9 +266,6 @@ func TestAdvanceDrift_EditBoundWithSplitEditKeys(t *testing.T) {
 			},
 		},
 	})
-	if result.Drift != nil {
-		t.Fatalf("unexpected drift: %v", result.Drift)
-	}
 	logChanges(t, "advance (EDIT channelId with splitEditKeys)", result.Changes)
 }
 
@@ -381,9 +374,6 @@ func TestAdvanceDrift_MixedBatchMultipleTables(t *testing.T) {
 			},
 		},
 	})
-	if result.Drift != nil {
-		t.Fatalf("unexpected drift: %v", result.Drift)
-	}
 	logChanges(t, "advance (mixed batch)", result.Changes)
 
 	// Only the conversations query is registered, so only conversations
@@ -427,9 +417,6 @@ func TestAdvanceDrift_SequentialAdvances(t *testing.T) {
 			},
 		},
 	})
-	if r1.Drift != nil {
-		t.Fatalf("advance 1 drift: %v", r1.Drift)
-	}
 	logChanges(t, "advance 1", r1.Changes)
 	if len(r1.Changes) != 2 {
 		t.Errorf("advance 1: expected 2 changes, got %d", len(r1.Changes))
@@ -445,9 +432,6 @@ func TestAdvanceDrift_SequentialAdvances(t *testing.T) {
 			},
 		},
 	})
-	if r2.Drift != nil {
-		t.Fatalf("advance 2 drift: %v", r2.Drift)
-	}
 	logChanges(t, "advance 2", r2.Changes)
 	if len(r2.Changes) != 2 {
 		t.Errorf("advance 2: expected 2 changes, got %d", len(r2.Changes))
@@ -491,9 +475,6 @@ func TestAdvanceDrift_RemoveBoundThenAdd(t *testing.T) {
 			},
 		},
 	})
-	if result.Drift != nil {
-		t.Fatalf("unexpected drift: %v", result.Drift)
-	}
 	logChanges(t, "advance (REMOVE bound + ADD new)", result.Changes)
 
 	// REMOVE 9d3f1b99: Take sees REMOVE for bound, promotes conv-mid
@@ -553,9 +534,6 @@ func TestAdvanceDrift_EditNonBoundThenAdd(t *testing.T) {
 			},
 		},
 	})
-	if result.Drift != nil {
-		t.Fatalf("unexpected drift: %v", result.Drift)
-	}
 	logChanges(t, "advance (EDIT non-bound + ADD)", result.Changes)
 
 	// EDIT conv-mid: outside bound → dropped (0 changes)
@@ -628,9 +606,6 @@ func TestAdvanceDrift_EditNonBoundRaisesIntoBoundThenAdd(t *testing.T) {
 			},
 		},
 	})
-	if result.Drift != nil {
-		t.Logf("advance returned drift=%v", result.Drift)
-	}
 	logChanges(t, "advance (EDIT non-bound raise + ADD)", result.Changes)
 }
 
@@ -662,9 +637,6 @@ func TestAdvanceDrift_SingleConversationOnly(t *testing.T) {
 			},
 		},
 	})
-	if result.Drift != nil {
-		t.Fatalf("unexpected drift: %v", result.Drift)
-	}
 	logChanges(t, "advance (single conv, ADD)", result.Changes)
 	if len(result.Changes) != 2 {
 		t.Errorf("expected 2 changes, got %d", len(result.Changes))
@@ -730,9 +702,6 @@ func TestAdvanceDrift_DebugLogLabels(t *testing.T) {
 			},
 		},
 	})
-	if result.Drift != nil {
-		t.Fatalf("unexpected drift: %v", result.Drift)
-	}
 	logChanges(t, "advance (EDIT + ADD with debug)", result.Changes)
 	t.Logf("total changes: %d", len(result.Changes))
 	// Print a summary

@@ -107,16 +107,9 @@ type SnapshotChange struct {
 // Timings is one entry per (table, sourceChange) — the same granularity TS
 // records to its `ivm.advance-time` histogram. Lets TS attribute wall time to
 // the responsible table/op instead of seeing a single opaque RPC duration.
-//
-// Drift is non-nil iff the engine recovered an *ivm.DriftError mid-advance.
-// In that case Changes is empty (any partial output is dropped — TS will
-// re-init from current SQLite truth so re-applying partial output risks
-// double-application) and Timings holds whatever was measured before the
-// drift was detected (useful for diagnostics, harmless to ship).
 type AdvanceResult struct {
 	Changes []RowChange
 	Timings []TableTiming
-	Drift   *ivm.DriftError
 }
 
 // TableTiming reports the wall time spent processing a single source change
@@ -154,9 +147,9 @@ type pipelineEntry struct {
 // output runs the live "scalar value changed" check: if a push moves the
 // resolved scalar's child field to a different value, the baked-in literal
 // in the main
-// query's plan is stale, so we raise a reset (DriftError) that flows
-// through the engine's existing recover→re-hydrate path — TS re-registers
-// the query, which re-runs ResolveSimpleScalarSubqueries against current
+// query's plan is stale, so we raise a *ScalarResetError — the sidecar maps
+// it to the reset RPC code and TS resets + re-registers the query, which
+// re-runs ResolveSimpleScalarSubqueries against current
 // truth and bakes the NEW value. Matches TS's ResetPipelinesSignal
 // ('scalar-subquery') end behavior. Unchanged-value pushes accumulate
 // normally.
@@ -178,13 +171,7 @@ type companionEntry struct {
 //
 // sources concurrency: held as atomic.Pointer to a map snapshot (copy-on-write).
 // Mutators (RegisterSource / Close) take e.mu, build a new map, and Store the
-// new pointer atomically. Readers — including the drift-audit's
-// RefreshAllSources path which deliberately bypasses the per-CG worker FIFO —
-// Load the pointer without taking any lock. This is what makes the bypass
-// actually bypass: pre-fix, RefreshAllSources took e.mu and serialized behind
-// multi-second AddQueriesStream / Advance holders, so the audit's 30s/120s
-// budget couldn't absorb sustained multi-CG load. With COW, refresh proceeds
-// concurrently regardless of how long other handlers run.
+// new pointer atomically. Readers Load the pointer without taking any lock.
 //
 // The map snapshot itself is treated as immutable after Store — never mutated
 // in place. Reads via sourcesView() return the live snapshot pointer; iterating
@@ -196,17 +183,6 @@ type Engine struct {
 	streamer  *Streamer
 	storage   *sqlite.DatabaseStorage
 	closed    bool // set true by Close; guards against post-Close calls
-
-	// activeDrains counts streaming-hydrate drain phases currently running
-	// OUTSIDE e.mu (DESIGN-duplex-streaming D5: build under e.mu, drain
-	// released so a pull producer parked on client demand cannot freeze the
-	// engine). Guarded by e.mu (incremented before the build phase unlocks,
-	// decremented after the post phase re-locks). RefreshAllSources checks
-	// it because the drift audit deliberately bypasses the per-CG FIFO
-	// (sidecar handleRefreshSnapshot releases group.mu before calling) —
-	// with e.mu no longer held across the drain, TryLock alone would let a
-	// RefreshSnapshot ROLLBACK the prev tx under a live hydrate cursor.
-	activeDrains int
 
 	// tableUniqueKeys: per-table list of unique key column sets. Used by the
 	// scalar-subquery resolver to detect "simple" subqueries — those whose
@@ -233,8 +209,7 @@ type Engine struct {
 // zeroVersionColumn is the row-version bookkeeping column (TS
 // ZERO_VERSION_COLUMN_NAME, replication-state.ts). Present on rows read from
 // the replica; compared/bumped against minRowVersion. Not part of the zql
-// spec, so it is stripped before client comparison — see the drift-audit
-// projection in pipeline-driver.ts.
+// spec.
 const zeroVersionColumn = "_0_version"
 
 // SetMinRowVersions installs the per-table minRowVersion map (from
@@ -342,12 +317,9 @@ func (e *Engine) SetTableUniqueKeys(tableName string, uniqueKeys [][]string) {
 }
 
 // PipelineCount returns the number of registered queries (pipelines) on
-// this engine. Used by the TS drift audit as a cross-validation signal:
-// if TS sees N registered queries but Go reports 0, the per-CG recovery
-// machinery has silently dropped Go's pipeline state (the C2 freeze
-// condition) — every advance will return empty changes and the client
-// view is permanently divergent until reconnect. The audit logs an
-// error + triggers resetEngine when this happens.
+// this engine. Consumed by the sidecar's warm-pool sizing (an existing
+// pipeline means a warm add must hydrate at the live pipelines' frame) and
+// by the cold-hydrate seam's "first hydrate" check.
 func (e *Engine) PipelineCount() int {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -435,58 +407,6 @@ func (e *Engine) RegisterSource(source Source) {
 	e.sources.Store(&next)
 }
 
-// RefreshAllSources rolls each source's pinned snapshot (if any) to the
-// current backing storage state. Sources without pinned snapshots
-// (MemorySource) are silently skipped. Used by the drift audit so its
-// comparison reads are at the same point in time as the underlying
-// replica writer, rather than against a snapshot pinned by the last
-// Push (which would show transient set differences during sustained
-// writes).
-//
-// NON-BLOCKING against the engine: TryLock, skip when busy (full-scale
-// review 2026-07-03). The audit RPC deliberately bypasses the per-CG worker
-// FIFO and used to run this fully concurrently with an in-flight advance.
-// That was DESTRUCTIVE: between two pushes of one batch the source's
-// overlay is nil, so RefreshSnapshot→OnAdvanceEnd would ROLLBACK the prev
-// tx — discarding the batch's earlier uncommitted writeChange rows — and
-// eagerly re-pin at the current WAL head, which (in shadow mode) already
-// contains the batch's committed rows. The next push's driftCheck then saw
-// post-batch state and false-drifted every Add (the exact pathology the
-// OnAdvanceEnd comment describes for lazy re-pins). Drive mode was shielded
-// by externalConn; shadow-mode advanceStream was exposed. Holding e.mu for
-// the (fast: ROLLBACK+BEGIN per source) refresh excludes advances entirely;
-// TryLock preserves the FIFO-bypass's real goal — the audit must never
-// BLOCK behind a multi-second advance — by skipping instead. A skipped
-// refresh degrades the audit to the pinned frame for one cycle (cosmetic
-// transient diffs at worst), vs. corrupting the in-flight advance.
-func (e *Engine) RefreshAllSources() {
-	if !e.mu.TryLock() {
-		// Advance/hydrate in flight — refreshing now would destroy its
-		// prev-tx state. Skip; the next audit cycle retries.
-		fmt.Fprintln(os.Stderr,
-			"[GO-IVM] refreshSnapshot skipped: engine busy (advance/hydrate in flight)")
-		return
-	}
-	defer e.mu.Unlock()
-	if e.activeDrains > 0 {
-		// D5: a streaming-hydrate drain is running OUTSIDE e.mu (build/post
-		// phases hold it; the fetch loops don't, so a pull producer parked
-		// on client demand can't freeze the engine). TryLock therefore no
-		// longer proves quiescence — without this check the audit's refresh
-		// would ROLLBACK+re-pin the prev tx UNDER the drain's live cursors:
-		// the exact mid-flight corruption described above, reintroduced via
-		// the FIFO-bypass. Skip identically to the TryLock failure.
-		fmt.Fprintln(os.Stderr,
-			"[GO-IVM] refreshSnapshot skipped: engine busy (hydrate drain in flight)")
-		return
-	}
-	for _, src := range e.sourcesView() {
-		if r, ok := src.(interface{ RefreshSnapshot() }); ok {
-			r.RefreshSnapshot()
-		}
-	}
-}
-
 // signalAdvanceEnd notifies every registered source that the current
 // advance batch is complete. Sources that don't implement OnAdvanceEnd
 // (MemorySource — state evolves naturally via writeChange) are silently
@@ -500,13 +420,10 @@ func (e *Engine) signalAdvanceEnd() {
 			h.OnAdvanceEnd()
 		}
 		// Clear per-batch state (intra-batch removed-PK set) at the true
-		// batch boundary. This is deliberately separate from OnAdvanceEnd:
-		// the drift audit reaches OnAdvanceEnd via RefreshSnapshot while an
-		// advance is in flight, but it never calls ClearBatchState — so the
-		// dedup set is only ever dropped between batches, not mid-batch.
-		// (MemorySource clears via its adapter's OnAdvanceEnd, which the
-		// audit can't reach since RefreshAllSources skips snapshot-less
-		// sources; TableSource needs this explicit hook.)
+		// batch boundary. This is deliberately separate from OnAdvanceEnd
+		// so the dedup set is only ever dropped between batches, not
+		// mid-batch. (MemorySource clears via its adapter's OnAdvanceEnd;
+		// TableSource needs this explicit hook.)
 		if c, ok := src.(interface{ ClearBatchState() }); ok {
 			c.ClearBatchState()
 		}
@@ -881,9 +798,8 @@ func (e *Engine) AddQueries(queries []QuerySpec) ([]QueryResult, error) {
 // Returns after all goroutines have finished. Engine.mu is held for the
 // BUILD and POST phases only; the drain runs outside it (D5,
 // DESIGN-duplex-streaming). "Source state stays read-only across the
-// hydration window" is now the CALLER's per-group serialization invariant
-// (worker FIFO + group.mu in the sidecar — TS's per-CG model), plus the
-// activeDrains guard for the one FIFO-bypassing caller (RefreshAllSources).
+// hydration window" is the CALLER's per-group serialization invariant
+// (worker FIFO + group.mu in the sidecar — TS's per-CG model).
 func (e *Engine) AddQueriesStream(
 	queries []QuerySpec,
 	onResult func(QueryResult),
@@ -951,11 +867,9 @@ func (e *Engine) addQueriesStreamChunked(
 	// READS source state; every source-mutating entry point is serialized
 	// against this call at the sidecar level (per-CG worker FIFO +
 	// group.mu held across the whole RPC — main.go handleAddQueriesStream)
-	// — the same per-CG serialization TS's view-syncer provides. The one
-	// caller that deliberately bypasses that serialization
-	// (handleRefreshSnapshot → RefreshAllSources) checks activeDrains.
+	// — the same per-CG serialization TS's view-syncer provides.
 	// Rationale: a pull producer parked on client demand while holding
-	// e.mu would freeze the engine (advances, PipelineCount, Close) for
+	// e.mu would freeze the engine (advances, Close) for
 	// client-think-time.
 	e.mu.Lock()
 
@@ -974,15 +888,13 @@ func (e *Engine) addQueriesStreamChunked(
 	// deferred unlock covers build-phase PANICS (unknown table → DataError
 	// panic, addqueries_build_unwind_test.go): the panic must escape to
 	// the caller with e.mu released, exactly as the pre-D5 whole-function
-	// defer provided. activeDrains++ is the closure's last statement, so a
-	// build panic never leaves a phantom drain registered.
+	// defer provided.
 	var built []*pipelineEntry
 	var mrv map[string]string
 	func() {
 		defer e.mu.Unlock()
 		built = e.buildBatchLocked(queries)
 		mrv = e.minRowVersions
-		e.activeDrains++
 	}()
 
 	// Phase 2 (drain, OUTSIDE e.mu): Hydrate via P worker lanes (or one
@@ -1145,7 +1057,6 @@ func (e *Engine) addQueriesStreamChunked(
 	// Phase 3 (post, under e.mu again).
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	e.activeDrains--
 	if err := firstHydratePanic(built, hydratePanics); err != nil {
 		return err
 	}
@@ -1171,16 +1082,12 @@ func (e *Engine) addQueriesStreamChunked(
 
 // firstHydratePanic converts the first non-nil per-goroutine hydrate panic into
 // an error so the RPC handler can return an error frame instead of letting the
-// panic abort the whole sidecar process (C1). A *DriftError is preserved as-is
-// (the caller's drift handling expects that type); any other value is wrapped
+// panic abort the whole sidecar process (C1). Any value is wrapped
 // with its query ID for diagnosis.
 func firstHydratePanic(built []*pipelineEntry, panics []any) error {
 	for i, p := range panics {
 		if p == nil {
 			continue
-		}
-		if d, ok := p.(*ivm.DriftError); ok {
-			return d
 		}
 		qid := ""
 		if i < len(built) && built[i] != nil {
@@ -1344,23 +1251,20 @@ func (e *Engine) removeQueryLocked(queryID string) {
 // Advance processes a batch of snapshot changes through all affected sources.
 // Returns flat RowChanges representing the effect on all registered pipelines.
 //
-// Drift recovery: if the source's pre-Push validation detects an Edit/Remove
-// against a missing row (or duplicate Add), it panics with *ivm.DriftError —
-// raised BEFORE any state mutation, so we can recover cleanly. In prod table
-// mode that check is tablesource.Source.driftCheckLocked; the in-memory
-// MemorySource port has the equivalent asserts in genPush. On drift we stop
-// the advance and EMIT the partial output prior successful Pushes already
-// produced (draining the streamer), then return a result with Drift set so
-// the sidecar signals TS — matching TS's assert-and-throw path, which streams
-// its partial computation before the snapshot revert. Discarding the partial
-// output here would diverge from TS for the corrupt advance.
+// Failure model (follow-TS): the source's pre-Push validation (tablesource
+// driftCheckLocked in prod; the MemorySource genPush asserts in the engine
+// test fixture) and every downstream operator assert PANIC with a plain
+// error — the direct twin of TS's assert-throws. The panic re-raises out of
+// this method after the streamer is drained (HIGH-10) and signalAdvanceEnd
+// has rotated the sources; the sidecar handler converts it to an RPC error
+// and TS tears the client group down.
 func (e *Engine) Advance(changes []SnapshotChange) *AdvanceResult {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	// End-of-batch hook for every registered source — rotates TableSource
 	// snapshots + clears their batch-scoped delta (incl. the removedInBatch
 	// dedup set) so the next batch starts clean. Deferred (not inline after the
-	// push loop) so it ALSO fires when a NON-drift panic re-raises out of the
+	// push loop) so it ALSO fires when a panic re-raises out of the
 	// recover()-guarded loop — matching AdvanceStream and guaranteeing the set
 	// never leaks across a batch boundary. Registered after e.mu.Unlock so it
 	// still runs while e.mu is held.
@@ -1368,34 +1272,17 @@ func (e *Engine) Advance(changes []SnapshotChange) *AdvanceResult {
 
 	var allRowChanges []RowChange
 	var timings []TableTiming
-	var drift *ivm.DriftError
 
 	func() {
 		defer func() {
 			if r := recover(); r != nil {
-				if d, ok := r.(*ivm.DriftError); ok {
-					drift = d
-					// Match TS view-syncer behavior: emit whatever output
-					// successful prior Push calls in this loop already
-					// produced, then signal drift so the caller re-hydrates.
-					// TS's assert-and-throw path emits its partial computation
-					// before snapshot revert; discarding prior output here would
-					// diverge from TS for the corrupt advance (TS emits its
-					// partial change set, Go would emit none for the failing
-					// batch). Drain anything still in the streamer in case the
-					// panicking Push emitted partial output before the panic.
-					if drained := e.streamer.Stream(); len(drained) > 0 {
-						allRowChanges = append(allRowChanges, drained...)
-					}
-					return
-				}
-				// HIGH-10: drain the streamer before re-raising a non-drift
-				// panic, matching AdvanceStream's recover. Otherwise this
-				// aborted advance's accumulated entries survive and the NEXT
-				// successful Advance's first streamer.Stream() surfaces them as
-				// if produced by that advance — wrong RowChanges to clients.
+				// HIGH-10: drain the streamer before re-raising, matching
+				// AdvanceStream's recover. Otherwise this aborted advance's
+				// accumulated entries survive and the NEXT successful
+				// Advance's first streamer.Stream() surfaces them as if
+				// produced by that advance — wrong RowChanges to clients.
 				_ = e.streamer.Stream()
-				panic(r) // re-raise non-drift panics
+				panic(r)
 			}
 		}()
 
@@ -1430,12 +1317,6 @@ func (e *Engine) Advance(changes []SnapshotChange) *AdvanceResult {
 		}
 	}()
 
-	if drift != nil {
-		// Partial-emit-then-drift: prior successful pushes' output goes to
-		// the caller so clients see it (TS behavior). The drift signal
-		// triggers re-hydrate which catches up any missed deltas.
-		return &AdvanceResult{Changes: bumpRowVersions(allRowChanges, e.minRowVersions), Timings: timings, Drift: drift}
-	}
 	return &AdvanceResult{Changes: bumpRowVersions(allRowChanges, e.minRowVersions), Timings: timings}
 }
 
@@ -1445,21 +1326,12 @@ func (e *Engine) Advance(changes []SnapshotChange) *AdvanceResult {
 // caller can record per-(table,op) histogram entries once, atomically with
 // the completion signal.
 //
-// Drift is non-nil only on the Final frame and only when the source (or a
-// downstream operator, e.g. a companion scalar reset / Take stale-bound)
-// raised *ivm.DriftError mid-advance. The TS accumulator attaches the
-// partial frames it already received to the DriftError (partialChanges) and
-// re-throws; GoComputeBackend's recovery emits them to clients before the
-// re-init — the same partial-emit-then-rehydrate sequence TS's native
-// assert-and-throw path produces.
-//
 // See Engine.AdvanceStream for the chunking contract.
 type AdvanceStreamPartial struct {
-	Changes    []RowChange     `json:"changes"`
-	ChunkIndex int             `json:"chunkIndex"`
-	Final      bool            `json:"final"`
-	Timings    []TableTiming   `json:"timings,omitempty"`
-	Drift      *ivm.DriftError `json:"drift,omitempty"`
+	Changes    []RowChange   `json:"changes"`
+	ChunkIndex int           `json:"chunkIndex"`
+	Final      bool          `json:"final"`
+	Timings    []TableTiming `json:"timings,omitempty"`
 }
 
 // advanceChunkSize is the max number of RowChanges per partial frame in
@@ -1579,15 +1451,13 @@ func (e *Engine) advanceStreamChunkedSeq(
 	pendingBytes := 0
 	var timings []TableTiming
 	chunkIndex := 0
-	var drift *ivm.DriftError
 	var flushMu sync.Mutex
 
 	// emitLocked writes ONE partial/final frame to the wire. Callers MUST hold
 	// flushMu — that is what keeps chunkIndex monotonic and frame SEND order
 	// equal to it, even when parallel push-fanout goroutines flush mid-flatten
 	// chunks (via the streamer's chunkSink) concurrently. Timings ride the
-	// final frame only; drift is set only on the terminal drift frame (drift
-	// is validated pre-fanout, so chunkSink never fires on a drift path).
+	// final frame only.
 	// `rows` is consumed synchronously — the sidecar's streamW → mpMarshal
 	// encodes it into a separate byte buffer before onResult returns, so
 	// callers may reuse the backing array after (T1-5 invariant).
@@ -1601,7 +1471,6 @@ func (e *Engine) advanceStreamChunkedSeq(
 			ChunkIndex: chunkIndex,
 			Final:      final,
 			Timings:    t,
-			Drift:      drift, // nil unless this is the terminal drift signal
 		})
 		chunkIndex++
 	}
@@ -1667,7 +1536,7 @@ func (e *Engine) advanceStreamChunkedSeq(
 	}, chunkSize, softChunkBytes)
 	defer e.streamer.SetChunkSink(nil, 0, 0)
 
-	// Non-Drift panic capture: pre-fix this re-raised inline (panic(r)
+	// Panic capture: pre-fix this re-raised inline (panic(r)
 	// in the deferred recover), skipping the terminal flush(true) below
 	// and leaving the TS-side accumulator throwing
 	// "finished without a final chunk". That cascaded to C5's protocol-
@@ -1675,33 +1544,21 @@ func (e *Engine) advanceStreamChunkedSeq(
 	// the panic and re-raising AFTER flush(true), TS always sees a
 	// clean terminal frame — empty changes signal "advance abandoned"
 	// rather than wire protocol corruption.
-	var nonDriftPanic any
+	var capturedPanic any
 	var seqErr error
 	func() {
 		defer func() {
 			if r := recover(); r != nil {
-				if d, ok := r.(*ivm.DriftError); ok {
-					drift = d
-					// Match TS view-syncer: emit whatever partial output
-					// successful prior pushes produced in this advance, then
-					// signal drift so TS re-hydrates. Dropping the partial
-					// output (`pending = nil`) would diverge from TS for the
-					// corrupt advance — TS emits its partial change set for the
-					// batch while Go would emit none. Drain anything still
-					// in the streamer in case the panicking Push left
-					// residual output before the panic point.
-					if drained := e.streamer.Stream(); len(drained) > 0 {
-						pending = append(pending, drained...)
-					}
-					return
-				}
-				// Capture non-Drift panic for re-raise after flush.
-				nonDriftPanic = r
-				// Drop partial output: an unrecovered panic mid-loop
+				// Capture for re-raise after flush. This includes the
+				// source/operator asserts (plain-error drift panics): TS's
+				// twin throws → the view-syncer tears the client group
+				// down, so no partial output may settle as a clean stream.
+				capturedPanic = r
+				// Drop partial output: a panic mid-loop
 				// means Go's state may have advanced partially; sending
 				// only the partial diff to TS would leave the CVR
 				// out of sync with Go. Safer to send empty Final and
-				// let the caller's restart machinery rebuild from
+				// let the caller's teardown machinery rebuild from
 				// scratch.
 				pending = nil
 				_ = e.streamer.Stream()
@@ -1755,7 +1612,7 @@ func (e *Engine) advanceStreamChunkedSeq(
 	// End-of-batch hook — rotate TableSource snapshots + clear their
 	// batch-scoped delta. See Engine.Advance for the full rationale; same
 	// invariant applies to the streaming path. Runs OUTSIDE the
-	// recover()-guarded func so it fires on the drift path too.
+	// recover()-guarded func so it fires on the panic path too.
 	e.signalAdvanceEnd()
 
 	// D9: a lazy-cursor failure settles the stream as an ERROR — no
@@ -1767,18 +1624,17 @@ func (e *Engine) advanceStreamChunkedSeq(
 	}
 
 	// Always emit a terminal Final frame. Carries cumulative timings on
-	// success; carries Drift + empty Changes on drift recovery (TS
-	// discards the whole stream and re-inits); carries empty Changes
-	// on non-Drift panic (caller's restart machinery rebuilds).
+	// success; carries empty Changes on a captured panic (the caller's
+	// teardown machinery rebuilds).
 	flush(true)
 
-	// Re-raise non-Drift panic AFTER flush so TS sees a clean wire.
-	// engine.Advance's caller (sidecar RPC handler) has its own
+	// Re-raise the captured panic AFTER flush so TS sees a clean wire.
+	// The sidecar RPC handler has its own
 	// recover that converts panic to an error response — the wire
 	// already carries the Final marker so TS doesn't trip the
 	// protocol-violation path.
-	if nonDriftPanic != nil {
-		panic(nonDriftPanic)
+	if capturedPanic != nil {
+		panic(capturedPanic)
 	}
 	return nil
 }
@@ -1862,11 +1718,12 @@ func (po *pipelineOutput) Push(change ivm.Change, pusher ivm.InputBase) []ivm.Ch
 // the scalar-value-changed reset check — a direct port of TS's live
 // companion push. A push that moves the
 // resolved scalar's child field to a different value makes the main
-// query's baked-in literal stale, so it raises a *ivm.DriftError to ride
-// the engine's existing recover→re-hydrate path: TS re-registers the
-// query, re-running ResolveSimpleScalarSubqueries against current truth
-// and baking the NEW value. Net behavior matches TS's
-// ResetPipelinesSignal('scalar-subquery'). Unchanged-value pushes
+// query's baked-in literal stale, so it panics with *ScalarResetError; the
+// sidecar maps it to the scalar-reset RPC code and TS resets +
+// re-registers the query, re-running ResolveSimpleScalarSubqueries against
+// current truth and baking the NEW value — TS's own companion push throws
+// ResetPipelinesSignal('scalar-subquery') at the same point
+// (pipeline-driver.ts:1468). Unchanged-value pushes
 // accumulate exactly as the plain pipelineOutput would.
 type companionOutput struct {
 	pipelineOutput
@@ -1874,30 +1731,75 @@ type companionOutput struct {
 	resolvedValue ivm.Value
 }
 
+// ScalarResetError is the panic a companionOutput raises when a resolved
+// scalar subquery's value changes — the twin of TS's
+// ResetPipelinesSignal('scalar-subquery') (pipeline-driver.ts:1468-1472).
+// Unlike the source/operator asserts (whose TS twins throw → teardown),
+// TS's disposition here is a RESET + re-hydrate, so the sidecar maps this
+// type to its own RPC code instead of the generic -32000. Message mirrors
+// the TS signal's message.
+type ScalarResetError struct {
+	Table    string
+	Resolved string // JS-String rendering of the resolved (baked) value
+	New      string // JS-String rendering of the pushed value
+}
+
+func (e *ScalarResetError) Error() string {
+	return fmt.Sprintf("Scalar subquery value changed for %s: %s -> %s",
+		e.Table, e.Resolved, e.New)
+}
+
+// jsScalarString approximates JS String(v) for the scalar values a
+// resolvable subquery yields (string/number/bool/null/undefined). Message
+// rendering only — never compared or parsed.
+func jsScalarString(v ivm.Value, undefined bool) string {
+	switch {
+	case undefined:
+		return "undefined"
+	case v == nil:
+		return "null"
+	}
+	switch x := v.(type) {
+	case string:
+		return x
+	case bool:
+		if x {
+			return "true"
+		}
+		return "false"
+	case float64:
+		return strconv.FormatFloat(x, 'f', -1, 64)
+	default:
+		return fmt.Sprintf("%v", v)
+	}
+}
+
 func (co *companionOutput) Push(change ivm.Change, pusher ivm.InputBase) []ivm.Change {
 	changed := false
+	var newValue ivm.Value
+	newUndefined := false
 	switch change.Type {
 	case ivm.ChangeTypeAdd, ivm.ChangeTypeEdit:
 		// New scalar value is the child field of the pushed (new) node.
 		// TS: newValue = change.node.row[childField] ?? null.
-		newValue := change.Node.Row[co.childField]
+		newValue = change.Node.Row[co.childField]
 		changed = !scalarValuesEqual(newValue, co.resolvedValue)
 	case ivm.ChangeTypeRemove:
 		// TS: newValue = undefined for REMOVE, and scalarValuesEqual(
 		// undefined, resolvedValue) is always false (resolvedValue is never
 		// undefined) — so removing the scalar's source row always resets.
 		changed = true
+		newUndefined = true
 	case ivm.ChangeTypeChild:
 		// TS returns [] for CHILD: a relationship-only change does not move
 		// the scalar value — neither accumulate nor reset.
 		return nil
 	}
 	if changed {
-		panic(&ivm.DriftError{
+		panic(&ScalarResetError{
 			Table:    co.schema.TableName,
-			Op:       "ScalarSubquery",
-			PK:       map[string]ivm.Value{},
-			HasCount: 0,
+			Resolved: jsScalarString(co.resolvedValue, false),
+			New:      jsScalarString(newValue, newUndefined),
 		})
 	}
 	return co.pipelineOutput.Push(change, pusher)
