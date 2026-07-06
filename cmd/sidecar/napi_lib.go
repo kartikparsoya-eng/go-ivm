@@ -43,6 +43,11 @@ package main
 /*
 #include <stdint.h>
 #include <stdlib.h>
+#include <unistd.h>
+
+// Declare environ explicitly — it's in <unistd.h> on POSIX but not
+// exported as a symbol cgo can link to on all platforms.
+extern char **environ;
 
 typedef void (*goivm_deliver_cb)(void* ctx, int32_t kind, const void* data, int32_t len);
 
@@ -50,12 +55,25 @@ typedef void (*goivm_deliver_cb)(void* ctx, int32_t kind, const void* data, int3
 static void goivm_call_deliver(goivm_deliver_cb cb, void* ctx, int32_t kind, const void* data, int32_t len) {
 	cb(ctx, kind, data, len);
 }
+
+// goivm_env_count returns the number of entries in C environ.
+static int goivm_env_count(void) {
+	int n = 0;
+	while (environ[n] != NULL) n++;
+	return n;
+}
+
+// goivm_env_at returns the i-th environ entry (NULL-terminated "KEY=VALUE").
+static const char *goivm_env_at(int i) {
+	return environ[i];
+}
 */
 import "C"
 
 import (
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"unsafe"
 )
@@ -89,6 +107,25 @@ func goivm_abi_version() C.int32_t {
 	return goivmABIVersion
 }
 
+// syncCEnvToGo copies the live C environ into Go's os.Getenv cache. The
+// Go runtime in c-shared mode snapshots environ at library-load (dlopen)
+// time into an internal slice (runtime.environ); os.Getenv reads from that
+// snapshot, NOT from the live C environ. When the embedder (Node.js)
+// sets process.env.X = 'y' before dlopen, C setenv() updates environ and
+// C getenv() sees it, but the Go snapshot was taken from a stale copy and
+// os.Getenv returns "". This function bridges the gap by iterating the
+// live C environ and calling os.Setenv for each entry, updating the Go
+// runtime's cache so newServerFromEnv and tuneRuntime see the host's env.
+func syncCEnvToGo() {
+	n := int(C.goivm_env_count())
+	for i := 0; i < n; i++ {
+		s := C.GoString(C.goivm_env_at(C.int(i)))
+		if idx := strings.IndexByte(s, '='); idx > 0 {
+			os.Setenv(s[:idx], s[idx+1:])
+		}
+	}
+}
+
 //export goivm_start
 func goivm_start(cb C.goivm_deliver_cb, ctx unsafe.Pointer) C.int32_t {
 	abiMu.Lock()
@@ -103,6 +140,13 @@ func goivm_start(cb C.goivm_deliver_cb, ctx unsafe.Pointer) C.int32_t {
 	}
 	abiCB = cb
 	abiCtx = ctx
+
+	// Sync the live C environ into Go's os.Getenv cache. The Go runtime
+	// snapshots environ at dlopen (which the addon called before us), but
+	// that snapshot misses env vars the host set via setenv() after the
+	// process started (e.g. Node.js process.env assignments). Without this,
+	// newServerFromEnv can't see GO_IVM_REPLICA_DB_PATH and returns rc=3.
+	syncCEnvToGo()
 
 	tuneRuntime()
 
