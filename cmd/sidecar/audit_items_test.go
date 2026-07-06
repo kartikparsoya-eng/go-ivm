@@ -131,15 +131,18 @@ func TestAdvanceToHeadStreamBudgetExceeded(t *testing.T) {
 	}
 	group := srv.getGroup("cg1", false)
 
-	// 2000 changes: deriving + Collecting this diff takes well over 1ms of
-	// SQLite work, so the deadline (anchored at handler entry) is
-	// deterministically expired by the collect checkpoint.
+	// 30000 changes: deriving + Collecting this diff takes well over 1ms of
+	// SQLite work EVERYWHERE, so the deadline (anchored at handler entry) is
+	// expired by the collect checkpoint. Sized up from 2000 (flaked 6/20 in
+	// isolation on an M-series: sub-millisecond derive → collect checkpoint
+	// passed → the apply path's fixture-only "database is locked" panic
+	// preempted the apply checkpoint and failed the message assertion).
 	mustExec(t, db, `INSERT INTO issue (id, title, number, _0_version)
 		SELECT 'i'||value, 't', value, '0000000002'
-		FROM (WITH RECURSIVE c(value) AS (SELECT 1 UNION ALL SELECT value+1 FROM c WHERE value < 2000) SELECT value FROM c)`)
+		FROM (WITH RECURSIVE c(value) AS (SELECT 1 UNION ALL SELECT value+1 FROM c WHERE value < 30000) SELECT value FROM c)`)
 	mustExec(t, db, `INSERT OR REPLACE INTO "_zero.changeLog2" ("stateVersion","pos","table","rowKey","op")
 		SELECT '0000000002', value, 'issue', '{"id":"i'||value||'"}', 's'
-		FROM (WITH RECURSIVE c(value) AS (SELECT 1 UNION ALL SELECT value+1 FROM c WHERE value < 2000) SELECT value FROM c)`)
+		FROM (WITH RECURSIVE c(value) AS (SELECT 1 UNION ALL SELECT value+1 FROM c WHERE value < 30000) SELECT value FROM c)`)
 	mustExec(t, db, `INSERT OR REPLACE INTO "_zero.replicationState" (stateVersion, lock) VALUES ('0000000002', 1)`)
 
 	w, _ := collectAdvanceToHeadStreamFrames()
