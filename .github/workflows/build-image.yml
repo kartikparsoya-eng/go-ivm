@@ -53,7 +53,10 @@ jobs:
         env:
           CGO_ENABLED: 1
           CGO_CFLAGS: -I${{ github.workspace }}/c/sqlite3
-          CGO_LDFLAGS: -L/tmp/wal2lib
+          # -lm: fts5Bm25Function needs log() — glibc keeps libm separate
+          # (macOS libSystem and alpine musl bundle it, so only this runner
+          # needs it spelled out; harmless elsewhere).
+          CGO_LDFLAGS: -L/tmp/wal2lib -lm
         run: |
           go test -count=1 -tags "libsqlite3 sqlite_omit_load_extension" \
             $(go list ./... | grep -v testharness)
