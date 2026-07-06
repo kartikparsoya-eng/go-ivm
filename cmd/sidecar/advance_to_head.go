@@ -83,17 +83,20 @@ func advanceDeadline() (time.Time, bool) {
 	return time.Now().Add(time.Duration(advanceBudgetMs) * time.Millisecond), true
 }
 
-// checkAdvanceBudget panics a PLAIN error (recovered by
-// handleStreamWithRecover → rpcError) when the budget deadline has passed.
-// Deliberately NOT a DataError: the TS classifier must file this under
-// 'unclassified' (→ ResetPipelinesSignal → re-hydrate), not 'data-error'
-// (→ CG teardown, never reset).
+// checkAdvanceBudget panics a TYPED *advanceAbortedError (recovered by
+// handleStreamWithRecover → rpcCodeAdvanceAborted) when the budget deadline
+// has passed. TS maps that code to ResetPipelinesSignal
+// ('advancement-timeout') — reset + re-hydrate, the same recovery as the
+// TS-economic abort. Deliberately NOT a DataError (→ 'data-error' teardown,
+// never reset) and NOT a plain string (→ -32000 'unclassified', which since
+// the follow-TS failure model RETHROWS into a CG teardown — a time-bound
+// overrun is an economics decision, not a bug).
 func checkAdvanceBudget(deadline time.Time, on bool, phase, cgID string) {
 	if on && time.Now().After(deadline) {
-		panic(fmt.Sprintf(
+		panic(&advanceAbortedError{msg: fmt.Sprintf(
 			"advance exceeded GO_IVM_ADVANCE_BUDGET_MS=%d during %s (cg=%s) — "+
 				"caller should reset/re-hydrate; a slow advance pins the WAL frame "+
-				"the diff was derived against", advanceBudgetMs, phase, cgID))
+				"the diff was derived against", advanceBudgetMs, phase, cgID)})
 	}
 }
 
@@ -634,7 +637,12 @@ func (s *Server) handleAdvanceToHead(req RPCRequest) RPCResponse {
 	// with bounded memory.
 	if diff.Changes > maxDiffChanges {
 		rebindCurr()
-		return rpcError(req.ID, -32000, fmt.Sprintf(
+		// Typed abort code: a bounded-MEMORY refusal wants the same
+		// disposition as the bounded-TIME aborts — reset/re-hydrate via
+		// ResetPipelinesSignal('advancement-timeout') — never the
+		// 'unclassified' bucket, which RETHROWS (CG teardown) under the
+		// follow-TS failure model.
+		return rpcError(req.ID, rpcCodeAdvanceAborted, fmt.Sprintf(
 			"advanceToHead diff: %d changes exceeds GO_IVM_MAX_DIFF_CHANGES=%d — "+
 				"caller should reset/re-hydrate instead of replaying this diff",
 			diff.Changes, maxDiffChanges))

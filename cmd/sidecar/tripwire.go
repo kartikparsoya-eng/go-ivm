@@ -53,3 +53,20 @@ func tripwire(site string) {
 			site)
 	})
 }
+
+// nonDefault logs the first use of a CONFIG-REACHABLE non-default path, once
+// per site per process. Distinct from tripwire: these paths are NOT scheduled
+// for removal — they are deliberate rollback/experiment knobs (drive-mode off,
+// eager advance, serial fanout, Phase-2 lazy hydrate) — but a production
+// deployment on the default path must show ZERO of these lines. Anything
+// outside the default path is outside the TS-faithfulness review surface;
+// this marker makes that boundary greppable in deployment logs
+// (see PROD-PATH.md).
+func nonDefault(site string) {
+	v, _ := tripwireOnces.LoadOrStore("nd:"+site, &sync.Once{})
+	v.(*sync.Once).Do(func() {
+		fmt.Fprintf(os.Stderr,
+			"[GO-IVM][NON-DEFAULT] %s engaged — this deployment is off the default (prod) path; see PROD-PATH.md\n",
+			site)
+	})
+}

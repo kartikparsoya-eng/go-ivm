@@ -123,6 +123,19 @@ func newServerFromEnv() (*Server, error) {
 				"[GO-IVM] advanceToHead ARMED [%s] (appID=%q)\n", mode, server.appID)
 		}
 	}
+	// Startup-time non-default engine-knob markers (see PROD-PATH.md): a
+	// default-path deployment prints NONE of these. Each gates an alternate
+	// implementation kept as a rollback/experiment — code that is off the
+	// TS-faithfulness review surface until deliberately engaged.
+	if !tablesource.LazyAdvance {
+		nonDefault("GO_IVM_LAZY_ADVANCE=false (eager advance fallback — materializes per-push rows up front)")
+	}
+	if !tablesource.ParallelAdvance {
+		nonDefault("GO_IVM_PARALLEL_ADVANCE=false (serial advance fanout fallback)")
+	}
+	if os.Getenv("GO_IVM_LAZY_HYDRATE") == "true" {
+		nonDefault("GO_IVM_LAZY_HYDRATE=true (Phase-2 lazy-hydrate experiment; Cmax from operator tree)")
+	}
 	return server, nil
 }
 

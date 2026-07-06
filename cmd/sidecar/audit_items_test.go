@@ -92,12 +92,18 @@ func TestAdvanceBudgetChecker(t *testing.T) {
 		}
 		if _, isDataErr := r.(*ivm.DataError); isDataErr {
 			t.Fatalf("budget panic is a DataError — TS would classify 'data-error' " +
-				"(teardown, never reset); it must stay a plain error → 'unclassified' → reset")
+				"(teardown, never reset); it must be the typed abort → reset")
 		}
-		msg, ok := r.(string)
+		// The typed abort maps to rpcCodeAdvanceAborted → TS resets via
+		// ResetPipelinesSignal('advancement-timeout'). A plain string would
+		// surface as -32000 'unclassified' — which now RETHROWS (CG teardown)
+		// under the follow-TS failure model, the wrong disposition for a
+		// deliberate time bound.
+		aerr, ok := r.(*advanceAbortedError)
 		if !ok {
-			t.Fatalf("budget panic value = %T, want string", r)
+			t.Fatalf("budget panic value = %T, want *advanceAbortedError", r)
 		}
+		msg := aerr.Error()
 		for _, needle := range []string{"GO_IVM_ADVANCE_BUDGET_MS", "apply", "cg1", "reset"} {
 			if !strings.Contains(msg, needle) {
 				t.Fatalf("budget panic %q missing %q", msg, needle)

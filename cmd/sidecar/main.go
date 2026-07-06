@@ -666,25 +666,30 @@ func connMaxIdleFromEnv() time.Duration {
 	return time.Duration(n) * time.Second
 }
 
-// maxDiffChanges caps how many change-log entries advanceToHead[Stream] will
-// materialize via diff.Collect (full row values per entry — see the guards at
-// the Collect call sites). Above the cap the RPC returns an error and the TS
-// caller resets/re-hydrates with bounded memory. 50k fat rows ≈ low hundreds
-// of MB transient per CG — past that, replaying the diff is slower than a
-// re-hydrate anyway.
+// maxDiffChanges caps how many change-log entries the UNARY advanceToHead
+// will materialize via diff.Collect (full row values per entry — see the
+// guard at its Collect call site). Above the cap the RPC returns an error and
+// the TS caller resets/re-hydrates with bounded memory. 50k fat rows ≈ low
+// hundreds of MB transient per CG — past that, replaying the diff is slower
+// than a re-hydrate anyway. SHADOW-ONLY since D9: the prod handler
+// (advanceToHeadStream) feeds the engine lazily off the changelog cursor and
+// has no Collect and no cap; the unary RPC's only callers are the drive-
+// shadow and P1 go-derived-diff audits (see PROD-PATH.md).
 var maxDiffChanges = envPositiveInt("GO_IVM_MAX_DIFF_CHANGES", 50_000)
 
 // advanceBudgetMs is the wall-clock budget for ONE advanceToHead[Stream]
 // call (derive + Collect + engine apply + emit). User's-audit item: a
 // pathologically slow advance pins the WAL2 frame the diff was derived
-// against for its whole duration (blocking checkpointing of that range),
-// and in Go-primary mode TS suppresses its own advance-time breaker — so
-// nothing bounded a wedged advance. On budget exceed the RPC errors
-// mid-stream (a plain error, NOT a DataError: it must land in the TS
-// classifier's 'unclassified' → ResetPipelinesSignal bucket so the caller
-// resets/re-hydrates with bounded time, exactly like the
-// GO_IVM_MAX_DIFF_CHANGES refusal bounds memory). Var, not const, for
-// tests. Practically disable by setting it very large.
+// against for its whole duration (blocking checkpointing of that range) — so
+// this bounds the pin even when the TS-economic abort is not armed (old TS,
+// shadow paths, suppressAbort). On budget exceed the RPC errors mid-stream
+// with the TYPED abort (rpcCodeAdvanceAborted → TS maps it to
+// ResetPipelinesSignal('advancement-timeout') — reset + re-hydrate with
+// bounded time, exactly like the GO_IVM_MAX_DIFF_CHANGES refusal bounds
+// memory). It must NOT be a plain -32000: since the follow-TS failure model,
+// 'unclassified' RETHROWS (CG teardown) — a time-bound overrun is an
+// economics decision, not a bug. Var, not const, for tests. Practically
+// disable by setting it very large.
 var advanceBudgetMs = envPositiveInt("GO_IVM_ADVANCE_BUDGET_MS", 60_000)
 
 // --- RPC types ---
@@ -2285,6 +2290,13 @@ type advanceStreamPartial struct {
 }
 
 func (s *Server) handleAdvanceStream(req RPCRequest, streamW streamWriter) RPCResponse {
+	// Push-mode advance: TS computes the diff and ships it. The default
+	// (prod) path is advanceToHeadStream — Go derives its own diff (drive
+	// mode, GO_IVM_ADVANCE_DRIVE=true + goSidecar.goPrimaryTrigger). This
+	// handler is the drive-off rollback path and the shadow harness's
+	// non-drive arm; it is NOT scheduled for removal, but a default-path
+	// deployment must never log this marker.
+	nonDefault("rpc advanceStream (push-mode advance; drive-off rollback / shadow harness)")
 	var p advanceParams
 	if err := mpUnmarshal(req.Params, &p); err != nil {
 		return rpcError(req.ID, -32602, err.Error())
