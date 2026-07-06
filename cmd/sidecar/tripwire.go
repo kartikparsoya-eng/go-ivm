@@ -10,10 +10,6 @@ package main
 //
 // Sites, and why each is suspect:
 //
-//	rpc addQuery / addQueries — unary hydrates. TS routes ALL hydrate
-//	    traffic through addQueriesStream (the fat-frame fix in
-//	    go-compute-backend hydrate()); the TS client wrappers are deleted.
-//	    A hit means an out-of-repo caller exists.
 //	rpc loadRows (memory-mode seeding) — production is table mode: the
 //	    replica is authoritative and TS ships no rows. Deleting memory
 //	    mode is gated on this never firing outside tests.

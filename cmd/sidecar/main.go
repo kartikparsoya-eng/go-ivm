@@ -1415,7 +1415,7 @@ func (g *ClientGroup) worker(s *Server) {
 			start = time.Now()
 			n := metrics.advancesInFlight.Add(1)
 			updatePeak(&metrics.peakAdvConc, n)
-		case "addQuery", "addQueries", "addQueriesStream":
+		case "addQueriesStream":
 			start = time.Now()
 			n := metrics.hydratesInFlight.Add(1)
 			updatePeak(&metrics.peakHydConc, n)
@@ -1452,7 +1452,7 @@ func (g *ClientGroup) worker(s *Server) {
 		case "advanceStream", "advanceToHeadStream":
 			metrics.advancesInFlight.Add(-1)
 			metrics.recordAdvance(time.Since(start))
-		case "addQuery", "addQueries", "addQueriesStream":
+		case "addQueriesStream":
 			metrics.hydratesInFlight.Add(-1)
 			metrics.recordHydrate(time.Since(start))
 		}
@@ -1697,10 +1697,6 @@ func (s *Server) handleRequest(req RPCRequest) (resp RPCResponse) {
 		return s.handleInit(req)
 	case "loadRows":
 		return s.handleLoadRows(req)
-	case "addQuery":
-		return s.handleAddQuery(req)
-	case "addQueries":
-		return s.handleAddQueries(req)
 	case "removeQuery":
 		return s.handleRemoveQuery(req)
 	case "advanceToHead":
@@ -1724,7 +1720,6 @@ func (s *Server) handleRequest(req RPCRequest) (resp RPCResponse) {
 
 type initParams struct {
 	ClientGroupID string                       `json:"clientGroupID"`
-	DBPath        string                       `json:"dbPath"` // deprecated, kept for compat
 	Storage       string                       `json:"storagePath"`
 	Tables        map[string]tableSchemaParams `json:"tables"`
 	// AppID names the app whose `${appID}.permissions` table the Snapshotter
@@ -1998,64 +1993,7 @@ func (s *Server) handleLoadRows(req RPCRequest) RPCResponse {
 	return RPCResponse{JSONRPC: "2.0", Result: "ok", ID: req.ID}
 }
 
-// --- addQuery: build pipeline + hydrate ---
-
-type addQueryParams struct {
-	ClientGroupID string      `json:"clientGroupID"`
-	QueryID       string      `json:"queryID"`
-	AST           builder.AST `json:"ast"`
-	InitEpoch     uint64      `json:"initEpoch"`
-}
-
-type addQueryResult struct {
-	Changes  []engine.RowChange `json:"changes"`
-	TimingMs float64            `json:"timingMs,omitempty"`
-}
-
-func (s *Server) handleAddQuery(req RPCRequest) RPCResponse {
-	tripwire("rpc addQuery (unary hydrate)")
-	var p addQueryParams
-	if err := mpUnmarshal(req.Params, &p); err != nil {
-		// Diagnostic: dump first 64 bytes so we can see what wire format arrived.
-		dump := req.Params
-		if len(dump) > 64 {
-			dump = dump[:64]
-		}
-		fmt.Fprintf(os.Stderr, "[GO-IVM] addQuery decode FAIL err=%v paramsLen=%d firstBytes=%x\n",
-			err, len(req.Params), dump)
-		return rpcError(req.ID, -32602, err.Error())
-	}
-
-	cgID := p.ClientGroupID
-	if cgID == "" {
-		cgID = "default"
-	}
-
-	group := s.getGroup(cgID, false)
-	if group == nil {
-		return rpcError(req.ID, -32000, "engine not initialized (call init first)")
-	}
-	group.mu.Lock()
-	defer group.mu.Unlock()
-
-	if group.eng == nil {
-		return rpcError(req.ID, -32000, "engine not initialized (call init first)")
-	}
-	if resp, stale := checkInitEpoch(group, req.ID, p.InitEpoch); stale {
-		return resp
-	}
-
-	s.refreshSnapForInitialHydrateLocked(cgID, group, []engine.QuerySpec{{AST: p.AST}})
-	changes, timingMs, err := group.eng.AddQuery(p.QueryID, p.AST)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "[GO-IVM] addQuery ERROR cg=%s query=%s: %v\n", cgID, p.QueryID, err)
-		return hydrateErrorResponse(req.ID, "addQuery: ", err)
-	}
-
-	return RPCResponse{JSONRPC: "2.0", Result: addQueryResult{Changes: changes, TimingMs: timingMs}, ID: req.ID}
-}
-
-// --- addQueries: batch build + parallel hydrate ---
+// --- addQueriesParams: shared by addQueriesStream (push + pull modes) ---
 
 type addQueriesParams struct {
 	ClientGroupID string `json:"clientGroupID"`
@@ -2080,84 +2018,6 @@ type addQueriesParams struct {
 	// until the idle sweep. 0/absent = zero opening credit (every row waits
 	// for an explicit grant — the lockstep test mode).
 	PullWindow int `json:"pullWindow,omitempty"`
-}
-
-type addQueriesResult struct {
-	Results []addQueryResult `json:"results"`
-}
-
-func (s *Server) handleAddQueries(req RPCRequest) RPCResponse {
-	tripwire("rpc addQueries (unary batch hydrate)")
-	var p addQueriesParams
-	if err := mpUnmarshal(req.Params, &p); err != nil {
-		// Find position of first 0xd4 in params for diagnosis
-		d4Pos := -1
-		for i, b := range req.Params {
-			if b == 0xd4 {
-				d4Pos = i
-				break
-			}
-		}
-		// Dump bytes around the d4 position (±20 bytes) plus tail of message
-		start := d4Pos - 20
-		if start < 0 {
-			start = 0
-		}
-		end := d4Pos + 20
-		if end > len(req.Params) {
-			end = len(req.Params)
-		}
-		ctx := req.Params[start:end]
-		tail := req.Params
-		if len(tail) > 64 {
-			tail = tail[len(tail)-64:]
-		}
-		fmt.Fprintf(os.Stderr, "[GO-IVM] addQueries decode FAIL err=%v len=%d d4Pos=%d ctx[%d:%d]=%x lastBytes=%x\n",
-			err, len(req.Params), d4Pos, start, end, ctx, tail)
-		return rpcError(req.ID, -32602, err.Error())
-	}
-
-	cgID := p.ClientGroupID
-	if cgID == "" {
-		cgID = "default"
-	}
-
-	group := s.getGroup(cgID, false)
-	if group == nil {
-		return rpcError(req.ID, -32000, "engine not initialized (call init first)")
-	}
-	group.mu.Lock()
-	defer group.mu.Unlock()
-
-	if group.eng == nil {
-		return rpcError(req.ID, -32000, "engine not initialized (call init first)")
-	}
-	if resp, stale := checkInitEpoch(group, req.ID, p.InitEpoch); stale {
-		return resp
-	}
-
-	specs := make([]engine.QuerySpec, len(p.Queries))
-	for i, q := range p.Queries {
-		specs[i] = engine.QuerySpec{QueryID: q.QueryID, AST: q.AST}
-	}
-
-	s.refreshSnapForInitialHydrateLocked(cgID, group, specs)
-	warmPool, warmCR := s.buildWarmReaderPoolLocked(group, engine.ConservativeHydrateCmaxForSpecs(specs))
-	if warmPool != nil {
-		defer s.tearDownWarmReaderPool(group, warmPool, warmCR)
-	}
-	results, err := group.eng.AddQueries(specs)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "[GO-IVM] addQueries ERROR cg=%s: %v\n", cgID, err)
-		return hydrateErrorResponse(req.ID, "addQueries: ", err)
-	}
-
-	resultList := make([]addQueryResult, len(results))
-	for i, r := range results {
-		resultList[i] = addQueryResult{Changes: r.Changes, TimingMs: r.TimingMs}
-	}
-
-	return RPCResponse{JSONRPC: "2.0", Result: addQueriesResult{Results: resultList}, ID: req.ID}
 }
 
 // --- addQueriesStream: build pipelines + parallel hydrate, emit per-query

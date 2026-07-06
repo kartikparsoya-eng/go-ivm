@@ -203,15 +203,9 @@ func TestAdvanceToHeadStream_DriveReassembles(t *testing.T) {
 	group := srv.getGroup("cg1", false)
 
 	// Hydrate a query so the advance produces RowChanges for it.
-	addReq := RPCRequest{Method: "addQuery", ID: 2, Params: mustMarshal(t, addQueryParams{
-		ClientGroupID: "cg1",
-		QueryID:       "q1",
-		AST:           builder.AST{Table: "issue", OrderBy: ivm.Ordering{{"id", "asc"}}},
-		InitEpoch:     group.initEpoch.Load(),
-	})}
-	if resp := srv.handleAddQuery(addReq); resp.Error != nil {
-		t.Fatalf("addQuery error: %+v", resp.Error)
-	}
+	hydrateOneStreamOK(t, srv, "cg1", "q1",
+		builder.AST{Table: "issue", OrderBy: ivm.Ordering{{"id", "asc"}}},
+		group.initEpoch.Load())
 
 	// V2: add issue id=2.
 	mustExec(t, db, `INSERT INTO "issue" VALUES ('2','two',2,'0000000002')`)
@@ -301,15 +295,9 @@ func TestAdvanceToHeadStream_RowMode(t *testing.T) {
 	}
 	group := srv.getGroup("cg1", false)
 
-	addReq := RPCRequest{Method: "addQuery", ID: 2, Params: mustMarshal(t, addQueryParams{
-		ClientGroupID: "cg1",
-		QueryID:       "q1",
-		AST:           builder.AST{Table: "issue", OrderBy: ivm.Ordering{{"id", "asc"}}},
-		InitEpoch:     group.initEpoch.Load(),
-	})}
-	if resp := srv.handleAddQuery(addReq); resp.Error != nil {
-		t.Fatalf("addQuery error: %+v", resp.Error)
-	}
+	hydrateOneStreamOK(t, srv, "cg1", "q1",
+		builder.AST{Table: "issue", OrderBy: ivm.Ordering{{"id", "asc"}}},
+		group.initEpoch.Load())
 
 	// V2: add issue id=2.
 	mustExec(t, db, `INSERT INTO "issue" VALUES ('2','two',2,'0000000002')`)
@@ -586,15 +574,9 @@ func TestAdvanceToHeadStream_OversizedDiffStreamsWithoutCap(t *testing.T) {
 	}
 	group := srv.getGroup("cg1", false)
 
-	addReq := RPCRequest{Method: "addQuery", ID: 2, Params: mustMarshal(t, addQueryParams{
-		ClientGroupID: "cg1",
-		QueryID:       "q1",
-		AST:           builder.AST{Table: "issue", OrderBy: ivm.Ordering{{"id", "asc"}}},
-		InitEpoch:     group.initEpoch.Load(),
-	})}
-	if resp := srv.handleAddQuery(addReq); resp.Error != nil {
-		t.Fatalf("addQuery error: %+v", resp.Error)
-	}
+	hydrateOneStreamOK(t, srv, "cg1", "q1",
+		builder.AST{Table: "issue", OrderBy: ivm.Ordering{{"id", "asc"}}},
+		group.initEpoch.Load())
 
 	// V2: 20 new issues (4x the shrunken cap).
 	const n = 20

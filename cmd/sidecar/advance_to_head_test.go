@@ -56,6 +56,36 @@ func mustMarshal(t *testing.T, v any) msgpack.RawMessage {
 	return msgpack.RawMessage(b)
 }
 
+// oneQueryStreamParams builds addQueriesParams for a single query — the
+// setup-hydrate shape shared by the advance/coread tests. The unary
+// addQuery/addQueries RPCs were removed in the Phase-2 RPC-surface cleanup;
+// addQueriesStream is the production hydrate path.
+func oneQueryStreamParams(cgID, queryID string, ast builder.AST, initEpoch uint64) addQueriesParams {
+	return addQueriesParams{
+		ClientGroupID: cgID,
+		Queries: []struct {
+			QueryID string      `json:"queryID"`
+			AST     builder.AST `json:"ast"`
+		}{{QueryID: queryID, AST: ast}},
+		InitEpoch: initEpoch,
+	}
+}
+
+// hydrateOneStreamOK hydrates a single query through handleAddQueriesStream
+// (discarding partial frames), failing the test on an error response. Runs
+// the same cold/warm reader-pool arming the deleted unary handler ran
+// (refreshSnapForInitialHydrateLocked + buildWarmReaderPoolLocked live in
+// the streaming handler too), so pool-sensitive tests keep their setup
+// semantics.
+func hydrateOneStreamOK(t *testing.T, srv *Server, cgID, queryID string, ast builder.AST, initEpoch uint64) {
+	t.Helper()
+	req := RPCRequest{Method: "addQueriesStream", ID: 2,
+		Params: mustMarshal(t, oneQueryStreamParams(cgID, queryID, ast, initEpoch))}
+	if resp := srv.handleAddQueriesStream(req, func(interface{}, interface{}) {}); resp.Error != nil {
+		t.Fatalf("addQueriesStream(%s): %+v", queryID, resp.Error)
+	}
+}
+
 func TestAdvanceToHead_DerivesDiff(t *testing.T) {
 	path, db := makeReplica(t)
 
@@ -187,15 +217,9 @@ func TestAdvanceToHead_DriveProducesRowChanges(t *testing.T) {
 	group := srv.getGroup("cg1", false)
 
 	// Hydrate a query (reads the Snapshotter's curr frame via the bound conn).
-	addReq := RPCRequest{Method: "addQuery", ID: 2, Params: mustMarshal(t, addQueryParams{
-		ClientGroupID: "cg1",
-		QueryID:       "q1",
-		AST:           builder.AST{Table: "issue", OrderBy: ivm.Ordering{{"id", "asc"}}},
-		InitEpoch:     group.initEpoch.Load(),
-	})}
-	if resp := srv.handleAddQuery(addReq); resp.Error != nil {
-		t.Fatalf("addQuery error: %+v", resp.Error)
-	}
+	hydrateOneStreamOK(t, srv, "cg1", "q1",
+		builder.AST{Table: "issue", OrderBy: ivm.Ordering{{"id", "asc"}}},
+		group.initEpoch.Load())
 
 	// V2: add issue id=2.
 	mustExec(t, db, `INSERT INTO "issue" VALUES ('2','two',2,'0000000002')`)

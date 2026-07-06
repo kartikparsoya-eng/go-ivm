@@ -112,8 +112,9 @@ func TestAbandonedAdvanceStream_FIFOIsolationAndConvergence(t *testing.T) {
 	readOK(2)
 
 	ast := builder.AST{Table: "tickets", OrderBy: ivm.Ordering{{"id", "asc"}}}
-	send("addQuery", 3, addQueryParams{ClientGroupID: "cg-T", QueryID: "q1", AST: ast, InitEpoch: 1})
-	readOK(3)
+	send("addQueriesStream", 3, oneQueryStreamParams("cg-T", "q1", ast, 1))
+	readOK(3) // final partial (all rows)
+	readOK(3) // terminal "done"
 
 	// --- The abandoned call + everything TS queues behind it, written
 	// back-to-back so all four sit in the CG FIFO together. ---
@@ -132,9 +133,10 @@ func TestAbandonedAdvanceStream_FIFOIsolationAndConvergence(t *testing.T) {
 		}
 	}
 	send("advanceStream", abandonedID, advanceParams{ClientGroupID: "cg-T", InitEpoch: 1, Changes: changes})
-	// TS gives up NOW (does not await) and resets: remove + re-add.
+	// TS gives up NOW (does not await) and resets: remove + re-add (re-add
+	// through the streaming hydrate — the unary addQuery RPC is gone).
 	send("removeQuery", removeID, removeQueryParams{ClientGroupID: "cg-T", QueryID: "q1", InitEpoch: 1})
-	send("addQuery", readdID, addQueryParams{ClientGroupID: "cg-T", QueryID: "q1", AST: ast, InitEpoch: 1})
+	send("addQueriesStream", readdID, oneQueryStreamParams("cg-T", "q1", ast, 1))
 	// And one more advance AFTER the reset — the re-wired world keeps moving.
 	send("advanceStream", afterID, advanceParams{
 		ClientGroupID: "cg-T", InitEpoch: 1,
@@ -187,8 +189,14 @@ func TestAbandonedAdvanceStream_FIFOIsolationAndConvergence(t *testing.T) {
 		case removeID:
 			removeReplied = true
 		case readdID:
-			rehydrateSeen = true
-			rehydrateRows = countAddQueryRows(t, resp.Result)
+			// Streaming re-hydrate: rows arrive on partial frames, completion
+			// on the terminal "done" frame (same positional wire shape as the
+			// advance partials).
+			if isDone {
+				rehydrateSeen = true
+			} else {
+				rehydrateRows += countPositionalRows(t, resp.Result)
+			}
 		case afterID:
 			if isDone {
 				afterDone = true
@@ -221,8 +229,9 @@ func TestAbandonedAdvanceStream_FIFOIsolationAndConvergence(t *testing.T) {
 	}
 }
 
-// countPositionalRows extracts the row count from a decoded advanceStream
-// partial (positional rev-9 wire keys: "d" = dict, "r" = rows).
+// countPositionalRows extracts the row count from a decoded streaming
+// partial (positional rev-9 wire keys: "d" = dict, "r" = rows — both the
+// advanceStream and addQueriesStream partial shapes).
 func countPositionalRows(t *testing.T, result interface{}) int {
 	t.Helper()
 	m, ok := result.(map[string]interface{})
@@ -231,15 +240,4 @@ func countPositionalRows(t *testing.T, result interface{}) int {
 	}
 	rows, _ := m["r"].([]interface{})
 	return len(rows)
-}
-
-// countAddQueryRows extracts len(changes) from an addQuery response.
-func countAddQueryRows(t *testing.T, result interface{}) int {
-	t.Helper()
-	m, ok := result.(map[string]interface{})
-	if !ok {
-		t.Fatalf("addQuery Result is %T, want map", result)
-	}
-	changes, _ := m["changes"].([]interface{})
-	return len(changes)
 }

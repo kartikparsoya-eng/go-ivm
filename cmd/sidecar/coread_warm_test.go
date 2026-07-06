@@ -50,15 +50,9 @@ func warmTestServer(t *testing.T) (*Server, *ClientGroup) {
 	// Cold hydrate one query — establishes a live pipeline (PipelineCount==1)
 	// and, on this first add, builds the cold reader pool (converge-fallback
 	// under the stub). Read-only, so it works on the default build.
-	addReq := RPCRequest{Method: "addQuery", ID: 2, Params: mustMarshal(t, addQueryParams{
-		ClientGroupID: "cg1",
-		QueryID:       "q1",
-		AST:           builder.AST{Table: "issue", OrderBy: ivm.Ordering{{"id", "asc"}}},
-		InitEpoch:     group.initEpoch.Load(),
-	})}
-	if resp := srv.handleAddQuery(addReq); resp.Error != nil {
-		t.Fatalf("addQuery error: %+v", resp.Error)
-	}
+	hydrateOneStreamOK(t, srv, "cg1", "q1",
+		builder.AST{Table: "issue", OrderBy: ivm.Ordering{{"id", "asc"}}},
+		group.initEpoch.Load())
 	if group.eng.PipelineCount() != 1 {
 		t.Fatalf("PipelineCount = %d, want 1 after cold hydrate", group.eng.PipelineCount())
 	}
