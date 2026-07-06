@@ -9,6 +9,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"iter"
 	"os"
 	"strconv"
 	"sync"
@@ -1517,8 +1518,50 @@ func (e *Engine) AdvanceStreamChunked(
 	return e.advanceStreamChunked(changes, chunkSize, onResult)
 }
 
+// AdvanceStreamChunkedSeq is AdvanceStreamChunked over a LAZY change
+// sequence (DESIGN-duplex-streaming D9): the snapshotter's changelog
+// cursor feeds the push loop one SnapshotChange at a time, so peak memory
+// is O(chunk) instead of O(diff) — the GO_IVM_MAX_DIFF_CHANGES cap and its
+// reset failure mode are unnecessary for callers of this variant. This is
+// TS's shape: #advance iterates its changelog cursor lazily and pushes
+// per-change; nothing materializes the diff.
+//
+// The seq's error slot carries the CURSOR's failure (reset signal /
+// invalid-diff / SQL error) in-band. On a yielded error the loop stops and
+// the error is returned WITHOUT the terminal Final flush: the engine may
+// have applied a prefix of the diff, so the stream must settle as an ERROR
+// (the sidecar's rpcError — classified into the caller's reset path, which
+// discards the half-advanced engine), never as a clean Final that a
+// consumer could mistake for a complete advance. signalAdvanceEnd still
+// runs (sources rotate to a sane frame for the teardown window), matching
+// the drift/panic paths.
+func (e *Engine) AdvanceStreamChunkedSeq(
+	changes iter.Seq2[SnapshotChange, error],
+	chunkSize int,
+	onResult func(AdvanceStreamPartial),
+) error {
+	if chunkSize <= 0 {
+		chunkSize = advanceChunkSize
+	}
+	return e.advanceStreamChunkedSeq(changes, chunkSize, onResult)
+}
+
 func (e *Engine) advanceStreamChunked(
 	changes []SnapshotChange,
+	chunkSize int,
+	onResult func(AdvanceStreamPartial),
+) error {
+	return e.advanceStreamChunkedSeq(func(yield func(SnapshotChange, error) bool) {
+		for _, c := range changes {
+			if !yield(c, nil) {
+				return
+			}
+		}
+	}, chunkSize, onResult)
+}
+
+func (e *Engine) advanceStreamChunkedSeq(
+	changes iter.Seq2[SnapshotChange, error],
 	chunkSize int,
 	onResult func(AdvanceStreamPartial),
 ) error {
@@ -1633,6 +1676,7 @@ func (e *Engine) advanceStreamChunked(
 	// clean terminal frame — empty changes signal "advance abandoned"
 	// rather than wire protocol corruption.
 	var nonDriftPanic any
+	var seqErr error
 	func() {
 		defer func() {
 			if r := recover(); r != nil {
@@ -1667,7 +1711,13 @@ func (e *Engine) advanceStreamChunked(
 		// Snapshot sources once; COW + atomic.Pointer guarantees this slice
 		// stays consistent for the duration of the advance loop.
 		sources := e.sourcesView()
-		for _, change := range changes {
+		for change, cerr := range changes {
+			if cerr != nil {
+				// Lazy cursor failed mid-diff (D9): stop consuming; the
+				// error settles the whole stream (see AdvanceStreamChunkedSeq).
+				seqErr = cerr
+				return
+			}
 			source, ok := sources[change.Table]
 			if !ok {
 				continue // no pipelines read this table
@@ -1707,6 +1757,14 @@ func (e *Engine) advanceStreamChunked(
 	// invariant applies to the streaming path. Runs OUTSIDE the
 	// recover()-guarded func so it fires on the drift path too.
 	e.signalAdvanceEnd()
+
+	// D9: a lazy-cursor failure settles the stream as an ERROR — no
+	// terminal Final frame (the caller's rpcError is the terminal; a clean
+	// Final here would let a consumer mistake a half-applied diff for a
+	// complete advance).
+	if seqErr != nil {
+		return seqErr
+	}
 
 	// Always emit a terminal Final frame. Carries cumulative timings on
 	// success; carries Drift + empty Changes on drift recovery (TS

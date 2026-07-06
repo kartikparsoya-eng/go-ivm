@@ -14,6 +14,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"time"
@@ -23,6 +24,12 @@ import (
 	"github.com/kartikparsoya-eng/go-ivm/internal/tablesource"
 	"github.com/kartikparsoya-eng/go-ivm/ivm"
 )
+
+// errSeqConsumerStopped aborts diff.Each when the engine stops consuming
+// the lazy change seq (D9): the engine broke its range (panic unwind /
+// budget abort), so the cursor must stop reading — it is NOT a cursor
+// failure and is swallowed by the seq adapter.
+var errSeqConsumerStopped = errors.New("advance seq consumer stopped")
 
 type advanceToHeadParams struct {
 	ClientGroupID string `json:"clientGroupID"`
@@ -811,25 +818,62 @@ func (s *Server) handleAdvanceToHeadStream(req RPCRequest, streamW streamWriter)
 	// rebind-before-Final-frame ordering.
 	defer rebindCurr()
 
-	// Memory guard — same rationale as handleAdvanceToHead: Collect
-	// materializes the full diff with row values; refuse oversized diffs so
-	// the caller resets/re-hydrates with bounded memory instead.
-	if diff.Changes > maxDiffChanges {
-		rebindCurr()
-		return rpcError(req.ID, -32000, fmt.Sprintf(
-			"advanceToHeadStream diff: %d changes exceeds GO_IVM_MAX_DIFF_CHANGES=%d — "+
-				"caller should reset/re-hydrate instead of replaying this diff",
-			diff.Changes, maxDiffChanges))
+	// D9 (DESIGN-duplex-streaming): the changelog cursor feeds the engine
+	// LAZILY — no diff.Collect materialization, no GO_IVM_MAX_DIFF_CHANGES
+	// cap (and no cap-induced reset). Peak memory is O(chunk); the a3 time
+	// budget (checked per emitted partial) is the bound. diff.Each runs
+	// INSIDE the engine's range on this goroutine: one changelog entry is
+	// read, pushed, flattened, and emitted before the next is read — TS's
+	// lazy-cursor #advance shape.
+	//
+	// Cursor errors surface IN-BAND through the seq's error slot. The
+	// engine stops, skips its terminal Final flush, and returns the error
+	// (a half-applied diff must never settle as a clean Final). Cursor
+	// failures split on whether anything already reached the wire:
+	//   - nothing emitted (common: reset detected at the first entries) →
+	//     today's clean single-Final reset frame / plain rpcError;
+	//   - partials already emitted → rpcError ONLY (a reset-Final after
+	//     row partials would double-terminate the accumulator); the TS
+	//     advance classifier routes it to reset/re-hydrate (a1), which
+	//     discards the half-advanced engine.
+	changesSeq := func(yield func(engine.SnapshotChange, error) bool) {
+		err := diff.Each(func(c snapshotter.Change) error {
+			if !yield(engine.SnapshotChange{
+				Table:      c.Table,
+				PrevValues: c.PrevValues,
+				NextValue:  c.NextValue,
+			}, nil) {
+				return errSeqConsumerStopped
+			}
+			return nil
+		})
+		if err != nil && !errors.Is(err, errSeqConsumerStopped) {
+			yield(engine.SnapshotChange{}, err)
+		}
 	}
+	// Budget cut between the leapfrog and the engine apply (the apply
+	// itself is checked per emitted partial below).
+	checkAdvanceBudget(budgetDeadline, budgetOn, "collect", cgID)
 
-	changes, err := diff.Collect()
-	if err != nil {
-		rebindCurr()
-		// A reset/truncate/permissions-change is a normal outcome: emit a single
-		// Final frame carrying the reset + version so the TS accumulator yields
-		// AdvanceToHeadResult{reset, version} and the caller re-hydrates at
-		// version. There are no RowChanges in this case.
-		if rs, ok := snapshotter.IsReset(err); ok {
+	// Version + NumChanges ride the Final frame only. Drift (if any) is
+	// carried on the Final frame by AdvanceStream itself (it recovers the
+	// drift panic and returns nil) — the TS accumulator re-throws it as a
+	// DriftError. diff.Changes is the changelog COUNT (known before any
+	// row values are read), so it still rides the Final frame.
+	numChanges := diff.Changes
+	var emittedPartial bool
+
+	// finishStream maps the engine's returned error to the wire per the
+	// cursor-error split above. Shared by the rowMode and frame branches.
+	finishStream := func(streamErr error) RPCResponse {
+		if streamErr == nil {
+			return RPCResponse{JSONRPC: "2.0", Result: "done", ID: req.ID}
+		}
+		if rs, ok := snapshotter.IsReset(streamErr); ok && !emittedPartial {
+			// Clean pre-stream reset: single Final frame carrying reset +
+			// version; the caller re-hydrates at version. streamW is safe
+			// in rowMode too — no records exist, so ordering is trivially
+			// preserved (see rowplane.go's emitAdvanceToHeadPartial note).
 			streamW(req.ID, advanceToHeadStreamPartial{
 				ChunkIndex: 0,
 				Final:      true,
@@ -838,29 +882,9 @@ func (s *Server) handleAdvanceToHeadStream(req RPCRequest, streamW streamWriter)
 			})
 			return RPCResponse{JSONRPC: "2.0", Result: "done", ID: req.ID}
 		}
-		// InvalidDiffError or a hard error (unknown table / SQL failure): surface
-		// to TS, which falls back to its own advance path.
-		return rpcError(req.ID, -32000, "advanceToHeadStream diff: "+err.Error())
+		fmt.Fprintf(os.Stderr, "[GO-IVM] advanceToHeadStream ERROR cg=%s: %v\n", cgID, streamErr)
+		return rpcError(req.ID, -32000, "advanceToHeadStream: "+streamErr.Error())
 	}
-
-	snapChanges := make([]engine.SnapshotChange, len(changes))
-	for i, c := range changes {
-		snapChanges[i] = engine.SnapshotChange{
-			Table:      c.Table,
-			PrevValues: c.PrevValues,
-			NextValue:  c.NextValue,
-		}
-	}
-	// Budget cut between Collect and the engine apply (the apply itself is
-	// checked per emitted partial below).
-	checkAdvanceBudget(budgetDeadline, budgetOn, "collect", cgID)
-
-	// Apply Go's own derived diff to Go's engine, frame-coordinated against
-	// diff.Prev(), streaming the resulting RowChanges in advanceChunkSize-sized
-	// frames. Version + NumChanges ride the Final frame only. Drift (if any) is
-	// carried on the Final frame by AdvanceStream itself (it recovers the drift
-	// panic and returns nil) — the TS accumulator re-throws it as a DriftError.
-	numChanges := diff.Changes
 
 	// Row mode (NAPI transport only): per-row records via abiDeliver with
 	// chunkSize=1 so each RowChange crosses the boundary as the engine
@@ -870,12 +894,13 @@ func (s *Server) handleAdvanceToHeadStream(req RPCRequest, streamW streamWriter)
 	// as kind-1 frames on the same ordered queue; "done" follows via the
 	// pipe (see rowplane.go's ordering invariant).
 	if rp := newRowPlane(s, req.ID, p.RowMode); rp != nil {
-		streamErr := group.eng.AdvanceStreamChunked(snapChanges, 1, func(r engine.AdvanceStreamPartial) {
+		streamErr := group.eng.AdvanceStreamChunkedSeq(changesSeq, 1, func(r engine.AdvanceStreamPartial) {
 			// Per-partial budget checkpoint: a panic here escapes
-			// AdvanceStreamChunked cleanly (engine stays reusable — see
+			// AdvanceStreamChunkedSeq cleanly (engine stays reusable — see
 			// TestAdvanceStream_PanickingSink_NoDeadlockAndEngineReusable)
 			// and handleStreamWithRecover converts it to an RPC error.
 			checkAdvanceBudget(budgetDeadline, budgetOn, "apply", cgID)
+			emittedPartial = true
 			rp.emitAdvanceToHeadPartial(r, version, numChanges)
 			if r.Drift != nil {
 				fmt.Fprintf(os.Stderr, "[GO-IVM][drift] advanceToHeadStream(rowMode) cg=%s %s\n",
@@ -889,15 +914,12 @@ func (s *Server) handleAdvanceToHeadStream(req RPCRequest, streamW streamWriter)
 			}
 		})
 		rebindCurr()
-		if streamErr != nil {
-			fmt.Fprintf(os.Stderr, "[GO-IVM] advanceToHeadStream(rowMode) ERROR cg=%s: %v\n", cgID, streamErr)
-			return rpcError(req.ID, -32000, "advanceToHeadStream: "+streamErr.Error())
-		}
-		return RPCResponse{JSONRPC: "2.0", Result: "done", ID: req.ID}
+		return finishStream(streamErr)
 	}
 
-	streamErr := group.eng.AdvanceStream(snapChanges, func(r engine.AdvanceStreamPartial) {
+	streamErr := group.eng.AdvanceStreamChunkedSeq(changesSeq, 0, func(r engine.AdvanceStreamPartial) {
 		checkAdvanceBudget(budgetDeadline, budgetOn, "apply", cgID)
+		emittedPartial = true
 		pc := toPositional(r.Changes)
 		part := advanceToHeadStreamPartial{
 			Dict:       pc.Dict,
@@ -921,11 +943,5 @@ func (s *Server) handleAdvanceToHeadStream(req RPCRequest, streamW streamWriter)
 		}
 	})
 	rebindCurr()
-	if streamErr != nil {
-		fmt.Fprintf(os.Stderr, "[GO-IVM] advanceToHeadStream ERROR cg=%s: %v\n", cgID, streamErr)
-		return rpcError(req.ID, -32000, "advanceToHeadStream: "+streamErr.Error())
-	}
-
-	// "done" sentinel — TS client uses this to resolve the call promise.
-	return RPCResponse{JSONRPC: "2.0", Result: "done", ID: req.ID}
+	return finishStream(streamErr)
 }

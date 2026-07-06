@@ -10,6 +10,7 @@ package main
 // advance_to_head_test.go (same package).
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -551,5 +552,79 @@ func TestPerfMetrics_AdvanceToHeadStreamCountsAsAdvance(t *testing.T) {
 	}
 	if got := metrics.advancesInFlight.Load(); got != beforeInFlight {
 		t.Fatalf("advancesInFlight = %d after completion, want %d — inc/dec unbalanced", got, beforeInFlight)
+	}
+}
+
+// D9 (DESIGN-duplex-streaming): the streaming handler feeds the engine from
+// the changelog cursor LAZILY — the GO_IVM_MAX_DIFF_CHANGES cap no longer
+// applies to it (only the non-streaming advanceToHead, which must
+// materialize its single-frame response, keeps the cap). A diff bigger than
+// the cap must stream to completion instead of erroring into the caller's
+// reset path. Fails pre-D9 ("exceeds GO_IVM_MAX_DIFF_CHANGES"). Skips
+// without BEGIN CONCURRENT (drive apply writes into a past-pinned
+// snapshot) — same constraint as TestAdvanceToHeadStream_DriveReassembles.
+func TestAdvanceToHeadStream_OversizedDiffStreamsWithoutCap(t *testing.T) {
+	path, db := makeReplica(t)
+	if !beginConcurrentSupported(t, db) {
+		t.Skip("drive mode writes into a past-pinned snapshot — requires BEGIN CONCURRENT (wal2/libsqlite3 build)")
+	}
+
+	// Cap far below the diff size: pre-D9 the stream handler refused this.
+	prevCap := maxDiffChanges
+	maxDiffChanges = 5
+	t.Cleanup(func() { maxDiffChanges = prevCap })
+
+	srv := NewServer(tablesource.ModeTable, path)
+	srv.appID = "myapp"
+	srv.advanceToHeadEnabled = true
+	srv.advanceDriveEnabled = true
+	t.Cleanup(srv.closeAll)
+
+	initReq := RPCRequest{Method: "init", ID: 1, Params: mustMarshal(t, issueInitParams("cg1"))}
+	if resp := srv.handleInit(initReq); resp.Error != nil {
+		t.Fatalf("init error: %+v", resp.Error)
+	}
+	group := srv.getGroup("cg1", false)
+
+	addReq := RPCRequest{Method: "addQuery", ID: 2, Params: mustMarshal(t, addQueryParams{
+		ClientGroupID: "cg1",
+		QueryID:       "q1",
+		AST:           builder.AST{Table: "issue", OrderBy: ivm.Ordering{{"id", "asc"}}},
+		InitEpoch:     group.initEpoch.Load(),
+	})}
+	if resp := srv.handleAddQuery(addReq); resp.Error != nil {
+		t.Fatalf("addQuery error: %+v", resp.Error)
+	}
+
+	// V2: 20 new issues (4x the shrunken cap).
+	const n = 20
+	for i := 0; i < n; i++ {
+		id := fmt.Sprintf("d9-%03d", i)
+		mustExec(t, db, `INSERT INTO "issue" VALUES (?,?,?,'0000000002')`, id, "t-"+id, 100+i)
+		mustExec(t, db, `INSERT OR REPLACE INTO "_zero.changeLog2" ("stateVersion","pos","table","rowKey","op") VALUES ('0000000002',?, 'issue', ?, 's')`,
+			i, fmt.Sprintf(`{"id":%q}`, id))
+	}
+	mustExec(t, db, `INSERT OR REPLACE INTO "_zero.replicationState" (stateVersion, lock) VALUES ('0000000002', 1)`)
+
+	w, frames := collectAdvanceToHeadStreamFrames()
+	req := RPCRequest{Method: "advanceToHeadStream", ID: 3, Params: mustMarshal(t, advanceToHeadParams{
+		ClientGroupID: "cg1", InitEpoch: group.initEpoch.Load(),
+	})}
+	resp := srv.handleAdvanceToHeadStream(req, w)
+	if resp.Error != nil {
+		t.Fatalf("oversized diff errored despite lazy streaming (cap resurrected?): %+v", resp.Error)
+	}
+	assertStreamFrameInvariants(t, *frames)
+
+	rows := 0
+	for _, f := range *frames {
+		rows += len(f.Rows)
+	}
+	if rows != n {
+		t.Fatalf("streamed %d rows, want %d (full oversized diff)", rows, n)
+	}
+	final := (*frames)[len(*frames)-1]
+	if final.NumChanges != n {
+		t.Fatalf("final NumChanges = %d, want %d", final.NumChanges, n)
 	}
 }
