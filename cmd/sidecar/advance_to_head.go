@@ -542,6 +542,7 @@ func (s *Server) refreshSnapForInitialHydrateLocked(cgID string, group *ClientGr
 }
 
 func (s *Server) handleAdvanceToHead(req RPCRequest) RPCResponse {
+	tripwire("rpc advanceToHead (unary; shadow-only caller set)")
 	var p advanceToHeadParams
 	if err := mpUnmarshal(req.Params, &p); err != nil {
 		return rpcError(req.ID, -32602, err.Error())

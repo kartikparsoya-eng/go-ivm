@@ -1840,6 +1840,7 @@ func (s *Server) handleInit(req RPCRequest) RPCResponse {
 			}
 			eng.RegisterSource(src)
 		} else {
+			tripwire("init memory-mode source (loadRows-backed MemorySource)")
 			// Inject FromSQLiteType as the column converter so MemorySource.NormalizeRow
 			// (called on every advance / loadRows row) produces the same type shapes
 			// as the init path for ALL column types — including json/string/blob,
@@ -1947,12 +1948,14 @@ func (s *Server) handleLoadRows(req RPCRequest) RPCResponse {
 	// loadRows for protocol compatibility, but we have nothing to do
 	// with the rows. Return success without touching engine state.
 	if s.sourceMode == tablesource.ModeTable {
+		tripwire("rpc loadRows (table-mode no-op; old zero-cache generation?)")
 		return RPCResponse{
 			JSONRPC: "2.0",
 			Result:  map[string]interface{}{"status": "ok"},
 			ID:      req.ID,
 		}
 	}
+	tripwire("rpc loadRows (memory-mode seeding)")
 
 	cgID := p.ClientGroupID
 	if cgID == "" {
@@ -2010,6 +2013,7 @@ type addQueryResult struct {
 }
 
 func (s *Server) handleAddQuery(req RPCRequest) RPCResponse {
+	tripwire("rpc addQuery (unary hydrate)")
 	var p addQueryParams
 	if err := mpUnmarshal(req.Params, &p); err != nil {
 		// Diagnostic: dump first 64 bytes so we can see what wire format arrived.
@@ -2083,6 +2087,7 @@ type addQueriesResult struct {
 }
 
 func (s *Server) handleAddQueries(req RPCRequest) RPCResponse {
+	tripwire("rpc addQueries (unary batch hydrate)")
 	var p addQueriesParams
 	if err := mpUnmarshal(req.Params, &p); err != nil {
 		// Find position of first 0xd4 in params for diagnosis
@@ -3072,6 +3077,7 @@ func main() {
 		if err != nil {
 			break
 		}
+		tripwire("socket transport (unix-listener connection accepted)")
 		go handleConnection(conn, server)
 	}
 }
