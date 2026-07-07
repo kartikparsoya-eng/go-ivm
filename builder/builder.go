@@ -191,7 +191,7 @@ func buildPipelineInternal(ast AST, delegate Delegate, p *Pipeline, partitionKey
 			ChildKey:         csq.Correlation.ChildField,
 			RelationshipName: childAlias,
 			Hidden:           csq.Hidden,
-			System:           csq.System,
+			System:           systemOrClient(csq.System),
 		})
 		p.Edges = append(p.Edges, [2]ivm.InputBase{end, join})
 		p.Edges = append(p.Edges, [2]ivm.InputBase{childInput, join})
@@ -251,7 +251,7 @@ func buildPipelineInternal(ast AST, delegate Delegate, p *Pipeline, partitionKey
 				ChildKey:         csq.Correlation.ChildField,
 				RelationshipName: e.alias,
 				Hidden:           csq.Hidden,
-				System:           csq.System,
+				System:           systemOrClient(csq.System),
 			})
 			p.Edges = append(p.Edges, [2]ivm.InputBase{end, join})
 			p.Edges = append(p.Edges, [2]ivm.InputBase{childInput, join})
@@ -634,13 +634,26 @@ func applyFilterWithFlips(input ivm.Input, cond *Condition, delegate Delegate, p
 			ChildKey:         csq.Correlation.ChildField,
 			RelationshipName: childAlias,
 			Hidden:           csq.Hidden,
-			System:           csq.System,
+			System:           systemOrClient(csq.System),
 		})
 		p.Edges = append(p.Edges, [2]ivm.InputBase{input, flippedJoin})
 		p.Edges = append(p.Edges, [2]ivm.InputBase{childInput, flippedJoin})
 		return flippedJoin
 	}
 	panic(ivm.NewDataError("applyFilterWithFlips: unknown condition type %q", cond.Type))
+}
+
+// systemOrClient defaults an omitted correlated-subquery system tag to
+// "client" — TS: `system: sq.system ?? 'client'` at both join construction
+// sites (builder.ts:508, builder.ts:682). The wire AST omits `system` for
+// ordinary client queries, so Go's zero value was ""; every consumer today
+// only compares == "permissions", making the difference inert, but the
+// schema value itself must match TS byte-for-byte.
+func systemOrClient(system string) string {
+	if system == "" {
+		return "client"
+	}
+	return system
 }
 
 // conditionIncludesFlippedSubquery reports whether the condition tree
