@@ -243,6 +243,21 @@ type connection struct {
 	lastPushedEpoch int
 }
 
+// presenceKey identifies one table on one read pool for the presence-probe
+// cache. The pool pointer (not the file path) is deliberate: a different
+// pool — different process wiring, potentially a different replica file —
+// must re-validate from scratch.
+type presenceKey struct {
+	db    *sql.DB
+	table string
+}
+
+// probedTables caches SUCCESSFUL presence probes per (read pool, table) so
+// CG init only touches the read pool for the first init of each table.
+// See the probe block in NewWithContext for the full rationale (2026-07-07
+// soak incident). Negative results are never stored.
+var probedTables sync.Map // presenceKey → struct{}
+
 // New constructs a Source for tableName.
 //
 // db is the read-only pool used for the table-presence probe; the live
@@ -286,16 +301,60 @@ func NewWithContext(parent context.Context, db *sql.DB, writableDB *sql.DB, tabl
 	// sat behind deadlocked pool builders; see PoolAcquireTimeout). The
 	// deadline is on the PROBE only — the Source's stored lifetime ctx
 	// below stays bound to parent, not to this timeout.
-	probeCtx, cancelProbe := context.WithTimeout(parent, PoolAcquireTimeout)
-	_, probeErr := db.ExecContext(probeCtx, `SELECT 1 FROM `+quoteIdent(tableName)+` LIMIT 0`)
-	cancelProbe()
-	if probeErr != nil {
-		if probeCtx.Err() != nil {
-			return nil, fmt.Errorf(
-				"tablesource.New %s: presence probe timed out after %v — replica read pool exhausted?: %w",
-				tableName, PoolAcquireTimeout, probeErr)
+	//
+	// CACHED per (pool, table) — 2026-07-07 soak incident: this probe was
+	// the only HARD-FAIL read-pool acquisition on the CG-init path, and it
+	// ran once per Source per CG init. Under sustained CG churn the warm-
+	// hydrate reader pools (K=8 conns each, held for the full hydrate —
+	// observed up to 10s) legitimately saturate the read pool (128/128 for
+	// 93 consecutive 10s windows), so init probes queued behind hydrates
+	// timed out (34 'presence probe timed out' failures in 40 min) → Go
+	// backend init failed → the TS view-syncer run-loop died → every
+	// subsequent client message hit the dead-but-lingering VS and got a
+	// Rehome storm (view-syncer.ts:460). Table presence is a property of
+	// the REPLICA FILE, not of the CG: once a table has been seen on a
+	// given pool, re-probing it per init buys nothing. TS never probes at
+	// all — its TableSource constructor (table-source.ts:96-119) builds
+	// from the replica's own introspected schema, so a missing table is
+	// impossible there; the Go probe guards wire-schema-vs-replica drift
+	// (the init schema arrives over RPC) and one probe per (pool, table)
+	// preserves that guard. With the cache, CG init touches the read pool
+	// only for the FIRST init of each table after process start; reader-
+	// pool builds (the remaining read-pool users) already degrade to
+	// serial hydrate on acquire timeout, so read-pool saturation no longer
+	// has any hard-failure path.
+	//
+	// Policy:
+	//   - Only SUCCESS is cached. A negative result is never stored: a
+	//     table created by a later schema migration must become probeable,
+	//     and a timed-out probe must retry on the next init.
+	//   - Keyed by the *sql.DB pointer, not the path: a hypothetical new
+	//     pool (e.g. after a replica swap) starts cold and re-validates
+	//     everything. A live cache entry pins its pool's struct; entries
+	//     for a closed pool are a few bytes each and bounded by table
+	//     count, which is accepted.
+	pkey := presenceKey{db: db, table: tableName}
+	if _, probed := probedTables.Load(pkey); !probed {
+		probeCtx, cancelProbe := context.WithTimeout(parent, PoolAcquireTimeout)
+		_, probeErr := db.ExecContext(probeCtx, `SELECT 1 FROM `+quoteIdent(tableName)+` LIMIT 0`)
+		cancelProbe()
+		if probeErr != nil {
+			// Classify on DeadlineExceeded SPECIFICALLY: cancelProbe() has
+			// already run, so probeCtx.Err() is never nil here — the old
+			// `probeCtx.Err() != nil` check made the "table not found"
+			// branch dead code and reported genuinely missing tables as
+			// pool exhaustion. Err() sticks at DeadlineExceeded once the
+			// deadline fires (a later cancel() does not overwrite it), so
+			// this cleanly separates "queued too long on the pool" from
+			// "the table is not in the replica".
+			if probeCtx.Err() == context.DeadlineExceeded {
+				return nil, fmt.Errorf(
+					"tablesource.New %s: presence probe timed out after %v — replica read pool exhausted?: %w",
+					tableName, PoolAcquireTimeout, probeErr)
+			}
+			return nil, fmt.Errorf("tablesource.New %s: table not found: %w", tableName, probeErr)
 		}
-		return nil, fmt.Errorf("tablesource.New %s: table not found: %w", tableName, probeErr)
+		probedTables.Store(pkey, struct{}{})
 	}
 
 	// Pre-compute the column ordering used for INSERT VALUES (...) and
