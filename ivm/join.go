@@ -16,7 +16,7 @@ type JoinArgs struct {
 	ChildKey         CompoundKey
 	RelationshipName string
 	Hidden           bool
-	System           string
+	System           System
 }
 
 // Join implements Input. It joins parent and child streams hierarchically.

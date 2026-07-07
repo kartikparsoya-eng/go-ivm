@@ -55,9 +55,18 @@ func RowMatchesMultiConstraints(multis []MultiConstraint, row Row) bool {
 	return true
 }
 
+// Basis is a Start cursor's inclusion mode — the TS union 'at' | 'after'
+// (operator.ts:86 `readonly basis: 'at' | 'after'`).
+type Basis string
+
+const (
+	BasisAt    Basis = "at"
+	BasisAfter Basis = "after"
+)
+
 type Start struct {
 	Row   Row
-	Basis string // "at" | "after"
+	Basis Basis
 }
 
 type FetchRequest struct {
@@ -79,6 +88,18 @@ type FetchRequest struct {
 	Reverse bool
 }
 
+// System tags which subsystem is responsible for a query/schema node — the
+// TS union 'permissions' | 'client' | 'test' (zero-protocol ast.ts:28,
+// carried on SourceSchema at schema.ts:22). The previous bare-string
+// comment here claimed a nonexistent "server" member.
+type System string
+
+const (
+	SystemPermissions System = "permissions"
+	SystemClient      System = "client"
+	SystemTest        System = "test"
+)
+
 // SourceSchema mirrors schema.ts
 type SourceSchema struct {
 	TableName     string
@@ -98,7 +119,7 @@ type SourceSchema struct {
 	// sources have both empty.
 	RelationshipOrder []string
 	IsHidden          bool
-	System            string // "client" | "permissions" | "server"
+	System            System
 	CompareRows       Comparator
 	Sort              Ordering
 }

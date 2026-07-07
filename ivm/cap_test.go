@@ -359,7 +359,7 @@ func TestCap_FetchAsserts(t *testing.T) {
 		cap := newCap(t)
 		c := Constraint{"issueID": "i1"}
 		expectPanic(t, "Cap does not support start", func() {
-			slices.Collect(cap.Fetch(FetchRequest{
+			_ = slices.Collect(cap.Fetch(FetchRequest{
 				Constraint: &c,
 				Start:      &Start{Row: Row{"id": "c1"}, Basis: "at"},
 			}))
@@ -369,13 +369,13 @@ func TestCap_FetchAsserts(t *testing.T) {
 		cap := newCap(t)
 		c := Constraint{"issueID": "i1"}
 		expectPanic(t, "Cap does not support reverse", func() {
-			slices.Collect(cap.Fetch(FetchRequest{Constraint: &c, Reverse: true}))
+			_ = slices.Collect(cap.Fetch(FetchRequest{Constraint: &c, Reverse: true}))
 		})
 	})
 	t.Run("missing constraint on partitioned cap", func(t *testing.T) {
 		cap := newCap(t)
 		expectPanic(t, "constraint must match partition key", func() {
-			slices.Collect(cap.Fetch(FetchRequest{}))
+			_ = slices.Collect(cap.Fetch(FetchRequest{}))
 		})
 	})
 }

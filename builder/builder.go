@@ -704,11 +704,11 @@ func applyFilterWithFlips(input ivm.Input, cond *Condition, delegate Delegate, p
 // ordinary client queries, so Go's zero value was ""; every consumer today
 // only compares == "permissions", making the difference inert, but the
 // schema value itself must match TS byte-for-byte.
-func systemOrClient(system string) string {
+func systemOrClient(system string) ivm.System {
 	if system == "" {
-		return "client"
+		return ivm.SystemClient
 	}
-	return system
+	return ivm.System(system)
 }
 
 // conditionIncludesFlippedSubquery reports whether the condition tree

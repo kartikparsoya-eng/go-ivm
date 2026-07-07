@@ -148,17 +148,22 @@ func overlayRowAtOrAfterStart(row ivm.Row, start *ivm.Start, comparator ivm.Comp
 // It is the per-row merge equivalent of applyOverlay — the branch
 // structure mirrors it case for case; keep the two in lockstep.
 //
-// Contract for the caller (fetchDuringPushStream):
+// Contract for the caller (fetchDuringPushStream) — the TS streaming form
+// (generateWithOverlayInner, memory-source.ts:856-877):
 //   - inject `add` immediately BEFORE the first streamed row R with
-//     comparator(add, R) <= 0, or after the last row if none — the
-//     leftmost position insertSorted picks (streamed rows arrive already
-//     sorted by the same comparator, so first-match == leftmost index);
+//     comparator(add, R) < 0 (TS `cmp < 0`, memory-source.ts:858-862), or
+//     after the last row if none — the rightmost position insertSorted
+//     picks (streamed rows arrive already sorted by the same comparator,
+//     so first-strict-match == rightmost-among-equals index). Equal keys
+//     are unreachable anyway: the comparator's sort always includes the
+//     PK (total order) and the overlay-add row is never in the streamed
+//     set, so cmp == 0 would mean the same row on both sides.
 //   - drop the first streamed row whose primary key equals `remove`
 //     (removeByPK removes exactly one; PKs are unique).
 //
 // Equivalence with applyOverlay's remove-then-insert sequencing holds
 // regardless of per-row check order: the add lands before the first
-// SURVIVING row that sorts >= it either way (total order + transitivity),
+// SURVIVING row that sorts > it either way (total order + transitivity),
 // which is exactly where insertSorted places it post-removal.
 func overlaySplicePlan(
 	change ivm.SourceChange,
@@ -270,11 +275,21 @@ func constraintMatchesRow(constraint ivm.Constraint, row ivm.Row) bool {
 	return true
 }
 
+// insertSorted places node at the RIGHTMOST position among equal keys —
+// the first index i where node sorts STRICTLY before nodes[i] — matching
+// TS's streaming overlay inject, which yields the add only before a row
+// it sorts strictly before (generateWithOverlayInner `cmp < 0`,
+// memory-source.ts:858-862; the trailing yield at :875-877 is the
+// after-last-row case). Equal keys are unreachable in practice (the
+// comparator's sort always includes the PK and the overlay-add row is
+// never in the fetched set), so leftmost-vs-rightmost is observationally
+// identical — rightmost is kept purely for line-faithfulness with the TS
+// form and for lockstep with fetchDuringPushStream's `< 0` inject.
 func insertSorted(nodes []ivm.Node, node ivm.Node, comparator ivm.Comparator) []ivm.Node {
 	lo, hi := 0, len(nodes)
 	for lo < hi {
 		mid := (lo + hi) / 2
-		if comparator(node.Row, nodes[mid].Row) > 0 {
+		if comparator(node.Row, nodes[mid].Row) >= 0 {
 			lo = mid + 1
 		} else {
 			hi = mid

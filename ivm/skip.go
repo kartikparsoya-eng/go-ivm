@@ -185,9 +185,9 @@ func (s *Skip) getStart(req FetchRequest) (*Start, bool) {
 	return req.Start, false
 }
 
-func basisFromExclusive(exclusive bool) string {
+func basisFromExclusive(exclusive bool) Basis {
 	if exclusive {
-		return "after"
+		return BasisAfter
 	}
-	return "at"
+	return BasisAt
 }

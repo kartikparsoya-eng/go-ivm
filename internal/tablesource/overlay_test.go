@@ -31,7 +31,7 @@ func TestApplyOverlayPartialCursorBoundary(t *testing.T) {
 		Row:  ivm.Row{"createdAt": float64(1779813937134), "conversationId": "8ec82a40"},
 	}
 
-	partialCursor := func(basis string) *ivm.Start {
+	partialCursor := func(basis ivm.Basis) *ivm.Start {
 		return &ivm.Start{Row: ivm.Row{"createdAt": float64(1779813937134)}, Basis: basis}
 	}
 

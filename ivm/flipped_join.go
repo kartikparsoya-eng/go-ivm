@@ -17,7 +17,7 @@ type FlippedJoinArgs struct {
 	ChildKey         CompoundKey
 	RelationshipName string
 	Hidden           bool
-	System           string
+	System           System
 }
 
 // FlippedJoin implements Input. It fetches child nodes first, then finds

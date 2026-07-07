@@ -1649,7 +1649,11 @@ func (s *Source) fetchDuringPushStream(req ivm.FetchRequest, conn *connection) i
 				pendingRemove = nil
 				continue
 			}
-			if pendingAdd != nil && effCmp(pendingAdd, row) <= 0 {
+			// TS generateWithOverlayInner yields the add before the first row
+			// it sorts STRICTLY before (`cmp < 0`, memory-source.ts:858-862);
+			// equal keys are unreachable (sort includes PK; the add row is
+			// not in the streamed set) — see overlaySplicePlan's contract.
+			if pendingAdd != nil && effCmp(pendingAdd, row) < 0 {
 				add := pendingAdd
 				pendingAdd = nil
 				if !yield(ivm.Node{Row: add}) {

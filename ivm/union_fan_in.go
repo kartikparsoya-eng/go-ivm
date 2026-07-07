@@ -9,6 +9,22 @@ import (
 // UnionFanIn merges results from multiple OR-condition branches back together,
 // deduplicating rows that appear in multiple branches.
 
+// sameSliceRef reports whether a and b are the SAME slice value — same
+// backing-array pointer and same length. This is the Go analog of TS's
+// `===` on the array references (union-fan-in.ts:59-62 primaryKey, :71
+// sort): reflect.DeepEqual was too lenient — two content-equal slices
+// built by unrelated schemas would pass here where TS throws. Branch
+// schemas all carry the fan-out schema's own slice headers (filter
+// operators pass the schema pointer through unchanged; FlippedJoin copies
+// parentSchema.PrimaryKey/Sort by header, flipped_join.go:83,89 — exactly
+// as TS's object spread copies the array references), so identity holds
+// precisely when TS's reference equality does. Both-nil compares equal,
+// matching TS undefined === undefined.
+func sameSliceRef[E any](a, b []E) bool {
+	return len(a) == len(b) &&
+		reflect.ValueOf(a).Pointer() == reflect.ValueOf(b).Pointer()
+}
+
 // UnionFanIn implements Operator. It receives pushes from multiple branches
 // that share a UnionFanOut, and merges/deduplicates them.
 type UnionFanIn struct {
@@ -41,7 +57,7 @@ func NewUnionFanIn(fanOut *UnionFanOut, inputs []Input) *UnionFanIn {
 		if fanOutSchema.TableName != inputSchema.TableName {
 			panic("Table name mismatch in union fan-in")
 		}
-		if !reflect.DeepEqual(fanOutSchema.PrimaryKey, inputSchema.PrimaryKey) {
+		if !sameSliceRef(fanOutSchema.PrimaryKey, inputSchema.PrimaryKey) {
 			panic("Primary key mismatch in union fan-in")
 		}
 		if fanOutSchema.System != inputSchema.System {
@@ -51,7 +67,7 @@ func NewUnionFanIn(fanOut *UnionFanOut, inputs []Input) *UnionFanIn {
 			(fanOutSchema.CompareRows != nil && reflect.ValueOf(fanOutSchema.CompareRows).Pointer() != reflect.ValueOf(inputSchema.CompareRows).Pointer()) {
 			panic("compareRows mismatch in union fan-in")
 		}
-		if !reflect.DeepEqual(fanOutSchema.Sort, inputSchema.Sort) {
+		if !sameSliceRef(fanOutSchema.Sort, inputSchema.Sort) {
 			panic("Sort mismatch in union fan-in")
 		}
 
