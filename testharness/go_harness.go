@@ -191,6 +191,10 @@ func (d *memoryDelegate) CreateStorage(name string) ivm.TakeStorage {
 	return s
 }
 
+func (d *memoryDelegate) CreateCapStorage(name string) ivm.CapStorage {
+	return ivm.NewMemoryCapStorage()
+}
+
 // --- memSourceAdapter wraps MemorySource as builder.Source ---
 
 type memSourceAdapter struct {

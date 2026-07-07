@@ -44,6 +44,11 @@ type Delegate interface {
 
 	// CreateStorage creates a Storage for an operator (used by Take).
 	CreateStorage(name string) ivm.TakeStorage
+
+	// CreateCapStorage creates a Storage for a Cap operator. TS has a single
+	// generic createStorage (builder.ts:83) that both operators cast; Go's
+	// storage is typed per operator, so the delegate vends each shape.
+	CreateCapStorage(name string) ivm.CapStorage
 }
 
 // Pipeline is the result of building a query — the terminal Input of the operator chain.
@@ -56,13 +61,18 @@ type Pipeline struct {
 // BuildPipeline constructs an operator tree from an AST.
 func BuildPipeline(ast AST, delegate Delegate) *Pipeline {
 	p := &Pipeline{Name: ast.Table}
-	input := buildPipelineInternal(ast, delegate, p, nil)
+	input := buildPipelineInternal(ast, delegate, p, nil, false)
 	p.Input = input
 	return p
 }
 
 // buildPipelineInternal recursively constructs operator chain.
-func buildPipelineInternal(ast AST, delegate Delegate, p *Pipeline, partitionKey []string) ivm.Input {
+//
+// isNonFlippedExistsChild is true when this pipeline is the child of a
+// non-flipped EXISTS condition (TS buildPipelineInternal's 6th parameter,
+// builder.ts:262): the csq-conditions loop passes true, ast.related and
+// flipped-CSQ children pass false.
+func buildPipelineInternal(ast AST, delegate Delegate, p *Pipeline, partitionKey []string, isNonFlippedExistsChild bool) ivm.Input {
 	name := ast.Table
 	if ast.Alias != "" {
 		name = ast.Alias
@@ -101,11 +111,38 @@ func buildPipelineInternal(ast AST, delegate Delegate, p *Pipeline, partitionKey
 		panic(ivm.NewDataError("no source for table %q", ast.Table))
 	}
 
+	// builder.ts:293-299 — non-flipped EXISTS children must be plain
+	// presence-check pipelines: no cursor bound, no attached related.
+	if isNonFlippedExistsChild {
+		if ast.Start != nil {
+			panic("EXISTS subqueries must not have start")
+		}
+		if ast.Related != nil {
+			panic("EXISTS subqueries must not have related")
+		}
+	}
+
+	// builder.ts:301-308 — the Cap optimization needs the source connect to
+	// be unordered, but applyFilterWithFlips builds a UnionFanIn over the
+	// source whenever ast.Where contains a flipped subquery, and UnionFanIn
+	// requires a sort on its inputs. In that case, fall back to the
+	// ordered + Take path for this EXISTS child.
+	useCap := isNonFlippedExistsChild &&
+		!(ast.Where != nil && conditionIncludesFlippedSubquery(ast.Where))
+
 	// Build filter condition (strip correlatedSubquery conditions for source-level filter)
 	simpleFilter := stripCSQConditions(ast.Where)
 
+	// builder.ts:310-313 — exists pipelines are unordered: orderBy is
+	// ignored so SQLite can pick any index and never build a temp b-tree.
+	// Non-exists pipelines always have orderBy completed with PKs.
+	connSort := ast.OrderBy
+	if useCap {
+		connSort = nil
+	}
+
 	sourceInput := source.Connect(ConnectOptions{
-		Sort:            ast.OrderBy,
+		Sort:            connSort,
 		Filter:          simpleFilter,
 		SplitEditKeys:   splitEditKeys,
 		FilterPredicate: BuildPredicate(simpleFilter),
@@ -172,8 +209,11 @@ func buildPipelineInternal(ast AST, delegate Delegate, p *Pipeline, partitionKey
 			childAlias = childAST.Table
 		}
 
-		// Recursively build child pipeline
-		childInput := buildPipelineInternal(childAST, delegate, p, csq.Correlation.ChildField)
+		// Recursively build child pipeline. fromCondition=true (TS
+		// builder.ts:329-349 → applyCorrelatedSubQuery(..., true)): this is a
+		// non-flipped EXISTS child, so it connects unordered and ends in Cap
+		// (unless its own WHERE carries a flipped subquery — see useCap).
+		childInput := buildPipelineInternal(childAST, delegate, p, csq.Correlation.ChildField, true)
 
 		// Any CSQ reaching this loop is one the scalar resolver could NOT
 		// rewrite (a non-simple subquery — its WHERE does not literal-
@@ -208,13 +248,25 @@ func buildPipelineInternal(ast AST, delegate Delegate, p *Pipeline, partitionKey
 		end = applyWhere(end, ast.Where, delegate, p)
 	}
 
-	// Step 5: Take (LIMIT)
+	// Step 5: Cap (EXISTS) or Take (LIMIT)
 	if ast.Limit != nil {
-		_ = fmt.Sprintf("%s:take", name)
-		storage := delegate.CreateStorage(fmt.Sprintf("%s:take", name))
-		take := ivm.NewTake(end, storage, *ast.Limit, partitionKey)
-		p.Edges = append(p.Edges, [2]ivm.InputBase{end, take})
-		end = take
+		// builder.ts:356-383 — we end `exists` pipelines with `cap`. The
+		// reason is that `cap` does not care about the order of the
+		// pipeline. This allows SQLite to choose the order and never end up
+		// creating temp b-trees. The problem with SQLite creating a temp
+		// b-tree is it will incur a scan of the entire result set where
+		// exists only needs the first row.
+		if useCap {
+			storage := delegate.CreateCapStorage(fmt.Sprintf("%s:cap", name))
+			capOp := ivm.NewCap(end, storage, *ast.Limit, partitionKey)
+			p.Edges = append(p.Edges, [2]ivm.InputBase{end, capOp})
+			end = capOp
+		} else {
+			storage := delegate.CreateStorage(fmt.Sprintf("%s:take", name))
+			take := ivm.NewTake(end, storage, *ast.Limit, partitionKey)
+			p.Edges = append(p.Edges, [2]ivm.InputBase{end, take})
+			end = take
+		}
 	}
 
 	// Step 6: Build joins for related subqueries
@@ -242,7 +294,7 @@ func buildPipelineInternal(ast AST, delegate Delegate, p *Pipeline, partitionKey
 
 		for _, e := range deduped {
 			csq := ast.Related[e.idx]
-			childInput := buildPipelineInternal(csq.Subquery, delegate, p, csq.Correlation.ChildField)
+			childInput := buildPipelineInternal(csq.Subquery, delegate, p, csq.Correlation.ChildField, false)
 
 			join := ivm.NewJoin(ivm.JoinArgs{
 				Parent:           end,
@@ -626,7 +678,10 @@ func applyFilterWithFlips(input ivm.Input, cond *Condition, delegate Delegate, p
 		if childAlias == "" {
 			childAlias = csq.Subquery.Table
 		}
-		childInput := buildPipelineInternal(csq.Subquery, delegate, p, csq.Correlation.ChildField)
+		// Flipped EXISTS children are NOT isNonFlippedExistsChild (TS
+		// builder.ts:490-497 passes false): FlippedJoin depends on ordering,
+		// so the child connects ordered and ends in Take.
+		childInput := buildPipelineInternal(csq.Subquery, delegate, p, csq.Correlation.ChildField, false)
 		flippedJoin := ivm.NewFlippedJoin(ivm.FlippedJoinArgs{
 			Parent:           input,
 			Child:            childInput,

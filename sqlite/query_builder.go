@@ -135,7 +135,13 @@ func BuildSelectQuery(
 	}
 
 	// Start cursor
-	if start != nil && order != nil {
+	if start != nil {
+		// TS query-builder.ts:50-53 — assert(order !== undefined, 'start
+		// requires ordering'): a cursor bound is meaningless without a sort,
+		// and unordered (Cap/EXISTS-child) connections must never see one.
+		if order == nil {
+			panic("start requires ordering")
+		}
 		startSQL, startParams := gatherStartConstraints(*start, reverse, order, columns)
 		constraints = append(constraints, startSQL)
 		params = append(params, startParams...)

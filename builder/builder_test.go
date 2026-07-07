@@ -48,6 +48,10 @@ func (md *mockDelegate) CreateStorage(name string) ivm.TakeStorage {
 	return ivm.NewMemoryTakeStorage()
 }
 
+func (md *mockDelegate) CreateCapStorage(name string) ivm.CapStorage {
+	return ivm.NewMemoryCapStorage()
+}
+
 func TestBuildSimplePipeline(t *testing.T) {
 	delegate := &mockDelegate{
 		sources: map[string]*mockSource{

@@ -203,6 +203,48 @@ func overlaySplicePlan(
 	return
 }
 
+// unorderedOverlayPlan reduces the in-flight overlay change to the
+// UNORDERED splice ingredients — porting TS generateWithOverlayUnordered's
+// overlay gating (memory-source.ts:885-926): the add side is gated by the
+// fetch's constraint and multi-constraints; the remove side needs no gate
+// (a removed row outside the constraint/multi window is absent from the
+// SQL result anyway, so the PK suppression is a no-op — the same
+// convention overlaySplicePlan documents for its remove side).
+//
+// Contract for the caller (per generateWithOverlayInnerUnordered,
+// memory-source.ts:929-951):
+//   - yield `add` eagerly BEFORE the first streamed row;
+//   - drop the first streamed row whose primary key equals `remove`.
+//
+// No start gate: BuildSelectQuery panics on start-without-ordering, so an
+// unordered fetch can never carry a cursor.
+func unorderedOverlayPlan(
+	change ivm.SourceChange,
+	constraint *ivm.Constraint,
+	multis []ivm.MultiConstraint,
+) (add, remove ivm.Row) {
+	addAllowed := func(row ivm.Row) bool {
+		if constraint != nil && !constraintMatchesRow(*constraint, row) {
+			return false
+		}
+		return ivm.RowMatchesMultiConstraints(multis, row)
+	}
+	switch change.Type {
+	case ivm.ChangeTypeAdd:
+		if addAllowed(change.Row) {
+			add = change.Row
+		}
+	case ivm.ChangeTypeRemove:
+		remove = change.Row
+	case ivm.ChangeTypeEdit:
+		remove = change.OldRow
+		if addAllowed(change.Row) {
+			add = change.Row
+		}
+	}
+	return
+}
+
 // pkRowsEqual reports whether two rows agree on every primary-key column,
 // using the same CompareValues convention as removeByPK.
 func pkRowsEqual(a, b ivm.Row, primaryKey []string) bool {

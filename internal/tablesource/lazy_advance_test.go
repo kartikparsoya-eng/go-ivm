@@ -61,9 +61,16 @@ func TestLazyAdvanceFetchParity(t *testing.T) {
 		sort ivm.Ordering
 		pred func(ivm.Row) bool
 	}{
-		{"pkSort", nil, nil},
+		{"pkSort", ivm.Ordering{{"id", "asc"}}, nil},
 		{"scoreSort", scoreSort, nil},
 		{"scoreSortPred", scoreSort, scorePred},
+		// UNORDERED connection (sort == nil) — the Cap/EXISTS-child path:
+		// SQL carries no ORDER BY and the overlay is applied via the
+		// unordered plan (add injected first, remove suppressed by PK).
+		// Start/reverse shapes are excluded below: TS's buildSelectQuery
+		// asserts 'start requires ordering' for unordered fetches.
+		{"unordered", nil, nil},
+		{"unorderedPred", nil, scorePred},
 	}
 
 	bobOld := ivm.Row{"id": float64(2), "name": "bob", "score": float64(80), "active": false}
@@ -91,25 +98,41 @@ func TestLazyAdvanceFetchParity(t *testing.T) {
 	// must be keyed by the connection's sort columns (production Starts come
 	// from the same ordering the fetch uses), so the cursor row differs per
 	// conn: id-based for the PK sort, score-based for the score sort.
+	// Unordered connections get NO start/reverse shapes — those are
+	// TS-forbidden without an ordering (query-builder.ts:51).
 	reqsFor := func(sort ivm.Ordering) []struct {
 		name string
 		req  ivm.FetchRequest
 	} {
-		startRow := ivm.Row{"id": float64(2)}
-		if sort != nil {
-			startRow = ivm.Row{"score": float64(80)}
-		}
-		return []struct {
+		base := []struct {
 			name string
 			req  ivm.FetchRequest
 		}{
 			{"plain", ivm.FetchRequest{}},
 			{"constraintActive", ivm.FetchRequest{Constraint: &activeTrue}},
-			{"startAt", ivm.FetchRequest{Start: &ivm.Start{Row: startRow, Basis: "at"}}},
-			{"startAfter", ivm.FetchRequest{Start: &ivm.Start{Row: startRow, Basis: "after"}}},
-			// Take's displaced-bound shape: reverse fetch from a bound.
-			{"reverseAt", ivm.FetchRequest{Start: &ivm.Start{Row: startRow, Basis: "at"}, Reverse: true}},
 		}
+		if sort == nil {
+			return base
+		}
+		startRow := ivm.Row{"id": float64(2)}
+		if sort[0][0] == "score" {
+			startRow = ivm.Row{"score": float64(80)}
+		}
+		return append(base,
+			struct {
+				name string
+				req  ivm.FetchRequest
+			}{"startAt", ivm.FetchRequest{Start: &ivm.Start{Row: startRow, Basis: "at"}}},
+			struct {
+				name string
+				req  ivm.FetchRequest
+			}{"startAfter", ivm.FetchRequest{Start: &ivm.Start{Row: startRow, Basis: "after"}}},
+			// Take's displaced-bound shape: reverse fetch from a bound.
+			struct {
+				name string
+				req  ivm.FetchRequest
+			}{"reverseAt", ivm.FetchRequest{Start: &ivm.Start{Row: startRow, Basis: "at"}, Reverse: true}},
+		)
 	}
 
 	for _, cs := range conns {
@@ -225,7 +248,11 @@ func TestLazyAdvanceNestedFetchDuringPush(t *testing.T) {
 	src, db := newUserSource(t)
 	defer db.Close()
 
-	in := src.Connect(nil, nil, nil, nil)
+	// Explicit PK sort: the assertions below pin the ORDERED overlay splice
+	// (id=4 lands at its sorted position). Unordered overlay semantics
+	// (add injected first) are covered by the parity matrix's unordered
+	// connections.
+	in := src.Connect(ivm.Ordering{{"id", "asc"}}, nil, nil, nil)
 
 	var a, b1, b2 []float64
 	fired := false

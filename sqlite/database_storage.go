@@ -321,6 +321,12 @@ func (cgs *ClientGroupStorage) CreateTakeStorage() ivm.TakeStorage {
 	return &SQLiteTakeStorage{storage: cgs.CreateStorage(), maxStates: takeStateCacheMax}
 }
 
+// CreateCapStorage returns a CapStorage backed by SQLite. Same opID
+// allocation as Take storage — one operator, one storage namespace.
+func (cgs *ClientGroupStorage) CreateCapStorage() ivm.CapStorage {
+	return &SQLiteCapStorage{storage: cgs.CreateStorage(), maxStates: takeStateCacheMax}
+}
+
 // Destroy deletes all storage for this client group, then reclaims freed
 // pages once enough have accumulated (TS: database-storage.ts:164-169 —
 // clear, checkpoint, compact).
@@ -614,6 +620,111 @@ func validateBoundRow(what string, row ivm.Row) {
 				"%s: column %q holds %T which does not survive the JSON round-trip "+
 					"through operator storage — sort/bound columns must be "+
 					"nil/string/bool/number/json", what, col, v))
+		}
+	}
+}
+
+// SQLiteCapStorage implements ivm.CapStorage using OperatorStorage, with a
+// bounded in-memory write-through LRU cache in front of the SQLite rows —
+// the same structure (and the same GO_IVM_TAKE_STATE_CACHE_MAX bound) as
+// SQLiteTakeStorage, minus the maxBound machinery Cap doesn't have.
+//
+// Why the cache: Cap sits on EXISTS children — the hottest push probe in
+// Take-heavy dashboards is "no state yet → drop push", and without a
+// negative cache every probe is a JSON round-trip through the engine-wide
+// DatabaseStorage mutex. SQLite stays authoritative: writes land there
+// FIRST (panicking via storageError on failure, leaving the cache
+// unchanged), then update the cache — so cache and DB can't diverge.
+// CapState is int + []string, always JSON-round-trip safe, so no
+// validateBoundRow equivalent is needed.
+type SQLiteCapStorage struct {
+	storage *OperatorStorage
+
+	mu sync.Mutex
+	// states maps key→LRU element; lru orders elements most-recently-used
+	// at the front. An element whose capStateEntry.state is nil is a
+	// NEGATIVE entry ("known absent") so repeated misses skip SQLite too.
+	states map[string]*list.Element
+	lru    *list.List
+	// maxStates caps the cache (0 = unbounded).
+	maxStates int
+}
+
+// capStateEntry is one LRU node: the cache key plus its state (nil =
+// negative "known absent").
+type capStateEntry struct {
+	key   string
+	state *ivm.CapState
+}
+
+func (s *SQLiteCapStorage) GetCapState(key string) *ivm.CapState {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if el, ok := s.states[key]; ok {
+		s.lru.MoveToFront(el)
+		cached := el.Value.(*capStateEntry).state
+		if cached == nil {
+			return nil
+		}
+		c := *cached
+		return &c
+	}
+	raw, ok := s.storage.Get(key)
+	if !ok {
+		s.cacheState(key, nil)
+		return nil
+	}
+	var state ivm.CapState
+	if err := json.Unmarshal(raw, &state); err != nil {
+		// A row we wrote that no longer parses is corrupted state, not "absent".
+		panic(storageError("cap-state-unmarshal "+key, err))
+	}
+	s.cacheState(key, &state)
+	c := state
+	return &c
+}
+
+func (s *SQLiteCapStorage) SetCapState(key string, state ivm.CapState) {
+	data, err := json.Marshal(state)
+	if err != nil {
+		panic(fmt.Sprintf("marshal CapState: %v", err))
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.storage.Set(key, data) // panics on failure → cache left unchanged
+	c := state
+	s.cacheState(key, &c)
+}
+
+func (s *SQLiteCapStorage) Del(key string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.storage.Del(key)
+	s.cacheState(key, nil)
+}
+
+// cacheState records key→state (nil = known absent) in the LRU, refreshing
+// recency, and evicts least-recently-used entries when maxStates>0 and the
+// cache would exceed it. MUST be called with s.mu held.
+func (s *SQLiteCapStorage) cacheState(key string, state *ivm.CapState) {
+	if s.states == nil {
+		s.states = make(map[string]*list.Element)
+		s.lru = list.New()
+	}
+	if el, ok := s.states[key]; ok {
+		el.Value.(*capStateEntry).state = state
+		s.lru.MoveToFront(el)
+		return
+	}
+	s.states[key] = s.lru.PushFront(&capStateEntry{key: key, state: state})
+	if s.maxStates > 0 {
+		for s.lru.Len() > s.maxStates {
+			oldest := s.lru.Back()
+			if oldest == nil {
+				break
+			}
+			delete(s.states, oldest.Value.(*capStateEntry).key)
+			s.lru.Remove(oldest)
 		}
 	}
 }

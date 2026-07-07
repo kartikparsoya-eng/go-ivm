@@ -1895,10 +1895,22 @@ func (d *engineDelegate) GetSource(tableName string) builder.Source {
 }
 
 func (d *engineDelegate) CreateStorage(name string) ivm.TakeStorage {
+	return d.ensureCGS().CreateTakeStorage()
+}
+
+func (d *engineDelegate) CreateCapStorage(name string) ivm.CapStorage {
+	return d.ensureCGS().CreateCapStorage()
+}
+
+// ensureCGS lazily creates the per-query ClientGroupStorage. Shared by both
+// storage factories: CreateClientGroupStorage DELETEs the queryID's rows at
+// creation, so a second instance mid-build would wipe storages already
+// vended to earlier operators of the same pipeline.
+func (d *engineDelegate) ensureCGS() *sqlite.ClientGroupStorage {
 	if d.cgs == nil {
 		d.cgs = d.engine.storage.CreateClientGroupStorage(d.queryID)
 	}
-	return d.cgs.CreateTakeStorage()
+	return d.cgs
 }
 
 // --- engineSource wraps Source as builder.Source ---

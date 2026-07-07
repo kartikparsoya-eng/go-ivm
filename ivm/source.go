@@ -176,6 +176,13 @@ func (ms *MemorySource) Connect(connSort Ordering, filterPredicate func(Row) boo
 	if connSort == nil {
 		connSort = ms.primarySort
 	}
+	// The SCHEMA keeps sort undefined for unordered connections
+	// (memory-source.ts:154); only the connection's internal scan uses the
+	// defaulted primary sort.
+	var schemaSort Ordering
+	if !unordered {
+		schemaSort = connSort
+	}
 	// memory-source.ts:198-200 — an explicit sort must include every PK
 	// column or the connection's comparator is not total.
 	if !unordered {
@@ -198,10 +205,17 @@ func (ms *MemorySource) Connect(connSort Ordering, filterPredicate func(Row) boo
 		source: ms,
 		conn:   conn,
 		schema: &SourceSchema{
-			TableName:     ms.tableName,
-			Columns:       ms.columns,
-			PrimaryKey:    ms.primaryKey,
-			Sort:          connSort,
+			TableName:  ms.tableName,
+			Columns:    ms.columns,
+			PrimaryKey: ms.primaryKey,
+			// memory-source.ts:149-160 (#getSchema) — an unordered
+			// connection's schema carries NO sort (`sort: unordered ?
+			// undefined : connection.sort`) even though the connection
+			// itself scans in primary-index order internally. Downstream
+			// order-dependent operators (Take, UnionFanIn) assert on
+			// schema.Sort, so surfacing the internal default here would
+			// mask misuse TS catches.
+			Sort:          schemaSort,
 			System:        "client",
 			Relationships: map[string]*SourceSchema{},
 			CompareRows:   compareRows,

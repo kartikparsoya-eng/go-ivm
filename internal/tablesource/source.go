@@ -1343,14 +1343,12 @@ func (s *Source) fetchForConn(req ivm.FetchRequest, conn *connection) []ivm.Node
 		panic(fmt.Sprintf("tablesource.Source.Fetch %s: ensurePrevTx: %v", s.tableName, err))
 	}
 
-	// ORDER BY clause from connection sort (PK ascending if unset).
+	// ORDER BY clause from the connection sort. An UNORDERED connection
+	// (sort == nil — the Cap/EXISTS-child path) issues NO ORDER BY: TS
+	// #requestToSQL passes the connection's (undefined) sort straight
+	// through (table-source.ts:283-286, query-builder.ts:63-66) so SQLite
+	// is free to pick any plan and never builds a temp b-tree.
 	order := conn.sort
-	if order == nil {
-		order = make(ivm.Ordering, len(s.primaryKey))
-		for i, k := range s.primaryKey {
-			order[i] = [2]string{k, "asc"}
-		}
-	}
 
 	q := sqlite.BuildSelectQuery(
 		s.tableName,
@@ -1427,6 +1425,22 @@ func (s *Source) fetchForConn(req ivm.FetchRequest, conn *connection) []ivm.Node
 	// pick a different boundNode/beforeBoundNode and emit a different
 	// displaced row than TS.
 	if s.overlay != nil && conn.lastPushedEpoch >= s.overlay.Epoch {
+		if order == nil {
+			// UNORDERED overlay — TS generateWithOverlayUnordered
+			// (memory-source.ts:885-951): no comparator and no start gate
+			// (BuildSelectQuery panics on start-without-ordering, so an
+			// unordered fetch can never carry a cursor). The remove overlay
+			// suppresses the first PK-matching row; the add overlay is
+			// injected eagerly at the START of the stream.
+			add, remove := unorderedOverlayPlan(s.overlay.Change, req.Constraint, req.MultiConstraints)
+			if remove != nil {
+				out = removeByPK(out, remove, s.primaryKey)
+			}
+			if add != nil && (conn.filterPredicate == nil || conn.filterPredicate(add)) {
+				out = append([]ivm.Node{{Row: add}}, out...)
+			}
+			return out
+		}
 		// PARTIAL-bound comparator: req.Start may be a partial pagination cursor
 		// (e.g. {createdAt} while the sort is [createdAt, conversationId]). The
 		// overlay start-gate (overlayRowAtOrAfterStart) compares the in-flight
@@ -1512,6 +1526,7 @@ func (s *Source) fetchDuringPushStream(req ivm.FetchRequest, conn *connection) i
 		// would leak until conn teardown).
 		var (
 			eager                     bool
+			unordered                 bool
 			dbConn                    *sql.Conn
 			stmt                      *sql.Stmt
 			qSQL                      string
@@ -1534,13 +1549,10 @@ func (s *Source) fetchDuringPushStream(req ivm.FetchRequest, conn *connection) i
 			if err := s.ensurePrevTxLocked(); err != nil {
 				panic(fmt.Sprintf("tablesource.Source.Fetch %s: ensurePrevTx: %v", s.tableName, err))
 			}
+			// Unordered connections (sort == nil) issue NO ORDER BY and use
+			// the unordered overlay plan — see fetchForConn.
 			order := conn.sort
-			if order == nil {
-				order = make(ivm.Ordering, len(s.primaryKey))
-				for i, k := range s.primaryKey {
-					order[i] = [2]string{k, "asc"}
-				}
-			}
+			unordered = order == nil
 			q := sqlite.BuildSelectQuery(
 				s.tableName,
 				s.columns,
@@ -1557,9 +1569,16 @@ func (s *Source) fetchDuringPushStream(req ivm.FetchRequest, conn *connection) i
 			// positional contract that makes the per-row merge equivalent to
 			// insertSorted + removeByPK on the materialized slice. CAN PANIC on
 			// poison values — deliberately placed BEFORE the stmt checkout.
-			effCmp = ivm.MakePartialBoundComparator(order, req.Reverse)
 			if conn.lastPushedEpoch >= s.overlay.Epoch {
-				pendingAdd, pendingRemove = overlaySplicePlan(s.overlay.Change, effCmp, req.Constraint, req.MultiConstraints, req.Start)
+				if unordered {
+					// TS generateWithOverlayUnordered — no comparator/start
+					// gate; the add is yielded eagerly before the first SQL
+					// row (see the pre-loop inject below).
+					pendingAdd, pendingRemove = unorderedOverlayPlan(s.overlay.Change, req.Constraint, req.MultiConstraints)
+				} else {
+					effCmp = ivm.MakePartialBoundComparator(order, req.Reverse)
+					pendingAdd, pendingRemove = overlaySplicePlan(s.overlay.Change, effCmp, req.Constraint, req.MultiConstraints, req.Start)
+				}
 				if pendingAdd != nil && conn.filterPredicate != nil && !conn.filterPredicate(pendingAdd) {
 					pendingAdd = nil
 				}
@@ -1600,6 +1619,15 @@ func (s *Source) fetchDuringPushStream(req ivm.FetchRequest, conn *connection) i
 		ptrs := make([]any, len(colNames))
 		for i := range raw {
 			ptrs[i] = &raw[i]
+		}
+		// Unordered overlay-add: TS generateWithOverlayInnerUnordered yields
+		// the add FIRST, before any SQL row (memory-source.ts:934-937).
+		if unordered && pendingAdd != nil {
+			add := pendingAdd
+			pendingAdd = nil
+			if !yield(ivm.Node{Row: add}) {
+				return
+			}
 		}
 		for rows.Next() {
 			if err := rows.Scan(ptrs...); err != nil {
@@ -1738,13 +1766,8 @@ func (s *Source) invalidColumnPanic(col string) {
 // intentionally absent: the pool is bound only in the advance-free window.
 func (s *Source) fetchViaPoolStream(req ivm.FetchRequest, conn *connection, pool *ReaderPool) iter.Seq[ivm.Node] {
 	return func(yield func(ivm.Node) bool) {
+		// Unordered connections issue NO ORDER BY — see fetchForConn.
 		order := conn.sort
-		if order == nil {
-			order = make(ivm.Ordering, len(s.primaryKey))
-			for i, k := range s.primaryKey {
-				order[i] = [2]string{k, "asc"}
-			}
-		}
 		q := sqlite.BuildSelectQuery(
 			s.tableName,
 			s.columns,
@@ -1813,13 +1836,8 @@ func (s *Source) fetchViaPoolStream(req ivm.FetchRequest, conn *connection, pool
 // fetchViaPoolStream path instead. Kept for correctness — no caller should
 // reach it via sourceInput.Fetch, but a direct fetchForConn caller might.
 func (s *Source) fetchViaPool(req ivm.FetchRequest, conn *connection, pool *ReaderPool) []ivm.Node {
+	// Unordered connections issue NO ORDER BY — see fetchForConn.
 	order := conn.sort
-	if order == nil {
-		order = make(ivm.Ordering, len(s.primaryKey))
-		for i, k := range s.primaryKey {
-			order[i] = [2]string{k, "asc"}
-		}
-	}
 	q := sqlite.BuildSelectQuery(
 		s.tableName,
 		s.columns,

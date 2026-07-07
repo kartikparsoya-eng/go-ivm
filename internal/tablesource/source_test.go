@@ -333,11 +333,14 @@ func TestNormalizeRow_IdempotentOnCanonicalRows(t *testing.T) {
 	}
 }
 
-func TestFetchDefaultOrderingByPK(t *testing.T) {
+// TestFetchPKOrdering: an explicit PK ordering returns rows in PK order.
+// (A nil sort is now the UNORDERED connect — TS table-source.ts:231 — with
+// no ORDER BY and no ordering guarantee; see the unordered fetch tests.)
+func TestFetchPKOrdering(t *testing.T) {
 	src, db := newUserSource(t)
 	defer db.Close()
 
-	in := src.Connect(nil, nil, nil, nil)
+	in := src.Connect(ivm.Ordering{{"id", "asc"}}, nil, nil, nil)
 	nodes := slices.Collect(in.Fetch(ivm.FetchRequest{}))
 	if len(nodes) != 3 {
 		t.Fatalf("got %d rows, want 3", len(nodes))
@@ -371,7 +374,10 @@ func TestFetchReverseFlipsDirection(t *testing.T) {
 	src, db := newUserSource(t)
 	defer db.Close()
 
-	in := src.Connect(nil, nil, nil, nil)
+	// Reverse is an ordered-fetch feature (it flips ORDER BY direction), so
+	// the connection needs an explicit sort — unordered fetches have no
+	// direction to flip.
+	in := src.Connect(ivm.Ordering{{"id", "asc"}}, nil, nil, nil)
 	nodes := slices.Collect(in.Fetch(ivm.FetchRequest{Reverse: true}))
 	wantIDs := []float64{3, 2, 1}
 	if len(nodes) != 3 {
@@ -938,7 +944,8 @@ func TestFetchStartAtInclusive(t *testing.T) {
 	defer db.Close()
 
 	// PK ASC, cursor at id=2 "at" basis → rows from 2 onward, inclusive.
-	in := src.Connect(nil, nil, nil, nil)
+	// Start requires an ordering (TS query-builder.ts:51).
+	in := src.Connect(ivm.Ordering{{"id", "asc"}}, nil, nil, nil)
 	nodes := slices.Collect(in.Fetch(ivm.FetchRequest{
 		Start: &ivm.Start{Row: ivm.Row{"id": float64(2)}, Basis: "at"},
 	}))
@@ -958,7 +965,8 @@ func TestFetchStartAfterExclusive(t *testing.T) {
 	defer db.Close()
 
 	// PK ASC, cursor at id=2 "after" → only id=3.
-	in := src.Connect(nil, nil, nil, nil)
+	// Start requires an ordering (TS query-builder.ts:51).
+	in := src.Connect(ivm.Ordering{{"id", "asc"}}, nil, nil, nil)
 	nodes := slices.Collect(in.Fetch(ivm.FetchRequest{
 		Start: &ivm.Start{Row: ivm.Row{"id": float64(2)}, Basis: "after"},
 	}))
@@ -973,7 +981,8 @@ func TestFetchStartReverseFromTop(t *testing.T) {
 
 	// PK ASC + Reverse → effective DESC.
 	// Cursor at id=2 "after" in DESC direction = strictly less than 2 = id=1.
-	in := src.Connect(nil, nil, nil, nil)
+	// Start/reverse require an ordering (TS query-builder.ts:51).
+	in := src.Connect(ivm.Ordering{{"id", "asc"}}, nil, nil, nil)
 	nodes := slices.Collect(in.Fetch(ivm.FetchRequest{
 		Start:   &ivm.Start{Row: ivm.Row{"id": float64(2)}, Basis: "after"},
 		Reverse: true,
@@ -1010,7 +1019,8 @@ func TestFetchStartCombinedWithConstraintAndFilter(t *testing.T) {
 
 	// active=true rows: id=1 (score 90), id=3 (score 70).
 	// PK ASC, cursor id=1 "after" → id=3 only.
-	in := src.Connect(nil, nil, func(r ivm.Row) bool {
+	// Start requires an ordering (TS query-builder.ts:51).
+	in := src.Connect(ivm.Ordering{{"id", "asc"}}, nil, func(r ivm.Row) bool {
 		v, _ := r["active"].(bool)
 		return v
 	}, nil)
