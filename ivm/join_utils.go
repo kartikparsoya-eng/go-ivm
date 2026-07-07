@@ -81,16 +81,14 @@ func GenerateWithOverlay(nodes []Node, overlay Change, schema *SourceSchema) []N
 			case ChangeTypeChild:
 				if schema.CompareRows(overlay.Node.Row, node.Row) == 0 {
 					applied = true
-					// Apply child overlay to the matching relationship
+					// Apply child overlay to the matching relationship.
+					// {...node.relationships, [childRelName]: overlaid} — the
+					// name already exists on the node, so RelOrder is unchanged.
 					childRelName := overlay.Child.RelationshipName
-					newRels := make(map[string]func() iter.Seq[Node])
-					for k, v := range node.Relationships {
-						newRels[k] = v
-					}
 					childChange := overlay.Child.Change
 					childSchema := schema.Relationships[childRelName]
 					origStream := node.Relationships[childRelName]
-					newRels[childRelName] = func() iter.Seq[Node] {
+					newRels, newOrder := SetRelationship(node.Relationships, node.RelOrder, childRelName, func() iter.Seq[Node] {
 						return func(yield func(Node) bool) {
 							origNodes := slices.Collect(origStream())
 							overlaid := GenerateWithOverlay(origNodes, childChange, childSchema)
@@ -100,8 +98,8 @@ func GenerateWithOverlay(nodes []Node, overlay Change, schema *SourceSchema) []N
 								}
 							}
 						}
-					}
-					result = append(result, Node{Row: node.Row, Relationships: newRels})
+					})
+					result = append(result, Node{Row: node.Row, Relationships: newRels, RelOrder: newOrder})
 					yieldNode = false
 				}
 			}
@@ -157,15 +155,13 @@ func GenerateWithOverlayUnordered(nodes []Node, overlay Change, schema *SourceSc
 			if overlay.Type == ChangeTypeChild {
 				if RowEqualsForCompoundKey(overlay.Node.Row, node.Row, schema.PrimaryKey) {
 					suppressed = true
+					// {...node.relationships, [childRelName]: overlaid} — the
+					// name already exists on the node, so RelOrder is unchanged.
 					childRelName := overlay.Child.RelationshipName
-					newRels := make(map[string]func() iter.Seq[Node])
-					for k, v := range node.Relationships {
-						newRels[k] = v
-					}
 					childChange := overlay.Child.Change
 					childSchema := schema.Relationships[childRelName]
 					origStream := node.Relationships[childRelName]
-					newRels[childRelName] = func() iter.Seq[Node] {
+					newRels, newOrder := SetRelationship(node.Relationships, node.RelOrder, childRelName, func() iter.Seq[Node] {
 						return func(yield func(Node) bool) {
 							origNodes := slices.Collect(origStream())
 							overlaid := GenerateWithOverlay(origNodes, childChange, childSchema)
@@ -175,8 +171,8 @@ func GenerateWithOverlayUnordered(nodes []Node, overlay Change, schema *SourceSc
 								}
 							}
 						}
-					}
-					result = append(result, Node{Row: node.Row, Relationships: newRels})
+					})
+					result = append(result, Node{Row: node.Row, Relationships: newRels, RelOrder: newOrder})
 					continue
 				}
 			}

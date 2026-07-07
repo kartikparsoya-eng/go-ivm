@@ -159,15 +159,15 @@ func (e *Exists) Push(change Change, pusher InputBase) {
 			size := e.fetchSize(change.Node)
 			if size == 1 {
 				if e.not {
-					// Push remove with empty relationship
-					emptyRels := make(map[string]func() iter.Seq[Node])
-					for k, v := range change.Node.Relationships {
-						emptyRels[k] = v
-					}
-					emptyRels[e.relationshipName] = func() iter.Seq[Node] { return func(yield func(Node) bool) {} }
+					// Push remove with empty relationship — exists.ts:150-152
+					// {...change.node.relationships, [name]: () => []}.
+					emptyRels, emptyOrder := SetRelationship(
+						change.Node.Relationships, change.Node.RelOrder, e.relationshipName,
+						func() iter.Seq[Node] { return func(yield func(Node) bool) {} })
 					e.output.Push(MakeRemoveChange(Node{
 						Row:           change.Node.Row,
 						Relationships: emptyRels,
+						RelOrder:      emptyOrder,
 					}), e)
 					return
 				}
@@ -184,16 +184,16 @@ func (e *Exists) Push(change Change, pusher InputBase) {
 					e.output.Push(MakeAddChange(change.Node), e)
 					return
 				}
-				// Push remove with the removed child included
-				withChildRels := make(map[string]func() iter.Seq[Node])
-				for k, v := range change.Node.Relationships {
-					withChildRels[k] = v
-				}
+				// Push remove with the removed child included — exists.ts:183-185
+				// {...change.node.relationships, [name]: () => [removedChild]}.
 				removedChild := change.Child.Change.Node
-				withChildRels[e.relationshipName] = func() iter.Seq[Node] { return slices.Values([]Node{removedChild}) }
+				withChildRels, withChildOrder := SetRelationship(
+					change.Node.Relationships, change.Node.RelOrder, e.relationshipName,
+					func() iter.Seq[Node] { return slices.Values([]Node{removedChild}) })
 				e.output.Push(MakeRemoveChange(Node{
 					Row:           change.Node.Row,
 					Relationships: withChildRels,
+					RelOrder:      withChildOrder,
 				}), e)
 				return
 			}

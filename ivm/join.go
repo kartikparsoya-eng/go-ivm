@@ -133,7 +133,7 @@ func (j *Join) GetSchema() *SourceSchema {
 func (j *Join) Fetch(req FetchRequest) iter.Seq[Node] {
 	return func(yield func(Node) bool) {
 		for pn := range j.parent.Fetch(req) {
-			if !yield(j.processParentNode(pn.Row, pn.Relationships)) {
+			if !yield(j.processParentNode(pn.Row, pn.Relationships, pn.RelOrder)) {
 				return
 			}
 		}
@@ -145,18 +145,18 @@ func (j *Join) pushParent(change Change) {
 	switch change.Type {
 	case ChangeTypeAdd:
 		j.output.Push(
-			MakeAddChange(j.processParentNode(change.Node.Row, change.Node.Relationships)),
+			MakeAddChange(j.processParentNode(change.Node.Row, change.Node.Relationships, change.Node.RelOrder)),
 			j,
 		)
 	case ChangeTypeRemove:
 		j.output.Push(
-			MakeRemoveChange(j.processParentNode(change.Node.Row, change.Node.Relationships)),
+			MakeRemoveChange(j.processParentNode(change.Node.Row, change.Node.Relationships, change.Node.RelOrder)),
 			j,
 		)
 	case ChangeTypeChild:
 		j.output.Push(
 			MakeChildChange(
-				j.processParentNode(change.Node.Row, change.Node.Relationships),
+				j.processParentNode(change.Node.Row, change.Node.Relationships, change.Node.RelOrder),
 				*change.Child,
 			),
 			j,
@@ -171,8 +171,8 @@ func (j *Join) pushParent(change Change) {
 		}
 		j.output.Push(
 			MakeEditChange(
-				j.processParentNode(change.Node.Row, change.Node.Relationships),
-				j.processParentNode(change.OldNode.Row, change.OldNode.Relationships),
+				j.processParentNode(change.Node.Row, change.Node.Relationships, change.Node.RelOrder),
+				j.processParentNode(change.OldNode.Row, change.OldNode.Relationships, change.OldNode.RelOrder),
 			),
 			j,
 		)
@@ -233,7 +233,7 @@ func (j *Join) pushChildChange(childRow Row, change Change) {
 	for parentNode := range j.parent.Fetch(FetchRequest{Constraint: constraint}) {
 		j.inprogressChildChangePosition = parentNode.Row
 		childChange := MakeChildChange(
-			j.processParentNode(parentNode.Row, parentNode.Relationships),
+			j.processParentNode(parentNode.Row, parentNode.Relationships, parentNode.RelOrder),
 			ChildData{
 				RelationshipName: j.relationshipName,
 				Change:           change,
@@ -244,7 +244,7 @@ func (j *Join) pushChildChange(childRow Row, change Change) {
 }
 
 // processParentNode — attaches the child relationship stream to a parent node.
-func (j *Join) processParentNode(parentNodeRow Row, parentNodeRelations map[string]func() iter.Seq[Node]) Node {
+func (j *Join) processParentNode(parentNodeRow Row, parentNodeRelations map[string]func() iter.Seq[Node], parentRelOrder []string) Node {
 	childStream := func() iter.Seq[Node] {
 		return func(yield func(Node) bool) {
 			constraint := BuildJoinConstraint(parentNodeRow, j.parentKey, j.childKey)
@@ -281,14 +281,13 @@ func (j *Join) processParentNode(parentNodeRow Row, parentNodeRelations map[stri
 		}
 	}
 
-	newRels := make(map[string]func() iter.Seq[Node])
-	for k, v := range parentNodeRelations {
-		newRels[k] = v
-	}
-	newRels[j.relationshipName] = childStream
+	// {...parentNodeRelations, [name]: childStream} (join.ts:295-301): value
+	// wins, position kept when the name already exists, appended when novel.
+	newRels, newOrder := SetRelationship(parentNodeRelations, parentRelOrder, j.relationshipName, childStream)
 
 	return Node{
 		Row:           parentNodeRow,
 		Relationships: newRels,
+		RelOrder:      newOrder,
 	}
 }

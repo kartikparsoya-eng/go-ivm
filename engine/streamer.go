@@ -14,7 +14,7 @@ import (
 // pkValue reads a primary-key column from a row, panicking if it is missing
 // or nil. Primary keys are NOT NULL by definition, so a nil PK means a
 // corrupted replica or a join mis-constructing the node — TS fails loud here
-// via must() (pipeline-driver.ts:3184). Go previously wrote nil silently,
+// via must() (pipeline-driver.ts:2959). Go previously wrote nil silently,
 // shipping a {pk: nil} rowKey the CVR records but no future advance matches →
 // permanent client-view soft-leak (HIGH-6). Panicking matches TS's
 // fail-fast contract; engine.Advance's recover surfaces it for re-init.
@@ -52,7 +52,7 @@ type RowChange struct {
 // still on the stack and the mutation overlay + join in-progress state are
 // live (§3). This deletes the eager materializeChange deep-copy and the
 // Nodes-then-RowChanges double-hold, matching TS's #streamNodes generator
-// (pipeline-driver.ts:6022-6024) which flattens inside the push loop.
+// (pipeline-driver.ts:2818-2866) which flattens inside the push loop.
 //
 // Ordering contract (D8):
 //   - Changes within a single Accumulate call preserve their input slice
@@ -249,7 +249,7 @@ func streamNodes(queryID string, schema *ivm.SourceSchema, op int, node ivm.Node
 // streamNodesInto appends the RowChanges for a node and its relationships into
 // *out, recursing in place so the entire subtree shares one backing slice.
 func streamNodesInto(emit func(RowChange), queryID string, schema *ivm.SourceSchema, op int, node ivm.Node) {
-	// Skip permission-system rows — mirrors TS pipeline-driver.ts:2101.
+	// Skip permission-system rows — mirrors TS pipeline-driver.ts:2829-2833.
 	// streamChanges already guards permissions for top-level Add/Remove, but
 	// the recursive descent into child relationships re-enters here with the
 	// child schema. If that child is a permission CSQ (e.g. the
@@ -276,41 +276,37 @@ func streamNodesInto(emit func(RowChange), queryID string, schema *ivm.SourceSch
 	}
 	emit(rc)
 
-	if node.Relationships != nil && schema.Relationships != nil {
-		// Iterate relationships in TS wire order. TS streams siblings in
-		// Object.entries insertion order of node.relationships
-		// (pipeline-driver.ts:2861); every operator constructs its node
-		// relationship objects in the same insertion order as its schema
-		// merge (join.ts:295-301 mirrors join.ts:86-96; flipped-join and
-		// union-fan-in likewise), so schema.RelationshipOrder reproduces the
-		// node's order exactly on the fetch/hydrate and ordinary advance
-		// paths.
-		//
-		// Known residual divergence: union fan-in accumulated pushes merge
-		// same-row changes with {...right, ...left}
-		// (push-accumulated.ts:265-331), which puts the LATER branch's names
-		// first — not schema order. Go nodes carry no per-node order, so
-		// that corner emits in schema order instead. Wire-visible only when
-		// one row's changes merge across >=2 fan-in branches each carrying
-		// non-empty relationship child rows.
-		if len(schema.RelationshipOrder) != len(schema.Relationships) {
+	if len(node.RelOrder) != len(node.Relationships) {
+		// Construction-bug tripwire: every operator that builds a node with
+		// relationships must thread RelOrder (ivm.Node invariant).
+		panic(fmt.Sprintf(
+			"streamNodesInto: node for table %q has %d ordered names, %d relationships — operator failed to thread RelOrder",
+			schema.TableName, len(node.RelOrder), len(node.Relationships)))
+	}
+	// Iterate relationships in TS wire order: TS streams siblings in
+	// Object.entries insertion order of the NODE's own relationships object
+	// (pipeline-driver.ts:2861), which node.RelOrder carries — including the
+	// union fan-in accumulated-merge case where {...right, ...left}
+	// (push-accumulated.ts:265-331) puts the LATER branch's names first,
+	// diverging from the schema's branch-declaration order.
+	for _, relName := range node.RelOrder {
+		childSchema := schema.Relationships[relName]
+		if childSchema == nil {
+			// TS: must(schema.relationships[relationship]) — a node carrying
+			// a relationship its schema doesn't know is a pipeline bug.
 			panic(fmt.Sprintf(
-				"streamNodesInto: schema %q RelationshipOrder has %d names, Relationships has %d — constructor failed to thread order",
-				schema.TableName, len(schema.RelationshipOrder), len(schema.Relationships)))
+				"streamNodesInto: node for table %q carries relationship %q missing from schema",
+				schema.TableName, relName))
 		}
-		for _, relName := range schema.RelationshipOrder {
-			childSchema := schema.Relationships[relName]
-			if childSchema == nil {
-				continue
-			}
-			rel, ok := node.Relationships[relName]
-			if !ok {
-				continue
-			}
-			if seq := rel(); seq != nil {
-				for childNode := range seq {
-					streamNodesInto(emit, queryID, childSchema, op, childNode)
-				}
+		rel, ok := node.Relationships[relName]
+		if !ok {
+			panic(fmt.Sprintf(
+				"streamNodesInto: node for table %q has %q in RelOrder but not in Relationships",
+				schema.TableName, relName))
+		}
+		if seq := rel(); seq != nil {
+			for childNode := range seq {
+				streamNodesInto(emit, queryID, childSchema, op, childNode)
 			}
 		}
 	}

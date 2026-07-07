@@ -367,14 +367,15 @@ func (fj *FlippedJoin) yieldParentWithOverlay(minHead Node, relatedChildNodes []
 
 	if len(overlaidRelatedChildNodes) > 0 {
 		captured := overlaidRelatedChildNodes
-		// New relationship wins over any same-named parent relationship,
-		// matching TS's spread order ({...parent, [relName]: ...}) at
-		// flipped-join.ts and the FlippedJoin schema (new key last).
+		// {...minParentNode.relationships, [relName]: children}
+		// (flipped-join.ts:377-380): new value wins; position kept when the
+		// name already exists, appended when novel.
+		rels, order := SetRelationship(minHead.Relationships, minHead.RelOrder, fj.relationshipName,
+			func() iter.Seq[Node] { return slices.Values(captured) })
 		nodeOut := Node{
-			Row: minHead.Row,
-			Relationships: mergeRelationshipMaps(Relationships{
-				fj.relationshipName: func() iter.Seq[Node] { return slices.Values(captured) },
-			}, minHead.Relationships),
+			Row:           minHead.Row,
+			Relationships: rels,
+			RelOrder:      order,
 		}
 		if !yield(nodeOut) {
 			return false
@@ -513,11 +514,13 @@ func (fj *FlippedJoin) pushChildChange(change Change, exists bool) {
 		}
 
 		if exists {
+			// {...parentNode.relationships, [relName]: children}
+			// (flipped-join.ts:457-459).
+			rels, order := SetRelationship(parentNode.Relationships, parentNode.RelOrder, fj.relationshipName, childNodeStream)
 			outNode := Node{
-				Row: parentNode.Row,
-				Relationships: mergeRelationshipMaps(Relationships{
-					fj.relationshipName: childNodeStream,
-				}, parentNode.Relationships),
+				Row:           parentNode.Row,
+				Relationships: rels,
+				RelOrder:      order,
 			}
 			outChange := MakeChildChange(outNode, ChildData{
 				RelationshipName: fj.relationshipName,
@@ -525,11 +528,14 @@ func (fj *FlippedJoin) pushChildChange(change Change, exists bool) {
 			})
 			fj.output.Push(outChange, fj)
 		} else {
+			// {...parentNode.relationships, [relName]: [change.node]}
+			// (flipped-join.ts:472-474).
+			rels, order := SetRelationship(parentNode.Relationships, parentNode.RelOrder, fj.relationshipName,
+				func() iter.Seq[Node] { return slices.Values([]Node{change.Node}) })
 			outNode := Node{
-				Row: parentNode.Row,
-				Relationships: mergeRelationshipMaps(Relationships{
-					fj.relationshipName: func() iter.Seq[Node] { return slices.Values([]Node{change.Node}) },
-				}, parentNode.Relationships),
+				Row:           parentNode.Row,
+				Relationships: rels,
+				RelOrder:      order,
 			}
 			var outChange Change
 			if change.Type == ChangeTypeAdd {
@@ -571,11 +577,12 @@ func (fj *FlippedJoin) pushParent(change Change) {
 	}
 
 	flip := func(node Node) Node {
+		// {...node.relationships, [relName]: children} (flipped-join.ts:502-504).
+		rels, order := SetRelationship(node.Relationships, node.RelOrder, fj.relationshipName, childNodeStream(node))
 		return Node{
-			Row: node.Row,
-			Relationships: mergeRelationshipMaps(Relationships{
-				fj.relationshipName: childNodeStream(node),
-			}, node.Relationships),
+			Row:           node.Row,
+			Relationships: rels,
+			RelOrder:      order,
 		}
 	}
 

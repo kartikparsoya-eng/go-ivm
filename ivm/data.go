@@ -142,6 +142,38 @@ func normalizeDecodedValue(v interface{}) interface{} {
 type Node struct {
 	Row           Row
 	Relationships map[string]func() iter.Seq[Node]
+	// RelOrder lists Relationships' names in TS object-insertion order — the
+	// order Object.entries(node.relationships) yields for the corresponding
+	// TS node. TS spreads ({...rels, [name]: fn} at join.ts:297,
+	// exists.ts:150/183, flipped-join.ts:377/457/472/502; {...right, ...left}
+	// at push-accumulated.ts:265-331) keep an existing name's position and
+	// append novel names last; the wire emitter walks the NODE's own order
+	// (pipeline-driver.ts:2861), so Go threads it here.
+	//
+	// Invariant: same key set as Relationships (len equal, every name
+	// present). Leaf nodes carry both empty.
+	RelOrder []string
+}
+
+// SetRelationship returns copies of rels/order with name bound to fn,
+// reproducing TS's `{...rels, [name]: fn}` spread: the new value always
+// wins; the name keeps its existing position when already present, else
+// appends last. The input map/slice are never mutated (nodes are shared
+// across overlays and merged changes).
+func SetRelationship(rels map[string]func() iter.Seq[Node], order []string, name string, fn func() iter.Seq[Node]) (map[string]func() iter.Seq[Node], []string) {
+	newRels := make(map[string]func() iter.Seq[Node], len(rels)+1)
+	for k, v := range rels {
+		newRels[k] = v
+	}
+	_, existed := rels[name]
+	newRels[name] = fn
+	if existed {
+		return newRels, order
+	}
+	newOrder := make([]string, 0, len(order)+1)
+	newOrder = append(newOrder, order...)
+	newOrder = append(newOrder, name)
+	return newRels, newOrder
 }
 
 // Comparator compares two rows. Returns <0, 0, or >0.

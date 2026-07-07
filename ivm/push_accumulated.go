@@ -3,6 +3,7 @@ package ivm
 import (
 	"fmt"
 	"iter"
+	"slices"
 )
 
 // Pushes accumulated changes from fan-out/fan-in sub-graphs,
@@ -158,28 +159,36 @@ func MergeRelationships(left, right Change) Change {
 	if left.Type == right.Type {
 		switch left.Type {
 		case ChangeTypeAdd:
+			rels, order := mergeRelationshipMaps(left.Node, right.Node)
 			return MakeAddChange(Node{
 				Row:           left.Node.Row,
-				Relationships: mergeRelationshipMaps(left.Node.Relationships, right.Node.Relationships),
+				Relationships: rels,
+				RelOrder:      order,
 			})
 		case ChangeTypeRemove:
+			rels, order := mergeRelationshipMaps(left.Node, right.Node)
 			return MakeRemoveChange(Node{
 				Row:           left.Node.Row,
-				Relationships: mergeRelationshipMaps(left.Node.Relationships, right.Node.Relationships),
+				Relationships: rels,
+				RelOrder:      order,
 			})
 		case ChangeTypeEdit:
 			// Source: push-accumulated.ts:290-294.
 			if right.Type != ChangeTypeEdit {
 				panic("mergeRelationships: when left.type is edit and types match, right.type must be edit")
 			}
+			newRels, newOrder := mergeRelationshipMaps(left.Node, right.Node)
+			oldRels, oldOrder := mergeRelationshipMaps(*left.OldNode, *right.OldNode)
 			return MakeEditChange(
 				Node{
 					Row:           left.Node.Row,
-					Relationships: mergeRelationshipMaps(left.Node.Relationships, right.Node.Relationships),
+					Relationships: newRels,
+					RelOrder:      newOrder,
 				},
 				Node{
 					Row:           left.OldNode.Row,
-					Relationships: mergeRelationshipMaps(left.OldNode.Relationships, right.OldNode.Relationships),
+					Relationships: oldRels,
+					RelOrder:      oldOrder,
 				},
 			)
 		case ChangeTypeChild:
@@ -187,10 +196,12 @@ func MergeRelationships(left, right Change) Change {
 			if right.Type != ChangeTypeChild {
 				panic("mergeRelationships: when left.type is child and types match, right.type must be child")
 			}
+			rels, order := mergeRelationshipMaps(left.Node, right.Node)
 			return MakeChildChange(
 				Node{
 					Row:           left.Node.Row,
-					Relationships: mergeRelationshipMaps(left.Node.Relationships, right.Node.Relationships),
+					Relationships: rels,
+					RelOrder:      order,
 				},
 				*left.Child,
 			)
@@ -204,19 +215,23 @@ func MergeRelationships(left, right Change) Change {
 	}
 	switch right.Type {
 	case ChangeTypeAdd:
+		rels, order := mergeRelationshipMaps(left.Node, right.Node)
 		return MakeEditChange(
 			Node{
 				Row:           left.Node.Row,
-				Relationships: mergeRelationshipMaps(left.Node.Relationships, right.Node.Relationships),
+				Relationships: rels,
+				RelOrder:      order,
 			},
 			*left.OldNode,
 		)
 	case ChangeTypeRemove:
+		rels, order := mergeRelationshipMaps(*left.OldNode, right.Node)
 		return MakeEditChange(
 			left.Node,
 			Node{
 				Row:           left.OldNode.Row,
-				Relationships: mergeRelationshipMaps(left.OldNode.Relationships, right.Node.Relationships),
+				Relationships: rels,
+				RelOrder:      order,
 			},
 		)
 	}
@@ -227,19 +242,31 @@ func MergeRelationships(left, right Change) Change {
 // Relationships is a type alias for the relationship map in Node.
 type Relationships = map[string]func() iter.Seq[Node]
 
-// mergeRelationshipMaps merges two relationship maps, left takes precedence.
-func mergeRelationshipMaps(left, right Relationships) Relationships {
-	if left == nil && right == nil {
-		return nil
+// mergeRelationshipMaps merges two nodes' relationship maps, left values
+// taking precedence, and returns the TS `{...right, ...left}` iteration
+// order (push-accumulated.ts:274-277): right's names in right's order — a
+// name present in both keeps RIGHT's position with LEFT's value — then
+// left's novel names appended in left's order. The fan-in accumulates
+// branch pushes first-branch-first, and each merge folds the LATER branch
+// in as `right`, so merged nodes emit later-branch names first on the wire
+// exactly as TS does.
+func mergeRelationshipMaps(left, right Node) (Relationships, []string) {
+	if left.Relationships == nil && right.Relationships == nil {
+		return nil, nil
 	}
-	merged := make(Relationships)
-	for k, v := range right {
-		merged[k] = v
+	merged := make(Relationships, len(left.Relationships)+len(right.Relationships))
+	order := make([]string, 0, len(left.Relationships)+len(right.Relationships))
+	for _, k := range right.RelOrder {
+		merged[k] = right.Relationships[k]
+		order = append(order, k)
 	}
-	for k, v := range left {
-		merged[k] = v
+	for _, k := range left.RelOrder {
+		if _, ok := merged[k]; !ok {
+			order = append(order, k)
+		}
+		merged[k] = left.Relationships[k]
 	}
-	return merged
+	return merged, order
 }
 
 // MakeAddEmptyRelationships returns a function that fills missing relationships with empty streams.
@@ -251,21 +278,21 @@ func MakeAddEmptyRelationships(schema *SourceSchema) AddEmptyRelationshipsFunc {
 
 		switch change.Type {
 		case ChangeTypeAdd:
-			rels := copyRelationships(change.Node.Relationships)
-			mergeEmpty(rels, schema.Relationships)
-			return MakeAddChange(Node{Row: change.Node.Row, Relationships: rels})
+			rels, order := copyRelationships(change.Node)
+			order = mergeEmpty(rels, order, schema)
+			return MakeAddChange(Node{Row: change.Node.Row, Relationships: rels, RelOrder: order})
 		case ChangeTypeRemove:
-			rels := copyRelationships(change.Node.Relationships)
-			mergeEmpty(rels, schema.Relationships)
-			return MakeRemoveChange(Node{Row: change.Node.Row, Relationships: rels})
+			rels, order := copyRelationships(change.Node)
+			order = mergeEmpty(rels, order, schema)
+			return MakeRemoveChange(Node{Row: change.Node.Row, Relationships: rels, RelOrder: order})
 		case ChangeTypeEdit:
-			nodeRels := copyRelationships(change.Node.Relationships)
-			oldNodeRels := copyRelationships(change.OldNode.Relationships)
-			mergeEmpty(nodeRels, schema.Relationships)
-			mergeEmpty(oldNodeRels, schema.Relationships)
+			nodeRels, nodeOrder := copyRelationships(change.Node)
+			oldNodeRels, oldNodeOrder := copyRelationships(*change.OldNode)
+			nodeOrder = mergeEmpty(nodeRels, nodeOrder, schema)
+			oldNodeOrder = mergeEmpty(oldNodeRels, oldNodeOrder, schema)
 			return MakeEditChange(
-				Node{Row: change.Node.Row, Relationships: nodeRels},
-				Node{Row: change.OldNode.Row, Relationships: oldNodeRels},
+				Node{Row: change.Node.Row, Relationships: nodeRels, RelOrder: nodeOrder},
+				Node{Row: change.OldNode.Row, Relationships: oldNodeRels, RelOrder: oldNodeOrder},
 			)
 		case ChangeTypeChild:
 			return change // children only have relationships along the path to the change
@@ -274,22 +301,30 @@ func MakeAddEmptyRelationships(schema *SourceSchema) AddEmptyRelationshipsFunc {
 	}
 }
 
-func copyRelationships(rels Relationships) Relationships {
-	if rels == nil {
-		return make(Relationships)
+// copyRelationships returns copies of the node's relationship map and order
+// (TS `{...change.node.relationships}` — same key order).
+func copyRelationships(node Node) (Relationships, []string) {
+	if node.Relationships == nil {
+		return make(Relationships), nil
 	}
-	copied := make(Relationships, len(rels))
-	for k, v := range rels {
+	copied := make(Relationships, len(node.Relationships))
+	for k, v := range node.Relationships {
 		copied[k] = v
 	}
-	return copied
+	return copied, slices.Clone(node.RelOrder)
 }
 
-// mergeEmpty adds empty streams for relationship names not present in rels.
-func mergeEmpty(rels Relationships, schemaRels map[string]*SourceSchema) {
-	for relName := range schemaRels {
+// mergeEmpty adds empty streams for schema relationship names not present in
+// rels, appending them to order AFTER the node's existing names — TS
+// mergeEmpty walks Object.keys(schema.relationships) (push-accumulated.ts
+// :421-430), i.e. the schema's insertion order, which schema
+// .RelationshipOrder carries. Returns the extended order.
+func mergeEmpty(rels Relationships, order []string, schema *SourceSchema) []string {
+	for _, relName := range schema.RelationshipOrder {
 		if _, ok := rels[relName]; !ok {
 			rels[relName] = func() iter.Seq[Node] { return func(yield func(Node) bool) {} }
+			order = append(order, relName)
 		}
 	}
+	return order
 }
