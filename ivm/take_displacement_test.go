@@ -94,9 +94,8 @@ type changeCollector struct {
 	schema  *SourceSchema
 }
 
-func (c *changeCollector) Push(change Change, pusher InputBase) []Change {
+func (c *changeCollector) Push(change Change, pusher InputBase) {
 	c.Changes = append(c.Changes, change)
-	return nil
 }
 
 func (c *changeCollector) Reset() {
@@ -189,7 +188,7 @@ func TestTakeDisplacement_DescSort_AddIntoFullWindow(t *testing.T) {
 			// New message with createdAt=3000 should enter window and displace msg-5
 			newMsg := makeMsg("msg-new-1", "user-7", float64(3000))
 			collector.Reset()
-			changes := ms.Push(MakeSourceChangeAdd(newMsg))
+			ms.Push(MakeSourceChangeAdd(newMsg))
 
 			// Count ADD and REMOVE changes
 			addCount := 0
@@ -203,8 +202,8 @@ func TestTakeDisplacement_DescSort_AddIntoFullWindow(t *testing.T) {
 				}
 			}
 
-			t.Logf("Storage=%s Push ADD: collector=%d changes (add=%d, remove=%d), source_returned=%d",
-				storageType, len(collector.Changes), addCount, removeCount, len(changes))
+			t.Logf("Storage=%s Push ADD: collector=%d changes (add=%d, remove=%d)",
+				storageType, len(collector.Changes), addCount, removeCount)
 
 			// We expect 2 changes: ADD(new msg) + REMOVE(displaced bound)
 			if addCount != 1 || removeCount != 1 {
@@ -286,7 +285,7 @@ func TestTakeDisplacement_DescSort_SustainedEdits_ThenAdd(t *testing.T) {
 			// This should ALWAYS produce a displacement pair.
 			newMsg := makeMsg("msg-final-insert", "user-7", nextTs+10000)
 			collector.Reset()
-			result := ms.Push(MakeSourceChangeAdd(newMsg))
+			ms.Push(MakeSourceChangeAdd(newMsg))
 
 			addCount := 0
 			removeCount := 0
@@ -299,8 +298,8 @@ func TestTakeDisplacement_DescSort_SustainedEdits_ThenAdd(t *testing.T) {
 				}
 			}
 
-			t.Logf("Storage=%s After 50 edits, INSERT: collector=%d changes (add=%d, remove=%d), source_returned=%d",
-				storageType, len(collector.Changes), addCount, removeCount, len(result))
+			t.Logf("Storage=%s After 50 edits, INSERT: collector=%d changes (add=%d, remove=%d)",
+				storageType, len(collector.Changes), addCount, removeCount)
 
 			if addCount != 1 || removeCount != 1 {
 				t.Errorf("Expected 1 ADD + 1 REMOVE after sustained edits, got %d ADD + %d REMOVE",
@@ -356,7 +355,7 @@ func TestTakeDisplacement_DescSort_EditBoundRowUp_ThenAdd(t *testing.T) {
 			// In DESC: 550 < 600 but 550 > 500, so 550 sorts between c and d. Inside the window.
 			newMsg := makeMsg("x", "user-7", float64(550))
 			collector.Reset()
-			changes := ms.Push(MakeSourceChangeAdd(newMsg))
+			ms.Push(MakeSourceChangeAdd(newMsg))
 
 			addCount := 0
 			removeCount := 0
@@ -369,8 +368,8 @@ func TestTakeDisplacement_DescSort_EditBoundRowUp_ThenAdd(t *testing.T) {
 				}
 			}
 
-			t.Logf("Storage=%s INSERT after bound edit: collector=%d (add=%d, remove=%d), returned=%d",
-				storageType, len(collector.Changes), addCount, removeCount, len(changes))
+			t.Logf("Storage=%s INSERT after bound edit: collector=%d (add=%d, remove=%d)",
+				storageType, len(collector.Changes), addCount, removeCount)
 
 			// x(550) enters window, d(500) = current bound should be displaced
 			if addCount != 1 || removeCount != 1 {
@@ -412,7 +411,7 @@ func TestTakeDisplacement_DescSort_EditOutsideRowIn_Displacement(t *testing.T) {
 			oldF := makeMsg("f", "user-7", float64(300))
 			newF := makeMsg("f", "user-7", float64(900))
 			collector.Reset()
-			result := ms.Push(MakeSourceChangeEdit(newF, oldF))
+			ms.Push(MakeSourceChangeEdit(newF, oldF))
 
 			// This should produce: REMOVE(e=bound) + ADD(f with new createdAt)
 			addCount := 0
@@ -429,8 +428,8 @@ func TestTakeDisplacement_DescSort_EditOutsideRowIn_Displacement(t *testing.T) {
 				}
 			}
 
-			t.Logf("Storage=%s Edit outside→inside: collector=%d (add=%d, remove=%d, edit=%d), returned=%d",
-				storageType, len(collector.Changes), addCount, removeCount, editCount, len(result))
+			t.Logf("Storage=%s Edit outside→inside: collector=%d (add=%d, remove=%d, edit=%d)",
+				storageType, len(collector.Changes), addCount, removeCount, editCount)
 
 			// Expected: 1 REMOVE (old bound) + 1 ADD (edited row entering window)
 			if addCount != 1 || removeCount != 1 {

@@ -48,36 +48,36 @@ func (f *Filter) GetSchema() *SourceSchema {
 }
 
 // Push — handles incremental changes through the filter.
-func (f *Filter) Push(change Change, pusher InputBase) []Change {
-	return filterPush(change, f.output, f, f.predicate)
+func (f *Filter) Push(change Change, pusher InputBase) {
+	filterPush(change, f.output, f, f.predicate)
 }
 
 // filterPush — 1:1 port of filter-push.ts
-func filterPush(change Change, output Output, pusher InputBase, predicate func(Row) bool) []Change {
+func filterPush(change Change, output Output, pusher InputBase, predicate func(Row) bool) {
 	if predicate == nil {
-		return output.Push(change, pusher)
+		output.Push(change, pusher)
+		return
 	}
 
 	switch change.Type {
 	case ChangeTypeAdd, ChangeTypeRemove:
 		if predicate(change.Node.Row) {
-			return output.Push(change, pusher)
+			output.Push(change, pusher)
 		}
 	case ChangeTypeChild:
 		if predicate(change.Node.Row) {
-			return output.Push(change, pusher)
+			output.Push(change, pusher)
 		}
 	case ChangeTypeEdit:
-		return maybeSplitAndPushEditChange(change, predicate, output, pusher)
+		maybeSplitAndPushEditChange(change, predicate, output, pusher)
 	default:
 		panic("filterPush: unreachable change type")
 	}
-	return nil
 }
 
 // maybeSplitAndPushEditChange is a thin alias for the exported version in
 // source.go. The two had duplicate implementations; consolidated per porting
 // review LOW-1.
-func maybeSplitAndPushEditChange(change Change, predicate func(Row) bool, output Output, pusher InputBase) []Change {
-	return MaybeSplitAndPushEditChange(change, predicate, output, pusher)
+func maybeSplitAndPushEditChange(change Change, predicate func(Row) bool, output Output, pusher InputBase) {
+	MaybeSplitAndPushEditChange(change, predicate, output, pusher)
 }

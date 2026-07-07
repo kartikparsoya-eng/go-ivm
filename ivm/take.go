@@ -206,7 +206,7 @@ func (t *Take) initialFetch(req FetchRequest) iter.Seq[Node] {
 }
 
 // Push — Source: take.ts line 247-430
-func (t *Take) Push(change Change, pusher InputBase) []Change {
+func (t *Take) Push(change Change, pusher InputBase) {
 	t.debugf("Push type=%d row=%v", change.Type, change.Node.Row["id"])
 	if change.Type == ChangeTypeEdit {
 		t.recordEvent(takeEvent{
@@ -216,7 +216,8 @@ func (t *Take) Push(change Change, pusher InputBase) []Change {
 			oldRowID: change.OldNode.Row["id"],
 			oldSort:  change.OldNode.Row[t.sortColName()],
 		})
-		return t.pushEditChange(change)
+		t.pushEditChange(change)
+		return
 	}
 
 	row := change.Node.Row
@@ -229,7 +230,7 @@ func (t *Take) Push(change Change, pusher InputBase) []Change {
 	takeStateKey, takeState, maxBound, constraint := t.getStateAndConstraint(row)
 	if takeState == nil {
 		t.debugf("Push type=%d row=%v: takeState==nil, dropping", change.Type, row["id"])
-		return nil
+		return
 	}
 
 	compareRows := t.GetSchema().CompareRows
@@ -243,12 +244,13 @@ func (t *Take) Push(change Change, pusher InputBase) []Change {
 			}
 			t.setTakeState(takeStateKey, takeState.Size+1, newBound, maxBound)
 			t.debugf("Push ADD row=%v: size<limit, added (size=%d→%d)", row["id"], takeState.Size, takeState.Size+1)
-			return t.output.Push(change, t)
+			t.output.Push(change, t)
+			return
 		}
 		// size === limit
 		if takeState.Bound == nil || compareRows(change.Node.Row, takeState.Bound) >= 0 {
 			t.debugf("Push ADD row=%v: DROPPED (outside bound=%v, size=%d)", row["id"], takeState.Bound["id"], takeState.Size)
-			return nil
+			return
 		}
 		// added row < bound
 		var beforeBoundNode, boundNode *Node
@@ -285,20 +287,19 @@ func (t *Take) Push(change Change, pusher InputBase) []Change {
 			newBound = beforeBoundNode.Row
 		}
 		t.setTakeState(takeStateKey, takeState.Size, newBound, maxBound)
-		var results []Change
-		results = append(results, t.pushWithRowHiddenFromFetch(change.Node.Row, removeChange)...)
-		results = append(results, t.output.Push(change, t)...)
-		return results
+		t.pushWithRowHiddenFromFetch(change.Node.Row, removeChange)
+		t.output.Push(change, t)
+		return
 
 	case ChangeTypeRemove:
 		if takeState.Bound == nil {
 			t.debugf("Push REMOVE row=%v: bound==nil, dropping", row["id"])
-			return nil
+			return
 		}
 		compToBound := compareRows(change.Node.Row, takeState.Bound)
 		if compToBound > 0 {
 			t.debugf("Push REMOVE row=%v: outside bound=%v (cmp=%d), dropping", row["id"], takeState.Bound["id"], compToBound)
-			return nil
+			return
 		}
 		t.debugf("Push REMOVE row=%v: inside (cmp=%d), bound=%v size=%d", row["id"], compToBound, takeState.Bound["id"], takeState.Size)
 
@@ -337,11 +338,10 @@ func (t *Take) Push(change Change, pusher InputBase) []Change {
 		}
 
 		if newBound != nil && newBound.push {
-			var results []Change
-			results = append(results, t.output.Push(change, t)...)
+			t.output.Push(change, t)
 			t.setTakeState(takeStateKey, takeState.Size, newBound.node.Row, maxBound)
-			results = append(results, t.output.Push(MakeAddChange(*newBound.node), t)...)
-			return results
+			t.output.Push(MakeAddChange(*newBound.node), t)
+			return
 		}
 		// Match TS take.ts:413-418 — unconditional Size-1, Bound = newBound?.node.row
 		// (may be nil). The Take invariant "Size > 0 → Bound != nil" is enforced
@@ -353,20 +353,18 @@ func (t *Take) Push(change Change, pusher InputBase) []Change {
 			boundRow = newBound.node.Row
 		}
 		t.setTakeState(takeStateKey, takeState.Size-1, boundRow, maxBound)
-		return t.output.Push(change, t)
+		t.output.Push(change, t)
 
 	case ChangeTypeChild:
 		if takeState.Bound != nil &&
 			compareRows(change.Node.Row, takeState.Bound) <= 0 {
-			return t.output.Push(change, t)
+			t.output.Push(change, t)
 		}
-		return nil
 	}
-	return nil
 }
 
 // pushEditChange — Source: take.ts line 432-675
-func (t *Take) pushEditChange(change Change) []Change {
+func (t *Take) pushEditChange(change Change) {
 	if t.partitionKeyComparator != nil &&
 		t.partitionKeyComparator(change.OldNode.Row, change.Node.Row) != 0 {
 		panic("Unexpected change of partition key")
@@ -375,7 +373,7 @@ func (t *Take) pushEditChange(change Change) []Change {
 	takeStateKey, takeState, maxBound, constraint := t.getStateAndConstraint(change.OldNode.Row)
 	if takeState == nil {
 		t.debugf("pushEdit row=%v: takeState==nil, dropping", change.Node.Row["id"])
-		return nil
+		return
 	}
 	if takeState.Bound == nil {
 		panic("Bound should be set")
@@ -386,19 +384,21 @@ func (t *Take) pushEditChange(change Change) []Change {
 	newCmp := compareRows(change.Node.Row, takeState.Bound)
 	t.debugf("pushEdit row=%v oldCmp=%d newCmp=%d bound=%v size=%d", change.Node.Row["id"], oldCmp, newCmp, takeState.Bound["id"], takeState.Size)
 
-	replaceBoundAndForwardChange := func() []Change {
+	replaceBoundAndForwardChange := func() {
 		t.setTakeState(takeStateKey, takeState.Size, change.Node.Row, maxBound)
-		return t.output.Push(change, t)
+		t.output.Push(change, t)
 	}
 
 	// Bounds row was changed
 	if oldCmp == 0 {
 		if newCmp == 0 {
-			return t.output.Push(change, t)
+			t.output.Push(change, t)
+			return
 		}
 		if newCmp < 0 {
 			if t.limit == 1 {
-				return replaceBoundAndForwardChange()
+				replaceBoundAndForwardChange()
+				return
 			}
 			var beforeBoundNode *Node
 			for node := range t.input.Fetch(FetchRequest{
@@ -419,7 +419,8 @@ func (t *Take) pushEditChange(change Change) []Change {
 				panic("Take.pushEditChange: beforeBoundNode must be found when oldCmp==0, newCmp<0, size>1")
 			}
 			t.setTakeState(takeStateKey, takeState.Size, beforeBoundNode.Row, maxBound)
-			return t.output.Push(change, t)
+			t.output.Push(change, t)
+			return
 		}
 
 		// newCmp > 0
@@ -436,13 +437,13 @@ func (t *Take) pushEditChange(change Change) []Change {
 			panic("Take: newBoundNode must be found during fetch")
 		}
 		if compareRows(newBoundNode.Row, change.Node.Row) == 0 {
-			return replaceBoundAndForwardChange()
+			replaceBoundAndForwardChange()
+			return
 		}
 		t.setTakeState(takeStateKey, takeState.Size, newBoundNode.Row, maxBound)
-		var results []Change
-		results = append(results, t.pushWithRowHiddenFromFetch(newBoundNode.Row, MakeRemoveChange(*change.OldNode))...)
-		results = append(results, t.output.Push(MakeAddChange(*newBoundNode), t)...)
-		return results
+		t.pushWithRowHiddenFromFetch(newBoundNode.Row, MakeRemoveChange(*change.OldNode))
+		t.output.Push(MakeAddChange(*newBoundNode), t)
+		return
 	}
 
 	if oldCmp > 0 {
@@ -459,7 +460,7 @@ func (t *Take) pushEditChange(change Change) []Change {
 		}
 		if newCmp > 0 {
 			t.debugf("pushEdit DROPPED (both outside) row=%v bound=%v", change.Node.Row["id"], takeState.Bound["id"])
-			return nil
+			return
 		}
 		// old outside, new inside
 		var oldBoundNode, newBoundNode *Node
@@ -495,10 +496,9 @@ func (t *Take) pushEditChange(change Change) []Change {
 			panic(t.staleBoundError(change, "newBoundNode nil (oldCmp>0, newCmp<0)"))
 		}
 		t.setTakeState(takeStateKey, takeState.Size, newBoundNode.Row, maxBound)
-		var results []Change
-		results = append(results, t.pushWithRowHiddenFromFetch(change.Node.Row, MakeRemoveChange(*oldBoundNode))...)
-		results = append(results, t.output.Push(MakeAddChange(change.Node), t)...)
-		return results
+		t.pushWithRowHiddenFromFetch(change.Node.Row, MakeRemoveChange(*oldBoundNode))
+		t.output.Push(MakeAddChange(change.Node), t)
+		return
 	}
 
 	// oldCmp < 0
@@ -510,7 +510,8 @@ func (t *Take) pushEditChange(change Change) []Change {
 		panic(t.staleBoundError(change, "oldCmp<0, newCmp==0"))
 	}
 	if newCmp < 0 {
-		return t.output.Push(change, t)
+		t.output.Push(change, t)
+		return
 	}
 	// old inside, new > bound
 	var afterBoundNode *Node
@@ -526,20 +527,19 @@ func (t *Take) pushEditChange(change Change) []Change {
 		panic("Take: afterBoundNode must be found during fetch")
 	}
 	if compareRows(afterBoundNode.Row, change.Node.Row) == 0 {
-		return replaceBoundAndForwardChange()
+		replaceBoundAndForwardChange()
+		return
 	}
-	var results []Change
-	results = append(results, t.output.Push(MakeRemoveChange(*change.OldNode), t)...)
+	t.output.Push(MakeRemoveChange(*change.OldNode), t)
 	t.setTakeState(takeStateKey, takeState.Size, afterBoundNode.Row, maxBound)
-	results = append(results, t.output.Push(MakeAddChange(*afterBoundNode), t)...)
-	return results
+	t.output.Push(MakeAddChange(*afterBoundNode), t)
 }
 
 // pushWithRowHiddenFromFetch — Source: take.ts line 677-684
-func (t *Take) pushWithRowHiddenFromFetch(row Row, change Change) []Change {
+func (t *Take) pushWithRowHiddenFromFetch(row Row, change Change) {
 	t.rowHiddenFromFetch = row
 	defer func() { t.rowHiddenFromFetch = nil }()
-	return t.output.Push(change, t)
+	t.output.Push(change, t)
 }
 
 // setTakeState — Source: take.ts line 686-703

@@ -3,6 +3,7 @@ package ivm
 import (
 	"iter"
 	"reflect"
+	"slices"
 )
 
 // UnionFanIn merges results from multiple OR-condition branches back together,
@@ -24,11 +25,15 @@ func NewUnionFanIn(fanOut *UnionFanOut, inputs []Input) *UnionFanIn {
 		panic("UnionFanIn requires sorted input")
 	}
 
-	// Build merged schema
+	// Build merged schema.
+	// TS: starts from the fan-out schema's relationships and appends each
+	// branch's novel names via Object.entries — branch insertion order
+	// (union-fan-in.ts:52-88).
 	rels := make(map[string]*SourceSchema)
 	for k, v := range fanOutSchema.Relationships {
 		rels[k] = v
 	}
+	relOrder := slices.Clone(fanOutSchema.RelationshipOrder)
 
 	relationshipsFromBranches := make(map[string]bool)
 	for _, input := range inputs {
@@ -50,7 +55,8 @@ func NewUnionFanIn(fanOut *UnionFanOut, inputs []Input) *UnionFanIn {
 			panic("Sort mismatch in union fan-in")
 		}
 
-		for relName, relSchema := range inputSchema.Relationships {
+		for _, relName := range inputSchema.RelationshipOrder {
+			relSchema := inputSchema.Relationships[relName]
 			if _, inFanOut := fanOutSchema.Relationships[relName]; inFanOut {
 				continue
 			}
@@ -59,20 +65,22 @@ func NewUnionFanIn(fanOut *UnionFanOut, inputs []Input) *UnionFanIn {
 			}
 			rels[relName] = relSchema
 			relationshipsFromBranches[relName] = true
+			relOrder = append(relOrder, relName)
 		}
 	}
 
 	ufi := &UnionFanIn{
 		inputs: inputs,
 		schema: &SourceSchema{
-			TableName:     fanOutSchema.TableName,
-			Columns:       fanOutSchema.Columns,
-			PrimaryKey:    fanOutSchema.PrimaryKey,
-			Relationships: rels,
-			IsHidden:      fanOutSchema.IsHidden,
-			System:        fanOutSchema.System,
-			CompareRows:   fanOutSchema.CompareRows,
-			Sort:          fanOutSchema.Sort,
+			TableName:         fanOutSchema.TableName,
+			Columns:           fanOutSchema.Columns,
+			PrimaryKey:        fanOutSchema.PrimaryKey,
+			Relationships:     rels,
+			RelationshipOrder: relOrder,
+			IsHidden:          fanOutSchema.IsHidden,
+			System:            fanOutSchema.System,
+			CompareRows:       fanOutSchema.CompareRows,
+			Sort:              fanOutSchema.Sort,
 		},
 		output: ThrowOutput,
 	}
@@ -174,18 +182,19 @@ func (ufi *UnionFanIn) GetSchema() *SourceSchema {
 
 // Push receives a change from a branch. If fan-out is active, accumulates;
 // otherwise processes as an internal change.
-func (ufi *UnionFanIn) Push(change Change, pusher InputBase) []Change {
+func (ufi *UnionFanIn) Push(change Change, pusher InputBase) {
 	if !ufi.fanOutPushStarted {
-		return ufi.pushInternalChange(change, pusher)
+		ufi.pushInternalChange(change, pusher)
+		return
 	}
 	ufi.accumulatedPushes = append(ufi.accumulatedPushes, change)
-	return nil
 }
 
 // pushInternalChange handles changes from inside the fan-out/fan-in sub-graph.
-func (ufi *UnionFanIn) pushInternalChange(change Change, pusher InputBase) []Change {
+func (ufi *UnionFanIn) pushInternalChange(change Change, pusher InputBase) {
 	if change.Type == ChangeTypeChild {
-		return ufi.output.Push(change, ufi)
+		ufi.output.Push(change, ufi)
+		return
 	}
 
 	if change.Type != ChangeTypeAdd && change.Type != ChangeTypeRemove {
@@ -209,7 +218,7 @@ func (ufi *UnionFanIn) pushInternalChange(change Change, pusher InputBase) []Cha
 			break
 		}
 		if found {
-			return nil
+			return
 		}
 	}
 
@@ -217,7 +226,7 @@ func (ufi *UnionFanIn) pushInternalChange(change Change, pusher InputBase) []Cha
 		panic("Pusher was not one of the inputs to union-fan-in!")
 	}
 
-	return ufi.output.Push(change, ufi)
+	ufi.output.Push(change, ufi)
 }
 
 // FanOutStartedPushing signals that the paired fan-out has started pushing.
@@ -229,24 +238,24 @@ func (ufi *UnionFanIn) FanOutStartedPushing() {
 }
 
 // FanOutDonePushing processes accumulated pushes after fan-out completes.
-func (ufi *UnionFanIn) FanOutDonePushing(fanOutChangeType ChangeType) []Change {
+func (ufi *UnionFanIn) FanOutDonePushing(fanOutChangeType ChangeType) {
 	if !ufi.fanOutPushStarted {
 		panic("UnionFanIn: fanOutDonePushing called without fanOutStartedPushing")
 	}
 	ufi.fanOutPushStarted = false
 
 	if len(ufi.inputs) == 0 {
-		return nil
+		return
 	}
 
 	accumulated := ufi.accumulatedPushes
 	ufi.accumulatedPushes = nil
 
 	if len(accumulated) == 0 {
-		return nil
+		return
 	}
 
-	return PushAccumulatedChanges(
+	PushAccumulatedChanges(
 		accumulated,
 		ufi.output,
 		ufi,

@@ -5,7 +5,6 @@ package engine
 
 import (
 	"fmt"
-	"sort"
 	"sync"
 	"sync/atomic"
 
@@ -278,27 +277,37 @@ func streamNodesInto(emit func(RowChange), queryID string, schema *ivm.SourceSch
 	emit(rc)
 
 	if node.Relationships != nil && schema.Relationships != nil {
-		// Iterate relationships in a STABLE order. TS streams them in
-		// Object.entries insertion order (pipeline-driver.ts:3189), which is
-		// deterministic; Go's map range is randomized per iteration, so the
-		// wire order of sibling-relationship child rows varied run-to-run.
-		// Sorting by relationship name restores determinism. (Exact parity
-		// with TS's insertion order would require threading an ordered
-		// relationship list through every Join/Exists/FlippedJoin schema
-		// merge — high cost; sibling order is semantically irrelevant since
-		// the client buckets child rows per relationship, and the shadow
-		// comparator is order-tolerant across relationships.)
-		relNames := make([]string, 0, len(node.Relationships))
-		for relName := range node.Relationships {
-			relNames = append(relNames, relName)
+		// Iterate relationships in TS wire order. TS streams siblings in
+		// Object.entries insertion order of node.relationships
+		// (pipeline-driver.ts:2861); every operator constructs its node
+		// relationship objects in the same insertion order as its schema
+		// merge (join.ts:295-301 mirrors join.ts:86-96; flipped-join and
+		// union-fan-in likewise), so schema.RelationshipOrder reproduces the
+		// node's order exactly on the fetch/hydrate and ordinary advance
+		// paths.
+		//
+		// Known residual divergence: union fan-in accumulated pushes merge
+		// same-row changes with {...right, ...left}
+		// (push-accumulated.ts:265-331), which puts the LATER branch's names
+		// first — not schema order. Go nodes carry no per-node order, so
+		// that corner emits in schema order instead. Wire-visible only when
+		// one row's changes merge across >=2 fan-in branches each carrying
+		// non-empty relationship child rows.
+		if len(schema.RelationshipOrder) != len(schema.Relationships) {
+			panic(fmt.Sprintf(
+				"streamNodesInto: schema %q RelationshipOrder has %d names, Relationships has %d — constructor failed to thread order",
+				schema.TableName, len(schema.RelationshipOrder), len(schema.Relationships)))
 		}
-		sort.Strings(relNames)
-		for _, relName := range relNames {
+		for _, relName := range schema.RelationshipOrder {
 			childSchema := schema.Relationships[relName]
 			if childSchema == nil {
 				continue
 			}
-			if seq := node.Relationships[relName](); seq != nil {
+			rel, ok := node.Relationships[relName]
+			if !ok {
+				continue
+			}
+			if seq := rel(); seq != nil {
 				for childNode := range seq {
 					streamNodesInto(emit, queryID, childSchema, op, childNode)
 				}

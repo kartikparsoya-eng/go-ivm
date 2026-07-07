@@ -107,18 +107,16 @@ func (s *Source) SetAdvanceClock(clk *procclock.Accumulator) {
 }
 
 // fanOut pushes one source-level change through every connection, in
-// parallel across pipeline groups when enabled. Returns the concatenated
-// outputs in GROUP-MAJOR order: groups in first-seen registration order,
-// connections in registration order within each. For engine-built
-// pipelines this equals plain registration order (a query's connections
-// are appended contiguously during its build), and the engine discards
-// Push's return value anyway — the real output rides the Streamer — but
-// the determinism keeps direct Push callers stable either way.
+// parallel across pipeline groups when enabled. Push output rides the
+// engine's Streamer (the terminal sink) — Output.Push is void, so there is
+// nothing to collect here; group scheduling only determines EXECUTION
+// interleave, which the Streamer's per-query Accumulate contract absorbs
+// (see the file header).
 //
 // Called WITHOUT s.mu (fanout must allow recursive Fetch
 // callbacks), after the overlay is set; the caller re-acquires s.mu for
 // writeChange after this returns.
-func (s *Source) fanOut(change ivm.SourceChange, epoch int, conns []*connection) []ivm.Change {
+func (s *Source) fanOut(change ivm.SourceChange, epoch int, conns []*connection) {
 	// Partition by group, preserving registration order both across groups
 	// (first-seen) and within them. output==nil conns (not yet wired) are
 	// skipped exactly as the serial loop does.
@@ -137,36 +135,32 @@ func (s *Source) fanOut(change ivm.SourceChange, epoch int, conns []*connection)
 		groups[gi] = append(groups[gi], conn)
 	}
 	if len(groups) == 0 {
-		return nil
+		return
 	}
 
 	// pushGroup is the EXACT serial per-connection body (epoch bump before
 	// filterPush so downstream Fetch's overlay gate matches TS genPush
 	// ordering; fresh outputChange per conn).
-	pushGroup := func(group []*connection) []ivm.Change {
-		var out []ivm.Change
+	pushGroup := func(group []*connection) {
 		for _, conn := range group {
 			conn.lastPushedEpoch = epoch
 			outputChange := sourceChangeToChange(change)
 			if outputChange == nil {
 				continue
 			}
-			out = append(out, filterPush(*outputChange, conn)...)
+			filterPush(*outputChange, conn)
 		}
-		return out
 	}
 
 	workers := ParallelAdvanceWorkers
 	if !ParallelAdvance || workers < 2 || len(groups) < 2 {
 		// Serial path — behaviorally identical to the pre-parallel loop.
-		var out []ivm.Change
 		for _, g := range groups {
-			out = append(out, pushGroup(g)...)
+			pushGroup(g)
 		}
-		return out
+		return
 	}
 
-	ordered := make([][]ivm.Change, len(groups))
 	panics := make([]any, len(groups))
 	// Processing clock of the advance in flight (nil outside a clocked
 	// advance — Begin on a nil accumulator is a no-op). Loaded once: the
@@ -191,7 +185,7 @@ func (s *Source) fanOut(change ivm.SourceChange, epoch int, conns []*connection)
 			// work still lands before the recover above captures.
 			stopClock := clk.Begin()
 			defer stopClock()
-			ordered[idx] = pushGroup(groups[idx])
+			pushGroup(groups[idx])
 		}(i)
 	}
 	wg.Wait()
@@ -205,10 +199,4 @@ func (s *Source) fanOut(change ivm.SourceChange, epoch int, conns []*connection)
 			panic(panics[i])
 		}
 	}
-
-	var out []ivm.Change
-	for _, changes := range ordered {
-		out = append(out, changes...)
-	}
-	return out
 }

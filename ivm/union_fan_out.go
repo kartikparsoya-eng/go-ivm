@@ -30,7 +30,7 @@ func (ufo *UnionFanOut) SetFanIn(fanIn *UnionFanIn) {
 }
 
 // Push broadcasts change to all outputs, then signals fan-in completion.
-func (ufo *UnionFanOut) Push(change Change, _ InputBase) []Change {
+func (ufo *UnionFanOut) Push(change Change, _ InputBase) {
 	if ufo.unionFanIn == nil {
 		panic("UnionFanIn not set")
 	}
@@ -38,7 +38,7 @@ func (ufo *UnionFanOut) Push(change Change, _ InputBase) []Change {
 	for _, output := range ufo.outputs {
 		output.Push(change, ufo)
 	}
-	return ufo.unionFanIn.FanOutDonePushing(change.Type)
+	ufo.unionFanIn.FanOutDonePushing(change.Type)
 }
 
 func (ufo *UnionFanOut) SetOutput(output Output) {

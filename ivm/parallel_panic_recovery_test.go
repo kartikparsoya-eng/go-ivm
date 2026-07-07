@@ -33,7 +33,7 @@ type panickingOutput struct {
 	panicWith any
 }
 
-func (p *panickingOutput) Push(change ivm.Change, pusher ivm.InputBase) []ivm.Change {
+func (p *panickingOutput) Push(change ivm.Change, pusher ivm.InputBase) {
 	panic(p.panicWith)
 }
 

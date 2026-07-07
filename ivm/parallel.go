@@ -11,8 +11,7 @@ import "sync"
 
 // GenPushParallel pushes a change to all connections concurrently.
 // Each connection's pipeline runs in its own goroutine.
-// Results are collected and returned in connection order (deterministic).
-func (ms *MemorySource) GenPushParallel(change SourceChange) []Change {
+func (ms *MemorySource) GenPushParallel(change SourceChange) {
 	// Validate (same as sequential) — the panic propagates out of the
 	// engine unrecovered (TS assert-throw → teardown disposition).
 	switch change.Type {
@@ -57,7 +56,7 @@ func (ms *MemorySource) GenPushParallel(change SourceChange) []Change {
 	ms.connsMu.RUnlock()
 
 	if len(activeConns) == 0 {
-		return nil
+		return
 	}
 
 	// Atomic Store of overlay establishes a happens-before edge to every
@@ -70,19 +69,18 @@ func (ms *MemorySource) GenPushParallel(change SourceChange) []Change {
 	if len(activeConns) == 1 {
 		conn := activeConns[0]
 		outputChange := ms.sourceChangeToChange(change)
-		return FilterPush(outputChange, conn.Output, conn.Input, conn.FilterPredicate)
+		FilterPush(outputChange, conn.Output, conn.Input, conn.FilterPredicate)
+		return
 	}
 
-	// Fan-out to goroutines. wg.Wait happens-before the read of `ordered`
-	// and `panics`, so direct-slot writes from each goroutine are safe
-	// without a channel.
+	// Fan-out to goroutines. wg.Wait happens-before the read of `panics`,
+	// so direct-slot writes from each goroutine are safe without a channel.
 	//
 	// Per-goroutine recover is load-bearing: a panic on a spawned goroutine
 	// terminates the entire Go runtime (panic-on-goroutine is fatal — no
 	// outer caller's recover can catch it). Capture per slot and re-raise
 	// the first (connection order) on the caller's goroutine so the panic
 	// unwinds through the engine in the ordinary single-goroutine scope.
-	ordered := make([][]Change, len(activeConns))
 	panics := make([]any, len(activeConns))
 	var wg sync.WaitGroup
 	for i, conn := range activeConns {
@@ -95,7 +93,7 @@ func (ms *MemorySource) GenPushParallel(change SourceChange) []Change {
 				}
 			}()
 			outputChange := ms.sourceChangeToChange(change)
-			ordered[idx] = FilterPush(outputChange, c.Output, c.Input, c.FilterPredicate)
+			FilterPush(outputChange, c.Output, c.Input, c.FilterPredicate)
 		}(i, conn)
 	}
 	wg.Wait()
@@ -108,12 +106,6 @@ func (ms *MemorySource) GenPushParallel(change SourceChange) []Change {
 			panic(p)
 		}
 	}
-
-	var allResults []Change
-	for _, changes := range ordered {
-		allResults = append(allResults, changes...)
-	}
-	return allResults
 }
 
 // SetParallel enables or disables parallel push on this source.
@@ -128,11 +120,11 @@ func (ms *MemorySource) SetParallel(enabled bool, threshold ...int) {
 
 // PushWithMode applies a source change using parallel or sequential mode.
 // Deprecated: Use Push() directly — it now checks the parallel flag internally.
-func (ms *MemorySource) PushWithMode(change SourceChange) []Change {
-	return ms.Push(change)
+func (ms *MemorySource) PushWithMode(change SourceChange) {
+	ms.Push(change)
 }
 
-func (ms *MemorySource) genPushAndWriteParallel(change SourceChange) []Change {
+func (ms *MemorySource) genPushAndWriteParallel(change SourceChange) {
 	// BUG 1b: if this Edit's OldRow was removed earlier in this batch,
 	// convert to Add (same as sequential path).
 	if change.Type == ChangeTypeEdit && !ms.has(change.OldRow) {
@@ -175,24 +167,20 @@ func (ms *MemorySource) genPushAndWriteParallel(change SourceChange) []Change {
 	}
 
 	if change.Type == ChangeTypeEdit && shouldSplit {
-		var results []Change
 		skipRemove := !ms.has(change.OldRow) && ms.removedInBatch != nil && ms.removedInBatch[ms.pkKey(change.OldRow)]
 		if !skipRemove {
-			r1 := ms.GenPushParallel(MakeSourceChangeRemove(change.OldRow))
+			ms.GenPushParallel(MakeSourceChangeRemove(change.OldRow))
 			ms.writeChange(MakeSourceChangeRemove(change.OldRow))
-			results = append(results, r1...)
 		}
-		r2 := ms.GenPushParallel(MakeSourceChangeAdd(change.Row))
+		ms.GenPushParallel(MakeSourceChangeAdd(change.Row))
 		ms.writeChange(MakeSourceChangeAdd(change.Row))
-		results = append(results, r2...)
-		return results
+		return
 	}
 
 	// BUG 1: skip duplicate Remove
 	if change.Type == ChangeTypeRemove && !ms.has(change.Row) && ms.removedInBatch != nil && ms.removedInBatch[ms.pkKey(change.Row)] {
-		return nil
+		return
 	}
-	results := ms.GenPushParallel(change)
+	ms.GenPushParallel(change)
 	ms.writeChange(change)
-	return results
 }

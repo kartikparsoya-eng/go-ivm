@@ -38,9 +38,8 @@ type skipCaptureOutput struct {
 	pushes []Change
 }
 
-func (c *skipCaptureOutput) Push(change Change, _ InputBase) []Change {
+func (c *skipCaptureOutput) Push(change Change, _ InputBase) {
 	c.pushes = append(c.pushes, change)
-	return nil
 }
 
 func newSkipParityFixture(t *testing.T, exclusive bool) (*MemorySource, *Skip, *skipCaptureOutput) {

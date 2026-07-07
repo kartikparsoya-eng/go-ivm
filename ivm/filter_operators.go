@@ -31,7 +31,7 @@ var ThrowFilterOutput FilterOutput = throwFilterOutputImpl{}
 
 type throwFilterOutputImpl struct{}
 
-func (throwFilterOutputImpl) Push(change Change, pusher InputBase) []Change {
+func (throwFilterOutputImpl) Push(change Change, pusher InputBase) {
 	panic("Output not set")
 }
 
@@ -70,8 +70,8 @@ func (fs *FilterStart) GetSchema() *SourceSchema {
 }
 
 // Push — called as Output by the upstream input.
-func (fs *FilterStart) Push(change Change, pusher InputBase) []Change {
-	return fs.output.Push(change, fs)
+func (fs *FilterStart) Push(change Change, pusher InputBase) {
+	fs.output.Push(change, fs)
 }
 
 // Fetch — filters nodes from upstream through the filter chain.
@@ -138,6 +138,6 @@ func (fe *FilterEnd) GetSchema() *SourceSchema {
 }
 
 // Push — called as FilterOutput by the filter chain.
-func (fe *FilterEnd) Push(change Change, pusher InputBase) []Change {
-	return fe.output.Push(change, fe)
+func (fe *FilterEnd) Push(change Change, pusher InputBase) {
+	fe.output.Push(change, fe)
 }

@@ -796,7 +796,7 @@ func (s *Source) Connect(
 //     b. Fan out to every connection through filterPush.
 //     c. After fanout: writeChange applies the change to prev tx.
 //     d. Clear overlay.
-func (s *Source) Push(change ivm.SourceChange) []ivm.Change {
+func (s *Source) Push(change ivm.SourceChange) {
 	// Acquire mu just long enough to set up the in-flight work:
 	// ensure prev tx, snapshot connections, decide shouldSplitEdit.
 	// Release before fanout — downstream output.Push callbacks may
@@ -820,14 +820,12 @@ func (s *Source) Push(change ivm.SourceChange) []ivm.Change {
 	copy(conns, s.connections)
 	s.mu.Unlock()
 
-	var out []ivm.Change
 	if change.Type == ivm.ChangeTypeEdit && shouldSplitEdit {
-		out = append(out, s.genPushAndWrite(ivm.MakeSourceChangeRemove(change.OldRow), conns)...)
-		out = append(out, s.genPushAndWrite(ivm.MakeSourceChangeAdd(change.Row), conns)...)
+		s.genPushAndWrite(ivm.MakeSourceChangeRemove(change.OldRow), conns)
+		s.genPushAndWrite(ivm.MakeSourceChangeAdd(change.Row), conns)
 	} else {
-		out = append(out, s.genPushAndWrite(change, conns)...)
+		s.genPushAndWrite(change, conns)
 	}
-	return out
 }
 
 // genPushAndWrite runs ONE source-level change through every connection's
@@ -840,7 +838,7 @@ func (s *Source) Push(change ivm.SourceChange) []ivm.Change {
 //     overlay, release.
 //
 // Direct port of TS's genPushAndWrite (memory-source.ts).
-func (s *Source) genPushAndWrite(change ivm.SourceChange, conns []*connection) []ivm.Change {
+func (s *Source) genPushAndWrite(change ivm.SourceChange, conns []*connection) {
 	s.mu.Lock()
 	// BUG 1b: if this Edit's OldRow was removed earlier in this batch,
 	// convert to Add (matching TS's lazy iteration: the prev row was
@@ -895,7 +893,7 @@ func (s *Source) genPushAndWrite(change ivm.SourceChange, conns []*connection) [
 		// BUG 1: skip Remove against a row removed earlier in this batch
 		if change.Type == ivm.ChangeTypeRemove && s.removedInBatch != nil && s.removedInBatch[s.pkKey(change.Row)] {
 			s.mu.Unlock()
-			return nil
+			return
 		}
 		s.mu.Unlock()
 		panic(d)
@@ -932,9 +930,8 @@ func (s *Source) genPushAndWrite(change ivm.SourceChange, conns []*connection) [
 	}()
 
 	// Fan out to every connection — in parallel across pipeline groups when
-	// enabled (see parallel_fanout.go), serially otherwise. Either way the
-	// returned Changes are in connection-registration order.
-	out := s.fanOut(change, epoch, conns)
+	// enabled (see parallel_fanout.go), serially otherwise.
+	s.fanOut(change, epoch, conns)
 
 	// Re-acquire mu for writeChange + overlay clear.
 	s.mu.Lock()
@@ -947,8 +944,6 @@ func (s *Source) genPushAndWrite(change ivm.SourceChange, conns []*connection) [
 		// torn down (TS's disposition for a failed write).
 		panic(fmt.Sprintf("tablesource.Source.Push %s: writeChange: %v", s.tableName, err))
 	}
-
-	return out
 }
 
 // driftCheckLocked validates the change against current source state,
@@ -1186,37 +1181,37 @@ func (s *Source) rowToNonPKArgs(row ivm.Row) []any {
 
 // filterPush is the per-connection filter-aware push.
 // Direct port of mono/packages/zql/src/ivm/filter-push.ts:10-38.
-func filterPush(change ivm.Change, conn *connection) []ivm.Change {
+func filterPush(change ivm.Change, conn *connection) {
 	if conn.filterPredicate == nil {
-		return conn.output.Push(change, conn.input)
+		conn.output.Push(change, conn.input)
+		return
 	}
 	switch change.Type {
 	case ivm.ChangeTypeAdd, ivm.ChangeTypeRemove, ivm.ChangeTypeChild:
 		if conn.filterPredicate(change.Node.Row) {
-			return conn.output.Push(change, conn.input)
+			conn.output.Push(change, conn.input)
 		}
-		return nil
 	case ivm.ChangeTypeEdit:
-		return maybeSplitAndPushEditChange(change, conn)
+		maybeSplitAndPushEditChange(change, conn)
 	}
-	return nil
 }
 
 // maybeSplitAndPushEditChange handles the EDIT-with-filter-transition
 // case. Direct port of mono/packages/zql/src/ivm/maybe-split-and-push-edit-change.ts.
-func maybeSplitAndPushEditChange(change ivm.Change, conn *connection) []ivm.Change {
+func maybeSplitAndPushEditChange(change ivm.Change, conn *connection) {
 	oldWasPresent := conn.filterPredicate(change.OldNode.Row)
 	newIsPresent := conn.filterPredicate(change.Node.Row)
 	if oldWasPresent && newIsPresent {
-		return conn.output.Push(change, conn.input)
+		conn.output.Push(change, conn.input)
+		return
 	}
 	if oldWasPresent && !newIsPresent {
-		return conn.output.Push(ivm.MakeRemoveChange(*change.OldNode), conn.input)
+		conn.output.Push(ivm.MakeRemoveChange(*change.OldNode), conn.input)
+		return
 	}
 	if !oldWasPresent && newIsPresent {
-		return conn.output.Push(ivm.MakeAddChange(change.Node), conn.input)
+		conn.output.Push(ivm.MakeAddChange(change.Node), conn.input)
 	}
-	return nil
 }
 
 // columnsAsTypeMap returns the column → type-name map used by the

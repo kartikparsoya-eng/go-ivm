@@ -134,9 +134,8 @@ type multiFetchingOutput struct {
 	seen   [][]float64
 }
 
-func (o *multiFetchingOutput) Push(change Change, pusher InputBase) []Change {
+func (o *multiFetchingOutput) Push(change Change, pusher InputBase) {
 	o.seen = append(o.seen, mcIDs(slices.Collect(o.conn.Fetch(FetchRequest{MultiConstraints: o.multis}))))
-	return nil
 }
 
 func TestMemorySourceMultiConstraintsGateOverlayDuringPush(t *testing.T) {

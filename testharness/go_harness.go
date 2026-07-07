@@ -153,9 +153,8 @@ type changeCollector struct {
 	changes []CaughtChange
 }
 
-func (c *changeCollector) Push(change ivm.Change, pusher ivm.InputBase) []ivm.Change {
+func (c *changeCollector) Push(change ivm.Change, pusher ivm.InputBase) {
 	c.changes = append(c.changes, expandChange(change))
-	return nil
 }
 
 func (c *changeCollector) Reset() {

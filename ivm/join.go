@@ -46,31 +46,40 @@ func NewJoin(args JoinArgs) *Join {
 	parentSchema := args.Parent.GetSchema()
 	childSchema := args.Child.GetSchema()
 
-	// Build merged schema with new relationship
+	// Build merged schema with new relationship.
+	// TS: {...parentSchema.relationships, [relationshipName]: {...}} —
+	// join.ts:86-96. A new name is appended last; an existing name keeps its
+	// original position (JS spread + computed-key semantics).
 	rels := make(map[string]*SourceSchema)
 	for k, v := range parentSchema.Relationships {
 		rels[k] = v
 	}
+	relOrder := slices.Clone(parentSchema.RelationshipOrder)
+	if _, exists := parentSchema.Relationships[args.RelationshipName]; !exists {
+		relOrder = append(relOrder, args.RelationshipName)
+	}
 	rels[args.RelationshipName] = &SourceSchema{
-		TableName:     childSchema.TableName,
-		Columns:       childSchema.Columns,
-		PrimaryKey:    childSchema.PrimaryKey,
-		Relationships: childSchema.Relationships,
-		IsHidden:      args.Hidden,
-		System:        args.System,
-		CompareRows:   childSchema.CompareRows,
-		Sort:          childSchema.Sort,
+		TableName:         childSchema.TableName,
+		Columns:           childSchema.Columns,
+		PrimaryKey:        childSchema.PrimaryKey,
+		Relationships:     childSchema.Relationships,
+		RelationshipOrder: childSchema.RelationshipOrder,
+		IsHidden:          args.Hidden,
+		System:            args.System,
+		CompareRows:       childSchema.CompareRows,
+		Sort:              childSchema.Sort,
 	}
 
 	schema := &SourceSchema{
-		TableName:     parentSchema.TableName,
-		Columns:       parentSchema.Columns,
-		PrimaryKey:    parentSchema.PrimaryKey,
-		Relationships: rels,
-		IsHidden:      parentSchema.IsHidden,
-		System:        parentSchema.System,
-		CompareRows:   parentSchema.CompareRows,
-		Sort:          parentSchema.Sort,
+		TableName:         parentSchema.TableName,
+		Columns:           parentSchema.Columns,
+		PrimaryKey:        parentSchema.PrimaryKey,
+		Relationships:     rels,
+		RelationshipOrder: relOrder,
+		IsHidden:          parentSchema.IsHidden,
+		System:            parentSchema.System,
+		CompareRows:       parentSchema.CompareRows,
+		Sort:              parentSchema.Sort,
 	}
 
 	j := &Join{
@@ -93,15 +102,15 @@ func NewJoin(args JoinArgs) *Join {
 // joinParentOutput adapts Join to receive pushes from parent.
 type joinParentOutput struct{ j *Join }
 
-func (o joinParentOutput) Push(change Change, pusher InputBase) []Change {
-	return o.j.pushParent(change)
+func (o joinParentOutput) Push(change Change, pusher InputBase) {
+	o.j.pushParent(change)
 }
 
 // joinChildOutput adapts Join to receive pushes from child.
 type joinChildOutput struct{ j *Join }
 
-func (o joinChildOutput) Push(change Change, pusher InputBase) []Change {
-	return o.j.pushChild(change)
+func (o joinChildOutput) Push(change Change, pusher InputBase) {
+	o.j.pushChild(change)
 }
 
 func (j *Join) Destroy() {
@@ -132,20 +141,20 @@ func (j *Join) Fetch(req FetchRequest) iter.Seq[Node] {
 }
 
 // pushParent — handles changes from the parent input.
-func (j *Join) pushParent(change Change) []Change {
+func (j *Join) pushParent(change Change) {
 	switch change.Type {
 	case ChangeTypeAdd:
-		return j.output.Push(
+		j.output.Push(
 			MakeAddChange(j.processParentNode(change.Node.Row, change.Node.Relationships)),
 			j,
 		)
 	case ChangeTypeRemove:
-		return j.output.Push(
+		j.output.Push(
 			MakeRemoveChange(j.processParentNode(change.Node.Row, change.Node.Relationships)),
 			j,
 		)
 	case ChangeTypeChild:
-		return j.output.Push(
+		j.output.Push(
 			MakeChildChange(
 				j.processParentNode(change.Node.Row, change.Node.Relationships),
 				*change.Child,
@@ -160,31 +169,33 @@ func (j *Join) pushParent(change Change) []Change {
 		if !RowEqualsForCompoundKey(change.OldNode.Row, change.Node.Row, j.parentKey) {
 			panic(joinKeyChangeError(j.parent.GetSchema(), change.OldNode.Row, "Join-parent-key-change"))
 		}
-		return j.output.Push(
+		j.output.Push(
 			MakeEditChange(
 				j.processParentNode(change.Node.Row, change.Node.Relationships),
 				j.processParentNode(change.OldNode.Row, change.OldNode.Relationships),
 			),
 			j,
 		)
+	default:
+		panic("unreachable")
 	}
-	panic("unreachable")
 }
 
 // pushChild — handles changes from the child input.
-func (j *Join) pushChild(change Change) []Change {
+func (j *Join) pushChild(change Change) {
 	switch change.Type {
 	case ChangeTypeAdd, ChangeTypeRemove:
-		return j.pushChildChange(change.Node.Row, change)
+		j.pushChildChange(change.Node.Row, change)
 	case ChangeTypeChild:
-		return j.pushChildChange(change.Node.Row, change)
+		j.pushChildChange(change.Node.Row, change)
 	case ChangeTypeEdit:
 		if !RowEqualsForCompoundKey(change.OldNode.Row, change.Node.Row, j.childKey) {
 			panic(joinKeyChangeError(j.child.GetSchema(), change.OldNode.Row, "Join-child-key-change"))
 		}
-		return j.pushChildChange(change.Node.Row, change)
+		j.pushChildChange(change.Node.Row, change)
+	default:
+		panic("unreachable")
 	}
-	panic("unreachable")
 }
 
 // joinKeyChangeError builds the plain error for a Join/FlippedJoin invariant
@@ -209,17 +220,16 @@ func joinKeyChangeError(schema *SourceSchema, oldRow Row, op string) error {
 }
 
 // pushChildChange — finds matching parents and pushes ChildChanges downstream.
-func (j *Join) pushChildChange(childRow Row, change Change) []Change {
+func (j *Join) pushChildChange(childRow Row, change Change) {
 	j.inprogressChildChange = &change
 	j.inprogressChildChangePosition = nil
 	defer func() { j.inprogressChildChange = nil }()
 
 	constraint := BuildJoinConstraint(childRow, j.childKey, j.parentKey)
 	if constraint == nil {
-		return nil
+		return
 	}
 
-	var allChanges []Change
 	for parentNode := range j.parent.Fetch(FetchRequest{Constraint: constraint}) {
 		j.inprogressChildChangePosition = parentNode.Row
 		childChange := MakeChildChange(
@@ -229,9 +239,8 @@ func (j *Join) pushChildChange(childRow Row, change Change) []Change {
 				Change:           change,
 			},
 		)
-		allChanges = append(allChanges, j.output.Push(childChange, j)...)
+		j.output.Push(childChange, j)
 	}
-	return allChanges
 }
 
 // processParentNode — attaches the child relationship stream to a parent node.

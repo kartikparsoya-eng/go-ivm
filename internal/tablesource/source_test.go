@@ -451,9 +451,8 @@ type recordingOutput struct {
 	pushed []ivm.Change
 }
 
-func (r *recordingOutput) Push(c ivm.Change, _ ivm.InputBase) []ivm.Change {
+func (r *recordingOutput) Push(c ivm.Change, _ ivm.InputBase) {
 	r.pushed = append(r.pushed, c)
-	return nil
 }
 
 func TestPushFanoutAddToConnection(t *testing.T) {
@@ -638,10 +637,9 @@ type overlayProbingOutput struct {
 	observedAfter int // node count seen by the re-fetch
 }
 
-func (o *overlayProbingOutput) Push(_ ivm.Change, _ ivm.InputBase) []ivm.Change {
+func (o *overlayProbingOutput) Push(_ ivm.Change, _ ivm.InputBase) {
 	nodes := slices.Collect(o.in.Fetch(ivm.FetchRequest{}))
 	o.observedAfter = len(nodes)
-	return nil
 }
 
 // TestPrevTxAppliesWritesAndRollback is the prev-snapshot tx contract
@@ -797,7 +795,7 @@ type refreshDuringPushOutput struct {
 	observedOverlay bool
 }
 
-func (o *refreshDuringPushOutput) Push(_ ivm.Change, _ ivm.InputBase) []ivm.Change {
+func (o *refreshDuringPushOutput) Push(_ ivm.Change, _ ivm.InputBase) {
 	// Try to refresh while the Push is still in-flight. The Source must
 	// recognize overlay != nil and skip the bump — otherwise the next
 	// Fetch (this one) would roll the tx, see post-replicator state,
@@ -807,7 +805,6 @@ func (o *refreshDuringPushOutput) Push(_ ivm.Change, _ ivm.InputBase) []ivm.Chan
 	// we'd see 5.
 	nodes := slices.Collect(o.in.Fetch(ivm.FetchRequest{}))
 	o.observedOverlay = len(nodes) == 4
-	return nil
 }
 
 func TestOverlayVisibleDuringPush(t *testing.T) {

@@ -11,9 +11,8 @@ type testOutput struct {
 	changes []Change
 }
 
-func (o *testOutput) Push(change Change, pusher InputBase) []Change {
+func (o *testOutput) Push(change Change, pusher InputBase) {
 	o.changes = append(o.changes, change)
-	return []Change{change}
 }
 
 // TestTakeWithJoinBoundaryDisplacement tests that when a Take operator

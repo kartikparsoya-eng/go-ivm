@@ -22,9 +22,9 @@ func PushAccumulatedChanges(
 	fanOutChangeType ChangeType,
 	mergeRelationships MergeRelationshipsFunc,
 	addEmptyRelationships AddEmptyRelationshipsFunc,
-) []Change {
+) {
 	if len(accumulatedPushes) == 0 {
-		return nil
+		return
 	}
 
 	// Collapse down to a single change per type
@@ -54,7 +54,8 @@ func PushAccumulatedChanges(
 		if len(candidatesToPush) != 1 || !ok {
 			panic("Fan-in:remove expected all removes")
 		}
-		return output.Push(addEmptyRelationships(c), pusher)
+		output.Push(addEmptyRelationships(c), pusher)
+		return
 
 	case ChangeTypeAdd:
 		// Source: push-accumulated.ts:149-152 — an ADD fan-out must yield only
@@ -63,7 +64,8 @@ func PushAccumulatedChanges(
 		if len(candidatesToPush) != 1 || !ok {
 			panic("Fan-in:add expected all adds")
 		}
-		return output.Push(addEmptyRelationships(c), pusher)
+		output.Push(addEmptyRelationships(c), pusher)
+		return
 
 	case ChangeTypeEdit:
 		// Source: push-accumulated.ts:159-167 — an EDIT fan-out may only yield
@@ -85,21 +87,25 @@ func PushAccumulatedChanges(
 			if hasRemove {
 				editChange = mergeRelationships(editChange, removeChange)
 			}
-			return output.Push(addEmptyRelationships(editChange), pusher)
+			output.Push(addEmptyRelationships(editChange), pusher)
+			return
 		}
 
 		// Both add and remove → convert back to edit
 		if hasAdd && hasRemove {
 			edit := MakeEditChange(addChange.Node, removeChange.Node)
-			return output.Push(addEmptyRelationships(edit), pusher)
+			output.Push(addEmptyRelationships(edit), pusher)
+			return
 		}
 
 		// Only one of add/remove
 		if hasAdd {
-			return output.Push(addEmptyRelationships(addChange), pusher)
+			output.Push(addEmptyRelationships(addChange), pusher)
+			return
 		}
 		if hasRemove {
-			return output.Push(addEmptyRelationships(removeChange), pusher)
+			output.Push(addEmptyRelationships(removeChange), pusher)
+			return
 		}
 		// Porting review MEDIUM-4: TS uses must(addChange ?? removeChange),
 		// which throws if neither is present. Go was silently falling through
@@ -121,7 +127,8 @@ func PushAccumulatedChanges(
 		// Child takes precedence
 		childChange, hasChild := candidatesToPush[ChangeTypeChild]
 		if hasChild {
-			return output.Push(childChange, pusher)
+			output.Push(childChange, pusher)
+			return
 		}
 
 		addChange, hasAdd := candidatesToPush[ChangeTypeAdd]
@@ -132,10 +139,12 @@ func PushAccumulatedChanges(
 		}
 
 		if hasAdd {
-			return output.Push(addEmptyRelationships(addChange), pusher)
+			output.Push(addEmptyRelationships(addChange), pusher)
+			return
 		}
 		if hasRemove {
-			return output.Push(addEmptyRelationships(removeChange), pusher)
+			output.Push(addEmptyRelationships(removeChange), pusher)
+			return
 		}
 		// Same MEDIUM-4 invariant for the CHILD branch.
 		panic("PushAccumulated CHILD: expected hasChild||hasAdd||hasRemove, got none")

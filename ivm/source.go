@@ -215,18 +215,19 @@ func (ms *MemorySource) Disconnect(si *SourceInput) {
 // engine layer (not visible here), and one tiny RLock per Push is
 // cheaper than a future regression where someone adds a Disconnect
 // path outside engine.mu and silently races a slice-header read.
-func (ms *MemorySource) Push(change SourceChange) []Change {
+func (ms *MemorySource) Push(change SourceChange) {
 	ms.connsMu.RLock()
 	useParallel := ms.parallel && len(ms.connections) >= ms.parallelThreshold
 	ms.connsMu.RUnlock()
 	if useParallel {
-		return ms.genPushAndWriteParallel(change)
+		ms.genPushAndWriteParallel(change)
+		return
 	}
-	return ms.genPushAndWriteWithSplitEdit(change)
+	ms.genPushAndWriteWithSplitEdit(change)
 }
 
 // genPushAndWriteWithSplitEdit — Source: memory-source.ts line 452-506
-func (ms *MemorySource) genPushAndWriteWithSplitEdit(change SourceChange) []Change {
+func (ms *MemorySource) genPushAndWriteWithSplitEdit(change SourceChange) {
 	shouldSplit := false
 	if change.Type == ChangeTypeEdit {
 		// connsMu guards the slice header against Connect/Disconnect
@@ -250,16 +251,15 @@ func (ms *MemorySource) genPushAndWriteWithSplitEdit(change SourceChange) []Chan
 	}
 
 	if change.Type == ChangeTypeEdit && shouldSplit {
-		var results []Change
-		results = append(results, ms.genPushAndWrite(MakeSourceChangeRemove(change.OldRow))...)
-		results = append(results, ms.genPushAndWrite(MakeSourceChangeAdd(change.Row))...)
-		return results
+		ms.genPushAndWrite(MakeSourceChangeRemove(change.OldRow))
+		ms.genPushAndWrite(MakeSourceChangeAdd(change.Row))
+		return
 	}
-	return ms.genPushAndWrite(change)
+	ms.genPushAndWrite(change)
 }
 
 // genPushAndWrite — Source: memory-source.ts line 508-520
-func (ms *MemorySource) genPushAndWrite(change SourceChange) []Change {
+func (ms *MemorySource) genPushAndWrite(change SourceChange) {
 	// BUG 1b: if this Edit's OldRow was removed earlier in this batch,
 	// convert to Add (matching TS's lazy iteration: the prev row was
 	// already deleted by a previous writeChange, so TS's prev.getRows
@@ -282,17 +282,16 @@ func (ms *MemorySource) genPushAndWrite(change SourceChange) []Change {
 	// BUG 1: skip duplicate Remove (row already removed in this batch)
 	if change.Type == ChangeTypeRemove && !ms.has(change.Row) {
 		if ms.removedInBatch != nil && ms.removedInBatch[ms.pkKey(change.Row)] {
-			return nil
+			return
 		}
 	}
-	results := ms.genPush(change)
+	ms.genPush(change)
 	ms.writeChange(change)
-	return results
 }
 
 // genPush — Source: memory-source.ts line 522-578
 // THIS IS WHERE PARALLELISM WILL BE INJECTED (goroutine fan-out across connections)
-func (ms *MemorySource) genPush(change SourceChange) []Change {
+func (ms *MemorySource) genPush(change SourceChange) {
 	// Validate — direct port of TS MemorySource genPush's asserts
 	// (memory-source.ts:529-550). TS throws; the Go panic propagates out of
 	// the engine unrecovered → RPC error → 'unclassified' → CG teardown —
@@ -337,7 +336,6 @@ func (ms *MemorySource) genPush(change SourceChange) []Change {
 	copy(conns, ms.connections)
 	ms.connsMu.RUnlock()
 
-	var results []Change
 	for _, conn := range conns {
 		if conn.Output == nil {
 			continue
@@ -346,10 +344,8 @@ func (ms *MemorySource) genPush(change SourceChange) []Change {
 		ms.overlay.Store(&Overlay{Epoch: epoch, Change: change})
 
 		outputChange := ms.sourceChangeToChange(change)
-		connResults := FilterPush(outputChange, conn.Output, conn.Input, conn.FilterPredicate)
-		results = append(results, connResults...)
+		FilterPush(outputChange, conn.Output, conn.Input, conn.FilterPredicate)
 	}
-	return results
 }
 
 // sourceChangeToChange converts SourceChange to pipeline Change.
@@ -547,20 +543,19 @@ func (ms *MemorySource) Data() []Row {
 }
 
 // FilterPush — port of filter-push.ts
-func FilterPush(change Change, output Output, pusher InputBase, predicate func(Row) bool) []Change {
+func FilterPush(change Change, output Output, pusher InputBase, predicate func(Row) bool) {
 	if predicate == nil {
-		return output.Push(change, pusher)
+		output.Push(change, pusher)
+		return
 	}
 	switch change.Type {
 	case ChangeTypeAdd, ChangeTypeRemove, ChangeTypeChild:
 		if predicate(change.Node.Row) {
-			return output.Push(change, pusher)
+			output.Push(change, pusher)
 		}
-		return nil
 	case ChangeTypeEdit:
-		return MaybeSplitAndPushEditChange(change, predicate, output, pusher)
+		MaybeSplitAndPushEditChange(change, predicate, output, pusher)
 	}
-	return nil
 }
 
 // SourceInput implements Input for a connection.
@@ -854,21 +849,22 @@ func ConstraintMatchesRow(constraint *Constraint, row Row) bool {
 }
 
 // MaybeSplitAndPushEditChange — port of maybe-split-and-push-edit-change.ts
-func MaybeSplitAndPushEditChange(change Change, predicate func(Row) bool, output Output, pusher InputBase) []Change {
+func MaybeSplitAndPushEditChange(change Change, predicate func(Row) bool, output Output, pusher InputBase) {
 	oldMatches := predicate(change.OldNode.Row)
 	newMatches := predicate(change.Node.Row)
 
 	if oldMatches && newMatches {
-		return output.Push(change, pusher)
+		output.Push(change, pusher)
+		return
 	}
 	if !oldMatches && newMatches {
-		return output.Push(MakeAddChange(change.Node), pusher)
+		output.Push(MakeAddChange(change.Node), pusher)
+		return
 	}
 	if oldMatches && !newMatches {
-		return output.Push(MakeRemoveChange(*change.OldNode), pusher)
+		output.Push(MakeRemoveChange(*change.OldNode), pusher)
 	}
-	// neither matches
-	return nil
+	// neither matches: no-op
 }
 
 // Ensure json import is used

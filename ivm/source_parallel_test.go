@@ -14,10 +14,9 @@ type collectOutput struct {
 	input   ivm.InputBase
 }
 
-func (c *collectOutput) Push(change ivm.Change, pusher ivm.InputBase) []ivm.Change {
+func (c *collectOutput) Push(change ivm.Change, pusher ivm.InputBase) {
 	c.changes = append(c.changes, change)
 	c.input = pusher
-	return nil
 }
 
 func newTestSource() *ivm.MemorySource {
@@ -60,15 +59,12 @@ func TestParallelFanOutMatchesSequential(t *testing.T) {
 
 	parSource.SetParallel(true)
 
-	// Push same change to both
+	// Push same change to both. Parity is asserted on the per-output
+	// collectors below — the terminal sink is where pushed data lands
+	// (Output.Push is void, like TS's data-free Stream<'yield'> return).
 	change := ivm.MakeSourceChangeAdd(ivm.Row{"id": "4", "name": "dave", "age": float64(28)})
-	seqResults := seqSource.Push(change)
-	parResults := parSource.PushWithMode(change)
-
-	// Compare results
-	if len(seqResults) != len(parResults) {
-		t.Fatalf("result count mismatch: seq=%d par=%d", len(seqResults), len(parResults))
-	}
+	seqSource.Push(change)
+	parSource.PushWithMode(change)
 
 	// Compare per-output changes
 	for i := 0; i < 3; i++ {

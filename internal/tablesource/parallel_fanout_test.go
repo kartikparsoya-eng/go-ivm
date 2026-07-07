@@ -8,8 +8,9 @@ package tablesource
 //
 //  1. connections of one group NEVER push concurrently (per-group serial),
 //  2. connections of different groups DO push concurrently (rendezvous),
-//  3. the returned Changes are in connection-REGISTRATION order regardless
-//     of goroutine completion order,
+//  3. every wired connection is pushed exactly once — fanOut is void (data
+//     rides the engine's terminal sink), so delivery is asserted on the
+//     per-connection stubs,
 //  4. panic discipline: every group still runs, non-drift beats drift on
 //     re-raise, group-order determinism, and the caller's goroutine (not a
 //     spawned one) observes the panic,
@@ -27,24 +28,28 @@ import (
 
 // stubOutput records pushes and runs an optional hook while "active".
 type stubOutput struct {
-	hook func()
-	out  []ivm.Change
+	hook   func()
+	pushed atomic.Int32
 }
 
-func (o *stubOutput) Push(change ivm.Change, _ ivm.InputBase) []ivm.Change {
+func (o *stubOutput) Push(change ivm.Change, _ ivm.InputBase) {
 	if o.hook != nil {
 		o.hook()
 	}
-	return o.out
+	o.pushed.Add(1)
 }
 
-// fanOutConn builds a connection in `group` whose output returns `marker`
-// and runs `hook` during the push.
-func fanOutConn(group string, marker []ivm.Change, hook func()) *connection {
+// fanOutConn builds a connection in `group` that runs `hook` during the
+// push and counts deliveries.
+func fanOutConn(group string, hook func()) *connection {
 	return &connection{
 		group:  group,
-		output: &stubOutput{hook: hook, out: marker},
+		output: &stubOutput{hook: hook},
 	}
+}
+
+func pushedCount(c *connection) int32 {
+	return c.output.(*stubOutput).pushed.Load()
 }
 
 func addChange() ivm.SourceChange {
@@ -58,13 +63,8 @@ func withFanoutKnobs(t *testing.T, parallel bool, workers int) {
 	ParallelAdvance, ParallelAdvanceWorkers = parallel, workers
 }
 
-func mk(id string) []ivm.Change {
-	return []ivm.Change{{Type: ivm.ChangeTypeAdd, Node: ivm.Node{Row: ivm.Row{"id": id}}}}
-}
-
-// Groups run concurrently (rendezvous proves overlap), same-group conns run
-// serially (per-group active counter never exceeds 1), and the return is in
-// registration order even though completion order is scrambled.
+// Groups run concurrently (rendezvous proves overlap) and same-group conns
+// run serially (per-group active counter never exceeds 1).
 func TestFanOutParallelAcrossGroupsSerialWithin(t *testing.T) {
 	withFanoutKnobs(t, true, 4)
 	s := &Source{}
@@ -110,29 +110,22 @@ func TestFanOutParallelAcrossGroupsSerialWithin(t *testing.T) {
 	}
 
 	// Registration order deliberately INTERLEAVES the groups (a1, b1, a2,
-	// b2) to pin fanOut's return contract: GROUP-MAJOR order (a1, a2, b1,
-	// b2). Engine-built pipelines never interleave (a query's connections
-	// are appended contiguously during its build, so group-major ==
-	// registration order there); this artificial shape exists only to make
-	// the contract observable.
+	// b2) so the grouping logic (group-major partition) is exercised on a
+	// shape the engine never produces (a query's connections are appended
+	// contiguously during its build).
 	conns := []*connection{
-		fanOutConn("qa", mk("a1"), guard(&activeA, "qa", true)),
-		fanOutConn("qb", mk("b1"), guard(&activeB, "qb", true)),
-		fanOutConn("qa", mk("a2"), guard(&activeA, "qa", false)),
-		fanOutConn("qb", mk("b2"), guard(&activeB, "qb", false)),
+		fanOutConn("qa", guard(&activeA, "qa", true)),
+		fanOutConn("qb", guard(&activeB, "qb", true)),
+		fanOutConn("qa", guard(&activeA, "qa", false)),
+		fanOutConn("qb", guard(&activeB, "qb", false)),
 	}
 
-	out := s.fanOut(addChange(), 1, conns)
+	s.fanOut(addChange(), 1, conns)
 
-	got := make([]string, len(out))
-	for i, c := range out {
-		got[i] = c.Node.Row["id"].(string)
-	}
-	want := []string{"a1", "a2", "b1", "b2"} // group-major, deterministic
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("return order = %v, want %v", got, want)
-	}
-	for _, c := range conns {
+	for i, c := range conns {
+		if got := pushedCount(c); got != 1 {
+			t.Fatalf("conn[%d] pushed %d times, want exactly 1", i, got)
+		}
 		if c.lastPushedEpoch != 1 {
 			t.Fatalf("lastPushedEpoch not bumped on all conns")
 		}
@@ -170,7 +163,7 @@ func TestFanOutSerialPaths(t *testing.T) {
 			conns := make([]*connection, len(tc.groups))
 			for i, g := range tc.groups {
 				id := string(rune('A' + i))
-				conns[i] = fanOutConn(g, mk(id), func() {
+				conns[i] = fanOutConn(g, func() {
 					if active.Add(1) > 1 {
 						panic("serial path overlapped")
 					}
@@ -181,9 +174,11 @@ func TestFanOutSerialPaths(t *testing.T) {
 					active.Add(-1)
 				})
 			}
-			out := s.fanOut(addChange(), 7, conns)
-			if len(out) != len(conns) {
-				t.Fatalf("out len = %d, want %d", len(out), len(conns))
+			s.fanOut(addChange(), 7, conns)
+			for i, c := range conns {
+				if got := pushedCount(c); got != 1 {
+					t.Fatalf("conn[%d] pushed %d times, want exactly 1", i, got)
+				}
 			}
 			want := []string{"A", "B", "C"}
 			if !reflect.DeepEqual(order, want) {
@@ -204,9 +199,9 @@ func TestFanOutPanicOrderAndCompleteness(t *testing.T) {
 	var ranC atomic.Bool
 	drift := ivm.SourceDriftError("t", "Add", nil, -1)
 	conns := []*connection{
-		fanOutConn("qa", nil, func() { panic(drift) }),
-		fanOutConn("qb", nil, func() { panic("programmer bug") }),
-		fanOutConn("qc", mk("c"), func() { ranC.Store(true) }),
+		fanOutConn("qa", func() { panic(drift) }),
+		fanOutConn("qb", func() { panic("programmer bug") }),
+		fanOutConn("qc", func() { ranC.Store(true) }),
 	}
 
 	var recovered any
@@ -226,8 +221,8 @@ func TestFanOutPanicOrderAndCompleteness(t *testing.T) {
 	// surfaced (determinism).
 	drift2 := ivm.SourceDriftError("t2", "Remove", nil, -1)
 	conns = []*connection{
-		fanOutConn("q1", nil, func() { panic(drift) }),
-		fanOutConn("q2", nil, func() { panic(drift2) }),
+		fanOutConn("q1", func() { panic(drift) }),
+		fanOutConn("q2", func() { panic(drift2) }),
 	}
 	recovered = nil
 	func() {
@@ -246,16 +241,19 @@ func TestFanOutSkipsUnwiredConnections(t *testing.T) {
 	s := &Source{}
 	conns := []*connection{
 		{group: "qa"}, // no output — never wired
-		fanOutConn("qb", mk("b"), nil),
+		fanOutConn("qb", nil),
 	}
-	out := s.fanOut(addChange(), 3, conns)
-	if len(out) != 1 || out[0].Node.Row["id"] != "b" {
-		t.Fatalf("out = %+v, want just b's change", out)
+	s.fanOut(addChange(), 3, conns)
+	if got := pushedCount(conns[1]); got != 1 {
+		t.Fatalf("wired conn pushed %d times, want exactly 1", got)
 	}
 	if conns[0].lastPushedEpoch != 0 {
 		t.Fatal("unwired conn must not get an epoch bump")
 	}
-	if s.fanOut(addChange(), 4, []*connection{{group: "x"}}) != nil {
-		t.Fatal("all-unwired fanout must return nil")
+	// All-unwired fanout is a no-op (no groups → early return, no panic).
+	unwired := &connection{group: "x"}
+	s.fanOut(addChange(), 4, []*connection{unwired})
+	if unwired.lastPushedEpoch != 0 {
+		t.Fatal("all-unwired fanout must not bump any epoch")
 	}
 }

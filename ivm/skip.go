@@ -126,18 +126,18 @@ func (s *Skip) Fetch(req FetchRequest) iter.Seq[Node] {
 }
 
 // Push — handles incremental changes respecting the bound.
-func (s *Skip) Push(change Change, pusher InputBase) []Change {
+func (s *Skip) Push(change Change, pusher InputBase) {
 	shouldBePresent := func(row Row) bool { return s.shouldBePresent(row) }
 
 	if change.Type == ChangeTypeEdit {
-		return maybeSplitAndPushEditChange(change, shouldBePresent, s.output, s)
+		maybeSplitAndPushEditChange(change, shouldBePresent, s.output, s)
+		return
 	}
 
 	// ADD, REMOVE, CHILD
 	if shouldBePresent(change.Node.Row) {
-		return s.output.Push(change, s)
+		s.output.Push(change, s)
 	}
-	return nil
 }
 
 // getStart — computes the effective start for a fetch request.

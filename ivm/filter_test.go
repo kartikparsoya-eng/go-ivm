@@ -17,9 +17,8 @@ type mockOutput struct {
 	pushed []Change
 }
 
-func (m *mockOutput) Push(change Change, pusher InputBase) []Change {
+func (m *mockOutput) Push(change Change, pusher InputBase) {
 	m.pushed = append(m.pushed, change)
-	return []Change{change}
 }
 
 func (m *mockOutput) BeginFilter()          {}
@@ -36,13 +35,13 @@ func TestFilter_Push_Add_PassesPredicate(t *testing.T) {
 	f.SetFilterOutput(out)
 
 	node := Node{Row: Row{"age": 25, "name": "Alice"}}
-	changes := f.Push(MakeAddChange(node), input)
+	f.Push(MakeAddChange(node), input)
 
-	if len(changes) != 1 {
-		t.Fatalf("expected 1 change, got %d", len(changes))
+	if len(out.pushed) != 1 {
+		t.Fatalf("expected 1 change, got %d", len(out.pushed))
 	}
-	if changes[0].Type != ChangeTypeAdd {
-		t.Fatalf("expected ADD change, got %d", changes[0].Type)
+	if out.pushed[0].Type != ChangeTypeAdd {
+		t.Fatalf("expected ADD change, got %d", out.pushed[0].Type)
 	}
 }
 
@@ -56,11 +55,8 @@ func TestFilter_Push_Add_FailsPredicate(t *testing.T) {
 	f.SetFilterOutput(out)
 
 	node := Node{Row: Row{"age": 10, "name": "Bob"}}
-	changes := f.Push(MakeAddChange(node), input)
+	f.Push(MakeAddChange(node), input)
 
-	if len(changes) != 0 {
-		t.Fatalf("expected 0 changes, got %d", len(changes))
-	}
 	if len(out.pushed) != 0 {
 		t.Fatalf("expected nothing pushed to output, got %d", len(out.pushed))
 	}
@@ -77,13 +73,13 @@ func TestFilter_Push_Edit_SplitsToAdd(t *testing.T) {
 
 	oldNode := Node{Row: Row{"age": 10, "name": "Bob"}}
 	newNode := Node{Row: Row{"age": 25, "name": "Bob"}}
-	changes := f.Push(MakeEditChange(newNode, oldNode), input)
+	f.Push(MakeEditChange(newNode, oldNode), input)
 
-	if len(changes) != 1 {
-		t.Fatalf("expected 1 change, got %d", len(changes))
+	if len(out.pushed) != 1 {
+		t.Fatalf("expected 1 change, got %d", len(out.pushed))
 	}
-	if changes[0].Type != ChangeTypeAdd {
-		t.Fatalf("expected ADD change (split from edit), got %d", changes[0].Type)
+	if out.pushed[0].Type != ChangeTypeAdd {
+		t.Fatalf("expected ADD change (split from edit), got %d", out.pushed[0].Type)
 	}
 }
 
@@ -98,13 +94,13 @@ func TestFilter_Push_Edit_SplitsToRemove(t *testing.T) {
 
 	oldNode := Node{Row: Row{"age": 25, "name": "Bob"}}
 	newNode := Node{Row: Row{"age": 10, "name": "Bob"}}
-	changes := f.Push(MakeEditChange(newNode, oldNode), input)
+	f.Push(MakeEditChange(newNode, oldNode), input)
 
-	if len(changes) != 1 {
-		t.Fatalf("expected 1 change, got %d", len(changes))
+	if len(out.pushed) != 1 {
+		t.Fatalf("expected 1 change, got %d", len(out.pushed))
 	}
-	if changes[0].Type != ChangeTypeRemove {
-		t.Fatalf("expected REMOVE change (split from edit), got %d", changes[0].Type)
+	if out.pushed[0].Type != ChangeTypeRemove {
+		t.Fatalf("expected REMOVE change (split from edit), got %d", out.pushed[0].Type)
 	}
 }
 
@@ -119,13 +115,13 @@ func TestFilter_Push_Edit_BothPass(t *testing.T) {
 
 	oldNode := Node{Row: Row{"age": 25, "name": "Bob"}}
 	newNode := Node{Row: Row{"age": 30, "name": "Bob"}}
-	changes := f.Push(MakeEditChange(newNode, oldNode), input)
+	f.Push(MakeEditChange(newNode, oldNode), input)
 
-	if len(changes) != 1 {
-		t.Fatalf("expected 1 change, got %d", len(changes))
+	if len(out.pushed) != 1 {
+		t.Fatalf("expected 1 change, got %d", len(out.pushed))
 	}
-	if changes[0].Type != ChangeTypeEdit {
-		t.Fatalf("expected EDIT change (both pass), got %d", changes[0].Type)
+	if out.pushed[0].Type != ChangeTypeEdit {
+		t.Fatalf("expected EDIT change (both pass), got %d", out.pushed[0].Type)
 	}
 }
 
@@ -140,10 +136,10 @@ func TestFilter_Push_Edit_NeitherPasses(t *testing.T) {
 
 	oldNode := Node{Row: Row{"age": 10, "name": "Bob"}}
 	newNode := Node{Row: Row{"age": 15, "name": "Bob"}}
-	changes := f.Push(MakeEditChange(newNode, oldNode), input)
+	f.Push(MakeEditChange(newNode, oldNode), input)
 
-	if len(changes) != 0 {
-		t.Fatalf("expected 0 changes, got %d", len(changes))
+	if len(out.pushed) != 0 {
+		t.Fatalf("expected 0 changes, got %d", len(out.pushed))
 	}
 }
 

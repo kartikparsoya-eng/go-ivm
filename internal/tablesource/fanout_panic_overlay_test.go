@@ -32,11 +32,10 @@ import (
 // records nothing otherwise (downstream changes are irrelevant here).
 type bombOutput struct{ armedID float64 }
 
-func (b *bombOutput) Push(c ivm.Change, _ ivm.InputBase) []ivm.Change {
+func (b *bombOutput) Push(c ivm.Change, _ ivm.InputBase) {
 	if c.Node.Row["id"] == b.armedID {
 		panic("fanout bomb")
 	}
-	return nil
 }
 
 func TestFanoutPanicClearsOverlay(t *testing.T) {

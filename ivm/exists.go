@@ -135,7 +135,7 @@ func (e *Exists) GetSchema() *SourceSchema {
 // (single-threaded) was safe with the same logic. The mutex preserves
 // the invariant the guard was meant to enforce — at most one Push in
 // progress at a time on a given Exists — without the panic.
-func (e *Exists) Push(change Change, pusher InputBase) []Change {
+func (e *Exists) Push(change Change, pusher InputBase) {
 	e.pushMu.Lock()
 	defer e.pushMu.Unlock()
 	e.inPush.Store(true)
@@ -143,14 +143,15 @@ func (e *Exists) Push(change Change, pusher InputBase) []Change {
 
 	switch change.Type {
 	case ChangeTypeAdd, ChangeTypeEdit, ChangeTypeRemove:
-		return e.pushWithFilter(change, nil)
+		e.pushWithFilter(change, nil)
 	case ChangeTypeChild:
 		// Only add/remove child changes for the specific relationship
 		// can change the existence condition
 		if change.Child.RelationshipName != e.relationshipName ||
 			change.Child.Change.Type == ChangeTypeEdit ||
 			change.Child.Change.Type == ChangeTypeChild {
-			return e.pushWithFilter(change, nil)
+			e.pushWithFilter(change, nil)
+			return
 		}
 
 		switch change.Child.Change.Type {
@@ -164,21 +165,24 @@ func (e *Exists) Push(change Change, pusher InputBase) []Change {
 						emptyRels[k] = v
 					}
 					emptyRels[e.relationshipName] = func() iter.Seq[Node] { return func(yield func(Node) bool) {} }
-					return e.output.Push(MakeRemoveChange(Node{
+					e.output.Push(MakeRemoveChange(Node{
 						Row:           change.Node.Row,
 						Relationships: emptyRels,
 					}), e)
+					return
 				}
-				return e.output.Push(MakeAddChange(change.Node), e)
+				e.output.Push(MakeAddChange(change.Node), e)
+				return
 			}
 			existsVal := size > 0
-			return e.pushWithFilter(change, &existsVal)
+			e.pushWithFilter(change, &existsVal)
 
 		case ChangeTypeRemove:
 			size := e.fetchSize(change.Node)
 			if size == 0 {
 				if e.not {
-					return e.output.Push(MakeAddChange(change.Node), e)
+					e.output.Push(MakeAddChange(change.Node), e)
+					return
 				}
 				// Push remove with the removed child included
 				withChildRels := make(map[string]func() iter.Seq[Node])
@@ -187,13 +191,14 @@ func (e *Exists) Push(change Change, pusher InputBase) []Change {
 				}
 				removedChild := change.Child.Change.Node
 				withChildRels[e.relationshipName] = func() iter.Seq[Node] { return slices.Values([]Node{removedChild}) }
-				return e.output.Push(MakeRemoveChange(Node{
+				e.output.Push(MakeRemoveChange(Node{
 					Row:           change.Node.Row,
 					Relationships: withChildRels,
 				}), e)
+				return
 			}
 			existsVal := size > 0
-			return e.pushWithFilter(change, &existsVal)
+			e.pushWithFilter(change, &existsVal)
 		default:
 			panic("Exists pushChild: unreachable child change type")
 		}
@@ -231,7 +236,7 @@ func (e *Exists) getCacheKey(node Node, key CompoundKey) string {
 }
 
 // pushWithFilter — pushes change if it passes the exists filter.
-func (e *Exists) pushWithFilter(change Change, exists *bool) []Change {
+func (e *Exists) pushWithFilter(change Change, exists *bool) {
 	var ex bool
 	if exists != nil {
 		ex = *exists
@@ -239,9 +244,8 @@ func (e *Exists) pushWithFilter(change Change, exists *bool) []Change {
 		ex = e.fetchExists(change.Node)
 	}
 	if e.filterWithExists(change.Node, ex) {
-		return e.output.Push(change, e)
+		e.output.Push(change, e)
 	}
-	return nil
 }
 
 // fetchExists — checks if relationship has any nodes.

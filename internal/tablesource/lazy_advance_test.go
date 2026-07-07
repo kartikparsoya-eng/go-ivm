@@ -205,9 +205,8 @@ type lazyPushProbe struct {
 	fn func(change ivm.Change)
 }
 
-func (p *lazyPushProbe) Push(change ivm.Change, _ ivm.InputBase) []ivm.Change {
+func (p *lazyPushProbe) Push(change ivm.Change, _ ivm.InputBase) {
 	p.fn(change)
-	return nil
 }
 
 // TestLazyAdvanceNestedFetchDuringPush drives a REAL Source.Push and, from

@@ -85,10 +85,22 @@ type SourceSchema struct {
 	Columns       map[string]string // column name → type name
 	PrimaryKey    []string
 	Relationships map[string]*SourceSchema
-	IsHidden      bool
-	System        string // "client" | "permissions" | "server"
-	CompareRows   Comparator
-	Sort          Ordering
+	// RelationshipOrder lists relationship names in TS insertion order — the
+	// order Object.entries(schema.relationships) yields in zql. TS object
+	// spread appends new names last and keeps the position of a name that is
+	// overwritten (join.ts:86-96, flipped-join.ts:128-138,
+	// union-fan-in.ts:73-88). The wire emitter (engine streamNodesInto)
+	// iterates this order so sibling relationships hit the wire exactly as
+	// TS's Object.entries walk does (pipeline-driver.ts:2861).
+	//
+	// Invariant: same key set as Relationships (len equal, every name
+	// present). Maintained by NewJoin/NewFlippedJoin/NewUnionFanIn; leaf
+	// sources have both empty.
+	RelationshipOrder []string
+	IsHidden          bool
+	System            string // "client" | "permissions" | "server"
+	CompareRows       Comparator
+	Sort              Ordering
 }
 
 type InputBase interface {
@@ -106,9 +118,14 @@ type Input interface {
 	Fetch(req FetchRequest) iter.Seq[Node]
 }
 
-// push returns []Change (TS Stream<'yield'> → Go []Change as output changes)
+// Output mirrors operator.ts:93-108. TS's push returns Stream<'yield'> —
+// cooperative-scheduling markers only, never data; pushed data reaches the
+// app solely through the terminal sink (Go: engine pipelineOutput →
+// Streamer; TS: the view / pipeline-driver walk). Go drops the 'yield'
+// signal entirely (preemptive scheduler — see the package note at the top
+// of this file), so the faithful Go shape is a plain void call.
 type Output interface {
-	Push(change Change, pusher InputBase) []Change
+	Push(change Change, pusher InputBase)
 }
 
 // Operator is Input + Output combined.
@@ -122,6 +139,6 @@ var ThrowOutput Output = throwOutputImpl{}
 
 type throwOutputImpl struct{}
 
-func (throwOutputImpl) Push(change Change, pusher InputBase) []Change {
+func (throwOutputImpl) Push(change Change, pusher InputBase) {
 	panic("Output not set")
 }

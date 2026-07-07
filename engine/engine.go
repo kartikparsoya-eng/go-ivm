@@ -68,7 +68,7 @@ type Source interface {
 	TableName() string
 	PrimaryKey() []string
 	NormalizeRow(ivm.Row)
-	Push(ivm.SourceChange) []ivm.Change
+	Push(ivm.SourceChange)
 	Connect(sort ivm.Ordering, filter *builder.Condition, filterPredicate func(ivm.Row) bool, splitEditKeys map[string]bool) ivm.Input
 	Close() error
 }
@@ -81,7 +81,7 @@ type memorySourceAdapter struct {
 func (a *memorySourceAdapter) TableName() string                     { return a.ms.TableName() }
 func (a *memorySourceAdapter) PrimaryKey() []string                  { return a.ms.PrimaryKey() }
 func (a *memorySourceAdapter) NormalizeRow(row ivm.Row)              { a.ms.NormalizeRow(row) }
-func (a *memorySourceAdapter) Push(sc ivm.SourceChange) []ivm.Change { return a.ms.Push(sc) }
+func (a *memorySourceAdapter) Push(sc ivm.SourceChange) { a.ms.Push(sc) }
 func (a *memorySourceAdapter) Connect(sort ivm.Ordering, filter *builder.Condition, filterPredicate func(ivm.Row) bool, splitEditKeys map[string]bool) ivm.Input {
 	return a.ms.Connect(sort, filterPredicate, splitEditKeys)
 }
@@ -1749,14 +1749,13 @@ type pipelineOutput struct {
 	schema  *ivm.SourceSchema
 }
 
-func (po *pipelineOutput) Push(change ivm.Change, pusher ivm.InputBase) []ivm.Change {
+func (po *pipelineOutput) Push(change ivm.Change, pusher ivm.InputBase) {
 	// Flatten-in-push (DESIGN-streaming-advance.md): Accumulate flattens the
 	// change tree to RowChanges NOW, while Output.Push is on the stack and the
 	// mutation overlay + join in-progress child state are still live (§3). No
 	// eager materializeChange deep-copy — streamNodesInto walks the lazy
 	// relationship closures directly, matching TS's #streamNodes generator.
 	po.engine.streamer.Accumulate(po.queryID, po.schema, []ivm.Change{change})
-	return nil
 }
 
 // companionOutput wraps pipelineOutput for a resolved scalar-subquery
@@ -1820,7 +1819,7 @@ func jsScalarString(v ivm.Value, undefined bool) string {
 	}
 }
 
-func (co *companionOutput) Push(change ivm.Change, pusher ivm.InputBase) []ivm.Change {
+func (co *companionOutput) Push(change ivm.Change, pusher ivm.InputBase) {
 	changed := false
 	var newValue ivm.Value
 	newUndefined := false
@@ -1839,7 +1838,7 @@ func (co *companionOutput) Push(change ivm.Change, pusher ivm.InputBase) []ivm.C
 	case ivm.ChangeTypeChild:
 		// TS returns [] for CHILD: a relationship-only change does not move
 		// the scalar value — neither accumulate nor reset.
-		return nil
+		return
 	}
 	if changed {
 		panic(&ScalarResetError{
@@ -1848,7 +1847,7 @@ func (co *companionOutput) Push(change ivm.Change, pusher ivm.InputBase) []ivm.C
 			New:      jsScalarString(newValue, newUndefined),
 		})
 	}
-	return co.pipelineOutput.Push(change, pusher)
+	co.pipelineOutput.Push(change, pusher)
 }
 
 // scalarValuesEqual ports TS's scalarValuesEqual (pipeline-driver.ts:3278,

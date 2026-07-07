@@ -65,14 +65,12 @@ func (fo *FanOut) Filter(node Node) bool {
 }
 
 // Push — pushes change to all outputs, then signals fan-in.
-func (fo *FanOut) Push(change Change, pusher InputBase) []Change {
-	var results []Change
+func (fo *FanOut) Push(change Change, pusher InputBase) {
 	for _, out := range fo.outputs {
-		results = append(results, out.Push(change, fo)...)
+		out.Push(change, fo)
 	}
 	if fo.fanIn == nil {
 		panic("fan-out must have a corresponding fan-in set!")
 	}
-	results = append(results, fo.fanIn.FanOutDonePushingToAllBranches(change.Type)...)
-	return results
+	fo.fanIn.FanOutDonePushingToAllBranches(change.Type)
 }

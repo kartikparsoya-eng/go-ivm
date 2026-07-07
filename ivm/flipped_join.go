@@ -48,19 +48,27 @@ func NewFlippedJoin(args FlippedJoinArgs) *FlippedJoin {
 	parentSchema := args.Parent.GetSchema()
 	childSchema := args.Child.GetSchema()
 
+	// TS: {...parentSchema.relationships, [relationshipName]: {...}} —
+	// flipped-join.ts:128-138. A new name is appended last; an existing name
+	// keeps its original position (JS spread + computed-key semantics).
 	rels := make(map[string]*SourceSchema)
 	for k, v := range parentSchema.Relationships {
 		rels[k] = v
 	}
+	relOrder := slices.Clone(parentSchema.RelationshipOrder)
+	if _, exists := parentSchema.Relationships[args.RelationshipName]; !exists {
+		relOrder = append(relOrder, args.RelationshipName)
+	}
 	rels[args.RelationshipName] = &SourceSchema{
-		TableName:     childSchema.TableName,
-		Columns:       childSchema.Columns,
-		PrimaryKey:    childSchema.PrimaryKey,
-		Relationships: childSchema.Relationships,
-		IsHidden:      args.Hidden,
-		System:        args.System,
-		CompareRows:   childSchema.CompareRows,
-		Sort:          childSchema.Sort,
+		TableName:         childSchema.TableName,
+		Columns:           childSchema.Columns,
+		PrimaryKey:        childSchema.PrimaryKey,
+		Relationships:     childSchema.Relationships,
+		RelationshipOrder: childSchema.RelationshipOrder,
+		IsHidden:          args.Hidden,
+		System:            args.System,
+		CompareRows:       childSchema.CompareRows,
+		Sort:              childSchema.Sort,
 	}
 
 	fj := &FlippedJoin{
@@ -70,14 +78,15 @@ func NewFlippedJoin(args FlippedJoinArgs) *FlippedJoin {
 		childKey:         args.ChildKey,
 		relationshipName: args.RelationshipName,
 		schema: &SourceSchema{
-			TableName:     parentSchema.TableName,
-			Columns:       parentSchema.Columns,
-			PrimaryKey:    parentSchema.PrimaryKey,
-			Relationships: rels,
-			IsHidden:      parentSchema.IsHidden,
-			System:        parentSchema.System,
-			CompareRows:   parentSchema.CompareRows,
-			Sort:          parentSchema.Sort,
+			TableName:         parentSchema.TableName,
+			Columns:           parentSchema.Columns,
+			PrimaryKey:        parentSchema.PrimaryKey,
+			Relationships:     rels,
+			RelationshipOrder: relOrder,
+			IsHidden:          parentSchema.IsHidden,
+			System:            parentSchema.System,
+			CompareRows:       parentSchema.CompareRows,
+			Sort:              parentSchema.Sort,
 		},
 		output: ThrowOutput,
 	}
@@ -445,38 +454,36 @@ type flippedJoinChildOutput struct {
 	fj *FlippedJoin
 }
 
-func (o *flippedJoinChildOutput) Push(change Change, _ InputBase) []Change {
-	return o.fj.pushChild(change)
+func (o *flippedJoinChildOutput) Push(change Change, _ InputBase) {
+	o.fj.pushChild(change)
 }
 
-func (fj *FlippedJoin) pushChild(change Change) []Change {
+func (fj *FlippedJoin) pushChild(change Change) {
 	switch change.Type {
 	case ChangeTypeAdd, ChangeTypeRemove:
-		return fj.pushChildChange(change, false)
+		fj.pushChildChange(change, false)
 	case ChangeTypeEdit:
 		if !RowEqualsForCompoundKey(change.OldNode.Row, change.Node.Row, fj.childKey) {
 			panic(joinKeyChangeError(fj.child.GetSchema(), change.OldNode.Row, "FlippedJoin-child-key-change"))
 		}
-		return fj.pushChildChange(change, true)
+		fj.pushChildChange(change, true)
 	case ChangeTypeChild:
-		return fj.pushChildChange(change, true)
+		fj.pushChildChange(change, true)
 	}
-	return nil
 }
 
 // pushChildChange — source: flipped-join.ts line 346-425
-func (fj *FlippedJoin) pushChildChange(change Change, exists bool) []Change {
+func (fj *FlippedJoin) pushChildChange(change Change, exists bool) {
 	fj.inprogressChildChange = &change
 	fj.inprogressChildChangePosition = nil
 	defer func() { fj.inprogressChildChange = nil }()
 
 	constraint := BuildJoinConstraint(change.Node.Row, fj.childKey, fj.parentKey)
 	if constraint == nil {
-		return nil
+		return
 	}
 
 	parentNodes := slices.Collect(fj.parent.Fetch(FetchRequest{Constraint: constraint}))
-	var allChanges []Change
 
 	for _, parentNode := range parentNodes {
 		fj.inprogressChildChange = &change
@@ -516,7 +523,7 @@ func (fj *FlippedJoin) pushChildChange(change Change, exists bool) []Change {
 				RelationshipName: fj.relationshipName,
 				Change:           change,
 			})
-			allChanges = append(allChanges, fj.output.Push(outChange, fj)...)
+			fj.output.Push(outChange, fj)
 		} else {
 			outNode := Node{
 				Row: parentNode.Row,
@@ -530,11 +537,9 @@ func (fj *FlippedJoin) pushChildChange(change Change, exists bool) []Change {
 			} else {
 				outChange = MakeRemoveChange(outNode)
 			}
-			allChanges = append(allChanges, fj.output.Push(outChange, fj)...)
+			fj.output.Push(outChange, fj)
 		}
 	}
-
-	return allChanges
 }
 
 // --- Push from parent side ---
@@ -543,12 +548,12 @@ type flippedJoinParentOutput struct {
 	fj *FlippedJoin
 }
 
-func (o *flippedJoinParentOutput) Push(change Change, _ InputBase) []Change {
-	return o.fj.pushParent(change)
+func (o *flippedJoinParentOutput) Push(change Change, _ InputBase) {
+	o.fj.pushParent(change)
 }
 
 // pushParent — source: flipped-join.ts line 427-504
-func (fj *FlippedJoin) pushParent(change Change) []Change {
+func (fj *FlippedJoin) pushParent(change Change) {
 	childNodeStream := func(node Node) func() iter.Seq[Node] {
 		return func() iter.Seq[Node] {
 			return func(yield func(Node) bool) {
@@ -581,23 +586,22 @@ func (fj *FlippedJoin) pushParent(change Change) []Change {
 		break
 	}
 	if !hasChildren {
-		return nil
+		return
 	}
 
 	switch change.Type {
 	case ChangeTypeAdd:
-		return fj.output.Push(MakeAddChange(flip(change.Node)), fj)
+		fj.output.Push(MakeAddChange(flip(change.Node)), fj)
 	case ChangeTypeRemove:
-		return fj.output.Push(MakeRemoveChange(flip(change.Node)), fj)
+		fj.output.Push(MakeRemoveChange(flip(change.Node)), fj)
 	case ChangeTypeChild:
-		return fj.output.Push(MakeChildChange(flip(change.Node), *change.Child), fj)
+		fj.output.Push(MakeChildChange(flip(change.Node), *change.Child), fj)
 	case ChangeTypeEdit:
 		if !RowEqualsForCompoundKey(change.OldNode.Row, change.Node.Row, fj.parentKey) {
 			panic(joinKeyChangeError(fj.schema, change.OldNode.Row, "FlippedJoin-parent-key-change"))
 		}
-		return fj.output.Push(MakeEditChange(flip(change.Node), flip(*change.OldNode)), fj)
+		fj.output.Push(MakeEditChange(flip(change.Node), flip(*change.OldNode)), fj)
 	}
-	return nil
 }
 
 // --- Helpers ---

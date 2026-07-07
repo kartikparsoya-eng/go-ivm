@@ -53,21 +53,20 @@ func (fi *FanIn) Filter(node Node) bool {
 }
 
 // Push — accumulates changes; does not forward immediately.
-func (fi *FanIn) Push(change Change, pusher InputBase) []Change {
+func (fi *FanIn) Push(change Change, pusher InputBase) {
 	fi.accumulatedPushes = append(fi.accumulatedPushes, change)
-	return nil
 }
 
 // FanOutDonePushingToAllBranches is called by FanOut after pushing to all branches.
-func (fi *FanIn) FanOutDonePushingToAllBranches(fanOutChangeType ChangeType) []Change {
+func (fi *FanIn) FanOutDonePushingToAllBranches(fanOutChangeType ChangeType) {
 	if len(fi.inputs) == 0 {
 		if len(fi.accumulatedPushes) != 0 {
 			panic("If there are no inputs then fan-in should not receive any pushes.")
 		}
-		return nil
+		return
 	}
 
-	result := PushAccumulatedChanges(
+	PushAccumulatedChanges(
 		fi.accumulatedPushes,
 		fi.output,
 		fi,
@@ -76,7 +75,6 @@ func (fi *FanIn) FanOutDonePushingToAllBranches(fanOutChangeType ChangeType) []C
 		identityChange,
 	)
 	fi.accumulatedPushes = fi.accumulatedPushes[:0]
-	return result
 }
 
 // identity merge — fan-in uses identity (no relationship merging needed at this level).
