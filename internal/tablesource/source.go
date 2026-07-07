@@ -42,6 +42,7 @@ import (
 	"fmt"
 	"iter"
 	"slices"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1609,7 +1610,7 @@ func (s *Source) fetchDuringPushStream(req ivm.FetchRequest, conn *connection) i
 			for i, c := range colNames {
 				cs, ok := s.columns[c]
 				if !ok {
-					continue
+					s.invalidColumnPanic(c)
 				}
 				row[c] = sqlite.FromSQLiteType(raw[i], cs.Type)
 			}
@@ -1685,7 +1686,7 @@ func (s *Source) scanRows(
 		for i, c := range colNames {
 			cs, ok := s.columns[c]
 			if !ok {
-				continue
+				s.invalidColumnPanic(c)
 			}
 			row[c] = sqlite.FromSQLiteType(raw[i], cs.Type)
 		}
@@ -1699,6 +1700,21 @@ func (s *Source) scanRows(
 			s.tableName, err))
 	}
 	return out
+}
+
+// invalidColumnPanic ports TS fromSQLiteTypes' unknown-column throw
+// (table-source.ts:608-614): a SELECTed column absent from the synced
+// schema is schema drift (e.g. a replica column added after the spec was
+// loaded) — TS fails loud and the view-syncer resets pipelines; silently
+// dropping the column would ship rows missing data with no signal.
+func (s *Source) invalidColumnPanic(col string) {
+	names := make([]string, 0, len(s.columns))
+	for c := range s.columns {
+		names = append(names, c)
+	}
+	sort.Strings(names)
+	panic(fmt.Sprintf("Invalid column %q for table %q. Synced columns include %s",
+		col, s.tableName, strings.Join(names, ", ")))
 }
 
 // fetchViaPool is the lock-free hydrate read: it borrows a frame-pinned reader
@@ -1773,7 +1789,7 @@ func (s *Source) fetchViaPoolStream(req ivm.FetchRequest, conn *connection, pool
 			for i, c := range colNames {
 				cs, ok := s.columns[c]
 				if !ok {
-					continue
+					s.invalidColumnPanic(c)
 				}
 				row[c] = sqlite.FromSQLiteType(raw[i], cs.Type)
 			}
