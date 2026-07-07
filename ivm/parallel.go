@@ -45,11 +45,16 @@ func (ms *MemorySource) GenPushParallel(change SourceChange) {
 	epoch := ms.pushEpoch
 
 	// Snapshot connections under RLock (see MemorySource.connsMu doc).
+	// LastPushedEpoch is NOT bumped here: TS bumps it per connection
+	// immediately before that connection's push (memory-source.ts:625-629),
+	// so an unpushed connection must never look pushed — pre-bumping made a
+	// concurrent fetch through a not-yet-pushed connection wrongly apply the
+	// overlay (computeOverlays: LastPushedEpoch >= overlay.Epoch ⇒ splice).
+	// Each goroutine bumps its own connection right before FilterPush.
 	ms.connsMu.RLock()
 	var activeConns []*Connection
 	for _, conn := range ms.connections {
 		if conn.Output != nil {
-			conn.LastPushedEpoch = epoch
 			activeConns = append(activeConns, conn)
 		}
 	}
@@ -68,6 +73,7 @@ func (ms *MemorySource) GenPushParallel(change SourceChange) {
 	// For single connection, skip goroutine overhead
 	if len(activeConns) == 1 {
 		conn := activeConns[0]
+		conn.LastPushedEpoch.Store(int64(epoch))
 		outputChange := ms.sourceChangeToChange(change)
 		FilterPush(outputChange, conn.Output, conn.Input, conn.FilterPredicate)
 		return
@@ -92,6 +98,7 @@ func (ms *MemorySource) GenPushParallel(change SourceChange) {
 					panics[idx] = r
 				}
 			}()
+			c.LastPushedEpoch.Store(int64(epoch))
 			outputChange := ms.sourceChangeToChange(change)
 			FilterPush(outputChange, c.Output, c.Input, c.FilterPredicate)
 		}(i, conn)
@@ -125,20 +132,14 @@ func (ms *MemorySource) PushWithMode(change SourceChange) {
 }
 
 func (ms *MemorySource) genPushAndWriteParallel(change SourceChange) {
-	// BUG 1b: if this Edit's OldRow was removed earlier in this batch,
-	// convert to Add (same as sequential path).
-	if change.Type == ChangeTypeEdit && !ms.has(change.OldRow) {
-		if ms.removedInBatch != nil && ms.removedInBatch[ms.pkKey(change.OldRow)] {
-			change = MakeSourceChangeAdd(change.Row)
-		}
-	}
-	// BUG 1c: Convert duplicate Add to Edit (same as sequential path).
-	if change.Type == ChangeTypeAdd && ms.has(change.Row) {
-		if ms.addedInBatch != nil {
-			if prevRow, ok := ms.addedInBatch[ms.pkKey(change.Row)]; ok {
-				change = MakeSourceChangeEdit(change.Row, prevRow)
-			}
-		}
+	// Resolve intra-batch staleness BEFORE the split decision — same order
+	// as the sequential path (genPushAndWriteWithSplitEdit): TS's split
+	// logic sees the Edit with the lazily-read OldRow, so the split-key
+	// comparison must run against the batch-current value. See
+	// resolveBatchChange (source.go) for the case table.
+	var skip bool
+	if change, skip = ms.resolveBatchChange(change); skip {
+		return
 	}
 	// Handle split-edit same as sequential.
 	// connsMu guards the slice header against Connect/Disconnect
@@ -167,20 +168,16 @@ func (ms *MemorySource) genPushAndWriteParallel(change SourceChange) {
 	}
 
 	if change.Type == ChangeTypeEdit && shouldSplit {
-		skipRemove := !ms.has(change.OldRow) && ms.removedInBatch != nil && ms.removedInBatch[ms.pkKey(change.OldRow)]
-		if !skipRemove {
-			ms.GenPushParallel(MakeSourceChangeRemove(change.OldRow))
-			ms.writeChange(MakeSourceChangeRemove(change.OldRow))
-		}
+		// The Edit was resolved above, so OldRow is the batch-current prev
+		// value — the Remove leg can never target an already-removed row
+		// (that case resolved to Add, which does not split).
+		ms.GenPushParallel(MakeSourceChangeRemove(change.OldRow))
+		ms.writeChange(MakeSourceChangeRemove(change.OldRow))
 		ms.GenPushParallel(MakeSourceChangeAdd(change.Row))
 		ms.writeChange(MakeSourceChangeAdd(change.Row))
 		return
 	}
 
-	// BUG 1: skip duplicate Remove
-	if change.Type == ChangeTypeRemove && !ms.has(change.Row) && ms.removedInBatch != nil && ms.removedInBatch[ms.pkKey(change.Row)] {
-		return
-	}
 	ms.GenPushParallel(change)
 	ms.writeChange(change)
 }

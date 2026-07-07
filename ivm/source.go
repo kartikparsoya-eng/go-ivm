@@ -73,7 +73,14 @@ type Connection struct {
 	SplitEditKeys   map[string]bool
 	CompareRows     Comparator
 	FilterPredicate func(Row) bool
-	LastPushedEpoch int
+	// LastPushedEpoch is the most recent pushEpoch delivered to this
+	// connection — bumped immediately before the connection's FilterPush,
+	// per connection, exactly like TS (memory-source.ts:625-629). Atomic
+	// because GenPushParallel bumps it on each connection's own fan-out
+	// goroutine while another connection's pipeline may concurrently fetch
+	// through this connection (computeOverlays reads it) — e.g. a self-join
+	// whose parent and child conns land on different fan-out goroutines.
+	LastPushedEpoch atomic.Int64
 	ConnID          int // unique ID for debug tracing
 }
 
@@ -105,9 +112,15 @@ type MemorySource struct {
 	// converter, if set, replaces the default partial-coverage NormalizeRow
 	// behavior with a per-column conversion (e.g. sqlite.FromSQLiteType).
 	// REVIEW-ts-integration CRITICAL-3 / REVIEW-porting MEDIUM-2.
-	converter      ValueConverter
-	removedInBatch map[string]bool // PKs removed in the current advance batch
-	addedInBatch   map[string]Row  // PKs → rows added in the current advance batch
+	converter ValueConverter
+	// batchState tracks, per PK written in the current advance batch, the row
+	// the source data now holds for that PK (nil = removed/absent). Last
+	// write wins: trackAdded overwrites trackRemoved and vice versa, so the
+	// entry always mirrors what TS's lazy diff would read from the mutated
+	// prev snapshot at this point in the batch (see resolveBatchChange).
+	// Allocated lazily; cleared by ClearBatchState at the true batch boundary
+	// (engine.signalAdvanceEnd).
+	batchState map[string]Row
 }
 
 // ValueConverter coerces a raw decoded value to its canonical Value for the
@@ -178,7 +191,6 @@ func (ms *MemorySource) Connect(connSort Ordering, filterPredicate func(Row) boo
 		SplitEditKeys:   splitEditKeys,
 		CompareRows:     compareRows,
 		FilterPredicate: filterPredicate,
-		LastPushedEpoch: 0,
 		ConnID:          connID,
 	}
 
@@ -240,6 +252,14 @@ func (ms *MemorySource) Push(change SourceChange) {
 
 // genPushAndWriteWithSplitEdit — Source: memory-source.ts line 452-506
 func (ms *MemorySource) genPushAndWriteWithSplitEdit(change SourceChange) {
+	// Resolve intra-batch staleness BEFORE the split decision: TS's split
+	// logic (memory-source.ts:452-506) receives the Edit with the OldRow the
+	// diff lazily read from the mutated prev, so the split-key comparison
+	// must run against the batch-current value, not the eager-collected one.
+	var skip bool
+	if change, skip = ms.resolveBatchChange(change); skip {
+		return
+	}
 	shouldSplit := false
 	if change.Type == ChangeTypeEdit {
 		// connsMu guards the slice header against Connect/Disconnect
@@ -270,32 +290,63 @@ func (ms *MemorySource) genPushAndWriteWithSplitEdit(change SourceChange) {
 	ms.genPushAndWrite(change)
 }
 
+// resolveBatchChange substitutes the change's prev-side values with the
+// batch-current state for any PK already written in this advance batch,
+// reproducing TS's diff-layer lazy iteration: TS reads prevValues from the
+// prev snapshot AFTER earlier writeChanges in the same batch mutated it
+// (snapshotter.ts:519-544), while Go's diff collects all entries eagerly
+// from the clean prev. For a PK untouched this batch the collected value IS
+// the current value, so the change passes through unchanged — and genuine
+// drift (an untouched PK contradicting source state) still reaches
+// genPush's asserts and panics.
+//
+// Cases (skip=true ⇒ drop the change entirely):
+//   - Edit, OldRow PK removed in-batch  → Add(Row)        (TS: prevValues=[] → Add)
+//   - Edit, OldRow PK written in-batch  → Edit(Row, cur)  (TS: prevValues=[cur] → Edit)
+//   - Add, PK holds an in-batch row     → Edit(Row, cur)  (TS: prevValues=[cur] → Edit)
+//   - Remove, PK removed in-batch       → skip            (TS no-op filter, snapshotter.ts:540-544)
+//   - Remove, PK written in-batch       → Remove(cur)     (TS: prev.getRow → cur)
+//
+// The first, third, and fourth cases are the original BUG 1b/1c/1 rewrites;
+// the Edit→Edit and Remove→Remove(cur) substitutions close the remaining
+// gap where a PK EDITED earlier in the batch passed its stale pre-batch
+// value through (silently divergent OldRow/Row — observable through filter
+// old-row predicates and sort position math downstream).
+func (ms *MemorySource) resolveBatchChange(change SourceChange) (SourceChange, bool) {
+	if ms.batchState == nil {
+		return change, false
+	}
+	switch change.Type {
+	case ChangeTypeEdit:
+		if cur, ok := ms.batchState[ms.pkKey(change.OldRow)]; ok {
+			if cur == nil {
+				return MakeSourceChangeAdd(change.Row), false
+			}
+			return MakeSourceChangeEdit(change.Row, cur), false
+		}
+	case ChangeTypeAdd:
+		if cur, ok := ms.batchState[ms.pkKey(change.Row)]; ok && cur != nil {
+			return MakeSourceChangeEdit(change.Row, cur), false
+		}
+	case ChangeTypeRemove:
+		if cur, ok := ms.batchState[ms.pkKey(change.Row)]; ok {
+			if cur == nil {
+				return SourceChange{}, true
+			}
+			return MakeSourceChangeRemove(cur), false
+		}
+	}
+	return change, false
+}
+
 // genPushAndWrite — Source: memory-source.ts line 508-520
 func (ms *MemorySource) genPushAndWrite(change SourceChange) {
-	// BUG 1b: if this Edit's OldRow was removed earlier in this batch,
-	// convert to Add (matching TS's lazy iteration: the prev row was
-	// already deleted by a previous writeChange, so TS's prev.getRows
-	// returns empty and TS emits an Add, not an Edit).
-	if change.Type == ChangeTypeEdit && !ms.has(change.OldRow) {
-		if ms.removedInBatch != nil && ms.removedInBatch[ms.pkKey(change.OldRow)] {
-			change = MakeSourceChangeAdd(change.Row)
-		}
-	}
-	// BUG 1c: if this Add duplicates a row added earlier in this batch,
-	// convert to Edit (matching TS's lazy iteration: TS's prev.getRows sees
-	// the just-INSERTed row and produces an Edit, not a duplicate Add).
-	if change.Type == ChangeTypeAdd && ms.has(change.Row) {
-		if ms.addedInBatch != nil {
-			if prevRow, ok := ms.addedInBatch[ms.pkKey(change.Row)]; ok {
-				change = MakeSourceChangeEdit(change.Row, prevRow)
-			}
-		}
-	}
-	// BUG 1: skip duplicate Remove (row already removed in this batch)
-	if change.Type == ChangeTypeRemove && !ms.has(change.Row) {
-		if ms.removedInBatch != nil && ms.removedInBatch[ms.pkKey(change.Row)] {
-			return
-		}
+	// Second resolution for the split-edit legs (the Remove leg's writeChange
+	// updates batchState before the Add leg arrives); idempotent for changes
+	// already resolved at the split-decision entry point.
+	var skip bool
+	if change, skip = ms.resolveBatchChange(change); skip {
+		return
 	}
 	ms.genPush(change)
 	ms.writeChange(change)
@@ -352,7 +403,7 @@ func (ms *MemorySource) genPush(change SourceChange) {
 		if conn.Output == nil {
 			continue
 		}
-		conn.LastPushedEpoch = epoch
+		conn.LastPushedEpoch.Store(int64(epoch))
 		ms.overlay.Store(&Overlay{Epoch: epoch, Change: change})
 
 		outputChange := ms.sourceChangeToChange(change)
@@ -418,17 +469,17 @@ func (ms *MemorySource) remove(row Row) {
 }
 
 func (ms *MemorySource) trackRemoved(row Row) {
-	if ms.removedInBatch == nil {
-		ms.removedInBatch = make(map[string]bool)
+	if ms.batchState == nil {
+		ms.batchState = make(map[string]Row)
 	}
-	ms.removedInBatch[ms.pkKey(row)] = true
+	ms.batchState[ms.pkKey(row)] = nil
 }
 
 func (ms *MemorySource) trackAdded(row Row) {
-	if ms.addedInBatch == nil {
-		ms.addedInBatch = make(map[string]Row)
+	if ms.batchState == nil {
+		ms.batchState = make(map[string]Row)
 	}
-	ms.addedInBatch[ms.pkKey(row)] = row
+	ms.batchState[ms.pkKey(row)] = row
 }
 
 func (ms *MemorySource) pkKey(row Row) string {
@@ -440,8 +491,7 @@ func (ms *MemorySource) pkKey(row Row) string {
 }
 
 func (ms *MemorySource) ClearBatchState() {
-	ms.removedInBatch = nil
-	ms.addedInBatch = nil
+	ms.batchState = nil
 }
 
 // search returns the index where row would be inserted (binary search).
@@ -657,7 +707,7 @@ func (ms *MemorySource) getSortedRows(ordering Ordering) []Row {
 func (ms *MemorySource) computeOverlays(start *Start, constraint *Constraint, conn *Connection, reverse bool) Overlays {
 	o := Overlays{}
 	overlay := ms.overlay.Load()
-	if overlay == nil || conn.LastPushedEpoch < overlay.Epoch {
+	if overlay == nil || conn.LastPushedEpoch.Load() < int64(overlay.Epoch) {
 		return o
 	}
 

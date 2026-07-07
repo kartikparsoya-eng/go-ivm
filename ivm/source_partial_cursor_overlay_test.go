@@ -54,7 +54,7 @@ func TestFetch_PartialCursor_LiveOverlay_Masking(t *testing.T) {
 	// Set a live overlay directly: simulate the window during genPush where
 	// the overlay is visible to a downstream Fetch but not yet written.
 	src.overlay.Store(&Overlay{Epoch: 1, Change: SourceChange{Type: ChangeTypeAdd, Row: boundaryAdd}})
-	si.conn.LastPushedEpoch = 1
+	si.conn.LastPushedEpoch.Store(1)
 	t.Cleanup(func() { src.overlay.Store(nil) })
 
 	has := func(nodes []Node, id string) bool {
@@ -148,7 +148,7 @@ func TestFetch_PartialCursor_LiveOverlay_ReverseInclusive(t *testing.T) {
 
 	boundaryAdd := Row{"createdAt": cursorTs, "conversationId": "8ec82a40"}
 	src.overlay.Store(&Overlay{Epoch: 1, Change: SourceChange{Type: ChangeTypeAdd, Row: boundaryAdd}})
-	si.conn.LastPushedEpoch = 1
+	si.conn.LastPushedEpoch.Store(1)
 	t.Cleanup(func() { src.overlay.Store(nil) })
 
 	has := func(nodes []Node, id string) bool {

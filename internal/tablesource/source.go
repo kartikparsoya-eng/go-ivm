@@ -143,14 +143,16 @@ type Source struct {
 	// cleared via BindConn/UnbindConn around a driven advance or hydrate.
 	externalConn *sql.Conn
 
-	// removedInBatch tracks PKs removed by writeChangeLocked in the
-	// current advance batch. Used to distinguish intra-batch duplicate
-	// Removes (skipped, matching TS's no-op filter) from genuine drift
-	// (panics — see driftCheckLocked). Allocated lazily in trackRemoved and
-	// cleared by ClearBatchState at the end of each advance batch (the
-	// true batch boundary — engine.signalAdvanceEnd).
-	removedInBatch map[string]bool
-	addedInBatch   map[string]ivm.Row
+	// batchState tracks, per PK written by writeChangeLocked in the current
+	// advance batch, the row the prev tx now holds for that PK (nil =
+	// removed/absent). Last write wins, so the entry always mirrors what
+	// TS's lazy diff would read from the mutated prev snapshot at this point
+	// in the batch (see resolveBatchChangeLocked). Genuine drift — an
+	// untouched PK contradicting prev state — is left to driftCheckLocked,
+	// which panics. Allocated lazily in trackAdded/trackRemoved and cleared
+	// by ClearBatchState at the end of each advance batch (the true batch
+	// boundary — engine.signalAdvanceEnd).
+	batchState map[string]ivm.Row
 	// stmtCache memoizes prepared SELECT statements for fetchForConn, keyed by
 	// (active conn, SQL text). database/sql's one-shot QueryContext re-runs
 	// sqlite3_prepare_v2 on every call (14.6% of cgo time in the live read-path
@@ -814,6 +816,15 @@ func (s *Source) Push(change ivm.SourceChange) {
 		s.mu.Unlock()
 		panic(fmt.Sprintf("tablesource.Source.Push %s: ensurePrevTx: %v", s.tableName, err))
 	}
+	// Resolve intra-batch staleness BEFORE the split decision: TS's split
+	// logic receives the Edit with the OldRow the diff lazily read from the
+	// mutated prev, so the split-key comparison must run against the
+	// batch-current value. See resolveBatchChangeLocked for the case table.
+	var skip bool
+	if change, skip = s.resolveBatchChangeLocked(change); skip {
+		s.mu.Unlock()
+		return
+	}
 	shouldSplitEdit := false
 	if change.Type == ivm.ChangeTypeEdit {
 		for _, conn := range s.connections {
@@ -847,34 +858,16 @@ func (s *Source) Push(change ivm.SourceChange) {
 // Direct port of TS's genPushAndWrite (memory-source.ts).
 func (s *Source) genPushAndWrite(change ivm.SourceChange, conns []*connection) {
 	s.mu.Lock()
-	// BUG 1b: if this Edit's OldRow was removed earlier in this batch,
-	// convert to Add (matching TS's lazy iteration: the prev row was
-	// already deleted by a previous writeChange, so TS's prev.getRows
-	// returns empty and TS emits an Add, not an Edit).
-	if change.Type == ivm.ChangeTypeEdit {
-		oldExists, err := s.existsLocked(change.OldRow)
-		if err != nil {
-			s.mu.Unlock() // never panic holding s.mu (see driftCheck path below)
-			panic(fmt.Sprintf("tablesource.Source.Push %s: %v", s.tableName, err))
-		}
-		if !oldExists && s.removedInBatch != nil && s.removedInBatch[s.pkKey(change.OldRow)] {
-			change = ivm.MakeSourceChangeAdd(change.Row)
-		}
-	}
-	// BUG 1c: if this Add duplicates a row added earlier in this batch,
-	// convert to Edit (matching TS's lazy iteration: TS's prev.getRows sees
-	// the just-INSERTed row and produces an Edit, not a duplicate Add).
-	if change.Type == ivm.ChangeTypeAdd {
-		rowExists, err := s.existsLocked(change.Row)
-		if err != nil {
-			s.mu.Unlock()
-			panic(fmt.Sprintf("tablesource.Source.Push %s: %v", s.tableName, err))
-		}
-		if rowExists && s.addedInBatch != nil {
-			if prevRow, ok := s.addedInBatch[s.pkKey(change.Row)]; ok {
-				change = ivm.MakeSourceChangeEdit(change.Row, prevRow)
-			}
-		}
+	// Second resolution for the split-edit legs (the Remove leg's
+	// writeChangeLocked updates batchState before the Add leg arrives);
+	// idempotent for changes already resolved in Push. This replaces the
+	// old BUG 1/1b/1c existsLocked probes — batchState is authoritative for
+	// any PK touched this batch, so no SQL probe is needed for the rewrite
+	// decision (untouched PKs pass through to driftCheckLocked unchanged).
+	var skip bool
+	if change, skip = s.resolveBatchChangeLocked(change); skip {
+		s.mu.Unlock()
+		return
 	}
 	// Drift validation BEFORE any state mutation or fanout — matches TS
 	// MemorySource.genPush (memory-source.ts:529-550) and the in-memory
@@ -897,11 +890,6 @@ func (s *Source) genPushAndWrite(change ivm.SourceChange, conns []*connection) {
 		panic(fmt.Sprintf("tablesource.Source.Push %s: %v", s.tableName, derr))
 	}
 	if d != nil {
-		// BUG 1: skip Remove against a row removed earlier in this batch
-		if change.Type == ivm.ChangeTypeRemove && s.removedInBatch != nil && s.removedInBatch[s.pkKey(change.Row)] {
-			s.mu.Unlock()
-			return
-		}
 		s.mu.Unlock()
 		panic(d)
 	}
@@ -1100,29 +1088,65 @@ func (s *Source) writeChangeLocked(change ivm.SourceChange) error {
 }
 
 func (s *Source) trackRemoved(row ivm.Row) {
-	if s.removedInBatch == nil {
-		s.removedInBatch = make(map[string]bool)
+	if s.batchState == nil {
+		s.batchState = make(map[string]ivm.Row)
 	}
-	s.removedInBatch[s.pkKey(row)] = true
+	s.batchState[s.pkKey(row)] = nil
 }
 
 func (s *Source) trackAdded(row ivm.Row) {
-	if s.addedInBatch == nil {
-		s.addedInBatch = make(map[string]ivm.Row)
+	if s.batchState == nil {
+		s.batchState = make(map[string]ivm.Row)
 	}
-	s.addedInBatch[s.pkKey(row)] = row
+	s.batchState[s.pkKey(row)] = row
 }
 
-// ClearBatchState drops the intra-batch removed-PK set. Called by
+// resolveBatchChangeLocked substitutes the change's prev-side values with
+// the batch-current state for any PK already written in this advance batch,
+// reproducing TS's diff-layer lazy iteration: TS reads prevValues from the
+// prev snapshot AFTER earlier writeChanges in the same batch mutated it
+// (snapshotter.ts:519-544), while Go's diff collects all entries eagerly
+// from the clean prev. Mirrors ivm.MemorySource.resolveBatchChange — see
+// its doc comment for the full case table (Edit→Add / Edit→Edit(cur) /
+// Add→Edit(cur) / Remove→skip / Remove→Remove(cur)).
+//
+// MUST be called with s.mu held (batchState is mu-guarded here).
+func (s *Source) resolveBatchChangeLocked(change ivm.SourceChange) (ivm.SourceChange, bool) {
+	if s.batchState == nil {
+		return change, false
+	}
+	switch change.Type {
+	case ivm.ChangeTypeEdit:
+		if cur, ok := s.batchState[s.pkKey(change.OldRow)]; ok {
+			if cur == nil {
+				return ivm.MakeSourceChangeAdd(change.Row), false
+			}
+			return ivm.MakeSourceChangeEdit(change.Row, cur), false
+		}
+	case ivm.ChangeTypeAdd:
+		if cur, ok := s.batchState[s.pkKey(change.Row)]; ok && cur != nil {
+			return ivm.MakeSourceChangeEdit(change.Row, cur), false
+		}
+	case ivm.ChangeTypeRemove:
+		if cur, ok := s.batchState[s.pkKey(change.Row)]; ok {
+			if cur == nil {
+				return ivm.SourceChange{}, true
+			}
+			return ivm.MakeSourceChangeRemove(cur), false
+		}
+	}
+	return change, false
+}
+
+// ClearBatchState drops the intra-batch PK→row state. Called by
 // engine.signalAdvanceEnd at the end of every advance batch (success OR
-// panic), so the set never outlives the batch that built it and can never
+// panic), so the map never outlives the batch that built it and can never
 // mask genuine cross-batch drift. Kept separate from OnAdvanceEnd so it
 // fires at true batch boundaries only. Mirrors
 // ivm.MemorySource.ClearBatchState.
 func (s *Source) ClearBatchState() {
 	s.mu.Lock()
-	s.removedInBatch = nil
-	s.addedInBatch = nil
+	s.batchState = nil
 	s.mu.Unlock()
 }
 
