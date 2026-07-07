@@ -49,6 +49,7 @@ import (
 	"time"
 
 	"github.com/kartikparsoya-eng/go-ivm/builder"
+	"github.com/kartikparsoya-eng/go-ivm/internal/procclock"
 	"github.com/kartikparsoya-eng/go-ivm/ivm"
 	"github.com/kartikparsoya-eng/go-ivm/sqlite"
 )
@@ -122,6 +123,15 @@ type Source struct {
 	// and subsequent Fetches see the change via the SQL read directly.
 	// Mirrors TS MemorySource's `#overlay` field (memory-source.ts).
 	overlay *ivm.Overlay
+
+	// advanceClock, when non-nil, is the processing-clock accumulator of
+	// the advance in flight: fanOut's parallel worker goroutines bracket
+	// their pushGroup CPU into it so the sidecar's economic
+	// advancement-abort budget sees their work (see
+	// cmd/sidecar/advance_abort.go MEASUREMENT). Installed/cleared by the
+	// engine around each clocked advance (engine.mu serializes advances;
+	// atomic.Pointer lets fanOut read it without s.mu).
+	advanceClock atomic.Pointer[procclock.Accumulator]
 
 	// Prev-tx state.
 	//

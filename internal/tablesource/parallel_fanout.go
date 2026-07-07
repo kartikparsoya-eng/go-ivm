@@ -58,6 +58,7 @@ import (
 	"strconv"
 	"sync"
 
+	"github.com/kartikparsoya-eng/go-ivm/internal/procclock"
 	"github.com/kartikparsoya-eng/go-ivm/ivm"
 )
 
@@ -91,6 +92,18 @@ func (s *Source) SetNextConnectGroup(group string) {
 	s.mu.Lock()
 	s.nextConnectGroup = group
 	s.mu.Unlock()
+}
+
+// SetAdvanceClock installs (nil: clears) the processing-clock accumulator
+// for the advance in flight. Called by the engine (under its own mu, which
+// serializes advances) before the first Push of a clocked advance and — via
+// defer, so the panic path clears too — after the last. fanOut's parallel
+// worker goroutines bracket their pushGroup CPU into it so the sidecar's
+// economic advancement-abort budget sees their work; the serial fallback
+// path needs no bracket (it runs on the coordinator thread, which the
+// sidecar registered itself).
+func (s *Source) SetAdvanceClock(clk *procclock.Accumulator) {
+	s.advanceClock.Store(clk)
 }
 
 // fanOut pushes one source-level change through every connection, in
@@ -155,6 +168,10 @@ func (s *Source) fanOut(change ivm.SourceChange, epoch int, conns []*connection)
 
 	ordered := make([][]ivm.Change, len(groups))
 	panics := make([]any, len(groups))
+	// Processing clock of the advance in flight (nil outside a clocked
+	// advance — Begin on a nil accumulator is a no-op). Loaded once: the
+	// engine installs/clears it around the whole advance, never mid-push.
+	clk := s.advanceClock.Load()
 	sem := make(chan struct{}, workers)
 	var wg sync.WaitGroup
 	for i := range groups {
@@ -168,6 +185,12 @@ func (s *Source) fanOut(change ivm.SourceChange, epoch int, conns []*connection)
 				}
 				<-sem
 			}()
+			// Bracket this worker's CPU into the advance's processing
+			// clock (economic-abort budget). Registered LAST so it
+			// publishes FIRST on unwind — a panicking group's partial
+			// work still lands before the recover above captures.
+			stopClock := clk.Begin()
+			defer stopClock()
 			ordered[idx] = pushGroup(groups[idx])
 		}(i)
 	}

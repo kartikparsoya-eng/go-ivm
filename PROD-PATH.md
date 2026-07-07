@@ -31,7 +31,7 @@ deployments).
 | `addQueriesStream` (pullMode) | PROD | ABI v3 credit-gated hydrate — the default (`pullHydrate=true`) |
 | `addQueriesStream` (push) | PROD (degrade) | non-rowMode / pull-refused degrade path |
 | `removeQuery` | PROD | |
-| `advanceToHeadStream` | PROD | drive mode; lazy changelog feed (D9); TS-economic abort + env budget both map to `rpcCodeAdvanceAborted` → `advancement-timeout` reset |
+| `advanceToHeadStream` | PROD | drive mode; lazy changelog feed (D9); TS-economic abort (budget = per-thread CPU via `internal/procclock`, the TS processing-lap analog — NOT wall; 2026-07-06 ART fix) + env budget both map to `rpcCodeAdvanceAborted` → `advancement-timeout` reset |
 | `destroy`, `ping`, `version` | PROD | |
 | `loadRows` | DELETED | memory-mode seeding removed; table mode reads from replica |
 | `advanceToHead` (unary) | DELETED | shadow-only caller set removed; `advanceToHeadStream` is the serving path |
@@ -52,7 +52,10 @@ deployments).
 | `GO_IVM_PARALLELISM` / `HYDRATE_LANES` / `HYDRATE_READERS` | 4 / 4 / 8 | PROD tuning |
 | `GO_IVM_HYDRATE_CHUNK_SIZE` / `ADVANCE_CHUNK_SIZE` / `CHUNK_SIZE` | 100 (Docker: 10000) | PROD tuning |
 | `GO_IVM_WARM_HYDRATE_POOL` | true | PROD |
-| `GO_IVM_ADVANCE_BUDGET_MS` | 60000 | PROD belt-and-braces WAL-pin bound; typed abort → `advancement-timeout` reset (never teardown) |
+| `GO_IVM_ADVANCE_BUDGET_MS` | 60000 | PROD belt-and-braces WAL-pin bound (WALL clock — the economics abort is CPU; this backstop covers waiting-not-working advances); typed abort → `advancement-timeout` reset (never teardown) |
+| `tablesource.PoolAcquireTimeout` | 5s | PROD bound on every read-pool conn acquire (reader-pool builds + init's presence probe). Exhaustion → bounded stall, then serial-hydrate fallback / fast init rpcError — never the pre-2026-07-06 hold-and-wait deadlock. Sustained saturation logs `replica read pool SATURATED` every 10s |
+| `GO_IVM_MAX_IDLE_CONNS` | = MAX_OPEN (self-clamped) | PROD keep-warm pools (2026-07-07): unset defaults to MAX_OPEN, explicit values clamp ≤ MAX_OPEN — idle-cap churn (47k reopens/soak) was a uniform steady-latency tax |
+| reader-pool build slots | 2/engine | PROD convoy guard (2026-07-07): ≤2 concurrent pool builds; warm builds never wait (serial fallback), cold builds wait ≤1s; `build-slot-skips` in PERF-POOL |
 | `GO_IVM_MAX_DIFF_CHANGES` | DELETED | unary advanceToHead removed |
 | `GO_IVM_PULL_IDLE_TIMEOUT_SEC`, `REAPER_*`, `CONN_MAX_IDLE_SEC`, `COLD_POOL_TTL_SEC`, `TAKE_STATE_CACHE_MAX`, `GOGC`/`GOMEMLIMIT` (+`GO_IVM_` twins), `PPROF_ADDR`, `OTEL_*`, `APP_ID`, `REPLICA_DB_PATH`/`ZERO_REPLICA_FILE` | — | PROD ops/tuning |
 | `GO_IVM_BENCH` | — | test-only (bench gates in `_test.go`) |

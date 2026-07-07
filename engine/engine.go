@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/kartikparsoya-eng/go-ivm/builder"
+	"github.com/kartikparsoya-eng/go-ivm/internal/procclock"
 	"github.com/kartikparsoya-eng/go-ivm/ivm"
 	"github.com/kartikparsoya-eng/go-ivm/sqlite"
 )
@@ -1415,7 +1416,32 @@ func (e *Engine) AdvanceStreamChunkedSeq(
 	if chunkSize <= 0 {
 		chunkSize = advanceChunkSize
 	}
-	return e.advanceStreamChunkedSeq(changes, chunkSize, onResult)
+	return e.advanceStreamChunkedSeq(changes, chunkSize, nil, onResult)
+}
+
+// advanceClockCarrier is implemented by sources whose push fan-out runs on
+// worker goroutines (tablesource.Source): the engine hands them the
+// advance's processing-clock accumulator so those worker threads' CPU is
+// bracketed into the same budget the sidecar's economic advancement-abort
+// evaluates (cmd/sidecar/advance_abort.go). ivm.MemorySource (engine-test
+// fixture, not on the production path) deliberately does not implement it.
+type advanceClockCarrier interface {
+	SetAdvanceClock(*procclock.Accumulator)
+}
+
+// AdvanceStreamChunkedSeqClocked is AdvanceStreamChunkedSeq with a
+// processing-clock accumulator threaded down to the sources' parallel
+// push-fanout workers. nil clk ≡ AdvanceStreamChunkedSeq (zero cost).
+func (e *Engine) AdvanceStreamChunkedSeqClocked(
+	changes iter.Seq2[SnapshotChange, error],
+	chunkSize int,
+	clk *procclock.Accumulator,
+	onResult func(AdvanceStreamPartial),
+) error {
+	if chunkSize <= 0 {
+		chunkSize = advanceChunkSize
+	}
+	return e.advanceStreamChunkedSeq(changes, chunkSize, clk, onResult)
 }
 
 func (e *Engine) advanceStreamChunked(
@@ -1429,12 +1455,13 @@ func (e *Engine) advanceStreamChunked(
 				return
 			}
 		}
-	}, chunkSize, onResult)
+	}, chunkSize, nil, onResult)
 }
 
 func (e *Engine) advanceStreamChunkedSeq(
 	changes iter.Seq2[SnapshotChange, error],
 	chunkSize int,
+	clk *procclock.Accumulator,
 	onResult func(AdvanceStreamPartial),
 ) error {
 	e.mu.Lock()
@@ -1445,6 +1472,27 @@ func (e *Engine) advanceStreamChunkedSeq(
 	// emit one empty Final frame, indistinguishable from a no-op advance.
 	if e.closed {
 		return ErrEngineClosed
+	}
+
+	// Snapshot sources once — COW + atomic.Pointer keeps the map consistent
+	// for the whole advance. Hand the processing clock to sources whose
+	// fan-out spawns worker goroutines, and clear it on ALL exits (defer
+	// runs on the panic path too) so this advance's clock can't leak into
+	// the next.
+	sources := e.sourcesView()
+	if clk != nil {
+		for _, src := range sources {
+			if c, ok := src.(advanceClockCarrier); ok {
+				c.SetAdvanceClock(clk)
+			}
+		}
+		defer func() {
+			for _, src := range sources {
+				if c, ok := src.(advanceClockCarrier); ok {
+					c.SetAdvanceClock(nil)
+				}
+			}
+		}()
 	}
 
 	var pending []RowChange
@@ -1565,9 +1613,7 @@ func (e *Engine) advanceStreamChunkedSeq(
 			}
 		}()
 
-		// Snapshot sources once; COW + atomic.Pointer guarantees this slice
-		// stays consistent for the duration of the advance loop.
-		sources := e.sourcesView()
+		// Sources snapshot hoisted above (shared with the clock plumbing).
 		for change, cerr := range changes {
 			if cerr != nil {
 				// Lazy cursor failed mid-diff (D9): stop consuming; the

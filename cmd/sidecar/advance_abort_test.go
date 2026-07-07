@@ -9,10 +9,14 @@ package main
 import (
 	"database/sql"
 	"regexp"
+	"runtime"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/kartikparsoya-eng/go-ivm/builder"
+	"github.com/kartikparsoya-eng/go-ivm/internal/procclock"
 	"github.com/kartikparsoya-eng/go-ivm/ivm"
 )
 
@@ -116,7 +120,7 @@ func TestAdvanceToHeadStream_SuppressAbort(t *testing.T) {
 	if resp.Error != nil {
 		t.Fatalf("suppressAbort advance failed: %+v", resp.Error)
 	}
-	assertAbortTestAdvanceCompleted(t, frames)
+	assertAbortTestAdvanceCompleted(t, frames, 20)
 }
 
 // TestAdvanceToHeadStream_GenerousBudgetNoAbort: with budget ≥ cost the
@@ -132,7 +136,7 @@ func TestAdvanceToHeadStream_GenerousBudgetNoAbort(t *testing.T) {
 	if resp.Error != nil {
 		t.Fatalf("generous-budget advance failed: %+v", resp.Error)
 	}
-	assertAbortTestAdvanceCompleted(t, frames)
+	assertAbortTestAdvanceCompleted(t, frames, 20)
 }
 
 // TestAdvanceToHeadStream_AbortDisarmedWhenParamAbsent pins old-client
@@ -153,10 +157,10 @@ func TestAdvanceToHeadStream_AbortDisarmedWhenParamAbsent(t *testing.T) {
 	if resp.Error != nil {
 		t.Fatalf("param-absent advance failed: %+v", resp.Error)
 	}
-	assertAbortTestAdvanceCompleted(t, frames)
+	assertAbortTestAdvanceCompleted(t, frames, 20)
 }
 
-func assertAbortTestAdvanceCompleted(t *testing.T, frames *[]advanceToHeadStreamPartial) {
+func assertAbortTestAdvanceCompleted(t *testing.T, frames *[]advanceToHeadStreamPartial, wantChanges int) {
 	t.Helper()
 	finals := 0
 	for _, fr := range *frames {
@@ -165,8 +169,8 @@ func assertAbortTestAdvanceCompleted(t *testing.T, frames *[]advanceToHeadStream
 			if fr.Version != "0000000002" {
 				t.Fatalf("final version = %q, want 0000000002", fr.Version)
 			}
-			if fr.NumChanges != 20 {
-				t.Fatalf("numChanges = %d, want 20", fr.NumChanges)
+			if fr.NumChanges != wantChanges {
+				t.Fatalf("numChanges = %d, want %d", fr.NumChanges, wantChanges)
 			}
 		}
 	}
@@ -200,12 +204,11 @@ func TestAdvanceToHeadStream_CleanRetryableOnSnapshotterFailure(t *testing.T) {
 
 // TestAdvanceAbortMessage_TSByteShape pins byte-identity of the rendered
 // message against the exact output of TS's template literal
-// (pipeline-driver.ts:6062-6066) for representative values, including the
+// (pipeline-driver.ts:2373-2375) for representative values, including the
 // JS number rendering (no trailing ".0" on integral floats, shortest
 // round-trip decimals otherwise).
 func TestAdvanceAbortMessage_TSByteShape(t *testing.T) {
-	a := &advanceAbort{armed: true, totalHydrationTimeMs: 120.5, numChanges: 30000, pos: 1499}
-	got := (&advanceAbortedError{msg: renderAdvanceAbortMessage(a.pos, a.numChanges, 234.56789, a.totalHydrationTimeMs)}).Error()
+	got := (&advanceAbortedError{msg: renderAdvanceAbortMessage(1499, 30000, 234.56789, 120.5)}).Error()
 	want := "Advancement exceeded timeout at 1499 of 30000 changes after 234.56789 ms. " +
 		"Advancement time limited based on total hydration time of 120.5 ms."
 	if got != want {
@@ -235,4 +238,143 @@ func TestPanicMapping_AdvanceAborted(t *testing.T) {
 	if msg := panicErrorMessage("boom"); msg != "panic: boom" {
 		t.Fatalf("generic panic message = %q, want prefixed", msg)
 	}
+}
+
+// TestAdvanceAbortFormula_InjectedClock pins the ported condition itself
+// (previously covered only end-to-end) with a deterministic elapsed source,
+// at the default 50ms floor.
+func TestAdvanceAbortFormula_InjectedClock(t *testing.T) {
+	cases := []struct {
+		name    string
+		elapsed float64
+		hyd     float64
+		pos     int
+		num     int
+		abort   bool
+	}{
+		{"under floor guards tiny budgets", 49, 10, 0, 10, false},
+		{"over floor and over budget", 51, 10, 9, 10, true},
+		{"over floor, under half budget", 60, 200, 0, 10, false},
+		{"half budget spent, behind schedule", 120, 200, 5, 10, true},
+		{"half budget spent, ahead of schedule", 120, 200, 6, 10, false},
+		{"full budget spent, ahead of schedule", 201, 200, 9, 10, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a := &advanceAbort{
+				armed:                true,
+				totalHydrationTimeMs: tc.hyd,
+				elapsedMsForTest:     func() float64 { return tc.elapsed },
+			}
+			a.setNumChanges(tc.num)
+			a.pos.Store(int64(tc.pos))
+			err := a.check()
+			if tc.abort && err == nil {
+				t.Fatalf("elapsed=%v hyd=%v pos=%d/%d: want abort, got nil",
+					tc.elapsed, tc.hyd, tc.pos, tc.num)
+			}
+			if !tc.abort && err != nil {
+				t.Fatalf("elapsed=%v hyd=%v pos=%d/%d: unexpected abort: %v",
+					tc.elapsed, tc.hyd, tc.pos, tc.num, err)
+			}
+		})
+	}
+	// Unarmed zero value: every check passes.
+	if err := (&advanceAbort{}).check(); err != nil {
+		t.Fatalf("unarmed check aborted: %v", err)
+	}
+}
+
+// spinThreadCPU burns the calling thread's CPU until its thread-CPU clock
+// advances by d. Caller must be locked to its OS thread (Begin does this).
+// Measuring the spin against the same clock the abort reads makes the
+// wall-vs-CPU pin below deterministic.
+func spinThreadCPU(d time.Duration) {
+	start := procclock.ThreadCPUNS()
+	if start < 0 {
+		return
+	}
+	for procclock.ThreadCPUNS()-start < int64(d) { //nolint:revive // hot loop
+	}
+}
+
+// TestAdvanceAbortMeasurement_WallAbortsCPUDoesNot is the measurement pin
+// for the 2026-07-06 ART finding: an advance that did ~2ms of real work but
+// sat descheduled for 80ms must NOT abort under the production CPU clock —
+// while the same scenario measured by wall (the pre-fix semantics, driven
+// through the test seam) provably WOULD have. Both halves are deterministic:
+// the spin is measured by the same clock the abort reads, and the sleep is
+// pure wall.
+func TestAdvanceAbortMeasurement_WallAbortsCPUDoesNot(t *testing.T) {
+	savedMin := minAdvancementTimeLimitMs
+	minAdvancementTimeLimitMs = 10 // floor below the 80ms stall, above the 2ms work
+	defer func() { minAdvancementTimeLimitMs = savedMin }()
+
+	// Production semantics: per-thread CPU. 2ms work + 80ms stall < 10ms floor.
+	a := &advanceAbort{armed: true, totalHydrationTimeMs: 30, clk: &procclock.Accumulator{}}
+	a.setNumChanges(4)
+	stop := a.beginProcessing()
+	spinThreadCPU(2 * time.Millisecond)
+	time.Sleep(80 * time.Millisecond) // scheduler-queueing / GC-wait analog
+	if err := a.check(); err != nil {
+		t.Fatalf("CPU-measured abort fired on a stalled-but-idle advance: %v", err)
+	}
+	stop()
+
+	// Pre-fix semantics (wall from arm time) via the seam: the same 80ms
+	// stall spends the whole budget and must abort — proving the scenario
+	// discriminates and the old clock was the storm.
+	start := time.Now()
+	w := &advanceAbort{
+		armed:                true,
+		totalHydrationTimeMs: 30,
+		elapsedMsForTest: func() float64 {
+			return float64(time.Since(start)) / float64(time.Millisecond)
+		},
+	}
+	w.setNumChanges(4)
+	time.Sleep(80 * time.Millisecond)
+	if err := w.check(); err == nil {
+		t.Fatal("wall-measured control did not abort — the scenario no longer discriminates")
+	}
+}
+
+// TestAdvanceToHeadStream_NoAbortUnderSchedulerContention is the end-to-end
+// regression pin for the ART storm: 8 workers × concurrent CG advances
+// inflated WALL past the 50ms floor while each advance did ~15ms of work —
+// 210 false aborts → 49 resets → 5 CG teardowns in ~90s. Here spinners
+// saturate the scheduler while a trivial 4-change advance runs armed with a
+// 1ms hydration budget: its CPU is far under the (default) 50ms floor, so it
+// must complete. Under the old wall clock this same shape aborted
+// load-dependently.
+func TestAdvanceToHeadStream_NoAbortUnderSchedulerContention(t *testing.T) {
+	srv, epoch, db := abortTestSetup(t, 4)
+	if !beginConcurrentSupported(t, db) {
+		t.Skip("completing the apply requires BEGIN CONCURRENT (wal2/libsqlite3 build)")
+	}
+
+	stopSpin := make(chan struct{})
+	var spinners sync.WaitGroup
+	for i := 0; i < 3*runtime.GOMAXPROCS(0); i++ {
+		spinners.Add(1)
+		go func() {
+			defer spinners.Done()
+			for {
+				select {
+				case <-stopSpin:
+					return
+				default:
+				}
+			}
+		}()
+	}
+	defer func() { close(stopSpin); spinners.Wait() }()
+
+	total := 1.0 // 1ms budget: the 50ms floor is the only guard left
+	w, frames := collectAdvanceToHeadStreamFrames()
+	resp := srv.handleStreamWithRecover(advanceToHeadStreamReq(t, epoch, &total, false), w, srv.handleAdvanceToHeadStream)
+	if resp.Error != nil {
+		t.Fatalf("advance failed under scheduler contention (wall leaking into the processing budget?): %+v", resp.Error)
+	}
+	assertAbortTestAdvanceCompleted(t, frames, 4)
 }

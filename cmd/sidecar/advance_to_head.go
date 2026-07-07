@@ -597,8 +597,10 @@ func (s *Server) handleAdvanceToHeadStream(req RPCRequest, streamW streamWriter)
 	budgetDeadline, budgetOn := advanceDeadline()
 
 	// TS economic abort (advance_abort.go): armed only when the request
-	// carries totalHydrationTimeMs — the production drive path. Clock starts
-	// here, mirroring TS's timer covering the whole advance.
+	// carries totalHydrationTimeMs — the production drive path. This only
+	// captures the formula params; the processing clock arms AFTER the
+	// leapfrog below (TS parity — its advance timer starts once the diff
+	// exists, view-syncer.ts:2544, and measures processing laps, not wall).
 	abort := newAdvanceAbort(p.TotalHydrationTimeMs, p.SuppressAbort)
 
 	// First advance ends the cold-start hydrate window; drop the reader pool
@@ -616,6 +618,17 @@ func (s *Server) handleAdvanceToHeadStream(req RPCRequest, streamW streamWriter)
 		return rpcError(req.ID, rpcCodeAdvanceCleanRetryable,
 			"advanceToHeadStream advance: "+err.Error())
 	}
+	// Arm the processing clock now that the diff exists: registers this
+	// goroutine's OS thread with the abort's CPU accumulator. The WAL
+	// leapfrog's lock/IO waits above are NOT processing — TS's timer
+	// starts after its snapshotter advanced, and counting wall waits was
+	// exactly what turned pod load into false-abort reset storms (see the
+	// MEASUREMENT note in advance_abort.go). Fanout worker threads bracket
+	// themselves via the engine plumbing (AdvanceStreamChunkedSeqClocked →
+	// tablesource.SetAdvanceClock).
+	stopProcessingClock := abort.beginProcessing()
+	defer stopProcessingClock()
+
 	version := diff.Curr().Version()
 
 	// After the leapfrog the sources (sticky-bound to the old curr) ARE bound to
@@ -668,10 +681,11 @@ func (s *Server) handleAdvanceToHeadStream(req RPCRequest, streamW streamWriter)
 			}, nil) {
 				return errSeqConsumerStopped
 			}
-			// TS increments pos in the per-change finally (:5941): by the
+			// TS increments pos in the per-change finally (:2257): by the
 			// time yield returns, the engine has fully processed this change
-			// (the lazy feed runs inside the engine's range).
-			abort.pos++
+			// (the lazy feed runs inside the engine's range). Atomic: sink-
+			// site checks read pos from parallel fanout goroutines.
+			abort.pos.Add(1)
 			return nil
 		})
 		if err != nil && !errors.Is(err, errSeqConsumerStopped) {
@@ -730,7 +744,7 @@ func (s *Server) handleAdvanceToHeadStream(req RPCRequest, streamW streamWriter)
 	// as kind-1 frames on the same ordered queue; "done" follows via the
 	// pipe (see rowplane.go's ordering invariant).
 	if rp := newRowPlane(s, req.ID, p.RowMode); rp != nil {
-		streamErr := group.eng.AdvanceStreamChunkedSeq(changesSeq, 1, func(r engine.AdvanceStreamPartial) {
+		streamErr := group.eng.AdvanceStreamChunkedSeqClocked(changesSeq, 1, abort.clock(), func(r engine.AdvanceStreamPartial) {
 			// Per-partial budget checkpoint: a panic here escapes
 			// AdvanceStreamChunkedSeq cleanly (engine stays reusable — see
 			// TestAdvanceStream_PanickingSink_NoDeadlockAndEngineReusable)
@@ -756,7 +770,7 @@ func (s *Server) handleAdvanceToHeadStream(req RPCRequest, streamW streamWriter)
 		return finishStream(streamErr)
 	}
 
-	streamErr := group.eng.AdvanceStreamChunkedSeq(changesSeq, 0, func(r engine.AdvanceStreamPartial) {
+	streamErr := group.eng.AdvanceStreamChunkedSeqClocked(changesSeq, 0, abort.clock(), func(r engine.AdvanceStreamPartial) {
 		checkAdvanceBudget(budgetDeadline, budgetOn, "apply", cgID)
 		if aerr := abort.check(); aerr != nil {
 			panic(aerr) // TS checkpoint 2 — see the rowMode branch
