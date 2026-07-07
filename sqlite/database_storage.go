@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/kartikparsoya-eng/go-ivm/ivm"
 
@@ -47,6 +48,15 @@ const createStorageTable = `
 `
 
 const defaultCommitInterval = 5000
+
+// defaultCompactionThresholdBytes mirrors TS defaultOptions
+// .compactionThresholdBytes (database-storage.ts:39): Destroy only bothers
+// running incremental_vacuum when at least this many bytes are freeable.
+const defaultCompactionThresholdBytes = 50 * 1024 * 1024
+
+// autoVacuumIncremental is PRAGMA auto_vacuum's INCREMENTAL mode (TS
+// db.ts:14). https://www.sqlite.org/pragma.html#pragma_auto_vacuum
+const autoVacuumIncremental = 2
 
 // defaultTakeStateCacheMax bounds the per-Take in-memory take-state LRU when
 // no operator override is set. The cache key varies over a Take's distinct
@@ -84,6 +94,13 @@ type DatabaseStorage struct {
 	numWrites      int
 	tx             *sql.Tx
 
+	// pageSize is read once at open (TS: db.ts:47-50) and drives compact()'s
+	// freeable-bytes math.
+	pageSize int64
+	// compactionThresholdBytes gates Destroy-time compaction; defaults to
+	// defaultCompactionThresholdBytes (TS: database-storage.ts:37-40).
+	compactionThresholdBytes int64
+
 	// Prepared statements (on current tx)
 	stmtGet  *sql.Stmt
 	stmtSet  *sql.Stmt
@@ -100,12 +117,17 @@ func NewDatabaseStorage(path string) (*DatabaseStorage, error) {
 	// Single connection — matches TS single-writer model, avoids SQLITE_BUSY
 	db.SetMaxOpenConns(1)
 
-	// Configure for ephemeral, single-writer usage (matching TS pragmas)
+	// Configure for ephemeral, single-writer usage (matching TS pragmas,
+	// database-storage.ts:55-59). auto_vacuum = INCREMENTAL must be set
+	// before the first table is created to take effect on a fresh file; on a
+	// pre-existing non-empty file it is a no-op and compact() warns-and-skips
+	// via the auto_vacuum mode check, exactly like TS (db.ts:94-103).
 	pragmas := []string{
 		"PRAGMA locking_mode = EXCLUSIVE",
 		"PRAGMA foreign_keys = OFF",
 		"PRAGMA journal_mode = OFF",
 		"PRAGMA synchronous = OFF",
+		"PRAGMA auto_vacuum = INCREMENTAL",
 	}
 	for _, p := range pragmas {
 		if _, err := db.Exec(p); err != nil {
@@ -114,14 +136,24 @@ func NewDatabaseStorage(path string) (*DatabaseStorage, error) {
 		}
 	}
 
+	// Read the page size once for compact()'s byte math (TS: db.ts:47-50
+	// reads page_size at Database construction).
+	var pageSize int64
+	if err := db.QueryRow("PRAGMA page_size").Scan(&pageSize); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("pragma page_size: %w", err)
+	}
+
 	if _, err := db.Exec(createStorageTable); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("create storage table: %w", err)
 	}
 
 	ds := &DatabaseStorage{
-		db:             db,
-		commitInterval: defaultCommitInterval,
+		db:                       db,
+		commitInterval:           defaultCommitInterval,
+		pageSize:                 pageSize,
+		compactionThresholdBytes: defaultCompactionThresholdBytes,
 	}
 	if err := ds.beginTx(); err != nil {
 		db.Close()
@@ -289,7 +321,9 @@ func (cgs *ClientGroupStorage) CreateTakeStorage() ivm.TakeStorage {
 	return &SQLiteTakeStorage{storage: cgs.CreateStorage(), maxStates: takeStateCacheMax}
 }
 
-// Destroy deletes all storage for this client group.
+// Destroy deletes all storage for this client group, then reclaims freed
+// pages once enough have accumulated (TS: database-storage.ts:164-169 —
+// clear, checkpoint, compact).
 func (cgs *ClientGroupStorage) Destroy() {
 	cgs.ds.mu.Lock()
 	defer cgs.ds.mu.Unlock()
@@ -297,6 +331,59 @@ func (cgs *ClientGroupStorage) Destroy() {
 		panic(storageError("storage-cg-destroy", err))
 	}
 	cgs.ds.checkpoint()
+	cgs.ds.compact(cgs.ds.compactionThresholdBytes)
+}
+
+// compact ports TS Database.compact (db.ts:82-121): when at least
+// freeableBytesThreshold bytes sit on the freelist, run incremental_vacuum
+// to return them to the OS. Failures panic via storageError — TS's pragma
+// calls throw on the same errors and the view-syncer tears the client group
+// down; skipping silently would let the file grow without bound.
+//
+// MUST be called with ds.mu held and the rolling tx open: with
+// MaxOpenConns(1) the tx owns the only connection, so the pragmas run on it
+// — the same single-connection-with-open-BEGIN state better-sqlite3 runs
+// them in (TS destroy calls compact right after #checkpoint's BEGIN).
+func (ds *DatabaseStorage) compact(freeableBytesThreshold int64) {
+	var freelistCount int64
+	if err := ds.tx.QueryRow("PRAGMA freelist_count").Scan(&freelistCount); err != nil {
+		panic(storageError("storage-compact-freelist", err))
+	}
+	freeable := freelistCount * ds.pageSize
+	if freeable < freeableBytesThreshold {
+		// TS logs this at debug level only (db.ts:88-93); stay quiet.
+		return
+	}
+	var autoVacuumMode int64
+	if err := ds.tx.QueryRow("PRAGMA auto_vacuum").Scan(&autoVacuumMode); err != nil {
+		panic(storageError("storage-compact-autovacuum", err))
+	}
+	if autoVacuumMode != autoVacuumIncremental {
+		// TS: db.ts:94-103 — e.g. a storage file created before auto_vacuum
+		// was enabled; the open-time pragma is a no-op on a pre-existing
+		// non-empty database, so incremental_vacuum would free nothing.
+		fmt.Fprintf(os.Stderr,
+			"[GO-IVM] cannot compact %.2f MB of operator storage: AUTO_VACUUM mode is %d\n",
+			float64(freeable)/(1024*1024), autoVacuumMode)
+		return
+	}
+	start := time.Now()
+	var pagesBefore int64
+	if err := ds.tx.QueryRow("PRAGMA page_count").Scan(&pagesBefore); err != nil {
+		panic(storageError("storage-compact-pagecount-before", err))
+	}
+	if _, err := ds.tx.Exec("PRAGMA incremental_vacuum"); err != nil {
+		panic(storageError("storage-compact-vacuum", err))
+	}
+	var pagesAfter int64
+	if err := ds.tx.QueryRow("PRAGMA page_count").Scan(&pagesAfter); err != nil {
+		panic(storageError("storage-compact-pagecount-after", err))
+	}
+	fmt.Fprintf(os.Stderr,
+		"[GO-IVM] compacted operator storage from %.2f MB to %.2f MB (%v)\n",
+		float64(pagesBefore*ds.pageSize)/(1024*1024),
+		float64(pagesAfter*ds.pageSize)/(1024*1024),
+		time.Since(start).Round(time.Millisecond))
 }
 
 // OperatorStorage is the generic KV storage for a single operator.

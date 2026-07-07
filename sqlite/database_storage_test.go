@@ -3,6 +3,7 @@ package sqlite
 import (
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/kartikparsoya-eng/go-ivm/ivm"
@@ -227,5 +228,94 @@ func TestReadTakeStateCacheMax(t *testing.T) {
 				t.Fatalf("got %d, want %d", got, tc.want)
 			}
 		})
+	}
+}
+
+// pageCount reads PRAGMA page_count on the rolling tx (the single
+// connection); test-only helper for the compaction assertions.
+func pageCount(t *testing.T, ds *DatabaseStorage) int64 {
+	t.Helper()
+	var n int64
+	if err := ds.tx.QueryRow("PRAGMA page_count").Scan(&n); err != nil {
+		t.Fatalf("PRAGMA page_count: %v", err)
+	}
+	return n
+}
+
+// Fresh storage databases must be created with auto_vacuum=INCREMENTAL
+// (TS: database-storage.ts:59) or freed pages can never be returned to the
+// OS by Destroy-time compaction. Pre-fix this read 0 (NONE).
+func TestDatabaseStorageAutoVacuumIncremental(t *testing.T) {
+	ds, err := NewDatabaseStorage(t.TempDir() + "/av.db")
+	if err != nil {
+		t.Fatalf("NewDatabaseStorage: %v", err)
+	}
+	defer ds.Close()
+
+	var mode int64
+	if err := ds.tx.QueryRow("PRAGMA auto_vacuum").Scan(&mode); err != nil {
+		t.Fatalf("PRAGMA auto_vacuum: %v", err)
+	}
+	if mode != autoVacuumIncremental {
+		t.Fatalf("auto_vacuum mode: got %d, want %d (INCREMENTAL)", mode, autoVacuumIncremental)
+	}
+}
+
+// Destroy must reclaim the deleted client group's pages once the freeable
+// bytes exceed the compaction threshold (TS: database-storage.ts:164-169 +
+// db.ts:82-121). Pre-fix the storage file never shrank: without
+// auto_vacuum=INCREMENTAL and the incremental_vacuum call, deleted pages sat
+// on the freelist for the life of the worker.
+func TestDatabaseStorageDestroyCompacts(t *testing.T) {
+	ds, err := NewDatabaseStorage(t.TempDir() + "/compact.db")
+	if err != nil {
+		t.Fatalf("NewDatabaseStorage: %v", err)
+	}
+	defer ds.Close()
+	// Production threshold is 50MB (defaultCompactionThresholdBytes); drop it
+	// to one page so a ~1MB test payload triggers compaction — the same knob
+	// TS injects via DatabaseStorage.create's options parameter.
+	ds.compactionThresholdBytes = ds.pageSize
+
+	cgs := ds.CreateClientGroupStorage("cg-compact")
+	store := cgs.CreateStorage()
+	val := []byte(`"` + strings.Repeat("x", 1024) + `"`)
+	for i := 0; i < 1000; i++ {
+		store.Set(fmt.Sprintf("k%04d", i), val)
+	}
+
+	before := pageCount(t, ds)
+	cgs.Destroy()
+	after := pageCount(t, ds)
+
+	if after >= before {
+		t.Fatalf("Destroy did not compact: page_count before=%d after=%d", before, after)
+	}
+}
+
+// Below the threshold Destroy must NOT vacuum — the gate is the whole point
+// of compactionThresholdBytes (TS: db.ts:87-93): tiny groups churn constantly
+// and re-truncating the file for a few KB each time would be pure overhead.
+func TestDatabaseStorageDestroyBelowThresholdSkipsCompaction(t *testing.T) {
+	ds, err := NewDatabaseStorage(t.TempDir() + "/nocompact.db")
+	if err != nil {
+		t.Fatalf("NewDatabaseStorage: %v", err)
+	}
+	defer ds.Close()
+	// Default 50MB threshold stays in force; ~1MB of freeable pages is
+	// far below it.
+	cgs := ds.CreateClientGroupStorage("cg-small")
+	store := cgs.CreateStorage()
+	val := []byte(`"` + strings.Repeat("x", 1024) + `"`)
+	for i := 0; i < 1000; i++ {
+		store.Set(fmt.Sprintf("k%04d", i), val)
+	}
+
+	before := pageCount(t, ds)
+	cgs.Destroy()
+	after := pageCount(t, ds)
+
+	if after != before {
+		t.Fatalf("sub-threshold Destroy should leave pages on the freelist: before=%d after=%d", before, after)
 	}
 }
