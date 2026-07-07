@@ -158,8 +158,6 @@ func (t *Take) initialFetch(req FetchRequest) iter.Seq[Node] {
 
 	takeStateKey := GetTakeStateKey(t.partitionKey, constraintToRow(req.Constraint))
 
-	req.Limit = t.limit
-
 	return func(yield func(Node) bool) {
 		var size int
 		var bound Row

@@ -4,7 +4,6 @@ import (
 	"database/sql"
 	"fmt"
 	"path/filepath"
-	"slices"
 	"testing"
 
 	"github.com/kartikparsoya-eng/go-ivm/ivm"
@@ -212,20 +211,31 @@ func BenchmarkSourceFetchRepeated(b *testing.B) {
 
 	// Sweep fetch sizes: the prepared-statement cache eliminates a CONSTANT
 	// per-fetch sqlite3_prepare_v2, so its relative win grows as the per-row
-	// work shrinks. limit=1 models the high-frequency small-advance path;
-	// limit=100 the hydrate/dashboard path. req.Limit early-breaks the Scan
-	// loop Go-side (source.go), so a small limit genuinely scans fewer rows.
+	// work shrinks. n=1 models the high-frequency small-advance path; n=100
+	// the hydrate/dashboard path. The leaf streams lazily (iter.Seq), so a
+	// consumer that stops after n rows genuinely scans fewer rows — the same
+	// early termination TS gets from its lazy generators (FetchRequest.Limit
+	// was deleted; laziness IS the mechanism).
+	pullN := func(n int) int {
+		count := 0
+		for range in.Fetch(ivm.FetchRequest{}) {
+			count++
+			if count >= n {
+				break
+			}
+		}
+		return count
+	}
 	for _, limit := range []int{1, 10, 100} {
-		req := ivm.FetchRequest{Limit: limit}
 		// Establish the prev tx + warm pages + (for the cached variant) prime
 		// the statement cache so we measure steady state, not first-touch.
-		if got := len(slices.Collect(in.Fetch(req))); got != limit {
+		if got := pullN(limit); got != limit {
 			b.Fatalf("warm fetch got %d rows, want %d", got, limit)
 		}
 		b.Run(fmt.Sprintf("limit=%d", limit), func(b *testing.B) {
 			b.ReportAllocs()
 			for i := 0; i < b.N; i++ {
-				if got := len(slices.Collect(in.Fetch(req))); got != limit {
+				if got := pullN(limit); got != limit {
 					b.Fatalf("fetch got %d rows, want %d", got, limit)
 				}
 			}

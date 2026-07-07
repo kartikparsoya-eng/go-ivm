@@ -405,45 +405,42 @@ func TestFetchFilterPredicate(t *testing.T) {
 	}
 }
 
-// TestFetchLimitPushdown locks the FetchRequest.Limit contract that powers the
-// Take O(table)→O(limit) hydrate optimization: the source stops after Limit
-// rows in the request's effective order, counted AFTER its own filter predicate
-// — never under-fetching (a filtered row must not consume the limit budget) and
-// never over-fetching (Limit larger than the result set returns the full set).
-func TestFetchLimitPushdown(t *testing.T) {
+// TestFetchLazyEarlyStop pins the lazy-leaf contract that replaced
+// FetchRequest.Limit (deleted — TS has no analog; its lazy generators get
+// early termination for free, and so does iter.Seq): a consumer that stops
+// pulling stops the scan. The filtered row ordering also pins that a
+// predicate-failing row is skipped without ending the stream — the first
+// PULLED row must be the first post-predicate row, exactly as a full
+// collect would order them.
+func TestFetchLazyEarlyStop(t *testing.T) {
 	src, db := newUserSource(t)
 	defer db.Close()
 
-	ids := func(nodes []ivm.Node) []float64 {
-		out := make([]float64, len(nodes))
-		for i, n := range nodes {
-			out[i], _ = n.Row["id"].(float64)
-		}
-		return out
-	}
-
-	// score<=80 passes id=2(80) and id=3(70); id=1(90) is filtered. So the
-	// filtered id=1 sits FIRST in id order — a correct limit must skip it
-	// without spending budget, returning id=2 as the first row.
+	// score<=80 passes id=2(80) and id=3(70); id=1(90) is filtered and sits
+	// FIRST in id order — the stream must skip it and yield id=2 first.
 	pred := func(r ivm.Row) bool { s, _ := r["score"].(float64); return s <= 80 }
 	in := src.Connect(nil, nil, pred, nil)
 
-	cases := []struct {
-		name string
-		req  ivm.FetchRequest
-		want []float64
-	}{
-		{"limit1_skips_filtered_first_row", ivm.FetchRequest{Limit: 1}, []float64{2}},
-		{"limit2_full_post_predicate_set", ivm.FetchRequest{Limit: 2}, []float64{2, 3}},
-		{"limit_over_set_no_overfetch", ivm.FetchRequest{Limit: 99}, []float64{2, 3}},
-		{"limit0_unlimited", ivm.FetchRequest{Limit: 0}, []float64{2, 3}},
-		{"reverse_limit1_first_in_desc_order", ivm.FetchRequest{Reverse: true, Limit: 1}, []float64{3}},
+	// Pull exactly one row, then stop — the Take(limit=1) consumption shape.
+	var got []float64
+	for n := range in.Fetch(ivm.FetchRequest{}) {
+		id, _ := n.Row["id"].(float64)
+		got = append(got, id)
+		break
 	}
-	for _, c := range cases {
-		got := ids(slices.Collect(in.Fetch(c.req)))
-		if !reflect.DeepEqual(got, c.want) {
-			t.Errorf("%s: Fetch(%+v) ids = %v, want %v", c.name, c.req, got, c.want)
-		}
+	if !reflect.DeepEqual(got, []float64{2}) {
+		t.Errorf("first pulled id = %v, want [2] (filtered row skipped, stream lazy)", got)
+	}
+
+	// The stream must be restartable after an early stop (cursor released):
+	// a fresh full collect returns the complete post-predicate set.
+	var all []float64
+	for n := range in.Fetch(ivm.FetchRequest{}) {
+		id, _ := n.Row["id"].(float64)
+		all = append(all, id)
+	}
+	if !reflect.DeepEqual(all, []float64{2, 3}) {
+		t.Errorf("full fetch after early stop = %v, want [2 3]", all)
 	}
 }
 

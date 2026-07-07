@@ -108,13 +108,6 @@ func (s *Skip) Fetch(req FetchRequest) iter.Seq[Node] {
 		Start:            start,
 		Reverse:          req.Reverse,
 	}
-	// Forward Limit in the forward case only. In reverse, Skip's
-	// shouldBePresent post-filter can discard rows, so forwarding
-	// Limit to Source risks under-fetch (Source returns N rows, Skip
-	// discards some, Take sets takeState with fewer than N — wrong bound).
-	if !req.Reverse {
-		newReq.Limit = req.Limit
-	}
 
 	if !req.Reverse {
 		return s.input.Fetch(newReq)

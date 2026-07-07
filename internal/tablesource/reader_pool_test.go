@@ -175,7 +175,6 @@ func TestSourceFetch_PoolEqualsSingleConn(t *testing.T) {
 		{name: "sorted_score_desc", sort: ivm.Ordering{{"score", "desc"}, {"id", "asc"}}},
 		{name: "reverse", req: ivm.FetchRequest{Reverse: true}},
 		{name: "filtered_active", pred: func(r ivm.Row) bool { return asInt(r["active"]) == 1 }},
-		{name: "limited", sort: ivm.Ordering{{"score", "desc"}, {"id", "asc"}}, req: ivm.FetchRequest{Limit: 2}},
 	}
 
 	for _, c := range cases {

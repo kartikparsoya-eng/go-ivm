@@ -18,10 +18,6 @@ import (
 )
 
 func TestFetchDuringPushStream_PoisonOverlayReleasesMutex(t *testing.T) {
-	prev := LazyAdvance
-	LazyAdvance = true
-	t.Cleanup(func() { LazyAdvance = prev })
-
 	path := seedReplica(t)
 	db, err := Open(path, OpenOptions{})
 	if err != nil {

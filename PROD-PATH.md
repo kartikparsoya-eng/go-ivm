@@ -46,9 +46,9 @@ deployments).
 | Knob | Default | Status |
 |---|---|---|
 | `GO_IVM_SOURCE_MODE` | DELETED | table mode is the only mode; env knob removed |
-| `GO_IVM_LAZY_ADVANCE` | true | PROD lazy cursor feed; `false` = eager fallback (NON-DEFAULT marker at startup) |
+| `GO_IVM_LAZY_ADVANCE` | DELETED (2026-07-07) | The lazy leaf (`fetchDuringPushStream`) is the unconditional advance-time dispatch; the eager escape hatch was removed together with `FetchRequest.Limit` — early termination is propagated pull-stop, exactly TS's lazy-generator semantics |
 | `GO_IVM_PARALLEL_ADVANCE` | true | PROD parallel fanout; `false` = serial fallback (marker) |
-| `GO_IVM_LAZY_HYDRATE` | false | Phase-2 experiment (lazy operator streaming, Cmax>1); ON = marker. The PROD hydrate is the eager/compat-shim path with Cmax=1 |
+| `GO_IVM_LAZY_HYDRATE` | DELETED (2026-07-07) | Gated only the dead `computeCmax` (never called); the operator tree streams lazily end-to-end and pool sizing always used `ConservativeHydrateCmax` |
 | `GO_IVM_PARALLELISM` / `HYDRATE_LANES` / `HYDRATE_READERS` | 4 / 4 / 8 | PROD tuning |
 | `GO_IVM_HYDRATE_CHUNK_SIZE` / `ADVANCE_CHUNK_SIZE` / `CHUNK_SIZE` | 100 (Docker: 10000) | PROD tuning |
 | `GO_IVM_WARM_HYDRATE_POOL` | true | PROD |

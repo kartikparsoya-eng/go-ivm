@@ -223,12 +223,6 @@ func (fj *FlippedJoin) fetchBatched(req FetchRequest, childNodes []Node) iter.Se
 	// FlippedJoins each contribute one entry, so the source ANDs them all
 	// (e.g. `assigneeID IN (…) AND creatorID IN (…)`).
 	parentReq := req
-	// Limit is a Go-only extension TS has no analog for; the pre-batched
-	// code never forwarded it to the parent, and it would be UNSAFE here:
-	// the canonical-key miss filter and the in-progress-child overlay below
-	// can drop fetched parents, so a source-side truncation could
-	// under-fetch. Strip it.
-	parentReq.Limit = 0
 	incoming := req.MultiConstraints
 
 	chunkSize := int(multiConstraintChunkSize.Load())

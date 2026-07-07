@@ -41,7 +41,6 @@ import (
 	"errors"
 	"fmt"
 	"iter"
-	"os"
 	"slices"
 	"strings"
 	"sync"
@@ -53,21 +52,6 @@ import (
 	"github.com/kartikparsoya-eng/go-ivm/ivm"
 	"github.com/kartikparsoya-eng/go-ivm/sqlite"
 )
-
-// LazyAdvance gates the streaming advance-time leaf fetch
-// (fetchDuringPushStream): when true, a Fetch issued while a Push is fanning
-// out yields rows from a live SQLite cursor on the prev-tx conn instead of
-// materializing the whole result set first — matching TS's lazy
-// statement.iterate() leaf (zqlite table-source.ts #fetch), whose cursor
-// nesting semantics SQLite natively supports on one connection (verified:
-// nested cursors on a single conn holding an uncommitted write interleave
-// correctly). Production default ON — the streaming leaf fetch is the
-// deployed path (parity with the eager fetch proven by
-// TestLazyAdvanceFetchParity + engine/lazy_advance_parity_test.go).
-// Exported as a var (not re-read from env per call) so engine-level tests
-// can toggle it. GO_IVM_LAZY_ADVANCE=false reverts to the eager
-// materialized fetchForConn path.
-var LazyAdvance = os.Getenv("GO_IVM_LAZY_ADVANCE") != "false"
 
 // Source is the read-only TableSource leaf. One instance per (CG, table).
 type Source struct {
@@ -1258,9 +1242,6 @@ type sourceInput struct {
 
 func (i *sourceInput) GetSchema() *ivm.SourceSchema { return i.schema }
 
-// LeafSourceMarker marks sourceInput as a base source for Take's limit pushdown.
-func (i *sourceInput) LeafSourceMarker() {}
-
 func (i *sourceInput) SetOutput(o ivm.Output) {
 	i.conn.output = o
 }
@@ -1273,10 +1254,13 @@ func (i *sourceInput) Fetch(req ivm.FetchRequest) iter.Seq[ivm.Node] {
 	if pool := i.src.readerPool.Load(); pool != nil {
 		return i.src.fetchViaPoolStream(req, i.conn, pool)
 	}
-	if LazyAdvance {
-		return i.src.fetchDuringPushStream(req, i.conn)
-	}
-	return slices.Values(i.src.fetchForConn(req, i.conn))
+	// Streaming advance-time leaf fetch: yields rows from a live SQLite
+	// cursor on the prev-tx conn instead of materializing the whole result
+	// set first — matching TS's lazy statement.iterate() leaf (zqlite
+	// table-source.ts #fetch), whose cursor nesting semantics SQLite
+	// natively supports on one connection. The eager fetchForConn survives
+	// only as the overlay-splice oracle fetchDuringPushStream delegates to.
+	return i.src.fetchDuringPushStream(req, i.conn)
 }
 
 // disconnect removes conn from the source's connection list.
@@ -1438,8 +1422,8 @@ func (s *Source) fetchForConn(req ivm.FetchRequest, conn *connection) []ivm.Node
 	return out
 }
 
-// fetchDuringPushStream is the LAZY advance-time leaf read (LazyAdvance /
-// GO_IVM_LAZY_ADVANCE): it yields rows one at a time from a live SQLite
+// fetchDuringPushStream is the LAZY advance-time leaf read — the
+// unconditional non-pooled dispatch: it yields rows one at a time from a live SQLite
 // cursor on the prev-tx conn, splicing the in-flight overlay per row, instead
 // of materializing the whole result set the way fetchForConn does. This is
 // the Go analog of TS's leaf during push processing — statement.iterate()
@@ -1679,14 +1663,6 @@ func (s *Source) scanRows(
 			continue
 		}
 		out = append(out, ivm.Node{Row: row})
-		// Limit pushdown (Take.initialFetch): once we have req.Limit
-		// post-predicate rows we can stop scanning. The SQLite cursor yields
-		// lazily via rows.Next(), so breaking here avoids materialising a Row
-		// map for every remaining replica row (a Limit:50 dashboard query over
-		// 1k rows built ~950 throwaway maps).
-		if req.Limit > 0 && !overlayActive && len(out) >= req.Limit {
-			break
-		}
 	}
 	if err := rows.Err(); err != nil {
 		panic(fmt.Sprintf("tablesource.Source.Fetch %s: rows: %v",
@@ -1758,7 +1734,6 @@ func (s *Source) fetchViaPoolStream(req ivm.FetchRequest, conn *connection, pool
 		for i := range raw {
 			ptrs[i] = &raw[i]
 		}
-		count := 0
 		for rows.Next() {
 			if err := rows.Scan(ptrs...); err != nil {
 				panic(fmt.Sprintf("tablesource.Source.Fetch %s: scan: %v",
@@ -1776,10 +1751,6 @@ func (s *Source) fetchViaPoolStream(req ivm.FetchRequest, conn *connection, pool
 				continue
 			}
 			if !yield(ivm.Node{Row: row}) {
-				return
-			}
-			count++
-			if req.Limit > 0 && count >= req.Limit {
 				return
 			}
 		}

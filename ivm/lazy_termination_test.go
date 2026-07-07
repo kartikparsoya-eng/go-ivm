@@ -7,7 +7,14 @@ import (
 	"testing"
 )
 
-// countingInput wraps an Input and counts how many nodes Fetch returns.
+// countingInput wraps an Input and counts Fetch calls and the rows the
+// consumer actually PULLS through it. It is lazy — it forwards the seq and
+// counts per yielded node — so a downstream early stop (Take reaching its
+// limit) freezes rowsReturned at the pulled count. The assertions below are
+// therefore laziness pins: bounded rowsReturned/fetchCount proves the
+// upstream scan stopped early with NO limit plumbing, exactly like TS's
+// lazy generators (FetchRequest.Limit was deleted — laziness IS the
+// early-termination mechanism).
 type countingInput struct {
 	inner        Input
 	fetchCount   int32
@@ -19,9 +26,15 @@ func (c *countingInput) Destroy()                 { c.inner.Destroy() }
 func (c *countingInput) SetOutput(o Output)       { c.inner.SetOutput(o) }
 func (c *countingInput) Fetch(req FetchRequest) iter.Seq[Node] {
 	atomic.AddInt32(&c.fetchCount, 1)
-	nodes := slices.Collect(c.inner.Fetch(req))
-	atomic.AddInt32(&c.rowsReturned, int32(len(nodes)))
-	return slices.Values(nodes)
+	inner := c.inner.Fetch(req)
+	return func(yield func(Node) bool) {
+		for n := range inner {
+			atomic.AddInt32(&c.rowsReturned, 1)
+			if !yield(n) {
+				return
+			}
+		}
+	}
 }
 
 func makeTestSource(t *testing.T, name string, cols map[string]string, pk []string, sort Ordering, rows []Row) *MemorySource {
@@ -78,9 +91,11 @@ func TestLimitThroughFilter_Correctness(t *testing.T) {
 	}
 }
 
-// TestLimitThroughFilter_EarlyTermination verifies that Filter breaks its
-// loop after collecting req.Limit post-filter rows, not iterating the entire
-// upstream result. This is the core EXISTS-explosion fix.
+// TestLimitThroughFilter_EarlyTermination verifies that a Take limit stops
+// the Filter predicate after ~limit post-filter rows via propagated lazy
+// early-stop (Take stops pulling → Filter stops pulling upstream), not by
+// iterating the entire upstream result. This is the core EXISTS-explosion
+// guarantee.
 func TestLimitThroughFilter_EarlyTermination(t *testing.T) {
 	cols := map[string]string{"id": "string", "active": "boolean", "val": "number"}
 	sort := Ordering{{"val", "asc"}, {"id", "asc"}}
@@ -214,8 +229,9 @@ func TestLimitThroughSkip_Correctness(t *testing.T) {
 	}
 }
 
-// TestLimitThroughSkip_ForwardedToSource verifies that Skip forwards
-// req.Limit to Source in the forward case, so Source truncates its output.
+// TestLimitThroughSkip_ForwardedToSource verifies that a Take limit above a
+// Skip stops the SOURCE scan after ~limit rows — the lazy early-stop
+// propagates through Skip's forward pass-through to the leaf.
 func TestLimitThroughSkip_ForwardedToSource(t *testing.T) {
 	cols := map[string]string{"id": "string", "val": "number"}
 	sort := Ordering{{"val", "asc"}, {"id", "asc"}}
@@ -246,14 +262,15 @@ func TestLimitThroughSkip_ForwardedToSource(t *testing.T) {
 		t.Fatalf("expected 3 results, got %d", len(result))
 	}
 
-	// Source should have received req.Limit=3, so it should return
-	// at most 3 rows (after applying start at val=5).
-	// Without Limit forwarding, Source would return all 15 rows after val=5.
+	// Take(limit=3) pulls exactly 3 post-skip rows; laziness propagates the
+	// stop through Skip to the source, so the source yields at most 3 rows
+	// (after the start bound at val=5). Without lazy propagation the source
+	// would yield all 15 remaining rows.
 	totalReturned := atomic.LoadInt32(&counter.rowsReturned)
 	if totalReturned > 3 {
-		t.Errorf("Source returned %d rows, expected <= 3 (Limit forwarded through Skip)", totalReturned)
+		t.Errorf("Source yielded %d rows, expected <= 3 (lazy stop propagated through Skip)", totalReturned)
 	}
-	t.Logf("Source returned %d rows with Limit forwarded through Skip", totalReturned)
+	t.Logf("Source yielded %d rows with lazy stop propagated through Skip", totalReturned)
 }
 
 // TestLimitThroughExists_EarlyTermination verifies that Source→Join→Filter(Exists)→Take
@@ -323,7 +340,8 @@ func TestLimitThroughExists_EarlyTermination(t *testing.T) {
 }
 
 // TestLimitDirectSource_Regression verifies that Source→Take (no intermediate
-// operators) still works correctly after removing the LeafSource gate.
+// operators) still works correctly — the leaf's lazy seq terminates at the
+// Take bound.
 func TestLimitDirectSource_Regression(t *testing.T) {
 	cols := map[string]string{"id": "string", "val": "number"}
 	sort := Ordering{{"val", "asc"}, {"id", "asc"}}
@@ -450,8 +468,10 @@ func TestLimitLargerThanSource(t *testing.T) {
 	}
 }
 
-// TestLimitThroughSkipReverse verifies that Skip does NOT forward Limit
-// in the reverse case (shouldBePresent post-filter can drop rows).
+// TestLimitThroughSkipReverse verifies reverse-Skip-under-Take correctness:
+// Skip's reverse path post-filters via shouldBePresent (rows can be
+// discarded after the leaf yields them), so the row set must still respect
+// the Take bound with no over-delivery.
 func TestLimitThroughSkipReverse(t *testing.T) {
 	cols := map[string]string{"id": "string", "val": "number"}
 	sort := Ordering{{"val", "asc"}, {"id", "asc"}}

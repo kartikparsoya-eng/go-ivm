@@ -76,29 +76,20 @@ func (fs *FilterStart) Push(change Change, pusher InputBase) []Change {
 
 // Fetch — filters nodes from upstream through the filter chain.
 //
-// Limit handling: Filter is non-transparent (it can drop rows), so it
-// MUST NOT forward req.Limit to upstream — the source would truncate
-// before Filter runs, causing an under-fetch. Instead, Filter strips
-// Limit from the upstream request and enforces early termination in its
-// own loop: once len(result) >= req.Limit, it breaks. This matches TS's
-// lazy-generator behavior where Take's break propagates through Filter,
-// stopping the EXISTS predicate from running on the entire upstream result.
+// Fully lazy (iter.Seq): a downstream consumer that stops pulling (e.g. Take
+// breaking at its limit) makes yield return false here, which stops pulling
+// from upstream in turn — the same propagated early termination TS gets from
+// its lazy generators, with no limit plumbing needed. The EXISTS predicate
+// (fs.output.Filter) therefore runs only for rows the consumer actually
+// demands.
 func (fs *FilterStart) Fetch(req FetchRequest) iter.Seq[Node] {
-	upstreamReq := req
-	upstreamReq.Limit = 0
-
 	return func(yield func(Node) bool) {
 		fs.output.BeginFilter()
 		defer fs.output.EndFilter()
 
-		count := 0
-		for node := range fs.input.Fetch(upstreamReq) {
+		for node := range fs.input.Fetch(req) {
 			if fs.output.Filter(node) {
 				if !yield(node) {
-					return
-				}
-				count++
-				if req.Limit > 0 && count >= req.Limit {
 					return
 				}
 			}

@@ -1377,7 +1377,7 @@ func (e *Engine) AdvanceStream(
 // AdvanceStreamChunked is AdvanceStream with a per-call chunk-size override.
 // chunkSize=1 yields one partial per RowChange — the NAPI row plane uses
 // this so each row crosses the Go↔JS boundary the moment the push's flatten
-// produces it (with GO_IVM_LAZY_ADVANCE, straight off the SQLite cursor),
+// produces it (straight off the lazy SQLite cursor),
 // instead of being re-batched into advanceChunkSize frames. chunkSize<=0
 // falls back to advanceChunkSize.
 func (e *Engine) AdvanceStreamChunked(

@@ -1,7 +1,8 @@
 package tablesource
 
-// Tests for the LazyAdvance streaming leaf fetch (fetchDuringPushStream) and
-// the checkout statement cache it depends on.
+// Tests for the streaming leaf fetch (fetchDuringPushStream) — the
+// unconditional advance-time path — and the checkout statement cache it
+// depends on.
 //
 // The correctness contract is PARITY: with an overlay live, the lazy path's
 // yielded sequence must be element-for-element identical to the eager
@@ -108,7 +109,6 @@ func TestLazyAdvanceFetchParity(t *testing.T) {
 			{"startAfter", ivm.FetchRequest{Start: &ivm.Start{Row: startRow, Basis: "after"}}},
 			// Take's displaced-bound shape: reverse fetch from a bound.
 			{"reverseAt", ivm.FetchRequest{Start: &ivm.Start{Row: startRow, Basis: "at"}, Reverse: true}},
-			{"limit2", ivm.FetchRequest{Limit: 2}},
 		}
 	}
 
@@ -177,14 +177,11 @@ func TestLazyAdvanceFetchParity(t *testing.T) {
 }
 
 // TestLazyAdvanceNoOverlayDelegates covers the dispatch + delegation path:
-// with LazyAdvance on but NO push in flight, sourceInput.Fetch must produce
+// with NO push in flight, sourceInput.Fetch must produce
 // the eager path's rows unchanged.
 func TestLazyAdvanceNoOverlayDelegates(t *testing.T) {
 	src, db := newUserSource(t)
 	defer db.Close()
-	prev := LazyAdvance
-	LazyAdvance = true
-	defer func() { LazyAdvance = prev }()
 
 	in := src.Connect(nil, nil, nil, nil)
 	conn := in.(*sourceInput).conn
@@ -228,9 +225,6 @@ func (p *lazyPushProbe) Push(change ivm.Change, _ ivm.InputBase) []ivm.Change {
 func TestLazyAdvanceNestedFetchDuringPush(t *testing.T) {
 	src, db := newUserSource(t)
 	defer db.Close()
-	prev := LazyAdvance
-	LazyAdvance = true
-	defer func() { LazyAdvance = prev }()
 
 	in := src.Connect(nil, nil, nil, nil)
 
@@ -390,9 +384,6 @@ func TestStmtCheckoutSemantics(t *testing.T) {
 func TestLazyAdvanceConcurrentRefreshSnapshot(t *testing.T) {
 	src, db := newUserSource(t)
 	defer db.Close()
-	prev := LazyAdvance
-	LazyAdvance = true
-	defer func() { LazyAdvance = prev }()
 
 	in := src.Connect(nil, nil, nil, nil)
 
