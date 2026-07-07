@@ -292,9 +292,23 @@ func NewWithContext(parent context.Context, db *sql.DB, writableDB *sql.DB, tabl
 		}
 	}
 	// Validate table presence — `SELECT 1 FROM "x" LIMIT 0` errors if the
-	// table doesn't exist, costs nothing if it does.
-	if _, err := db.Exec(`SELECT 1 FROM ` + quoteIdent(tableName) + ` LIMIT 0`); err != nil {
-		return nil, fmt.Errorf("tablesource.New %s: table not found: %w", tableName, err)
+	// table doesn't exist, costs nothing if it does. Bounded: this probe
+	// acquires a read-pool conn, and under pool exhaustion an unbounded
+	// acquire wedged handleInit for the full 120s TS RPC timeout and then
+	// leaked the goroutine forever (2026-07-06 ART incident — the probe
+	// sat behind deadlocked pool builders; see PoolAcquireTimeout). The
+	// deadline is on the PROBE only — the Source's stored lifetime ctx
+	// below stays bound to parent, not to this timeout.
+	probeCtx, cancelProbe := context.WithTimeout(parent, PoolAcquireTimeout)
+	_, probeErr := db.ExecContext(probeCtx, `SELECT 1 FROM `+quoteIdent(tableName)+` LIMIT 0`)
+	cancelProbe()
+	if probeErr != nil {
+		if probeCtx.Err() != nil {
+			return nil, fmt.Errorf(
+				"tablesource.New %s: presence probe timed out after %v — replica read pool exhausted?: %w",
+				tableName, PoolAcquireTimeout, probeErr)
+		}
+		return nil, fmt.Errorf("tablesource.New %s: table not found: %w", tableName, probeErr)
 	}
 
 	// Pre-compute the column ordering used for INSERT VALUES (...) and

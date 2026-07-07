@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"sort"
+	"time"
 )
 
 // stateVersionSQL reads the replica's monotonic replication version — TS's
@@ -27,6 +28,24 @@ const stateVersionSQL = `SELECT stateVersion FROM "_zero.replicationState"`
 // lands on the latest (or same) frame, so convergence is guaranteed under a
 // quiescent replica and bounded under sustained writes.
 const maxConvergeAttempts = 10
+
+// PoolAcquireTimeout bounds EVERY conn acquisition a reader-pool build (or
+// the Source constructor's presence probe) performs against the shared
+// replica read pool. Var (not const) so tests can shrink the window.
+//
+// Load-bearing (2026-07-06 ART incident): pool builds acquire K conns ONE AT
+// A TIME while holding the ones already acquired — hold-and-wait. With
+// unbounded contexts, N concurrent builders under read-pool exhaustion each
+// held partial sets and blocked in db.Conn forever: a permanent deadlock
+// that also starved handleInit's probe (blocked 120s until the TS RPC
+// timeout, then leaked — goroutine dumps showed builders + inits wedged
+// 19+ minutes after the burst). Every builder caller already has a serial
+// fallback (cold: converge→serial; warm: co-read→serial) and init failure
+// is a clean rpcError — the deadline converts the deadlock into a bounded
+// stall + degrade, and the first builder to time out releases its holds,
+// letting the others complete. Same idiom as ensurePrevTxLocked's bounded
+// writable-pool acquire (an earlier incident, same shape).
+var PoolAcquireTimeout = 5 * time.Second
 
 // poolReader is one frame-pinned read connection plus its own prepared-statement
 // cache. It is borrowed exclusively (one goroutine at a time) via ReaderPool,
@@ -153,6 +172,11 @@ func NewReaderPool(ctx context.Context, db *sql.DB, _ string, k int) (*ReaderPoo
 	if k < 1 {
 		k = 1
 	}
+	// Bound the whole build (acquires + BEGINs + converge reads): see
+	// PoolAcquireTimeout. On expiry the error paths below unwind every
+	// already-held reader and the caller falls back to serial hydrate.
+	ctx, cancel := context.WithTimeout(ctx, PoolAcquireTimeout)
+	defer cancel()
 
 	readers := make([]*poolReader, k)
 	versions := make([]string, k)

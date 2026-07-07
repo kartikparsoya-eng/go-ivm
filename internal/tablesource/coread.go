@@ -263,6 +263,12 @@ func NewCoReadReaderPool(ctx context.Context, db *sql.DB, cr *CoRead, k int) (*R
 	if k < 1 {
 		k = 1
 	}
+	// Bound the whole build — hold-and-wait across concurrent builders on
+	// an exhausted read pool was a permanent deadlock (2026-07-06 ART
+	// incident; see PoolAcquireTimeout). Error paths below unwind every
+	// held reader; the callers fall back to serial hydrate.
+	ctx, cancel := context.WithTimeout(ctx, PoolAcquireTimeout)
+	defer cancel()
 
 	readers := make([]*poolReader, k)
 	var version string
