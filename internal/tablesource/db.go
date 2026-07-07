@@ -177,7 +177,6 @@ const (
 	// (causes indefinite Conn() blocking → 120s RPC timeout on the TS
 	// side). 256 supports ~36 concurrent CGs comfortably.
 	defaultMaxOpenConns = 256
-	defaultMaxIdleConns = 32
 
 	// How long a conn may sit in the pool's idle list before database/sql's
 	// cleaner closes it. THE memory-release valve for the replica pools:
@@ -197,7 +196,15 @@ const (
 type OpenOptions struct {
 	// MaxOpenConns caps the pool. 0 → defaultMaxOpenConns.
 	MaxOpenConns int
-	// MaxIdleConns caps idle conns kept ready. 0 → defaultMaxIdleConns.
+	// MaxIdleConns caps idle conns kept ready. 0 → MaxOpenConns (keep-warm:
+	// 2026-07-07 latency forensics — an idle cap ≪ open cap made every
+	// pool-demand burst churn fresh SQLite opens against the replica
+	// (wal-index mmap + cold page cache), a uniform tax on the warm
+	// hydrate/advance path: 70s cumulative read-pool wait per 10s window
+	// with sampled in-use as low as 0–25/128. Conn COUNT is capped by
+	// MaxOpenConns and memory by ConnMaxIdle's time-based reaping, so a
+	// small idle cap buys nothing but reopen churn). Values above
+	// MaxOpenConns clamp to it.
 	MaxIdleConns int
 	// BusyTimeoutMs is the per-conn SQLite busy timeout. 0 → defaultBusyTimeoutMs.
 	BusyTimeoutMs int
@@ -235,8 +242,8 @@ func Open(path string, opts OpenOptions) (*sql.DB, error) {
 		maxOpen = defaultMaxOpenConns
 	}
 	maxIdle := opts.MaxIdleConns
-	if maxIdle <= 0 {
-		maxIdle = defaultMaxIdleConns
+	if maxIdle <= 0 || maxIdle > maxOpen {
+		maxIdle = maxOpen // keep-warm: see OpenOptions.MaxIdleConns
 	}
 
 	// mattn/go-sqlite3 honors SQLite URI form when DSN starts with
@@ -342,8 +349,8 @@ func OpenWritable(path string, opts OpenOptions) (*sql.DB, error) {
 		maxOpen = defaultMaxOpenConns
 	}
 	maxIdle := opts.MaxIdleConns
-	if maxIdle <= 0 {
-		maxIdle = defaultMaxIdleConns
+	if maxIdle <= 0 || maxIdle > maxOpen {
+		maxIdle = maxOpen // keep-warm: see OpenOptions.MaxIdleConns
 	}
 
 	// No `_query_only` — we run INSERT/UPDATE/DELETE on the prev tx.

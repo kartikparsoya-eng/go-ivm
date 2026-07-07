@@ -297,6 +297,10 @@ type perfMetrics struct {
 	// never converges to head (it would desync the new query from live pipelines).
 	readerPoolWarmCoread atomic.Int64
 	readerPoolWarmSerial atomic.Int64
+	// readerPoolBuildSlotSkips counts builds (warm or cold) that fell back
+	// to serial because both build slots were busy — the convoy-avoidance
+	// path (see Server.readerPoolBuildSlots).
+	readerPoolBuildSlotSkips atomic.Int64
 }
 
 var metrics = &perfMetrics{}
@@ -496,9 +500,10 @@ func (m *perfMetrics) reportAndReset() {
 	convergeAttempts := m.readerPoolConvergeAttempts.Swap(0)
 	warmCoread := m.readerPoolWarmCoread.Swap(0)
 	warmSerial := m.readerPoolWarmSerial.Swap(0)
+	slotSkips := m.readerPoolBuildSlotSkips.Swap(0)
 
 	if advCount == 0 && hydCount == 0 && bindCoread == 0 && bindConverge == 0 &&
-		bindSerial == 0 && warmCoread == 0 && warmSerial == 0 {
+		bindSerial == 0 && warmCoread == 0 && warmSerial == 0 && slotSkips == 0 {
 		return
 	}
 
@@ -565,6 +570,17 @@ func (m *perfMetrics) reportAndReset() {
 		fmt.Fprintf(os.Stderr,
 			"[GO-IVM][PERF-POOL] 10s window: warm-hydrate pins coread=%d serial=%d (pin-rate=%.1f%%)\n",
 			warmCoread, warmSerial, warmRate)
+	}
+
+	// Build-slot skips: pool builds (cold or warm) that degraded to serial
+	// because both build slots were busy (Server.readerPoolBuildSlots).
+	// Occasional skips during a churn burst are the design working;
+	// SUSTAINED skips mean build demand outruns the slot cap — correlate
+	// with the serial shares above before touching the cap.
+	if slotSkips > 0 {
+		fmt.Fprintf(os.Stderr,
+			"[GO-IVM][PERF-POOL] 10s window: build-slot-skips=%d (pool builds degraded to serial; slots busy)\n",
+			slotSkips)
 	}
 }
 
@@ -915,13 +931,22 @@ type Server struct {
 	// warmHydratePoolEnabled extends the parallel-hydrate reader pool to WARM
 	// hydrates (addQueriesStream on a CG that already has live pipelines), not
 	// just the first cold one. From GO_IVM_WARM_HYDRATE_POOL=true; default OFF so
-	// the shipped cold-only path is untouched. Unlike the cold pool, the warm
-	// pool is co-read-ONLY and pinned to curr's EXISTING frame (no
-	// RefreshCurrentToHead): a converge-upward fallback would read a NEWER frame
-	// than the live pipelines and desync the new query, so on any co-read failure
-	// the warm path stays serial (reads the bound curr.Conn()) rather than
-	// converging. Requires hydrateReaders>1 + advanceDrive.
+	// the shipped default behavior is unchanged until the flag flips.
 	warmHydratePoolEnabled bool
+
+	// readerPoolBuildSlots bounds CONCURRENT reader-pool builds (cold +
+	// warm) per engine (2026-07-07 latency forensics). Builds acquire K
+	// conns one at a time while holding the ones they have — hold-and-wait.
+	// PoolAcquireTimeout bounds each build, but N concurrent builders under
+	// churn still mutually starve for the full window (observed: warm
+	// pin-rate 100%→62% with serial fallbacks, 70s cumulative read-pool
+	// wait per 10s window, group.mu held throughout → per-CG advance
+	// convoys). Two slots keep in-flight build demand ≤ 2×(K+1) conns:
+	// warm builds try-acquire and skip straight to serial (the pool is an
+	// optimization; queueing the CG worker for it inverts the win), cold
+	// builds wait briefly (their serial fallback costs the whole first
+	// hydrate). Buffered-chan semaphore; sized in NewServer.
+	readerPoolBuildSlots chan struct{}
 }
 
 func NewServer(replicaPath string) *Server {
@@ -931,6 +956,11 @@ func NewServer(replicaPath string) *Server {
 		replicaPath:    replicaPath,
 		hydrateReaders: 1,
 		hydrateLanes:   4,
+		// Sized here, not lazily: a nil channel would silently disable
+		// every pool build (nil send never proceeds → warm skips, cold
+		// waits the full coldBuildSlotWait then goes serial). Pinned by
+		// TestNewServer_BuildSlotsSized.
+		readerPoolBuildSlots: make(chan struct{}, readerPoolBuildSlotCap),
 	}
 }
 

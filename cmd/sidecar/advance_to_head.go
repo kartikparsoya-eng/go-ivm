@@ -146,6 +146,43 @@ func (s *Server) buildSnapshotterLocked(group *ClientGroup, p *initParams) error
 	return nil
 }
 
+// tryAcquireBuildSlot claims a reader-pool build slot, waiting at most
+// maxWait (0 = non-blocking). Returns (release, true) on success. On
+// failure the caller MUST fall back to serial hydrate — that is the whole
+// point: bounded build concurrency, never a queue.
+func (s *Server) tryAcquireBuildSlot(maxWait time.Duration) (func(), bool) {
+	if maxWait <= 0 {
+		select {
+		case s.readerPoolBuildSlots <- struct{}{}:
+			return func() { <-s.readerPoolBuildSlots }, true
+		default:
+			metrics.readerPoolBuildSlotSkips.Add(1)
+			return nil, false
+		}
+	}
+	t := time.NewTimer(maxWait)
+	defer t.Stop()
+	select {
+	case s.readerPoolBuildSlots <- struct{}{}:
+		return func() { <-s.readerPoolBuildSlots }, true
+	case <-t.C:
+		metrics.readerPoolBuildSlotSkips.Add(1)
+		return nil, false
+	}
+}
+
+// coldBuildSlotWait is how long a COLD pool build waits for a slot before
+// degrading to serial hydrate. Cold pools front the CG's first hydrate
+// (biggest payoff), so they wait briefly; warm builds never wait (0).
+const coldBuildSlotWait = time.Second
+
+// readerPoolBuildSlotCap is the per-Server bound on CONCURRENT reader-pool
+// builds (see Server.readerPoolBuildSlots). Two keeps worst-case in-flight
+// build demand at 2×(K+1) conns — small enough that concurrent builders
+// can't mutually starve inside PoolAcquireTimeout, large enough that a slow
+// build doesn't serialize every other CG behind it.
+const readerPoolBuildSlotCap = 2
+
 // buildReaderPoolLocked builds a reader pool whose K connections are all
 // converged onto the same WAL frame (the replica head at build time).
 // NewReaderPool handles the internal convergence (converge-upward) so all K
@@ -171,6 +208,14 @@ func (s *Server) buildReaderPoolLocked(cur *snapshotter.Snapshot, cmax int) (*ta
 	if k <= 1 {
 		return nil, nil, nil // feature off: serial by design, not a failure
 	}
+	// Bound concurrent builds (see Server.readerPoolBuildSlots): under a
+	// churn burst, unbounded builders hold-and-wait each other into the
+	// PoolAcquireTimeout; two at a time complete in milliseconds each.
+	release, ok := s.tryAcquireBuildSlot(coldBuildSlotWait)
+	if !ok {
+		return nil, nil, nil // slots busy → serial hydrate (bounded degrade)
+	}
+	defer release()
 	rdb, derr := s.getReplicaDB()
 	if derr != nil {
 		return nil, nil, derr
@@ -294,6 +339,17 @@ func (s *Server) buildWarmReaderPoolLocked(group *ClientGroup, cmax int) (*table
 		metrics.recordWarmReaderPoolBind(false)
 		return nil, nil
 	}
+
+	// Bound concurrent builds — NON-blocking for warm adds: the pool is an
+	// optimization, and this runs with group.mu held (queueing the CG's
+	// worker behind a build slot inverts the win — the 2026-07-07 convoy).
+	// Slots busy → serial hydrate through the bound curr.Conn(), instantly.
+	release, ok := s.tryAcquireBuildSlot(0)
+	if !ok {
+		metrics.recordWarmReaderPoolBind(false)
+		return nil, nil
+	}
+	defer release()
 
 	// Co-read-ONLY capture of curr's existing frame. No converge fallback.
 	cr, capErr := tablesource.CaptureCoReadFromConn(cur.Conn())
