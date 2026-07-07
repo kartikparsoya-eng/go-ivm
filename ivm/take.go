@@ -74,6 +74,9 @@ func NewTake(input Input, storage TakeStorage, limit int, partitionKey Partition
 	if schema.Sort == nil {
 		panic("Take requires sorted input")
 	}
+	// take.ts:75 — a sort that omits PK columns is not total, so the bound
+	// comparison could not distinguish distinct rows.
+	AssertOrderingIncludesPK(schema.Sort, schema.PrimaryKey)
 	t := &Take{
 		input:        input,
 		storage:      storage,
@@ -152,13 +155,30 @@ func (t *Take) Fetch(req FetchRequest) iter.Seq[Node] {
 
 // initialFetch — Source: take.ts line 158-216
 func (t *Take) initialFetch(req FetchRequest) iter.Seq[Node] {
-	if t.limit <= 0 {
-		return emptyNodeSeq
-	}
-
 	takeStateKey := GetTakeStateKey(t.partitionKey, constraintToRow(req.Constraint))
 
 	return func(yield func(Node) bool) {
+		// take.ts:159-175 — the asserts (and the limit-0 return) live INSIDE
+		// the generator body in TS, so they run lazily at first consumption,
+		// after Fetch's takeState==nil probe. Mirror that: a limit-0 Take with
+		// a malformed request still trips the asserts, and the limit-0 return
+		// happens BEFORE the defer below so no takeState is persisted for it.
+		if req.Start != nil {
+			panic("Take.initialFetch: Start should be undefined")
+		}
+		if req.Reverse {
+			panic("Take.initialFetch: Reverse should be false")
+		}
+		if t.limit == 0 {
+			return
+		}
+		if !ConstraintMatchesPartitionKey(req.Constraint, t.partitionKey) {
+			panic("Take.initialFetch: Constraint should match partition key")
+		}
+		if t.storage.GetTakeState(takeStateKey) != nil {
+			panic("Take.initialFetch: Take state should be undefined")
+		}
+
 		var size int
 		var bound Row
 		// Source: take.ts:177-215 (try/catch/finally).

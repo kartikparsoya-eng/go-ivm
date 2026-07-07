@@ -910,9 +910,12 @@ func TestFetchConstraintWithFilterAndSort(t *testing.T) {
 	src, db := newUserSource(t)
 	defer db.Close()
 
-	// active=true users (cuts bob), sorted DESC by score → carol then alice
+	// active=true users (cuts bob), sorted DESC by score → carol then alice.
+	// Sort includes the PK tiebreaker — TS completeOrdering always appends it
+	// and table-source.ts:266-268 asserts it, so a PK-less sort can never
+	// reach Connect.
 	in := src.Connect(
-		ivm.Ordering{{"score", "asc"}},
+		ivm.Ordering{{"score", "asc"}, {"id", "asc"}},
 		nil,
 		func(r ivm.Row) bool { v, _ := r["active"].(bool); return v },
 		nil,

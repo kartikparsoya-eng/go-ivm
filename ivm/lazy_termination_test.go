@@ -491,6 +491,11 @@ func TestLimitThroughSkipReverse(t *testing.T) {
 	out := &testOutput{}
 	take.SetOutput(out)
 
+	// Hydrate forward first — take.ts:159-160 asserts initial fetches are
+	// forward and unpositioned, so a reverse fetch only ever reaches a
+	// hydrated Take (the takeState path, which has no such assert).
+	_ = slices.Collect(take.Fetch(FetchRequest{}))
+
 	result := slices.Collect(take.Fetch(FetchRequest{Reverse: true}))
 	if len(result) > 3 {
 		t.Errorf("expected at most 3 results, got %d", len(result))

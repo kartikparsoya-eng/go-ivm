@@ -749,6 +749,13 @@ func (s *Source) Connect(
 		pkSort[i] = [2]string{k, "asc"}
 	}
 
+	// table-source.ts:266-268 — an explicit sort must include every PK column
+	// or the connection's comparator is not total ("unordered" connections
+	// fall back to the PK comparator, which trivially qualifies).
+	if sort != nil {
+		ivm.AssertOrderingIncludesPK(sort, s.primaryKey)
+	}
+
 	cmp := ivm.MakeComparator(sort, false)
 	if sort == nil {
 		cmp = ivm.MakeComparator(pkSort, false)
@@ -1268,6 +1275,10 @@ func (s *Source) disconnect(c *connection) {
 			return
 		}
 	}
+	// table-source.ts:243-244 — assert(idx !== -1): a double-disconnect or a
+	// disconnect of a never-connected input is a pipeline-lifecycle bug;
+	// silently ignoring it would mask double-Destroy paths.
+	panic("Connection not found")
 }
 
 // fetchForConn runs the SELECT for conn and returns the resulting nodes.

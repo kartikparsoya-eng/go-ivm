@@ -293,6 +293,32 @@ func ValuesEqual(a, b Value) bool {
 // Each element is [columnName, "asc"|"desc"].
 type Ordering [][2]string
 
+// AssertOrderingIncludesPK panics unless every primary-key column appears in
+// the ordering — Source: complete-ordering.ts:30-44 (assertOrderingIncludesPK).
+// An ordering that omits PK columns is not total: operators that bound or
+// dedup by row comparison (Take, the sources) would treat distinct rows as
+// equal, corrupting windows far from the cause. TS asserts at Take
+// construction and both source connects; Go mirrors all three sites.
+func AssertOrderingIncludesPK(ordering Ordering, pk []string) {
+	var missing []string
+	for _, pkField := range pk {
+		found := false
+		for _, ord := range ordering {
+			if ord[0] == pkField {
+				found = true
+				break
+			}
+		}
+		if !found {
+			missing = append(missing, pkField)
+		}
+	}
+	if len(missing) > 0 {
+		panic(fmt.Sprintf("Ordering must include all primary key fields. Missing: %s.",
+			strings.Join(missing, ", ")))
+	}
+}
+
 // MakeComparator creates a Comparator from an ordering.
 func MakeComparator(order Ordering, reverse bool) Comparator {
 	return func(a, b Row) int {

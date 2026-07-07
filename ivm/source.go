@@ -157,8 +157,16 @@ func NewMemorySourceWithConverter(
 // Takes connsMu write lock to mutate connections; safe against concurrent push
 // (which only takes RLock-style reads of a snapshotted slice).
 func (ms *MemorySource) Connect(connSort Ordering, filterPredicate func(Row) bool, splitEditKeys map[string]bool) *SourceInput {
+	// memory-source.ts:168 — "unordered" means the caller passed no sort and
+	// we default to the primary index sort (which trivially includes the PK).
+	unordered := connSort == nil
 	if connSort == nil {
 		connSort = ms.primarySort
+	}
+	// memory-source.ts:198-200 — an explicit sort must include every PK
+	// column or the connection's comparator is not total.
+	if !unordered {
+		AssertOrderingIncludesPK(connSort, ms.primaryKey)
 	}
 	compareRows := MakeComparator(connSort, false)
 
@@ -203,6 +211,10 @@ func (ms *MemorySource) Disconnect(si *SourceInput) {
 			return
 		}
 	}
+	// memory-source.ts:207 — assert(idx !== -1): a double-disconnect or a
+	// disconnect of a never-connected input is a pipeline-lifecycle bug;
+	// silently ignoring it would mask double-Destroy paths.
+	panic("Connection not found")
 }
 
 // Push applies a source change: pushes to all connections, then writes.
