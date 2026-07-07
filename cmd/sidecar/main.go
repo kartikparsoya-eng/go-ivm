@@ -1864,11 +1864,25 @@ func (s *Server) handleInit(req RPCRequest) RPCResponse {
 		return rpcError(req.ID, -32000, "snapshotter init: "+err.Error())
 	}
 
+	// Report the snapshotter's pinned stateVersion — the frame the FIRST
+	// hydrate reads at (refreshSnapForInitialHydrateLocked deliberately does
+	// not re-pin). TS stamps its CVR hydrate updater at
+	// max(tsVersion, THIS) so hydrated rows written after TS's own (earlier)
+	// snapshot pin are never received under an unbumped CVR version —
+	// the cvr.ts:778 "Expected CVR version to have been bumped" teardown
+	// (gen-6). Fail loudly if the just-built snapshotter can't report it:
+	// silently omitting the field would resurrect that bug for this CG.
+	cur, cerr := group.snap.Current()
+	if cerr != nil {
+		return rpcError(req.ID, -32000, "snapshotter current: "+cerr.Error())
+	}
+
 	return RPCResponse{
 		JSONRPC: "2.0",
 		Result: map[string]interface{}{
 			"status":    "ok",
 			"initEpoch": currentEpoch,
+			"version":   cur.Version(),
 		},
 		ID: req.ID,
 	}
