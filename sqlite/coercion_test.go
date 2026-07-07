@@ -1,6 +1,7 @@
 package sqlite
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -51,40 +52,41 @@ func TestSelfCheckCoercionStillPasses(t *testing.T) {
 	}
 }
 
-// TestFromSQLiteTypeTimeValue guards the mattn time.Time gotcha: mattn/go-sqlite3
-// auto-converts columns whose declared SQLite type is exactly
-// "timestamp"/"datetime"/"date" into time.Time. Zero's NULLABLE temporal columns
-// arrive bare (e.g. "timestamp") so they hit that path, while NOT-null ones carry
-// a "|NOT_NULL" suffix that dodges mattn's exact match and stay int64. Before the
-// fix, an unconverted time.Time skipped numeric coercion and msgpack-encoded as
-// `{}` — shipping clients an empty object for nullable timestamps
-// (channel_user_status.conversationSeenCutoffAt + updatedAt, found via the shadow
-// SQL oracle 2026-06-08). FromSQLiteType must normalize time.Time back to the
-// epoch-millisecond number TS uses, identically to a NOT-null temporal column.
+// TestFromSQLiteTypeTimeValue pins the time.Time invariant. History, in
+// order:
+//
+//  1. mattn/go-sqlite3 converts INTEGER result columns declared exactly
+//     "timestamp"/"datetime"/"date" (zero's NULLABLE temporal columns;
+//     NOT-null ones carry "|NOT_NULL" and dodge the exact match) into
+//     time.Time. Unhandled, that msgpack-encoded as `{}` (shadow SQL
+//     oracle, 2026-06-08) — so FromSQLiteType normalized with UnixMilli().
+//  2. But mattn's heuristic reads |v| <= 1e12 as SECONDS, so the UnixMilli
+//     reversal multiplied every pre-2001 epoch-ms value by 1000 (ART G15,
+//     2026-07-07). No reversal is correct — stored 2e9 and 2e12 yield the
+//     identical time.Time.
+//  3. Now the conversion is killed at the SQL level: every row SELECT wraps
+//     its result columns in the unary-+ no-op (`+"col" AS "col"`), which
+//     strips the declared type, so the raw integer ships exactly as TS's
+//     better-sqlite3 ships it. A time.Time reaching FromSQLiteType is
+//     therefore a PLUMBING BUG (an unwrapped SELECT site) and must panic
+//     loudly instead of silently shipping a maybe-×1000 value.
 func TestFromSQLiteTypeTimeValue(t *testing.T) {
-	// mattn builds the time.Time from an epoch-ms integer (>1e12 ⇒ ms heuristic)
-	// via time.Unix(0, ms*1e6).UTC(); time.UnixMilli(ms).UTC() reproduces that.
-	const epochMs int64 = 1779813865070 // a real channel_user_status value
-	mattnTime := time.UnixMilli(epochMs).UTC()
+	mattnTime := time.UnixMilli(1779813865070).UTC()
 
-	// Zero's clientType for a timestamp column is "number", so the converted
-	// time.Time must land on float64(epochMs) — the same value (and Go type) a
-	// NOT-null temporal column produces from its raw int64.
-	got := FromSQLiteType(mattnTime, "number")
-	want := float64(epochMs)
-	if got != want {
-		t.Fatalf("FromSQLiteType(time.Time(%d ms), number) = %#v (%T), want %#v (float64)",
-			epochMs, got, got, want)
-	}
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("FromSQLiteType(time.Time) did not panic — the silent-normalization path is back; a pre-2001 value would ship ×1000")
+		}
+		msg, ok := r.(string)
+		if !ok || !strings.Contains(msg, "SELECT site") {
+			t.Fatalf("panic = %v, want the unwrapped-SELECT-site diagnostic", r)
+		}
+	}()
+	FromSQLiteType(mattnTime, "number")
+}
 
-	// The nullable (time.Time) and NOT-null (raw int64) paths must produce the
-	// IDENTICAL value so the two render the same on the wire (init/advance parity);
-	// before the fix the time.Time path diverged (msgpack `{}`).
-	if a, b := FromSQLiteType(epochMs, "number"), FromSQLiteType(mattnTime, "number"); a != b {
-		t.Fatalf("int64 path %#v != time.Time path %#v — nullable and NOT-null temporal columns diverge", a, b)
-	}
-
-	// nil (a NULL nullable timestamp) must still pass through as nil, not 0.
+func TestFromSQLiteTypeNilNumber(t *testing.T) {
 	if got := FromSQLiteType(nil, "number"); got != nil {
 		t.Fatalf("FromSQLiteType(nil, number) = %#v, want nil", got)
 	}

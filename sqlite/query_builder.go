@@ -69,10 +69,43 @@ func BuildSelectQuery(
 	var params []interface{}
 	colNames := sortedColumnNames(columns)
 
-	// SELECT columns FROM table
+	// SELECT columns FROM table.
+	//
+	// Every result column is wrapped in SQLite's unary `+` no-op and aliased
+	// back to its bare name: `+"col" AS "col"`. The unary + returns its
+	// operand unchanged for every storage class (INTEGER/REAL/TEXT/BLOB/NULL)
+	// but turns the result column into an EXPRESSION, and expressions carry
+	// no declared type — sqlite3_column_decltype returns NULL.
+	//
+	// That kills mattn/go-sqlite3's decltype-driven value conversions in
+	// Rows.Next (sqlite3.go:2571-2638 @ v1.14.44), which TS's better-sqlite3
+	// does not have — TS ships the raw cell:
+	//
+	//   - INTEGER in a column declared exactly "timestamp"/"datetime"/"date"
+	//     (nullable temporal columns; NOT-null ones are declared
+	//     "timestamp|NOT_NULL" which dodges the exact-string match) became
+	//     time.Time via a magnitude heuristic: |v| <= 1e12 ⇒ SECONDS, else
+	//     ms. Reversing with UnixMilli() multiplied every pre-2001 epoch-ms
+	//     value (|v| <= 1e12, negatives included) by 1000 — a real
+	//     hydration-vs-TS data divergence (ART G15, 2026-07-07: replica 1 →
+	//     Go 1000, TS 1). A smarter reversal is provably impossible (stored
+	//     2e9 and 2e12 produce the identical time.Time), so the conversion
+	//     must not happen at all.
+	//   - TEXT in a temporal column parsed to time.Time (zero time on parse
+	//     failure) instead of shipping the raw string.
+	//   - INTEGER in a column declared exactly "boolean" became Go bool via
+	//     `val > 0`, which disagrees with TS's `!!v` truthiness for negative
+	//     integers. FromSQLiteType's boolean case applies `val != 0` to the
+	//     raw integer, matching TS.
+	//
+	// The alias back to the bare name is load-bearing: every scan site maps
+	// values by rows.Columns() name (tablesource source.go scanRows /
+	// fetchDuringPushStream; snapshotter scanRawRow uses spec order but the
+	// harness reads names too) — without it the result column would be
+	// named `+"col"` and the schema lookup would drop every value.
 	quotedCols := make([]string, len(colNames))
 	for i, c := range colNames {
-		quotedCols[i] = quoteIdent(c)
+		quotedCols[i] = "+" + quoteIdent(c) + " AS " + quoteIdent(c)
 	}
 	query := fmt.Sprintf("SELECT %s FROM %s", strings.Join(quotedCols, ", "), quoteIdent(tableName))
 
@@ -542,24 +575,26 @@ func FromSQLiteType(v interface{}, colType string) ivm.Value {
 	if v == nil {
 		return nil
 	}
-	// mattn/go-sqlite3 auto-converts columns whose declared SQLite type is
-	// EXACTLY "timestamp"/"datetime"/"date" (case-insensitive) into time.Time
-	// in Rows.Next. Zero's replica declares NULLABLE temporal columns as bare
-	// "timestamp"/"date" but NON-null ones as "timestamp|NOT_NULL" — the
-	// "|NOT_NULL" suffix dodges mattn's exact-string decltype match, so ONLY
-	// nullable temporal columns reach us as time.Time (non-null ones arrive as
-	// the raw int64 epoch and flow through the numeric path below). TS models
-	// every timestamp as an epoch-MILLISECOND number, so an unconverted
-	// time.Time would (a) skip the numeric coercion below and (b) msgpack-encode
-	// as `{}` (a struct with only unexported fields), shipping the client an
-	// empty object instead of the timestamp — a real go-vs-TS content drift
-	// caught by the shadow SQL oracle on channel_user_status.conversationSeenCutoffAt
-	// + updatedAt. Normalize back to epoch ms here so the value rejoins the
-	// normal numeric path identically to a NOT_NULL temporal column. mattn builds
-	// the time.Time with a >1e12 ⇒ milliseconds heuristic, so UnixMilli()
-	// round-trips every real (post-2001) timestamp exactly.
+	// A time.Time here is a PLUMBING BUG, never a data condition. TS's
+	// better-sqlite3 has no decltype conversion — it ships raw cells — and
+	// every Go-side row SELECT strips the declared type with the unary-+
+	// wrap (`+"col" AS "col"` — BuildSelectQuery and the snapshotter's
+	// selectColList), so mattn/go-sqlite3's decltype-driven time.Time
+	// conversion (sqlite3.go:2571-2638 @ v1.14.44) can no longer fire.
+	//
+	// History: this used to be `v = t.UnixMilli()` (2026-06-08, fixing
+	// nullable timestamps msgpack-encoding as `{}`), but mattn builds the
+	// time.Time with a |v| <= 1e12 ⇒ SECONDS heuristic, so the reversal
+	// multiplied every pre-2001 epoch-ms value by 1000 (ART G15,
+	// 2026-07-07). No reversal can be correct — stored 2e9 (seconds path)
+	// and 2e12 (ms path) yield the identical time.Time — so reaching this
+	// branch means some SELECT site exposes a bare temporal decltype and
+	// must be given the unary-+ wrap. Panic loudly instead of shipping a
+	// silently wrong value; the engine's recover surfaces it as an RPC
+	// error → CG teardown.
 	if t, ok := v.(time.Time); ok {
-		v = t.UnixMilli()
+		panic(fmt.Sprintf(
+			"FromSQLiteType: time.Time %v reached coercion — a SELECT site exposes a bare temporal decltype to mattn's driver conversion; wrap its result columns in `+\"col\" AS \"col\"` (see BuildSelectQuery)", t))
 	}
 	switch colType {
 	case "boolean":

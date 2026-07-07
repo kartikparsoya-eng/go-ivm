@@ -164,12 +164,13 @@ type rowScanner interface {
 }
 
 // scanRawRow scans the current row into a name→value map using Go-native
-// SQLite scan types (the driver yields string/int64/float64/[]byte/nil — plus
-// time.Time for columns whose declared type mattn/go-sqlite3 matches exactly as
-// "timestamp"/"datetime"/"date", i.e. NULLABLE temporal columns; non-null ones
-// carry a "|NOT_NULL" suffix that dodges mattn's match and stay int64).
-// coerceRow → sqlite.FromSQLiteType normalizes that time.Time back to epoch ms;
-// do NOT consume these raw values for emission without that coercion.
+// SQLite scan types (string/int64/float64/[]byte/nil). selectColList wraps
+// every column in the unary-+ no-op, which strips the declared type and so
+// disables mattn/go-sqlite3's decltype conversions — a nullable temporal
+// column arrives as its raw int64 epoch-ms (never time.Time), exactly what
+// TS's better-sqlite3 yields. coerceRow → sqlite.FromSQLiteType applies the
+// logical-type coercion at emit; FromSQLiteType panics if a time.Time ever
+// reaches it (a SELECT site missing the wrap).
 func scanRawRow(sc rowScanner, cols []string) (map[string]any, error) {
 	dest := make([]any, len(cols))
 	ptrs := make([]any, len(cols))

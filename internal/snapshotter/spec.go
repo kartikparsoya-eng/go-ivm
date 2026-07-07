@@ -37,12 +37,20 @@ func (t *TableSpec) cols() []string {
 	return cols
 }
 
-// selectColList renders the quoted column list for a SELECT.
+// selectColList renders the column list for a SELECT. Each column is wrapped
+// in SQLite's unary `+` no-op and aliased back to its bare name — an
+// expression result carries no declared type, which disables
+// mattn/go-sqlite3's decltype-driven conversions (nullable temporal columns
+// → time.Time with a |v| <= 1e12 ⇒ seconds heuristic that multiplied
+// pre-2001 epoch-ms values by 1000; boolean columns → `val > 0`). TS's
+// better-sqlite3 ships raw cells; this makes the Go read byte-identical.
+// Shared rationale: sqlite.BuildSelectQuery (query_builder.go).
 func (t *TableSpec) selectColList() string {
 	cols := t.cols()
 	quoted := make([]string, len(cols))
 	for i, c := range cols {
-		quoted[i] = quoteIdent(c)
+		q := quoteIdent(c)
+		quoted[i] = "+" + q + " AS " + q
 	}
 	return strings.Join(quoted, ",")
 }
