@@ -176,12 +176,14 @@ func buildPipelineInternal(ast AST, delegate Delegate, p *Pipeline, partitionKey
 		childInput := buildPipelineInternal(childAST, delegate, p, csq.Correlation.ChildField)
 
 		// Any CSQ reaching this loop is one the scalar resolver could NOT
-		// rewrite (a non-simple subquery — childField is not all unique-key
-		// columns). TS leaves these in place and emits the subquery rows as
-		// a normal relationship; do the same here. Propagating Scalar:true
-		// to the Join would mark the child schema IsScalar so the streamer
-		// drops emission entirely — which suppresses subquery rows (e.g. a
-		// scalar EXISTS over a related table) that TS still emits.
+		// rewrite (a non-simple subquery — its WHERE does not literal-
+		// constrain a full unique key). TS leaves these in place and emits
+		// the subquery rows as a normal relationship; do the same here.
+		// Simple scalar CSQs never reach this loop: the engine runs
+		// ResolveSimpleScalarSubqueries before BuildPipeline, replacing them
+		// with literal conditions — exactly like TS, no join exists for a
+		// resolved scalar at all (the companion pipeline is the only live
+		// element). Pinned by TestAddQuery_ResolvedScalarCSQ_BuildsNoJoin.
 		join := ivm.NewJoin(ivm.JoinArgs{
 			Parent:           end,
 			Child:            childInput,

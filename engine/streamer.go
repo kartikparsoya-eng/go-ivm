@@ -207,12 +207,6 @@ func streamChangesInto(emit func(RowChange), queryID string, schema *ivm.SourceS
 		case ivm.ChangeTypeRemove:
 			streamNodesInto(emit, queryID, schema, RowChangeRemove, change.Node)
 		case ivm.ChangeTypeEdit:
-			// IsScalar guard — mirrors streamNodesInto's check (:180). Without
-			// this, an Edit on a pre-resolved scalar CSQ row is emitted while
-			// Add/Remove for the same schema are correctly suppressed.
-			if schema.IsScalar {
-				continue
-			}
 			// Edit: emit the new row only (no relationship recursion for edits)
 			rowKey := make(map[string]interface{}, len(schema.PrimaryKey))
 			for _, pk := range schema.PrimaryKey {
@@ -264,15 +258,6 @@ func streamNodesInto(emit func(RowChange), queryID string, schema *ivm.SourceSch
 	// this guard Go emits those rows to the client while TS correctly
 	// suppresses them.
 	if schema.System == "permissions" {
-		return
-	}
-	// IsScalar skip — when a CSQ was pre-resolved by the scalar resolver as
-	// a companion subquery, the join's relationship is still built (the
-	// EXISTS check is needed) but its row emissions are suppressed at the
-	// wire so they don't double-count with the companion's own emissions.
-	// Mirrors TS's pattern where pre-resolved scalar CSQs don't add a
-	// relationship to the streamed node.
-	if schema.IsScalar {
 		return
 	}
 

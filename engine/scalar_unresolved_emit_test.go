@@ -102,7 +102,7 @@ func TestAddQuery_UnresolvedScalarCSQ_EmitsBothSides(t *testing.T) {
 		t.Errorf("channels: want 2 (c1, c2), got %d", counts["channels"])
 	}
 	if counts["conversations"] != 3 {
-		t.Errorf("conversations: want 3 (v1, v2, v3), got %d — IsScalar streamer-drop regressed",
+		t.Errorf("conversations: want 3 (v1, v2, v3), got %d — unresolved-scalar subquery rows must emit like TS",
 			counts["conversations"])
 	}
 }

@@ -45,8 +45,9 @@ package engine
 //      parent EDIT, 0 child ADDs. This is the production scenario:
 //      Go's advance had 41 conversation EDITs → 0 channel_participants.
 //   3. ScalarExistsSuppressesChild — with Scalar=true AND a unique-key
-//      filter, the resolver pre-resolves → IsScalar=true → 0 child
-//      ADDs. Documents the IsScalar suppression path.
+//      filter, the resolver replaces the EXISTS with a literal BEFORE the
+//      build — no join exists at all (TS shape) → 0 child ADDs; the
+//      companion pipeline is the only live element.
 //
 // Mismatch 2 tests:
 //   1. EditEmittedInAdvance — Go correctly emits EDIT for a received
@@ -241,9 +242,8 @@ func seedConversations(numConversations int) []ivm.Row {
 // changes (one per matching parent) — the same fan-out TS would produce.
 //
 // The production whereExists is NON-scalar (no {scalar: true} option),
-// so the scalar resolver does not touch it. The builder creates a Join
-// with Scalar=false, IsScalar=false, and the streamer does not suppress
-// child emissions.
+// so the scalar resolver does not touch it. The builder creates a normal
+// Join and the streamer emits child rows — exactly like TS.
 //
 // In production, the 588 TS-only channel_participants ADDs arose because
 // Go's snapshotter placed the child ADD in a different advance batch.
@@ -259,7 +259,7 @@ func TestMismatch1_ChildAddFanOut(t *testing.T) {
 	}
 
 	// Non-scalar whereExists, unique key on {id} only — resolver cannot
-	// resolve (userId is not a unique key), so IsScalar=false.
+	// resolve (userId is not a unique key), so a normal emitting Join is built.
 	eng, _, _ := setupConversationsAndParticipants(t, convSeed, partSeed, [][]string{{"id"}})
 
 	ast := userConversationsPaginatedAST(userID, 50, false)
@@ -403,14 +403,14 @@ func TestMismatch1_ParentEditNoChildReEmission(t *testing.T) {
 // TestMismatch1_ScalarExistsSuppressesChild verifies that when a scalar
 // EXISTS (Scalar=true) CAN be resolved by the scalar resolver (the
 // subquery filters on a column that IS a unique key), Go pre-resolves
-// the EXISTS into a literal comparison, marks the child schema IsScalar=true,
-// and the streamer suppresses child fan-out from the Join.
+// the EXISTS into a literal comparison BEFORE the pipeline is built —
+// so, exactly like TS, no join exists for the subquery at all and no
+// child fan-out is possible.
 //
 // This test uses a unique key on {userId} so the subquery
 // channel_participants.where('userId', literal) is "simple" — all unique-
-// key columns are equality-constrained by literals. The resolver resolves
-// it, IsScalar=true, and the Join's child relationship emissions are
-// suppressed.
+// key columns are equality-constrained by literals. The resolver replaces
+// the condition with a literal; BuildPipeline sees no CSQ.
 //
 // However, the companion pipeline still emits the new channel_participants
 // row as a TOP-LEVEL ADD (not as a child of conversations). This is
@@ -418,12 +418,13 @@ func TestMismatch1_ParentEditNoChildReEmission(t *testing.T) {
 // can re-evaluate its own EXISTS condition. The distinction from the
 // non-scalar case is:
 //   - Non-scalar: N CHILD→ADD from Join (one per matching parent)
-//   - Scalar: 1 top-level ADD from companion (no child fan-out)
+//   - Scalar: 1 top-level ADD from companion (no join, no child fan-out)
 //
-// This documents the IsScalar suppression path. The production query
-// does NOT trigger this path (it's non-scalar and userId is not a unique
-// key), but the path exists for queries that do use {scalar: true} with
-// a unique-key filter.
+// The structural half (a resolved scalar builds NO Join/FlippedJoin/
+// Exists) is pinned by TestAddQuery_ResolvedScalarCSQ_BuildsNoJoin.
+// The production query does NOT trigger this path (it's non-scalar and
+// userId is not a unique key), but the path exists for queries that do
+// use {scalar: true} with a unique-key filter.
 func TestMismatch1_ScalarExistsSuppressesChild(t *testing.T) {
 	const numConversations = 10
 	const userID = "user1"
@@ -444,8 +445,9 @@ func TestMismatch1_ScalarExistsSuppressesChild(t *testing.T) {
 	}
 	logChanges(t, "hydrate", hydrate)
 
-	// Hydrate: 10 conversations (no child relationship rows — IsScalar
-	// suppresses them) + 1 companion channel_participants row (part1).
+	// Hydrate: 10 conversations (no child relationship rows — the resolver
+	// replaced the EXISTS with a literal, so no join exists to fan out)
+	// + 1 companion channel_participants row (part1).
 	convCount := 0
 	for _, c := range hydrate {
 		if c.Table == "conversations" {
@@ -470,11 +472,10 @@ func TestMismatch1_ScalarExistsSuppressesChild(t *testing.T) {
 	})
 	logChanges(t, "advance (ADD channel_participants part2, scalar)", r.Changes)
 
-	// With IsScalar=true, the Join's child relationship emissions are
-	// suppressed — no N-way fan-out. But the companion pipeline emits
-	// the new row as 1 top-level ADD (so the client can re-evaluate
-	// its EXISTS). The scalar value (channelId=ch1) didn't change, so
-	// no drift/reset is triggered.
+	// The resolved scalar has NO join — no N-way fan-out is possible. The
+	// companion pipeline emits the new row as 1 top-level ADD (so the
+	// client can re-evaluate its EXISTS). The scalar value (channelId=ch1)
+	// didn't change, so no drift/reset is triggered.
 	//
 	// Key distinction from non-scalar: 1 companion ADD vs N child fan-out.
 	partCount := 0
@@ -485,8 +486,8 @@ func TestMismatch1_ScalarExistsSuppressesChild(t *testing.T) {
 	}
 	if partCount != 1 {
 		t.Errorf("Expected 1 channel_participants ADD (companion emission, no child fan-out), got %d. "+
-			"With IsScalar=true, the Join suppresses child fan-out but the companion pipeline "+
-			"still emits the new row as a top-level ADD.", partCount)
+			"A resolved scalar builds no join, so the only legal emission is the companion "+
+			"pipeline's top-level ADD.", partCount)
 	}
 }
 
