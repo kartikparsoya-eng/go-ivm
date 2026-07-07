@@ -10,7 +10,7 @@ import (
 // rows whose _0_version is below the table's minRowVersion are rewritten up
 // to it; everything else is left untouched, and the source row map is never
 // mutated in place (copy-on-bump). Port of TS streamNodes
-// (pipeline-driver.ts:3172-3178).
+// (pipeline-driver.ts:2843-2850).
 func TestBumpRowVersions(t *testing.T) {
 	mrv := map[string]string{"messages": "0e"}
 

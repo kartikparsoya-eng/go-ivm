@@ -1618,7 +1618,7 @@ const rpcCodeDataError = -32102
 // rpcCodeScalarReset marks a recovered *engine.ScalarResetError: a resolved
 // scalar subquery's value changed mid-advance, so the main query's baked-in
 // literal is stale. TS's own companion push throws
-// ResetPipelinesSignal('scalar-subquery') here (pipeline-driver.ts:1468) —
+// ResetPipelinesSignal('scalar-subquery') here (pipeline-driver.ts:1717-1723) —
 // a RESET + re-hydrate, NOT a teardown — so this must not ride -32000
 // ('unclassified' → teardown). The TS client maps this code back to the
 // same ResetPipelinesSignal('scalar-subquery').
@@ -1762,7 +1762,7 @@ type tableSchemaParams struct {
 	// MinRowVersion: the table's minRowVersion (TS liteTableSpec.minRowVersion),
 	// set after a RESET during incremental catchup. Forwarded so streamNodes can
 	// bump an emitted row's _0_version up to it when below (audit item K, port of
-	// pipeline-driver.ts:3172-3178). Empty/absent means no bump for this table.
+	// pipeline-driver.ts:2843-2850). Empty/absent means no bump for this table.
 	MinRowVersion string `json:"minRowVersion,omitempty"`
 }
 

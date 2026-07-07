@@ -88,7 +88,7 @@ func TestAdvanceToHeadStream_EconomicAbort(t *testing.T) {
 		t.Fatalf("code = %d, want %d (rpcCodeAdvanceAborted): %s",
 			resp.Error.Code, rpcCodeAdvanceAborted, resp.Error.Message)
 	}
-	// Byte-shape of the TS template literal (pipeline-driver.ts:6062-6066).
+	// Byte-shape of the TS template literal (pipeline-driver.ts:2657-2659).
 	re := regexp.MustCompile(`^Advancement exceeded timeout at \d+ of 20 changes after [0-9.]+ ms\. ` +
 		`Advancement time limited based on total hydration time of 0\.000001 ms\.$`)
 	if !re.MatchString(resp.Error.Message) {
@@ -204,7 +204,7 @@ func TestAdvanceToHeadStream_CleanRetryableOnSnapshotterFailure(t *testing.T) {
 
 // TestAdvanceAbortMessage_TSByteShape pins byte-identity of the rendered
 // message against the exact output of TS's template literal
-// (pipeline-driver.ts:2373-2375) for representative values, including the
+// (pipeline-driver.ts:2657-2659) for representative values, including the
 // JS number rendering (no trailing ".0" on integral floats, shortest
 // round-trip decimals otherwise).
 func TestAdvanceAbortMessage_TSByteShape(t *testing.T) {

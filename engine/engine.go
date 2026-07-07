@@ -201,7 +201,7 @@ type Engine struct {
 	// tableSpec.minRowVersion (set after a RESET during incremental catchup).
 	// Used to bump an emitted row's _0_version up to minRowVersion when the
 	// row's stored version is below it — direct port of TS streamNodes
-	// (pipeline-driver.ts:3172-3178). Empty/missing for a table means no bump.
+	// (pipeline-driver.ts:2843-2850). Empty/missing for a table means no bump.
 	// The bump is a no-op in steady state (minRowVersion unset or rows already
 	// at/above it), so it only activates in the rare post-RESET window.
 	minRowVersions map[string]string
@@ -222,7 +222,7 @@ func (e *Engine) SetMinRowVersions(m map[string]string) {
 }
 
 // bumpRowVersions applies the TS streamNodes minRowVersion bump
-// (pipeline-driver.ts:3172-3178) to a finished RowChange slice: for each
+// (pipeline-driver.ts:2843-2850) to a finished RowChange slice: for each
 // non-REMOVE change whose table has a minRowVersion and whose row's stored
 // _0_version is below it, rewrite _0_version up to minRowVersion. Bumps on a
 // COPY of the row so the source's row map is never mutated. No-op (returns the
@@ -621,7 +621,7 @@ func (e *Engine) buildAndRegisterLocked(queryID string, ast builder.AST) *pipeli
 
 	// HIGH-11: companion outputs are wired AFTER hydrate (see
 	// wireCompanionOutputsLocked), matching TS which wires the main pipeline
-	// before hydrate but companions after (pipeline-driver.ts:1936-2026). They
+	// before hydrate but companions after (pipeline-driver.ts:1615-1747). They
 	// only emit on advance (source.Push), never during the hydrate Fetch, so
 	// deferring the wiring keeps companion emissions out of the hydrate window
 	// even if the build+hydrate locking is ever loosened for throughput.
@@ -1302,7 +1302,7 @@ func (e *Engine) Advance(changes []SnapshotChange) *AdvanceResult {
 			// Push each source change and collect streamer output. Time each
 			// one individually so TS can attribute wall time to the
 			// responsible (table, op) pair — matches the granularity of TS's
-			// #advanceTime histogram (pipeline-driver.ts:1351).
+			// #advanceTime histogram (pipeline-driver.ts:2545).
 			for _, sc := range sourceChanges {
 				start := time.Now()
 				source.Push(sc)
@@ -1768,7 +1768,7 @@ func (po *pipelineOutput) Push(change ivm.Change, pusher ivm.InputBase) {
 // re-registers the query, re-running ResolveSimpleScalarSubqueries against
 // current truth and baking the NEW value — TS's own companion push throws
 // ResetPipelinesSignal('scalar-subquery') at the same point
-// (pipeline-driver.ts:1468). Unchanged-value pushes
+// (pipeline-driver.ts:1717). Unchanged-value pushes
 // accumulate exactly as the plain pipelineOutput would.
 type companionOutput struct {
 	pipelineOutput
@@ -1778,7 +1778,7 @@ type companionOutput struct {
 
 // ScalarResetError is the panic a companionOutput raises when a resolved
 // scalar subquery's value changes — the twin of TS's
-// ResetPipelinesSignal('scalar-subquery') (pipeline-driver.ts:1468-1472).
+// ResetPipelinesSignal('scalar-subquery') (pipeline-driver.ts:1717-1723).
 // Unlike the source/operator asserts (whose TS twins throw → teardown),
 // TS's disposition here is a RESET + re-hydrate, so the sidecar maps this
 // type to its own RPC code instead of the generic -32000. Message mirrors
@@ -1850,7 +1850,7 @@ func (co *companionOutput) Push(change ivm.Change, pusher ivm.InputBase) {
 	co.pipelineOutput.Push(change, pusher)
 }
 
-// scalarValuesEqual ports TS's scalarValuesEqual (pipeline-driver.ts:3278,
+// scalarValuesEqual ports TS's scalarValuesEqual (pipeline-driver.ts:3029-3034,
 // strict `a === b`) for the resolved-scalar child-field comparison. Go's
 // interface `==` matches JS `===` for scalar literals (the only thing a
 // resolvable scalar subquery yields), with nil == SQL/JS null. The recover

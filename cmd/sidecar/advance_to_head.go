@@ -722,7 +722,7 @@ func (s *Server) handleAdvanceToHeadStream(req RPCRequest, streamW streamWriter)
 	//     discards the half-advanced engine.
 	changesSeq := func(yield func(engine.SnapshotChange, error) bool) {
 		err := diff.Each(func(c snapshotter.Change) error {
-			// TS checkpoint 1 (pipeline-driver.ts:5883-5890): "Check progress
+			// TS checkpoint 1 (pipeline-driver.ts:2484-2490): "Check progress
 			// here before processing the next change." The abort error rides
 			// the seq's error slot — the same in-band path as cursor errors —
 			// so the engine stops, skips its Final flush, and unwinds its

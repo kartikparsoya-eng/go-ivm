@@ -191,7 +191,7 @@ func (a *advanceAbort) check() error {
 }
 
 // renderAdvanceAbortMessage is TS's template literal at
-// pipeline-driver.ts:2373-2375, byte-for-byte (numbers rendered as JS
+// pipeline-driver.ts:2657-2659, byte-for-byte (numbers rendered as JS
 // renders them — see jsNum). Split out so the byte-shape is pin-testable
 // with controlled elapsed values.
 func renderAdvanceAbortMessage(pos, numChanges int, elapsedMs, totalHydrationTimeMs float64) string {
