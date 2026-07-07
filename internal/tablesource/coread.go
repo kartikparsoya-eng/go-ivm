@@ -266,9 +266,14 @@ func NewCoReadReaderPool(ctx context.Context, db *sql.DB, cr *CoRead, k int) (*R
 	// Bound the whole build — hold-and-wait across concurrent builders on
 	// an exhausted read pool was a permanent deadlock (2026-07-06 ART
 	// incident; see PoolAcquireTimeout). Error paths below unwind every
-	// held reader; the callers fall back to serial hydrate.
+	// held reader; the callers fall back to serial hydrate. closeCtx: the
+	// unwinds must not reuse the possibly-expired build ctx (see
+	// NewReaderPool's note — a skipped ROLLBACK returns a WAL-pinning conn
+	// to the pool). WithoutCancel, no fresh deadline: one anchored here
+	// would itself be expired by unwind time.
 	ctx, cancel := context.WithTimeout(ctx, PoolAcquireTimeout)
 	defer cancel()
+	closeCtx := context.WithoutCancel(ctx)
 
 	readers := make([]*poolReader, k)
 	var version string
@@ -276,7 +281,7 @@ func NewCoReadReaderPool(ctx context.Context, db *sql.DB, cr *CoRead, k int) (*R
 		conn, err := db.Conn(ctx)
 		if err != nil {
 			for j := 0; j < i; j++ {
-				readers[j].close(ctx)
+				readers[j].close(closeCtx)
 			}
 			return nil, fmt.Errorf("coread reader pool: acquire conn %d: %w", i, err)
 		}
@@ -285,26 +290,26 @@ func NewCoReadReaderPool(ctx context.Context, db *sql.DB, cr *CoRead, k int) (*R
 		if _, err := conn.ExecContext(ctx, "BEGIN"); err != nil {
 			_ = conn.Close()
 			for j := 0; j < i; j++ {
-				readers[j].close(ctx)
+				readers[j].close(closeCtx)
 			}
 			return nil, fmt.Errorf("coread reader pool: BEGIN conn %d: %w", i, err)
 		}
 		// Arm the conn onto the coread's frame. This latches the read tx
 		// at the anchor's frame inside walTryBeginRead.
 		if err := cr.armConn(conn); err != nil {
-			_, _ = conn.ExecContext(ctx, "ROLLBACK")
+			_, _ = conn.ExecContext(closeCtx, "ROLLBACK")
 			_ = conn.Close()
 			for j := 0; j < i; j++ {
-				readers[j].close(ctx)
+				readers[j].close(closeCtx)
 			}
 			return nil, fmt.Errorf("coread reader pool: arm conn %d: %w", i, err)
 		}
 		var ver string
 		if err := conn.QueryRowContext(ctx, stateVersionSQL).Scan(&ver); err != nil {
-			_, _ = conn.ExecContext(ctx, "ROLLBACK")
+			_, _ = conn.ExecContext(closeCtx, "ROLLBACK")
 			_ = conn.Close()
 			for j := 0; j < i; j++ {
-				readers[j].close(ctx)
+				readers[j].close(closeCtx)
 			}
 			return nil, fmt.Errorf("coread reader pool: read stateVersion conn %d: %w", i, err)
 		}
@@ -314,7 +319,7 @@ func NewCoReadReaderPool(ctx context.Context, db *sql.DB, cr *CoRead, k int) (*R
 		} else if ver != version {
 			for _, r := range readers {
 				if r != nil {
-					r.close(ctx)
+					r.close(closeCtx)
 				}
 			}
 			return nil, fmt.Errorf("coread reader pool: version mismatch conn %d (%q vs %q)", i, ver, version)

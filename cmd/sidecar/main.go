@@ -386,7 +386,7 @@ func startPprofServer() *http.Server {
 func (s *Server) runPerfReporter(ctx context.Context) {
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
-	var lastWait int64
+	var lastReadWait, lastWriteWait int64
 	for {
 		select {
 		case <-ctx.Done():
@@ -402,17 +402,31 @@ func (s *Server) runPerfReporter(ctx context.Context) {
 		s.replicaMu.Unlock()
 		if rdb != nil && wdb != nil {
 			rs, ws := rdb.Stats(), wdb.Stats()
-			wait := rs.WaitCount + ws.WaitCount
-			if wait > lastWait {
+			// Read vs writable waits reported SEPARATELY: the summed count
+			// made the 2026-07-06 latency forensics ambiguous (read-pool
+			// saturation from warm-pool K bursts vs writable prev-conn
+			// contention need different remedies).
+			if rs.WaitCount > lastReadWait || ws.WaitCount > lastWriteWait {
 				fmt.Fprintf(os.Stderr,
-					"[GO-IVM] replica pool pressure: +%d conn waits in last 10s "+
-						"(read in-use %d/%d, writable in-use %d/%d, total wait %s) — "+
+					"[GO-IVM] replica pool pressure: read +%d waits (in-use %d/%d, wait %s) "+
+						"writable +%d waits (in-use %d/%d, wait %s) in last 10s — "+
 						"consider raising GO_IVM_MAX_OPEN_CONNS\n",
-					wait-lastWait, rs.InUse, rs.MaxOpenConnections,
-					ws.InUse, ws.MaxOpenConnections,
-					(rs.WaitDuration + ws.WaitDuration).Round(time.Millisecond))
+					rs.WaitCount-lastReadWait, rs.InUse, rs.MaxOpenConnections,
+					rs.WaitDuration.Round(time.Millisecond),
+					ws.WaitCount-lastWriteWait, ws.InUse, ws.MaxOpenConnections,
+					ws.WaitDuration.Round(time.Millisecond))
+			} else if rs.MaxOpenConnections > 0 && rs.InUse >= rs.MaxOpenConnections {
+				// Saturation without NEW waits is the deadlock signature the
+				// 2026-07-06 incident hid: blocked acquirers bump WaitCount
+				// exactly once, so a wedged-full pool goes silent under the
+				// growth-only gate above. Log it every window until it clears.
+				fmt.Fprintf(os.Stderr,
+					"[GO-IVM] replica read pool SATURATED: in-use %d/%d for a full 10s window "+
+						"(writable in-use %d/%d) — acquires are queueing; sustained saturation "+
+						"suggests leaked readers or GO_IVM_MAX_OPEN_CONNS too low\n",
+					rs.InUse, rs.MaxOpenConnections, ws.InUse, ws.MaxOpenConnections)
 			}
-			lastWait = wait
+			lastReadWait, lastWriteWait = rs.WaitCount, ws.WaitCount
 		}
 	}
 }

@@ -175,8 +175,18 @@ func NewReaderPool(ctx context.Context, db *sql.DB, _ string, k int) (*ReaderPoo
 	// Bound the whole build (acquires + BEGINs + converge reads): see
 	// PoolAcquireTimeout. On expiry the error paths below unwind every
 	// already-held reader and the caller falls back to serial hydrate.
+	//
+	// closeCtx: the unwind paths MUST NOT reuse the (possibly just-expired)
+	// build ctx — close(expiredCtx) fails the ROLLBACK instantly without
+	// executing it, returning conns to the pool with OPEN read txs. mattn's
+	// ResetSession discards such conns, but only at their NEXT checkout —
+	// until then each one pins a WAL frame (wal2 switch deferral → WAL
+	// growth → uniform read slowdown). WithoutCancel (no fresh deadline:
+	// one anchored at build start would itself be expired by unwind time,
+	// and a read-tx ROLLBACK takes no locks — it cannot meaningfully hang).
 	ctx, cancel := context.WithTimeout(ctx, PoolAcquireTimeout)
 	defer cancel()
+	closeCtx := context.WithoutCancel(ctx)
 
 	readers := make([]*poolReader, k)
 	versions := make([]string, k)
@@ -185,14 +195,14 @@ func NewReaderPool(ctx context.Context, db *sql.DB, _ string, k int) (*ReaderPoo
 		conn, err := db.Conn(ctx)
 		if err != nil {
 			for j := 0; j < i; j++ {
-				readers[j].close(ctx)
+				readers[j].close(closeCtx)
 			}
 			return nil, fmt.Errorf("reader pool: acquire conn %d: %w", i, err)
 		}
 		if _, err := conn.ExecContext(ctx, "BEGIN"); err != nil {
 			_ = conn.Close()
 			for j := 0; j < i; j++ {
-				readers[j].close(ctx)
+				readers[j].close(closeCtx)
 			}
 			return nil, fmt.Errorf("reader pool: BEGIN conn %d: %w", i, err)
 		}
@@ -200,7 +210,7 @@ func NewReaderPool(ctx context.Context, db *sql.DB, _ string, k int) (*ReaderPoo
 		if err := conn.QueryRowContext(ctx, stateVersionSQL).Scan(&ver); err != nil {
 			_ = conn.Close()
 			for j := 0; j < i; j++ {
-				readers[j].close(ctx)
+				readers[j].close(closeCtx)
 			}
 			return nil, fmt.Errorf("reader pool: read stateVersion conn %d: %w", i, err)
 		}
@@ -220,20 +230,20 @@ func NewReaderPool(ctx context.Context, db *sql.DB, _ string, k int) (*ReaderPoo
 			if versions[i] != maxVer {
 				if _, err := r.conn.ExecContext(ctx, "ROLLBACK"); err != nil {
 					for _, r2 := range readers {
-						r2.close(ctx)
+						r2.close(closeCtx)
 					}
 					return nil, fmt.Errorf("reader pool: converge ROLLBACK: %w", err)
 				}
 				if _, err := r.conn.ExecContext(ctx, "BEGIN"); err != nil {
 					for _, r2 := range readers {
-						r2.close(ctx)
+						r2.close(closeCtx)
 					}
 					return nil, fmt.Errorf("reader pool: converge BEGIN: %w", err)
 				}
 				var ver string
 				if err := r.conn.QueryRowContext(ctx, stateVersionSQL).Scan(&ver); err != nil {
 					for _, r2 := range readers {
-						r2.close(ctx)
+						r2.close(closeCtx)
 					}
 					return nil, fmt.Errorf("reader pool: converge read: %w", err)
 				}
@@ -257,7 +267,7 @@ func NewReaderPool(ctx context.Context, db *sql.DB, _ string, k int) (*ReaderPoo
 	}
 
 	for _, r := range readers {
-		r.close(ctx)
+		r.close(closeCtx)
 	}
 	return nil, fmt.Errorf("reader pool: could not converge %d readers after %d attempts", k, maxConvergeAttempts)
 }
