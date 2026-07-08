@@ -720,7 +720,7 @@ func (s *Server) handleAdvanceToHeadStream(req RPCRequest, streamW streamWriter)
 	// the terminal Final (carrying Version/NumChanges/Timings) ship
 	// as kind-1 frames on the same ordered queue; "done" follows via the
 	// pipe (see rowplane.go's ordering invariant).
-	if rp := newRowPlane(s, req.ID, p.RowMode); rp != nil {
+	if rp := newRowPlane(s, req.ID, p.RowMode, cgID, group.done); rp != nil {
 		streamErr := group.eng.AdvanceStreamChunkedSeqClocked(changesSeq, 1, abort.clock(), func(r engine.AdvanceStreamPartial) {
 			// Per-partial budget checkpoint: a panic here escapes
 			// AdvanceStreamChunkedSeq cleanly (engine stays reusable — see
@@ -735,7 +735,17 @@ func (s *Server) handleAdvanceToHeadStream(req RPCRequest, streamW streamWriter)
 				panic(aerr)
 			}
 			emittedPartial = true
-			rp.emitAdvanceToHeadPartial(r, version, numChanges)
+			if !rp.emitAdvanceToHeadPartial(r, version, numChanges) {
+				// Row-plane delivery dead (TSFN closed / group teardown /
+				// GO_IVM_DELIVER_TIMEOUT — the bounded successor of the G13
+				// blocking-deliver wedge). The engine's sink has no error
+				// return — panic into handleStreamWithRecover exactly like
+				// the economic abort; the -32000 classification tears the
+				// CG down on the TS side, which is right: the client is
+				// gone or its loop is starved beyond recovery, and state is
+				// half-advanced.
+				panic(fmt.Errorf("advanceToHeadStream cg=%s: row-plane delivery dead (stream cancelled or deliver timeout) — aborting advance", cgID))
+			}
 			if r.Final {
 				// rowMode: chunkSize=1, so ChunkIndex+1 is the per-row
 				// DELIVERY count, not a chunk count — record it as rows so the

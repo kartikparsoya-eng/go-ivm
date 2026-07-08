@@ -43,7 +43,7 @@ func TestReaper_DoesNotReapGroupWithInFlightHandler(t *testing.T) {
 		entMu   sync.Mutex
 		entries []sinkEntry
 	)
-	sink := func(kind int32, payload []byte) {
+	sink := func(kind int32, payload []byte) int32 {
 		gateMu.Lock()
 		ch := gateCh
 		gateMu.Unlock()
@@ -57,6 +57,7 @@ func TestReaper_DoesNotReapGroupWithInFlightHandler(t *testing.T) {
 		entMu.Lock()
 		entries = append(entries, sinkEntry{kind: kind, payload: buf})
 		entMu.Unlock()
+		return deliverOK
 	}
 
 	path, db := makeReplica(t)

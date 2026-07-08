@@ -21,7 +21,7 @@ import (
 
 func rowPlaneForTest(t *testing.T, col *sinkCollector, reqID float64) *rowPlane {
 	t.Helper()
-	rp := newRowPlane(&Server{abiDeliver: col.sink}, reqID, true)
+	rp := newRowPlane(&Server{abiDeliver: col.sink}, reqID, true, "cg-test", nil)
 	if rp == nil {
 		t.Fatal("newRowPlane returned nil with abiDeliver set + numeric id")
 	}

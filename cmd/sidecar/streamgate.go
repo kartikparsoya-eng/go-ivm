@@ -113,6 +113,17 @@ func (g *streamGate) cancel() {
 	g.mu.Unlock()
 }
 
+// isCancelled reports the gate's cancelled flag. The row plane polls it
+// between deliver-retry attempts (rowplane.go retryDeliver): a producer
+// parked on a FULL TSFN queue is not a gate waiter, so cancel's cond
+// broadcast cannot reach it — the poll is what carries the client's
+// .return()/.throw()/timeout across that gap.
+func (g *streamGate) isCancelled() bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.cancelled
+}
+
 // idleParked reports whether at least one producer has been parked with no
 // grant for longer than idle. Used by the sweeper (D7): parked-past-timeout
 // gates are auto-cancelled — same unwind as a client cancel; the client

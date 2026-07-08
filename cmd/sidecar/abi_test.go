@@ -32,7 +32,7 @@ func newSinkCollector() *sinkCollector {
 	return &sinkCollector{notify: make(chan struct{}, 4096)}
 }
 
-func (c *sinkCollector) sink(kind int32, payload []byte) {
+func (c *sinkCollector) sink(kind int32, payload []byte) int32 {
 	buf := make([]byte, len(payload))
 	copy(buf, payload)
 	c.mu.Lock()
@@ -42,6 +42,7 @@ func (c *sinkCollector) sink(kind int32, payload []byte) {
 	}
 	c.mu.Unlock()
 	c.notify <- struct{}{}
+	return deliverOK
 }
 
 func (c *sinkCollector) waitFrames(t *testing.T, n int, timeout time.Duration) [][]byte {
@@ -188,12 +189,12 @@ func TestABIHost_SlowSinkBackpressureLossless(t *testing.T) {
 	got := make(map[int]int)
 	var count int
 	release := make(chan struct{})
-	slowSink := func(kind int32, payload []byte) {
+	slowSink := func(kind int32, payload []byte) int32 {
 		<-release // hold every delivery until the test opens the gate
 		var resp RPCResponse
 		if err := mpUnmarshal(payload, &resp); err != nil {
 			t.Errorf("decode: %v", err)
-			return
+			return deliverOK
 		}
 		if f, ok := toFloat(resp.ID); ok {
 			mu.Lock()
@@ -201,6 +202,7 @@ func TestABIHost_SlowSinkBackpressureLossless(t *testing.T) {
 			count++
 			mu.Unlock()
 		}
+		return deliverOK
 	}
 	h := startABIHostWithServer(NewServer(makeReplicaPathOnly(t)), slowSink, nil)
 	defer h.Shutdown()

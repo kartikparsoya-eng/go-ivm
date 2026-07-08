@@ -80,8 +80,8 @@ operators, engine loop, and the Go↔JS boundary.
 | Terminal sink | push | `Streamer.Accumulate` flattens **during** push (streamer.go:122), mid-flatten chunk sink (streamer.go:110, :154-162) | **YES** (shipped, DESIGN-streaming-advance + chunk sink) |
 | Engine hydrate | pull | producer ranges lazily: `for node := range entry.pipeline.Input.Fetch(...)` (engine.go:966), chunk-flushes via `onResult` | **producer-side yes** — but demand never reaches it |
 | Engine advance | push | `AdvanceStream` pushes per source-change, chunkSink flushes mid-flatten (engine.go:1329-1335) | **YES** |
-| NAPI boundary | hydrate | TSFN queue, `napi_tsfn_blocking`, fixed 8192 window (addon.c:65, :187) — **Go pushes at its own pace** | **NO — gap G1** |
-| NAPI boundary | advance | same TSFN push queue, blocking = bounded buffer | **YES** (TS drains advance synchronously; a bounded push queue is the faithful equivalent) |
+| NAPI boundary | hydrate | TSFN queue, fixed 8192 window; **ABI v4 (2026-07-09):** `napi_tsfn_nonblocking` + Go-side cancellable retry (rowplane.go) — Go pushes at its own pace, parks BOUNDED on a full queue | pull mode + credits close G1; the v4 retry closes the wedge the blocking enqueue hid |
+| NAPI boundary | advance | same TSFN queue; v4 nonblocking + retry with `GO_IVM_DELIVER_TIMEOUT` tripwire | **YES** (TS drains advance synchronously; a bounded queue is the faithful equivalent — and the park is now cancellable/bounded instead of a blocked cgo call: the G13 wedge fix) |
 | Cancellation | hydrate | none — `onResult` cannot abort; client close ≠ `.return()` | **NO — gap G2** |
 | Advance-diff derivation | push | changelog materialized up to `GO_IVM_MAX_DIFF_CHANGES` (50k) before pushing | **NO — gap G4** (TS's changelog cursor feeds `#advance` lazily) |
 

@@ -38,6 +38,7 @@ import (
 	"os"
 	"strconv"
 	"sync"
+	"time"
 
 	"github.com/kartikparsoya-eng/go-ivm/internal/tablesource"
 	"github.com/kartikparsoya-eng/go-ivm/sqlite"
@@ -123,14 +124,19 @@ type abiHost struct {
 	clientEnd net.Conn // ABI side: requests written here, responses read here
 	serverEnd net.Conn // handleConnection side
 
-	// deliver receives every outbound entry: (kind, payload). Kind 1 =
-	// msgpack RPC frame (length prefix stripped), kinds 2/3 = row-plane
+	// deliver receives every outbound entry: (kind, payload) → status. Kind
+	// 1 = msgpack RPC frame (length prefix stripped), kinds 2/3 = row-plane
 	// records (see rowrecord.go), kind 4 = host death (see the death
-	// watcher in startABIHostWithServer). The bytes are valid ONLY for the
-	// duration of the call — the receiver must copy before returning
-	// (the cgo shim's C callback contract; the addon memcpy's into its
-	// TSFN queue entry).
-	deliver func(kind int32, payload []byte)
+	// watcher in startABIHostWithServer). The enqueue is NONBLOCKING (ABI
+	// v4): deliverOK means the receiver copied the payload into its TSFN
+	// queue entry synchronously (the bytes are valid ONLY for the duration
+	// of the call); deliverFull means NOTHING was enqueued and the caller
+	// owns the retry (rowplane.go retryDeliver for the row plane;
+	// deliverPumpFrame for the pump); deliverClosed means the transport is
+	// dead. Pre-v4 this callback BLOCKED on a full queue — an uncancellable
+	// park inside cgo that composed with rp.mu + wg.Wait + the inFlight
+	// worker into the G13 permanent CG wedge.
+	deliver func(kind int32, payload []byte) int32
 
 	mu     sync.Mutex
 	cond   *sync.Cond
@@ -178,7 +184,7 @@ var errHostClosed = errors.New("goivm abi host closed")
 
 // startABIHost builds the server from env, wires the pipe to
 // handleConnection, and starts the pump goroutines.
-func startABIHost(deliver func(kind int32, payload []byte)) (*abiHost, error) {
+func startABIHost(deliver func(kind int32, payload []byte) int32) (*abiHost, error) {
 	if deliver == nil {
 		return nil, errors.New("deliver callback is required")
 	}
@@ -203,10 +209,13 @@ func startABIHost(deliver func(kind int32, payload []byte)) (*abiHost, error) {
 // deliver contract: the ABI host owns ONE delivery callback used by BOTH
 // planes — the pump reader (kind 1, msgpack frames read back off the pipe)
 // and the row plane (kinds 2/3 + row-mode kind-1 frames, called directly by
-// handlers via server.abiDeliver). Every payload is valid only for the
-// duration of the call; the receiver (the addon's C callback) copies into
-// its TSFN queue entry before returning.
-func startABIHostWithServer(server *Server, deliver func(kind int32, payload []byte), _ func([]byte)) *abiHost {
+// handlers via server.abiDeliver). The enqueue is NONBLOCKING and returns a
+// status (deliverOK/deliverFull/deliverClosed — ABI v4); on deliverOK the
+// receiver (the addon's C callback) copied the payload into its TSFN queue
+// entry before returning, so payloads are valid only for the duration of
+// the call. Retry policy is the CALLER's: the row plane parks cancellably
+// (rowplane.go), the pump parks until the host closes (deliverPumpFrame).
+func startABIHostWithServer(server *Server, deliver func(kind int32, payload []byte) int32, _ func([]byte)) *abiHost {
 	clientEnd, serverEnd := net.Pipe()
 	h := &abiHost{
 		server:    server,
@@ -299,7 +308,10 @@ func startABIHostWithServer(server *Server, deliver func(kind int32, payload []b
 				h.setDeathCause(err)
 				return
 			}
-			h.deliver(abiKindFrame, payload)
+			if !h.deliverPumpFrame(abiKindFrame, payload) {
+				h.setDeathCause(errors.New("TSFN closed while delivering a response frame"))
+				return
+			}
 		}
 	}()
 
@@ -325,11 +337,63 @@ func startABIHostWithServer(server *Server, deliver func(kind int32, payload []b
 			if cause != nil {
 				reason += ": " + cause.Error()
 			}
-			h.deliver(abiKindHostDeath, []byte(reason))
+			// Best-effort bounded retry: the death record is the client's
+			// ONLY signal that the host is gone, so give a starved loop a
+			// few seconds to accept it — but the process is dying either
+			// way, so never park forever (that would also hold close(h.done)
+			// and with it Shutdown()).
+			deadline := time.Now().Add(5 * time.Second)
+			for {
+				st := h.deliver(abiKindHostDeath, []byte(reason))
+				if st != deliverFull || time.Now().After(deadline) {
+					break
+				}
+				time.Sleep(5 * time.Millisecond)
+			}
 		}
 		close(h.done)
 	}()
 	return h
+}
+
+// deliverPumpFrame delivers one control-plane frame off the pump, parking
+// while the TSFN queue is full. Control frames (RPC responses, "done"
+// sentinels) must never be DROPPED — a missing frame orphans its RPC into
+// the TS timeout — so unlike the row plane there is no deadline here: the
+// park IS the transport backpressure the pipe chain propagates (and it
+// wedges nothing — the pump is its own goroutine; CG workers hand frames
+// off via respCh and move on). The park stays escapable: host teardown
+// (markClosed → h.closed) or a dying TSFN (deliverClosed) breaks it.
+func (h *abiHost) deliverPumpFrame(kind int32, payload []byte) bool {
+	switch h.deliver(kind, payload) {
+	case deliverOK:
+		return true
+	case deliverClosed:
+		return false
+	}
+	metrics.napiDeliverStalls.Add(1)
+	sleep := 100 * time.Microsecond
+	for {
+		if h.isClosed() {
+			return false
+		}
+		time.Sleep(sleep)
+		if sleep < 5*time.Millisecond {
+			sleep *= 2
+		}
+		switch h.deliver(kind, payload) {
+		case deliverOK:
+			return true
+		case deliverClosed:
+			return false
+		}
+	}
+}
+
+func (h *abiHost) isClosed() bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.closed
 }
 
 // Send enqueues one request frame (payload WITHOUT length prefix; the writer

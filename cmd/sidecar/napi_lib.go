@@ -13,8 +13,8 @@ package main
 //
 // ABI (see goivm_abi_version for compatibility):
 //
-//	typedef void (*goivm_deliver_cb)(void* ctx, int32_t kind,
-//	                                 const void* data, int32_t len);
+//	typedef int32_t (*goivm_deliver_cb)(void* ctx, int32_t kind,
+//	                                    const void* data, int32_t len);
 //	int32_t goivm_start(goivm_deliver_cb cb, void* ctx);
 //	int32_t goivm_send(const void* data, int32_t len);
 //	void    goivm_shutdown(void);
@@ -24,12 +24,18 @@ package main
 //
 // Threading & memory contract:
 //   - The deliver callback is invoked from Go-runtime goroutines (NOT the
-//     JS thread). It may block — blocking propagates backpressure into the
-//     engine exactly like a slow socket. It must NOT call back into
-//     goivm_send (deadlock risk via the pipe backpressure chain).
+//     JS thread). It must be NONBLOCKING (ABI v4): it attempts the TSFN
+//     enqueue and returns 0 (queued — payload copied synchronously),
+//     1 (queue full — nothing enqueued; the Go side owns the retry, which
+//     is what makes a stalled JS consumer CANCELLABLE), or 2 (TSFN
+//     closing — transport dead). It must NOT call back into goivm_send
+//     (deadlock risk via the pipe backpressure chain). Pre-v4 the callback
+//     was allowed to block — "backpressure like a slow socket" — which
+//     parked Go goroutines in an uninterruptible cgo call for as long as
+//     the JS event loop stayed starved (the G13 CG wedge).
 //   - (data,len) passed to the callback are valid ONLY for the duration of
-//     the call; the receiver must copy before returning. This satisfies the
-//     cgo pointer rules: the Go-owned buffer is never retained by C.
+//     the call; the receiver must copy before returning 0. This satisfies
+//     the cgo pointer rules: the Go-owned buffer is never retained by C.
 //   - goivm_send copies (data,len) before returning; the caller may free
 //     its buffer immediately. It never blocks the calling (JS) thread —
 //     enqueue is O(1) into an unbounded queue drained by a Go goroutine.
@@ -49,11 +55,11 @@ package main
 // exported as a symbol cgo can link to on all platforms.
 extern char **environ;
 
-typedef void (*goivm_deliver_cb)(void* ctx, int32_t kind, const void* data, int32_t len);
+typedef int32_t (*goivm_deliver_cb)(void* ctx, int32_t kind, const void* data, int32_t len);
 
 // cgo cannot call a C function pointer directly; this trampoline does.
-static void goivm_call_deliver(goivm_deliver_cb cb, void* ctx, int32_t kind, const void* data, int32_t len) {
-	cb(ctx, kind, data, len);
+static int32_t goivm_call_deliver(goivm_deliver_cb cb, void* ctx, int32_t kind, const void* data, int32_t len) {
+	return cb(ctx, kind, data, len);
 }
 
 // goivm_env_count returns the number of entries in C environ.
@@ -92,7 +98,18 @@ import (
 //	    a v3 addon dlsym-ing the credit exports must never pair with a
 //	    library that silently lacks them (grants would vanish and every
 //	    pull hydrate would park to idle-timeout).
-const goivmABIVersion = 3
+//	v4: the deliver callback returns int32_t status (0=queued, 1=queue
+//	    full, 2=closing) and the addon enqueues with napi_tsfn_nonblocking;
+//	    the Go side owns the retry, which makes a delivery parked on a
+//	    starved JS event loop CANCELLABLE (pull-gate cancel / group
+//	    teardown / GO_IVM_DELIVER_TIMEOUT) — the G13 CG-wedge fix. The
+//	    version gates the SIGNATURE: a v4 library reading a return value
+//	    from a v3 addon's void callback would consume a garbage register
+//	    (a phantom "queue full" retries an enqueue that SUCCEEDED —
+//	    duplicate delivery → stream corruption), and a v3 library's
+//	    blocking semantics on a v4 addon would silently reintroduce the
+//	    wedge.
+const goivmABIVersion = 4
 
 var (
 	abiMu   sync.Mutex
@@ -150,16 +167,17 @@ func goivm_start(cb C.goivm_deliver_cb, ctx unsafe.Pointer) C.int32_t {
 
 	tuneRuntime()
 
-	deliver := func(kind int32, payload []byte) {
+	deliver := func(kind int32, payload []byte) int32 {
 		// Pass the Go slice's base pointer into C for the DURATION OF THE
 		// CALL only — legal under the cgo pointer rules; the addon copies
-		// into its TSFN queue entry before returning. Empty payloads pass
-		// a nil pointer with len 0.
+		// into its TSFN queue entry before returning 0. Empty payloads pass
+		// a nil pointer with len 0. The returned status (0/1/2) is the
+		// nonblocking enqueue outcome — see the ABI v4 notes above.
 		var p unsafe.Pointer
 		if len(payload) > 0 {
 			p = unsafe.Pointer(&payload[0])
 		}
-		C.goivm_call_deliver(abiCB, abiCtx, C.int32_t(kind), p, C.int32_t(len(payload)))
+		return int32(C.goivm_call_deliver(abiCB, abiCtx, C.int32_t(kind), p, C.int32_t(len(payload))))
 	}
 
 	h, err := startABIHost(deliver)

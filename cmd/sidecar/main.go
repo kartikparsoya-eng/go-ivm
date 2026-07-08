@@ -303,6 +303,16 @@ type perfMetrics struct {
 	// reporter goroutine.
 	lastReaderCacheHits   int64
 	lastReaderCacheMisses int64
+
+	// napiDeliverStalls counts deliveries that found the addon's TSFN queue
+	// FULL and entered the cancellable retry loop (rowplane.go
+	// retryDeliver) — the bounded replacement for the pre-ABI-v4 blocking
+	// enqueue that wedged CG workers (G13). Correlates directly with
+	// JS-event-loop stalls. napiDeliverTimeouts counts retries that hit
+	// GO_IVM_DELIVER_TIMEOUT — incident-class, paired with the
+	// [GO-IVM][DELIVER-TIMEOUT] marker.
+	napiDeliverStalls   atomic.Int64
+	napiDeliverTimeouts atomic.Int64
 }
 
 var metrics = &perfMetrics{}
@@ -502,12 +512,15 @@ func (m *perfMetrics) reportAndReset() {
 	convergeAttempts := m.readerPoolConvergeAttempts.Swap(0)
 	warmCoread := m.readerPoolWarmCoread.Swap(0)
 	warmSerial := m.readerPoolWarmSerial.Swap(0)
+	deliverStalls := m.napiDeliverStalls.Swap(0)
+	deliverTimeouts := m.napiDeliverTimeouts.Swap(0)
 	cacheHits, cacheMisses := tablesource.ReaderShellCacheCounters()
 	dHits, dMisses := cacheHits-m.lastReaderCacheHits, cacheMisses-m.lastReaderCacheMisses
 	m.lastReaderCacheHits, m.lastReaderCacheMisses = cacheHits, cacheMisses
 
 	if advCount == 0 && hydCount == 0 && bindCoread == 0 && bindConverge == 0 &&
-		bindSerial == 0 && warmCoread == 0 && warmSerial == 0 && dHits == 0 && dMisses == 0 {
+		bindSerial == 0 && warmCoread == 0 && warmSerial == 0 && dHits == 0 && dMisses == 0 &&
+		deliverStalls == 0 && deliverTimeouts == 0 {
 		return
 	}
 
@@ -585,6 +598,17 @@ func (m *perfMetrics) reportAndReset() {
 		fmt.Fprintf(os.Stderr,
 			"[GO-IVM][PERF-POOL] 10s window: reader-shell cache hits=%d misses=%d (reuse-rate=%.1f%%)\n",
 			dHits, dMisses, reuse)
+	}
+
+	// NAPI deliver backpressure: stalls = deliveries that found the TSFN
+	// queue full and parked in the cancellable retry (bounded — the G13
+	// wedge class is gone); timeouts = retries that outlived
+	// GO_IVM_DELIVER_TIMEOUT (incident — see [GO-IVM][DELIVER-TIMEOUT]).
+	// Sustained stalls track JS-event-loop starvation, the upstream cause.
+	if deliverStalls > 0 || deliverTimeouts > 0 {
+		fmt.Fprintf(os.Stderr,
+			"[GO-IVM][PERF-NAPI] 10s window: deliver queue-full stalls=%d timeouts=%d\n",
+			deliverStalls, deliverTimeouts)
 	}
 }
 
@@ -897,13 +921,16 @@ type Server struct {
 
 	// abiDeliver, when non-nil, is the in-process (NAPI) transport's
 	// out-of-band delivery callback: (kind, payload) entries land on the
-	// addon's single ordered TSFN queue. Set ONCE by the ABI host before
+	// addon's single ordered TSFN queue; the returned status reports the
+	// NONBLOCKING enqueue outcome (deliverOK / deliverFull / deliverClosed
+	// — ABI v4; the CALLER owns retry policy, see rowplane.go's lock
+	// discipline). Set ONCE by the ABI host before
 	// handleConnection starts (never mutated after) — handlers read it
 	// lock-free. nil disables row mode (e.g. pipe-only unit fixtures):
 	// rowMode requests then stream ordinary msgpack partials via streamW.
 	// Payload bytes are valid only for the duration of the call (the
-	// receiver copies), so encoders may reuse their buffers.
-	abiDeliver func(kind int32, payload []byte)
+	// receiver copies ON deliverOK), so encoders may reuse their buffers.
+	abiDeliver func(kind int32, payload []byte) int32
 
 	// streamGates is the pull-hydration (ABI v3) demand-gate registry: one
 	// gate per in-flight pullMode addQueriesStream RPC, keyed by the f64
@@ -2144,7 +2171,7 @@ func (s *Server) handleAddQueriesStream(req RPCRequest, streamW streamWriter) RP
 	// chunkSize=1; each query's Final partial still ships as a kind-1 frame
 	// (per-query TimingMs + completion signal). onResult runs concurrently
 	// from hydrate lanes — rowPlane's mutex serializes the encoder.
-	if rp := newRowPlane(s, req.ID, p.RowMode); rp != nil {
+	if rp := newRowPlane(s, req.ID, p.RowMode, cgID, group.done); rp != nil {
 		// Pull mode (ABI v3): register the per-RPC demand gate. Row-BEARING
 		// deliveries acquire one credit each; group defs, Final frames, and
 		// error frames ride free (D3 — gating them deadlocks: the client is
@@ -2156,6 +2183,10 @@ func (s *Server) handleAddQueriesStream(req RPCRequest, streamW streamWriter) RP
 			if gate := s.streamGates.register(rid, group, int64(p.PullWindow), func() {
 				group.lastUsedNs.Store(time.Now().UnixNano())
 			}); gate != nil {
+				// The gate's cancel must also unpark a delivery stuck on a
+				// full TSFN queue (the cond broadcast only reaches gate
+				// waiters) — fold it into the plane's cancellation check.
+				rp.setPullGate(gate)
 				defer s.streamGates.unregister(rid)
 				err := group.eng.AddQueriesStreamPull(specs, 1, func(r engine.QueryResult) bool {
 					if len(r.Changes) > 0 && !gate.acquire() {
@@ -2165,7 +2196,12 @@ func (s *Server) handleAddQueriesStream(req RPCRequest, streamW streamWriter) RP
 						// for this RPC except the terminal error frame.
 						return false
 					}
-					rp.emitHydratePartial(r)
+					if !rp.emitHydratePartial(r) {
+						// Stream dead mid-delivery (TSFN closed, client gone,
+						// or deliver timeout — the G13 wedge class, now a
+						// bounded refusal): same unwind as a gate cancel.
+						return false
+					}
 					if r.Final {
 						metrics.recordHydrateChunks(r.ChunkIndex + 1)
 					}
@@ -2184,7 +2220,9 @@ func (s *Server) handleAddQueriesStream(req RPCRequest, streamW streamWriter) RP
 			}
 		}
 		err := group.eng.AddQueriesStreamChunked(specs, 1, func(r engine.QueryResult) bool {
-			rp.emitHydratePartial(r)
+			if !rp.emitHydratePartial(r) {
+				return false // stream dead — same unwind as a consumer refusal
+			}
 			if r.Final {
 				metrics.recordHydrateChunks(r.ChunkIndex + 1)
 			}
