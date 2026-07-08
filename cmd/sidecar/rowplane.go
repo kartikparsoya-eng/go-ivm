@@ -467,6 +467,53 @@ func (rp *rowPlane) sendOrStageLocked(kind int32, payload []byte) bool {
 // and no gate cancel reaches — the exact convoy shape v4 exists to kill,
 // reintroduced via the panic path. Every unlock-for-park window inside
 // (flushStageLocked) defer-relocks, so this defer can never double-unlock.
+// flushStage ships any staged records ahead of a wait whose UNPARKER
+// depends on the staged data being VISIBLE to the client — deliverFrame's
+// flush-first rule, exported for the pull loop's credit park (see
+// acquirePullCredit). Cancellable + drain-woken like every stage flush;
+// returns false when the stream is dead. Cheap no-op when the stage is
+// empty.
+func (rp *rowPlane) flushStage() bool {
+	rp.mu.Lock()
+	defer rp.mu.Unlock()
+	return rp.flushStageLocked()
+}
+
+// acquirePullCredit consumes one pull credit for a row-bearing delivery,
+// flushing the stage BEFORE any park on client demand. Returns false when
+// the stream is dead (gate cancelled, or the flush was cancelled/timed
+// out/closed).
+//
+// The rule (credit-park stalemate, 2026-07-10 — found auditing the v5
+// staging design): staged rows are granted-but-undelivered, INVISIBLE to
+// the client. Its top-up policy grants only when outstanding
+// (granted − consumed) falls to the low-water mark — and it can never
+// consume rows sitting in the stage. So a producer that parks in
+// gate.acquire with a non-empty stage can deadlock the demand loop:
+// queue-full episode stages > lowWater rows → credits exhaust → every
+// producer parks as a GATE waiter → the TSFN drain broadcast wakes nobody
+// (they are not drain waiters) → the stage never flushes → the client
+// never grants. Only the 60s pull idle sweep breaks it — as a SPURIOUS
+// stream cancel + client re-hydrate. Small stages dodge it (a sibling's
+// next emit opportunistically flushes), which is why light soaks never
+// saw it; a single full-queue episode staging > lowWater rows with
+// credits running out is deterministic.
+//
+// tryAcquire first: credit in hand → zero new cost on the hot path. Only
+// the about-to-park case pays the flush — which is exactly when shipping
+// the stage is REQUIRED for the park to ever end. The flush itself may
+// park on the full queue (drain-woken, cancellable): that is the correct
+// wait — the client is slow at the TRANSPORT level, not the demand level.
+func acquirePullCredit(gate *streamGate, rp *rowPlane) bool {
+	if gate.tryAcquire() {
+		return true
+	}
+	if !rp.flushStage() {
+		return false
+	}
+	return gate.acquire()
+}
+
 func (rp *rowPlane) emitChangesGuarded(changes []engine.RowChange) (fallback []engine.RowChange, ok bool) {
 	rp.mu.Lock()
 	defer rp.mu.Unlock()

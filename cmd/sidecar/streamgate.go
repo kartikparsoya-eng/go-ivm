@@ -84,6 +84,22 @@ func (g *streamGate) acquire() bool {
 	return true
 }
 
+// tryAcquire consumes one credit WITHOUT parking. Returns true when a
+// credit was consumed; false when the gate has no credit (the caller is
+// about to park — see acquirePullCredit's flush-before-park rule) or is
+// cancelled (the fallback acquire resolves that case with the proper
+// unwind). Same single-mutex cost as a credit-available acquire, so the
+// credit-in-hand fast path pays nothing new.
+func (g *streamGate) tryAcquire() bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.cancelled || g.credit == 0 {
+		return false
+	}
+	g.credit--
+	return true
+}
+
 // grant adds n credits and wakes parked producers. n <= 0 is ignored.
 // Granting a cancelled gate is a no-op (the producers already unwound).
 func (g *streamGate) grant(n int64) {

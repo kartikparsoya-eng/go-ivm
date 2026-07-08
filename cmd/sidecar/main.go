@@ -2199,11 +2199,15 @@ func (s *Server) handleAddQueriesStream(req RPCRequest, streamW streamWriter) RP
 				rp.setPullGate(gate)
 				defer s.streamGates.unregister(rid)
 				err := group.eng.AddQueriesStreamPull(specs, 1, func(r engine.QueryResult) bool {
-					if len(r.Changes) > 0 && !gate.acquire() {
+					if len(r.Changes) > 0 && !acquirePullCredit(gate, rp) {
 						// Cancelled (client .return(), teardown, or idle
-						// timeout): refuse — the engine breaks the fetch
-						// range and unwinds (D4). Nothing more is emitted
-						// for this RPC except the terminal error frame.
+						// timeout), or the pre-park stage flush failed: refuse
+						// — the engine breaks the fetch range and unwinds
+						// (D4). Nothing more is emitted for this RPC except
+						// the terminal error frame. acquirePullCredit flushes
+						// staged rows BEFORE parking on client demand — a
+						// park with a non-empty stage is the credit-park
+						// stalemate (see rowplane.go).
 						return false
 					}
 					if !rp.emitHydratePartial(r) {

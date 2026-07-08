@@ -30,6 +30,7 @@ package main
 
 import (
 	"encoding/binary"
+	"fmt"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -479,4 +480,124 @@ func captureDeliverLog(t *testing.T) *syncBuf {
 	deliverLogW = b
 	t.Cleanup(func() { deliverLogW = saved })
 	return b
+}
+
+// TestPullCredit_FlushBeforeParkPreventsStalemate is the credit-park
+// stalemate red-proof (2026-07-10, staging-design audit). The trap: staged
+// rows are granted-but-UNDELIVERED — the client's top-up policy grants only
+// when outstanding (granted − consumed) falls to the low-water mark, and it
+// can never consume rows sitting in the stage. A producer that parks in
+// gate.acquire with a non-empty stage therefore deadlocks the demand loop:
+// the TSFN drain broadcast wakes only DRAIN waiters, not gate waiters, so
+// the stage never flushes and the client never grants — only the 60s pull
+// idle sweep would break it, as a spurious stream failure.
+//
+// This models the client faithfully (grant +W/2 only when DELIVERED rows
+// bring outstanding to the low-water mark) and drives acquirePullCredit
+// exactly as the pull loop does. Red-proof: replacing acquirePullCredit's
+// body with plain gate.acquire() (the pre-fix shape) makes this test time
+// out in the stalemate — verified during development.
+func TestPullCredit_FlushBeforeParkPreventsStalemate(t *testing.T) {
+	const window = 4 // W; lowWater = 2
+	const lowWater = window / 2
+
+	s := newScriptedSink(deliverFull) // queue-full episode from the start
+	rp := wedgeTestPlane(t, s, 30*time.Second)
+	gate := newStreamGate(nil)
+	gate.grant(window) // the opening window rides the request params
+	rp.setPullGate(gate)
+
+	// Client model: counts DELIVERED rows (records + batch sub-records) off
+	// the sink and grants +lowWater whenever outstanding hits the low-water
+	// mark — the go-ivm-client.ts policy in miniature. It can only see what
+	// actually crossed the boundary; staged rows are invisible to it.
+	granted := int64(window)
+	consumedFromSink := func() int64 {
+		var n int64
+		for _, k := range s.kindSeq() {
+			if k == abiKindRow {
+				n++
+			}
+		}
+		s.mu.Lock()
+		for i, k := range s.kinds {
+			if k == abiKindBatch {
+				kinds, _ := decodeBatch(t, s.payloads[i])
+				for _, sk := range kinds {
+					if sk == abiKindRow {
+						n++
+					}
+				}
+			}
+		}
+		s.mu.Unlock()
+		return n
+	}
+	stopClient := make(chan struct{})
+	clientDone := make(chan struct{})
+	go func() {
+		defer close(clientDone)
+		for {
+			select {
+			case <-stopClient:
+				return
+			case <-time.After(2 * time.Millisecond):
+				if granted-consumedFromSink() <= lowWater {
+					granted += lowWater
+					gate.grant(lowWater)
+				}
+			}
+		}
+	}()
+	defer func() { close(stopClient); <-clientDone }()
+
+	// Producer: W row partials against the FULL queue — every credit
+	// consumed, every row STAGED (invisible to the client). Then the queue
+	// recovers, and partial W+1 needs a credit the client will only grant
+	// after it SEES rows.
+	done := make(chan bool, 1)
+	go func() {
+		for i := 0; i < window; i++ {
+			if !acquirePullCredit(gate, rp) {
+				done <- false
+				return
+			}
+			if !rp.emitHydratePartial(engine.QueryResult{
+				QueryID: "q1", Changes: []engine.RowChange{rcAdd("q1", fmt.Sprintf("r%d", i))},
+			}) {
+				done <- false
+				return
+			}
+		}
+		// Queue recovers mid-run — but the drain broadcast reaches only
+		// DRAIN waiters; a gate waiter would sleep through it (the trap).
+		s.setMode(deliverOK)
+		tsfnDrain.broadcast()
+		// Credit W+1: exhausted → about to park on client demand with a
+		// full stage. The fix flushes here; the pre-fix shape parks
+		// forever (client never sees the staged rows, never grants).
+		if !acquirePullCredit(gate, rp) {
+			done <- false
+			return
+		}
+		done <- rp.emitHydratePartial(engine.QueryResult{
+			QueryID: "q1", Changes: []engine.RowChange{rcAdd("q1", "final")}, Final: true,
+		})
+	}()
+
+	select {
+	case ok := <-done:
+		if !ok {
+			t.Fatal("pull producer failed — stream died instead of flushing before the credit park")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("CREDIT-PARK STALEMATE: producer parked on client demand with staged rows — " +
+			"the client cannot consume undelivered rows, so no grant ever arrives " +
+			"(pre-fix shape; only the 60s idle sweep would break this, as a spurious stream failure)")
+	}
+	// Everything must have shipped: W staged rows in a batch + the final
+	// row + Final frame, in order.
+	if got := consumedFromSink(); got != window+1 {
+		t.Fatalf("delivered rows = %d, want %d (staged rows lost?)", got, window+1)
+	}
 }
