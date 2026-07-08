@@ -293,45 +293,39 @@ func NewCoReadReaderPool(ctx context.Context, db *sql.DB, cr *CoRead, k int) (*R
 
 	readers := make([]*poolReader, k)
 	var version string
+	// The pin-establishing sequence for a coread reader: deferred BEGIN
+	// (autoCommit=0, txnState NONE — the arm's precondition; a cached shell
+	// with a leaked tx fails HERE, closed, and provisionReader self-heals),
+	// arm onto the anchor's frame (arm→begin→disarm is atomic inside
+	// sqlite3_wal2_coread_open — no arm residue survives onto a cached
+	// shell), then the frame-identifying read.
+	beginArm := func(bctx context.Context, r *poolReader) (string, error) {
+		if err := r.rawExec(bctx, "BEGIN"); err != nil {
+			return "", fmt.Errorf("BEGIN: %w", err)
+		}
+		if err := cr.armRawConn(r.dc); err != nil {
+			return "", fmt.Errorf("arm: %w", err)
+		}
+		ver, err := r.readStateVersion(bctx)
+		if err != nil {
+			return "", fmt.Errorf("read stateVersion: %w", err)
+		}
+		return ver, nil
+	}
 	for i := 0; i < k; i++ {
-		dc, err := rawOpenReaderConn(db)
+		r, ver, err := provisionReader(ctx, closeCtx, db, beginArm)
 		if err != nil {
 			for j := 0; j < i; j++ {
 				readers[j].close(closeCtx)
 			}
-			return nil, fmt.Errorf("coread reader pool: open raw conn %d: %w", i, err)
+			return nil, fmt.Errorf("coread reader pool: conn %d: %w", i, err)
 		}
-		readers[i] = &poolReader{dc: dc, stmts: map[string]*poolStmt{}}
-		// Deferred BEGIN: sets autoCommit=0 without taking a read lock
-		// (txnState stays NONE), so coread_open can arm + begin the read.
-		if err := readers[i].rawExec(ctx, "BEGIN"); err != nil {
-			for j := 0; j <= i; j++ {
-				readers[j].close(closeCtx)
-			}
-			return nil, fmt.Errorf("coread reader pool: BEGIN conn %d: %w", i, err)
-		}
-		// Arm the conn onto the coread's frame. This latches the read tx
-		// at the anchor's frame inside walTryBeginRead.
-		if err := cr.armRawConn(dc); err != nil {
-			for j := 0; j <= i; j++ {
-				readers[j].close(closeCtx)
-			}
-			return nil, fmt.Errorf("coread reader pool: arm conn %d: %w", i, err)
-		}
-		ver, err := readers[i].readStateVersion(ctx)
-		if err != nil {
-			for j := 0; j <= i; j++ {
-				readers[j].close(closeCtx)
-			}
-			return nil, fmt.Errorf("coread reader pool: read stateVersion conn %d: %w", i, err)
-		}
+		readers[i] = r
 		if i == 0 {
 			version = ver
 		} else if ver != version {
-			for _, r := range readers {
-				if r != nil {
-					r.close(closeCtx)
-				}
+			for j := 0; j <= i; j++ {
+				readers[j].close(closeCtx)
 			}
 			return nil, fmt.Errorf("coread reader pool: version mismatch conn %d (%q vs %q)", i, ver, version)
 		}
@@ -340,6 +334,7 @@ func NewCoReadReaderPool(ctx context.Context, db *sql.DB, cr *CoRead, k int) (*R
 		free:    make(chan *poolReader, k),
 		all:     readers,
 		version: version,
+		db:      db,
 	}
 	for _, r := range readers {
 		p.free <- r

@@ -13,6 +13,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"time"
 
@@ -146,42 +147,23 @@ func (s *Server) buildSnapshotterLocked(group *ClientGroup, p *initParams) error
 	return nil
 }
 
-// tryAcquireBuildSlot claims a reader-pool build slot, waiting at most
-// maxWait (0 = non-blocking). Returns (release, true) on success. On
-// failure the caller MUST fall back to serial hydrate — that is the whole
-// point: bounded build concurrency, never a queue.
-func (s *Server) tryAcquireBuildSlot(maxWait time.Duration) (func(), bool) {
-	if maxWait <= 0 {
-		select {
-		case s.readerPoolBuildSlots <- struct{}{}:
-			return func() { <-s.readerPoolBuildSlots }, true
-		default:
-			metrics.readerPoolBuildSlotSkips.Add(1)
-			return nil, false
-		}
-	}
-	t := time.NewTimer(maxWait)
-	defer t.Stop()
-	select {
-	case s.readerPoolBuildSlots <- struct{}{}:
-		return func() { <-s.readerPoolBuildSlots }, true
-	case <-t.C:
-		metrics.readerPoolBuildSlotSkips.Add(1)
-		return nil, false
-	}
+// poolSerialLogW is the sink for the [GO-IVM][POOL-SERIAL] incident marker
+// (test-swappable, like wedgeLogW; production is always os.Stderr).
+var poolSerialLogW io.Writer = os.Stderr
+
+// logPoolSerial emits the incident-class serial-hydrate marker: a pool
+// build FAILED and the hydrate is running single-conn. With the reader-shell
+// cache (reader_cache.go) making builds nearly free, the 7addd28 build-slot
+// gate — whose skip-to-serial was the last ROUTINE serial path — is deleted;
+// what remains serial is failure-only (coread capture error, frame
+// mismatch, build error), which deserves the same greppable incident status
+// as [GO-IVM][WEDGE]: any nonzero count in a soak is a bug to chase, never
+// "the design working". Deliberate configuration serial (feature off, K≤1)
+// stays silent — it is not an incident.
+func logPoolSerial(cgID, path, reason string, err error) {
+	fmt.Fprintf(poolSerialLogW, "[GO-IVM][POOL-SERIAL] cg=%s path=%s reason=%s err=%v\n",
+		cgID, path, reason, err)
 }
-
-// coldBuildSlotWait is how long a COLD pool build waits for a slot before
-// degrading to serial hydrate. Cold pools front the CG's first hydrate
-// (biggest payoff), so they wait briefly; warm builds never wait (0).
-const coldBuildSlotWait = time.Second
-
-// readerPoolBuildSlotCap is the per-Server bound on CONCURRENT reader-pool
-// builds (see Server.readerPoolBuildSlots). Two keeps worst-case in-flight
-// build demand at 2×(K+1) conns — small enough that concurrent builders
-// can't mutually starve inside PoolAcquireTimeout, large enough that a slow
-// build doesn't serialize every other CG behind it.
-const readerPoolBuildSlotCap = 2
 
 // buildReaderPoolLocked builds a reader pool whose K connections are all
 // converged onto the same WAL frame (the replica head at build time).
@@ -208,14 +190,11 @@ func (s *Server) buildReaderPoolLocked(cur *snapshotter.Snapshot) (*tablesource.
 	if k <= 1 {
 		return nil, nil, nil // feature off: serial by design, not a failure
 	}
-	// Bound concurrent builds (see Server.readerPoolBuildSlots): a build
-	// burst opening K raw conns each is bounded fd/page-cache churn; two at
-	// a time complete in milliseconds each.
-	release, ok := s.tryAcquireBuildSlot(coldBuildSlotWait)
-	if !ok {
-		return nil, nil, nil // slots busy → serial hydrate (bounded degrade)
-	}
-	defer release()
+	// No build-concurrency gate: builds provision conns from the worker-wide
+	// reader-shell cache (reader_cache.go) — a churn burst costs cache pops,
+	// not K fresh SQLite opens — so the 7addd28 build-slot cap (and its
+	// skip-to-serial, the last ROUTINE serial-hydrate path) is deleted with
+	// the provisioning cost that justified it.
 	rdb, derr := s.getReplicaDB()
 	if derr != nil {
 		return nil, nil, derr
@@ -279,7 +258,7 @@ func (s *Server) tearDownReaderPool(group *ClientGroup) {
 // return with tearDownWarmReaderPool after AddQueriesStream. The pool is NOT
 // stored on the group (it is per-call); group.readerPool is the cold pool's
 // slot and is left untouched. MUST hold group.mu.
-func (s *Server) buildWarmReaderPoolLocked(group *ClientGroup) (*tablesource.ReaderPool, *tablesource.CoRead) {
+func (s *Server) buildWarmReaderPoolLocked(group *ClientGroup, cgID string) (*tablesource.ReaderPool, *tablesource.CoRead) {
 	// K = admission width (see buildReaderPoolLocked — Option B: one reader
 	// per hydrate pipeline, wider batches queue while holding nothing).
 	k := s.hydrateReaders
@@ -320,35 +299,32 @@ func (s *Server) buildWarmReaderPoolLocked(group *ClientGroup) (*tablesource.Rea
 
 	rdb, derr := s.getReplicaDB()
 	if derr != nil {
+		logPoolSerial(cgID, "warm", "replica-db", derr)
 		metrics.recordWarmReaderPoolBind(false)
 		return nil, nil
 	}
 	cur, cerr := group.snap.Current()
 	if cerr != nil {
+		logPoolSerial(cgID, "warm", "snapshot-current", cerr)
 		metrics.recordWarmReaderPoolBind(false)
 		return nil, nil
 	}
-
-	// Bound concurrent builds — NON-blocking for warm adds: the pool is an
-	// optimization, and this runs with group.mu held (queueing the CG's
-	// worker behind a build slot inverts the win — the 2026-07-07 convoy).
-	// Slots busy → serial hydrate through the bound curr.Conn(), instantly.
-	release, ok := s.tryAcquireBuildSlot(0)
-	if !ok {
-		metrics.recordWarmReaderPoolBind(false)
-		return nil, nil
-	}
-	defer release()
 
 	// Co-read-ONLY capture of curr's existing frame. No converge fallback.
 	cr, capErr := tablesource.CaptureCoReadFromConn(cur.Conn())
 	if capErr != nil {
-		metrics.recordWarmReaderPoolBind(false) // non-wal2 or capture error → serial
+		// Non-wal2 or capture error → serial. On a wal2 production replica
+		// this is an INCIDENT (co-read should always capture from a pinned
+		// anchor); on plain-wal builds it is the expected mode — the marker's
+		// reason string keeps the two distinguishable in one grep.
+		logPoolSerial(cgID, "warm", "coread-capture", capErr)
+		metrics.recordWarmReaderPoolBind(false)
 		return nil, nil
 	}
 	pool, perr := tablesource.NewCoReadReaderPool(context.Background(), rdb, cr, k)
 	if perr != nil {
 		cr.Free()
+		logPoolSerial(cgID, "warm", "coread-pool-build", perr)
 		metrics.recordWarmReaderPoolBind(false)
 		return nil, nil
 	}
@@ -357,8 +333,11 @@ func (s *Server) buildWarmReaderPoolLocked(group *ClientGroup) (*tablesource.Rea
 	// the pool rather than hydrate the new query at a frame the live pipelines
 	// aren't on.
 	if pool.Version() != cur.Version() {
+		poolVer := pool.Version()
 		pool.Close()
 		cr.Free()
+		logPoolSerial(cgID, "warm", "frame-mismatch",
+			fmt.Errorf("pool pinned %s, curr at %s", poolVer, cur.Version()))
 		metrics.recordWarmReaderPoolBind(false)
 		return nil, nil
 	}
@@ -482,6 +461,9 @@ func (s *Server) refreshSnapForInitialHydrateLocked(cgID string, group *ClientGr
 	// rather than hydrating at a frame that doesn't match TS.
 	pool, cr, perr := s.buildReaderPoolLocked(cur)
 	if perr != nil || pool == nil {
+		if perr != nil {
+			logPoolSerial(cgID, "cold", "build-error", perr)
+		}
 		if s.hydrateReaders > 1 {
 			metrics.recordReaderPoolBind(poolBindSerial, 1)
 		}
@@ -506,10 +488,13 @@ func (s *Server) refreshSnapForInitialHydrateLocked(cgID string, group *ClientGr
 
 	// Pool converged to head while curr stayed at the init-time pin. Stay
 	// serial — hydrating at head would mismatch TS's version.
+	poolVer := pool.Version()
 	pool.Close()
 	if cr != nil {
 		cr.Free()
 	}
+	logPoolSerial(cgID, "cold", "frame-mismatch",
+		fmt.Errorf("pool converged to %s, curr pinned %s", poolVer, cur.Version()))
 	metrics.recordReaderPoolBind(poolBindSerial, 1)
 }
 

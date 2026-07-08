@@ -204,13 +204,20 @@ func (r *poolReader) evictColdest() {
 	}
 }
 
-func (r *poolReader) close(ctx context.Context) {
+// closeConn finalizes every cached stmt and closes the raw conn. The
+// tx-release half lives in close(); the shell cache calls this directly on
+// shells whose tx was already rolled back at cache time.
+func (r *poolReader) closeConn() {
 	for _, e := range r.stmts {
 		_ = e.st.Close()
 	}
 	r.stmts = nil
-	_ = r.rawExec(ctx, "ROLLBACK")
 	_ = r.dc.Close()
+}
+
+func (r *poolReader) close(ctx context.Context) {
+	_ = r.rawExec(ctx, "ROLLBACK")
+	r.closeConn()
 }
 
 // ReaderPool is a set of K raw read connections ALL pinned to the same WAL
@@ -232,10 +239,49 @@ type ReaderPool struct {
 	free    chan *poolReader
 	all     []*poolReader
 	version string
+	// db is the replica read pool the readers were provisioned against —
+	// Close uses it to return idle shells to the reader-shell cache
+	// (reader_cache.go) instead of closing them.
+	db *sql.DB
 	// bound maps a pipeline group (the engine's queryID) to the reader that
 	// pipeline exclusively holds, from AcquireForPipeline to its release.
 	// Read lock-free by every leaf fetch (readerFor) on the hydrate path.
 	bound sync.Map // string → *poolReader
+}
+
+// provisionReader returns one reader with an open (or armed) read tx plus
+// the stateVersion it landed on: a cached shell when the reader-shell cache
+// has one (the conn + prepared-stmt cache survive pool generations — see
+// reader_cache.go), a fresh raw open otherwise. begin performs the
+// pin-establishing sequence (converge: BEGIN+read; coread: BEGIN+arm+read).
+//
+// Self-healing: a cached shell that fails begin — the conn died while idle,
+// or a leaked tx made BEGIN fail closed ("cannot start a transaction within
+// a transaction" / the coread TXN_NONE guard) — is closed and replaced with
+// ONE fresh open. A fresh conn's failure is systemic (expired build budget,
+// non-wal2 arm, anchor gone) and is returned to fail the build.
+func provisionReader(
+	ctx, closeCtx context.Context,
+	db *sql.DB,
+	begin func(context.Context, *poolReader) (string, error),
+) (*poolReader, string, error) {
+	if r := popCachedShell(db); r != nil {
+		if ver, err := begin(ctx, r); err == nil {
+			return r, ver, nil
+		}
+		r.close(closeCtx)
+	}
+	dc, err := rawOpenReaderConn(db)
+	if err != nil {
+		return nil, "", err
+	}
+	r := &poolReader{dc: dc, stmts: map[string]*poolStmt{}}
+	ver, err := begin(ctx, r)
+	if err != nil {
+		r.close(closeCtx)
+		return nil, "", err
+	}
+	return r, ver, nil
 }
 
 // NewReaderPool opens k RAW read connections (rawOpenReaderConn — same DSN,
@@ -278,28 +324,28 @@ func NewReaderPool(ctx context.Context, db *sql.DB, _ string, k int) (*ReaderPoo
 	readers := make([]*poolReader, k)
 	versions := make([]string, k)
 
+	// The pin-establishing sequence for a converge reader: a fresh BEGIN
+	// lands on the latest frame; the stateVersion read identifies it.
+	beginConverge := func(bctx context.Context, r *poolReader) (string, error) {
+		if err := r.rawExec(bctx, "BEGIN"); err != nil {
+			return "", fmt.Errorf("BEGIN: %w", err)
+		}
+		ver, err := r.readStateVersion(bctx)
+		if err != nil {
+			return "", fmt.Errorf("read stateVersion: %w", err)
+		}
+		return ver, nil
+	}
+
 	for i := 0; i < k; i++ {
-		dc, err := rawOpenReaderConn(db)
+		r, ver, err := provisionReader(ctx, closeCtx, db, beginConverge)
 		if err != nil {
 			for j := 0; j < i; j++ {
 				readers[j].close(closeCtx)
 			}
-			return nil, fmt.Errorf("reader pool: open raw conn %d: %w", i, err)
+			return nil, fmt.Errorf("reader pool: conn %d: %w", i, err)
 		}
-		readers[i] = &poolReader{dc: dc, stmts: map[string]*poolStmt{}}
-		if err := readers[i].rawExec(ctx, "BEGIN"); err != nil {
-			for j := 0; j <= i; j++ {
-				readers[j].close(closeCtx)
-			}
-			return nil, fmt.Errorf("reader pool: BEGIN conn %d: %w", i, err)
-		}
-		ver, err := readers[i].readStateVersion(ctx)
-		if err != nil {
-			for j := 0; j <= i; j++ {
-				readers[j].close(closeCtx)
-			}
-			return nil, fmt.Errorf("reader pool: read stateVersion conn %d: %w", i, err)
-		}
+		readers[i] = r
 		versions[i] = ver
 	}
 
@@ -343,6 +389,7 @@ func NewReaderPool(ctx context.Context, db *sql.DB, _ string, k int) (*ReaderPoo
 				free:    make(chan *poolReader, k),
 				all:     readers,
 				version: maxVer,
+				db:      db,
 			}
 			for _, r := range readers {
 				p.free <- r
@@ -420,23 +467,41 @@ func (p *ReaderPool) Version() string { return p.version }
 // queue at AcquireForPipeline).
 func (p *ReaderPool) Size() int { return len(p.all) }
 
-// Close rolls back and closes every reader. Safe to call on a partially-built
-// pool (NewReaderPool calls it on the error path).
+// Close releases every reader. Healthy teardown (no reader borrowed — the
+// lifecycle invariant below) returns each shell to the reader-shell cache
+// when one is enabled for p.db: the read tx is ROLLED BACK first (a cached
+// shell pins NO WAL frame and satisfies the coread arm's TXN_NONE
+// precondition), the conn + prepared-stmt cache survive for the next pool
+// generation. Without a cache — or on the BUG path — readers close outright.
+// Safe to call on a partially-built pool (NewReaderPool's error path closes
+// readers directly, never through here).
 //
 // Lifecycle invariant: the owner (sidecar ClientGroup) tears the pool down
 // only under group.mu, which every hydrate RPC holds for its whole duration —
 // so no reader can be borrowed when Close runs. Violations are a lifecycle
-// bug upstream; Close reports them loudly rather than freeing conns with
-// live cursors (a use-after-free at the C boundary).
+// bug upstream; Close reports them loudly and closes everything outright
+// rather than caching conns with live cursors (a cached shell must be
+// provably idle).
 func (p *ReaderPool) Close() {
+	ctx := context.Background()
 	if n := len(p.free); p.all != nil && n != len(p.all) {
 		fmt.Fprintf(os.Stderr,
 			"[GO-IVM][POOL] BUG: ReaderPool.Close with %d/%d readers still borrowed — closing anyway; borrowers hold dead conns\n",
 			len(p.all)-n, len(p.all))
+		for _, r := range p.all {
+			r.close(ctx)
+		}
+		p.all = nil
+		return
 	}
-	ctx := context.Background()
+	cache := shellCacheFor(p.db)
 	for _, r := range p.all {
-		r.close(ctx)
+		if cache == nil {
+			r.close(ctx)
+			continue
+		}
+		_ = r.rawExec(ctx, "ROLLBACK")
+		cache.put(r)
 	}
 	p.all = nil
 }

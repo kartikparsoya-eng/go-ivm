@@ -78,7 +78,7 @@ func TestBuildWarmReaderPool_NonWal2StaysSerial(t *testing.T) {
 	beforeSerial := metrics.readerPoolWarmSerial.Load()
 	beforeCoread := metrics.readerPoolWarmCoread.Load()
 
-	pool, cr := srv.buildWarmReaderPoolLocked(group)
+	pool, cr := srv.buildWarmReaderPoolLocked(group, "cg1")
 	if pool != nil || cr != nil {
 		if cr != nil {
 			cr.Free()
@@ -135,7 +135,7 @@ func assertWarmNoop(t *testing.T, srv *Server, group *ClientGroup) {
 	t.Helper()
 	beforeSerial := metrics.readerPoolWarmSerial.Load()
 	beforeCoread := metrics.readerPoolWarmCoread.Load()
-	pool, cr := srv.buildWarmReaderPoolLocked(group)
+	pool, cr := srv.buildWarmReaderPoolLocked(group, "cg-noop")
 	if pool != nil || cr != nil {
 		if cr != nil {
 			cr.Free()
@@ -173,7 +173,7 @@ func TestBuildWarmReaderPool_BoundColdPoolReusedForAnyBatch(t *testing.T) {
 	sizeBefore := boundBefore.Size()
 	frameBefore := boundBefore.Version()
 
-	pool, cr := srv.buildWarmReaderPoolLocked(group)
+	pool, cr := srv.buildWarmReaderPoolLocked(group, "cg1")
 	if pool != nil || cr != nil {
 		if cr != nil {
 			cr.Free()

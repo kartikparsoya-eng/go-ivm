@@ -297,10 +297,12 @@ type perfMetrics struct {
 	// never converges to head (it would desync the new query from live pipelines).
 	readerPoolWarmCoread atomic.Int64
 	readerPoolWarmSerial atomic.Int64
-	// readerPoolBuildSlotSkips counts builds (warm or cold) that fell back
-	// to serial because both build slots were busy — the convoy-avoidance
-	// path (see Server.readerPoolBuildSlots).
-	readerPoolBuildSlotSkips atomic.Int64
+	// lastReaderCacheHits/Misses hold the previous window's cumulative
+	// reader-shell cache counters (tablesource.ReaderShellCacheCounters) so
+	// reportAndReset prints per-window deltas. Touched only by the single
+	// reporter goroutine.
+	lastReaderCacheHits   int64
+	lastReaderCacheMisses int64
 }
 
 var metrics = &perfMetrics{}
@@ -500,10 +502,12 @@ func (m *perfMetrics) reportAndReset() {
 	convergeAttempts := m.readerPoolConvergeAttempts.Swap(0)
 	warmCoread := m.readerPoolWarmCoread.Swap(0)
 	warmSerial := m.readerPoolWarmSerial.Swap(0)
-	slotSkips := m.readerPoolBuildSlotSkips.Swap(0)
+	cacheHits, cacheMisses := tablesource.ReaderShellCacheCounters()
+	dHits, dMisses := cacheHits-m.lastReaderCacheHits, cacheMisses-m.lastReaderCacheMisses
+	m.lastReaderCacheHits, m.lastReaderCacheMisses = cacheHits, cacheMisses
 
 	if advCount == 0 && hydCount == 0 && bindCoread == 0 && bindConverge == 0 &&
-		bindSerial == 0 && warmCoread == 0 && warmSerial == 0 && slotSkips == 0 {
+		bindSerial == 0 && warmCoread == 0 && warmSerial == 0 && dHits == 0 && dMisses == 0 {
 		return
 	}
 
@@ -572,15 +576,15 @@ func (m *perfMetrics) reportAndReset() {
 			warmCoread, warmSerial, warmRate)
 	}
 
-	// Build-slot skips: pool builds (cold or warm) that degraded to serial
-	// because both build slots were busy (Server.readerPoolBuildSlots).
-	// Occasional skips during a churn burst are the design working;
-	// SUSTAINED skips mean build demand outruns the slot cap — correlate
-	// with the serial shares above before touching the cap.
-	if slotSkips > 0 {
+	// Reader-shell cache (reader_cache.go): pool builds provisioning conns
+	// from the worker-wide cache vs fresh SQLite opens. A reuse-rate
+	// collapsing toward 0 under steady churn means teardowns aren't feeding
+	// the cache (or the TTL sweep is outrunning the churn interval).
+	if dHits > 0 || dMisses > 0 {
+		reuse := float64(dHits) / float64(dHits+dMisses) * 100
 		fmt.Fprintf(os.Stderr,
-			"[GO-IVM][PERF-POOL] 10s window: build-slot-skips=%d (pool builds degraded to serial; slots busy)\n",
-			slotSkips)
+			"[GO-IVM][PERF-POOL] 10s window: reader-shell cache hits=%d misses=%d (reuse-rate=%.1f%%)\n",
+			dHits, dMisses, reuse)
 	}
 }
 
@@ -789,6 +793,17 @@ type ClientGroup struct {
 	// just-finished group is never "idle since dequeue".
 	inFlight atomic.Bool
 
+	// curReq describes the request the worker is CURRENTLY executing —
+	// stamped at dequeue, cleared after the respCh send. The wedge watchdog
+	// (wedgewatch.go) reads it lock-free to detect handlers running past
+	// GO_IVM_WEDGE_WATCHDOG_SEC. Written only by the worker goroutine.
+	curReq atomic.Pointer[activeReq]
+	// wedgeDumped latches the once-per-incident all-goroutine stack dump
+	// (set by the watchdog on first detection, re-armed by the worker when
+	// the handler completes) so a wedge produces exactly one dump, however
+	// many scan ticks it spans.
+	wedgeDumped atomic.Bool
+
 	// sendMu closes the orphaned-respCh race between trySendReq and the
 	// worker's post-done drain (full-scale review 2026-07-03). trySendReq
 	// holds RLock across its done pre-check AND the reqC send; the exiting
@@ -849,6 +864,13 @@ type clientGroupReq struct {
 	// worker goroutine) that handlers would then fail against and the
 	// 30-min reaper would only collect much later.
 	group *ClientGroup
+	// cgID is the clientGroupID the dispatcher already extracted to route
+	// this request (handleConnection) — threaded through so the worker's
+	// per-request observability (wedge-watchdog stamp, TEARDOWN/SLOW/
+	// WEDGE-CLEAR lines) never re-parses params on the hot path. Empty for
+	// direct trySendReq callers (tests); the worker falls back to
+	// extractClientGroupID then.
+	cgID string
 }
 
 // streamWriter writes a partial frame carrying part of a streaming RPC
@@ -941,19 +963,12 @@ type Server struct {
 	// the shipped default behavior is unchanged until the flag flips.
 	warmHydratePoolEnabled bool
 
-	// readerPoolBuildSlots bounds CONCURRENT reader-pool builds (cold +
-	// warm) per engine (2026-07-07 latency forensics). Builds acquire K
-	// conns one at a time while holding the ones they have — hold-and-wait.
-	// PoolAcquireTimeout bounds each build, but N concurrent builders under
-	// churn still mutually starve for the full window (observed: warm
-	// pin-rate 100%→62% with serial fallbacks, 70s cumulative read-pool
-	// wait per 10s window, group.mu held throughout → per-CG advance
-	// convoys). Two slots keep in-flight build demand ≤ 2×(K+1) conns:
-	// warm builds try-acquire and skip straight to serial (the pool is an
-	// optimization; queueing the CG worker for it inverts the win), cold
-	// builds wait briefly (their serial fallback costs the whole first
-	// hydrate). Buffered-chan semaphore; sized in NewServer.
-	readerPoolBuildSlots chan struct{}
+	// wedgeThreshold is how long one handler may run before the wedge
+	// watchdog (wedgewatch.go) reports it and the worker emits WEDGE-CLEAR
+	// on its eventual return. From GO_IVM_WEDGE_WATCHDOG_SEC (default 90s,
+	// below the TS 120s RPC deadline). Set once in NewServer; tests
+	// override the field directly before traffic starts.
+	wedgeThreshold time.Duration
 }
 
 func NewServer(replicaPath string) *Server {
@@ -963,11 +978,7 @@ func NewServer(replicaPath string) *Server {
 		replicaPath:    replicaPath,
 		hydrateReaders: 1,
 		hydrateLanes:   4,
-		// Sized here, not lazily: a nil channel would silently disable
-		// every pool build (nil send never proceeds → warm skips, cold
-		// waits the full coldBuildSlotWait then goes serial). Pinned by
-		// TestNewServer_BuildSlotsSized.
-		readerPoolBuildSlots: make(chan struct{}, readerPoolBuildSlotCap),
+		wedgeThreshold: wedgeWatchdogThreshold(),
 	}
 }
 
@@ -1081,6 +1092,22 @@ func (s *Server) getReplicaDB() (*sql.DB, error) {
 		fmt.Fprintf(os.Stderr,
 			"[GO-IVM] opened replica %s (WAL mode; query_only read pool + writable prev-tx pool)\n",
 			s.replicaPath)
+		// Reader-shell cache (reader_cache.go): pool builds reuse idle raw
+		// conns (+ their prepared-stmt caches) across pool generations
+		// instead of paying K SQLite opens per build — what made the
+		// build-slot gate (and its skip-to-serial) deletable. Cap 0 disables.
+		cacheCap := 32
+		if v := os.Getenv("GO_IVM_READER_CACHE_CAP"); v != "" {
+			if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+				cacheCap = n
+			}
+		}
+		if cacheCap > 0 {
+			tablesource.EnableReaderShellCache(db, cacheCap)
+			fmt.Fprintf(os.Stderr,
+				"[GO-IVM] reader-shell cache enabled: cap=%d ttl=%v (GO_IVM_READER_CACHE_CAP / GO_IVM_READER_CACHE_TTL_SEC)\n",
+				cacheCap, readerCacheTTL())
+		}
 		break
 	}
 
@@ -1255,6 +1282,20 @@ func (s *Server) runPullIdleSweeper(ctx context.Context) {
 	}
 }
 
+// readerCacheTTL bounds how long an idle reader shell may sit in the
+// reader-shell cache before the reaper tick closes it (returns its fd +
+// stmt-cache C-heap). Env-tunable via GO_IVM_READER_CACHE_TTL_SEC; default
+// 5 min — same order as coldPoolTTL, comfortably covering CG churn
+// intervals while bounding the standing footprint after churn subsides.
+func readerCacheTTL() time.Duration {
+	if v := os.Getenv("GO_IVM_READER_CACHE_TTL_SEC"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return time.Duration(n) * time.Second
+		}
+	}
+	return 5 * time.Minute
+}
+
 // runReaper periodically reaps idle client groups until ctx is cancelled.
 // Started by BOTH transports — main() for the socket sidecar AND the NAPI
 // ABI host (abi.go). Before the ABI host wired this, in-process (napi) mode
@@ -1267,6 +1308,7 @@ func (s *Server) runReaper(ctx context.Context) {
 	defer ticker.Stop()
 	idle := reaperIdleTimeout()
 	poolTTL := coldPoolTTL()
+	cacheTTL := readerCacheTTL()
 	for {
 		select {
 		case <-ctx.Done():
@@ -1278,6 +1320,16 @@ func (s *Server) runReaper(ctx context.Context) {
 			}
 			if p := s.reapStaleColdPools(now, poolTTL); p > 0 {
 				fmt.Fprintf(os.Stderr, "[GO-IVM] tore down %d stale cold reader pool(s) past TTL\n", p)
+			}
+			// Reader-shell cache TTL: close shells idle past cacheTTL
+			// (bounds standing fds + stmt-cache C-heap after churn subsides).
+			s.replicaMu.Lock()
+			rdb := s.replicaDB
+			s.replicaMu.Unlock()
+			if rdb != nil {
+				if c := tablesource.SweepReaderShellCache(rdb, cacheTTL); c > 0 {
+					fmt.Fprintf(os.Stderr, "[GO-IVM] closed %d idle reader-shell conn(s) past TTL\n", c)
+				}
 			}
 		}
 	}
@@ -1419,16 +1471,38 @@ func (g *ClientGroup) worker(s *Server) {
 		g.inFlight.Store(true) // A4: reap-proof while the handler runs
 		var start time.Time
 		method := req.req.Method
+		dequeued := time.Now()
+		cg := req.cgID
+		if cg == "" {
+			// Direct trySendReq callers (tests) skip the dispatcher's
+			// extraction; parse once here so the stamp + logs still carry it.
+			cg = extractClientGroupID(req.req)
+		}
+		var qWait time.Duration
+		if !req.enqueuedAt.IsZero() {
+			qWait = dequeued.Sub(req.enqueuedAt)
+		}
+		// Wedge-watchdog stamp (wedgewatch.go): makes this handler's
+		// execution OBSERVABLE while in flight — the 7fbeed43 incident was
+		// undiagnosable precisely because a running handler was invisible
+		// (nothing logs until it returns, and a successful return logged
+		// nothing at all).
+		g.curReq.Store(&activeReq{
+			method:    method,
+			cgID:      cg,
+			reqID:     req.req.ID,
+			start:     dequeued,
+			queueWait: qWait,
+		})
 
 		// Teardown-window measurement: the destroy RPC's FIFO queue-wait is
 		// the TS zombie window's dominant Go-side term when the worker is
 		// busy (the CG worker serializes handlers, so a destroy behind an
 		// in-flight hydrate/advance waits for ALL of it). Logged per destroy
-		// — destroys are CG-lifecycle-rate, not row-rate. The msgpack
-		// re-parse for the cgID is destroy-only, off every hot path.
+		// — destroys are CG-lifecycle-rate, not row-rate.
 		if method == "destroy" && !req.enqueuedAt.IsZero() {
 			fmt.Fprintf(os.Stderr, "[GO-IVM][TEARDOWN] destroy dequeued cg=%s queueWait=%v\n",
-				extractClientGroupID(req.req), time.Since(req.enqueuedAt))
+				cg, qWait)
 		}
 
 		// advanceToHeadStream is THE advance: TS ships no changes; Go derives
@@ -1478,14 +1552,31 @@ func (g *ClientGroup) worker(s *Server) {
 		}
 
 		// Slow-handler log doubles as a fallback breadcrumb when OTel is off.
+		// UNCONDITIONAL on traceparent (7fbeed43 forensics): the old
+		// `Traceparent != ""` gate made a slow-but-successful hydrate
+		// invisible when the request arrived without one — the exact
+		// blindspot that left a ~140s silent return indistinguishable from a
+		// permanent wedge across two ART builds. cg is included so the line
+		// correlates without a params re-parse.
 		if !start.IsZero() {
-			if elapsed := time.Since(start); elapsed > 500*time.Millisecond && req.req.Traceparent != "" {
-				fmt.Fprintf(os.Stderr, "[GO-IVM][SLOW] method=%s elapsed=%v traceparent=%s\n",
-					method, elapsed, req.req.Traceparent)
+			if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+				fmt.Fprintf(os.Stderr, "[GO-IVM][SLOW] method=%s cg=%s elapsed=%v traceparent=%s\n",
+					method, cg, elapsed, req.req.Traceparent)
 			}
 		}
 
 		req.respCh <- resp
+		// WEDGE-CLEAR: a handler that ran past the watchdog threshold has
+		// RETURNED — the release-side timestamp that discriminates "wedged
+		// forever" from "silently un-stuck at ~120s" (see wedgewatch.go).
+		// Fires for EVERY method (an init/destroy that took 90s matters as
+		// much as a hydrate), incident-rate by construction.
+		if elapsed := time.Since(dequeued); elapsed > s.wedgeThreshold {
+			fmt.Fprintf(wedgeLogW, "[GO-IVM][WEDGE-CLEAR] cg=%s method=%s elapsed=%v err=%v\n",
+				cg, method, elapsed.Round(time.Millisecond), resp.Error != nil)
+		}
+		g.curReq.Store(nil)
+		g.wedgeDumped.Store(false) // re-arm the once-per-incident dump latch
 		// Completion stamp BEFORE clearing inFlight (see the field comment):
 		// without it, a handler that ran longer than the idle window left
 		// lastUsedNs at its DEQUEUE time — instantly reap-eligible the
@@ -1646,6 +1737,16 @@ func (s *Server) closeAll() {
 	s.mu.Unlock()
 	for id, g := range groups {
 		s.shutdownGroup(g, id, "close-all")
+	}
+	// Reader-shell cache last: the group teardowns above RETURN shells to
+	// it (pool.Close), so draining before them would strand those. Cached
+	// raw conns are invisible to the *sql.DB pools — they must be closed
+	// explicitly or they outlive the server.
+	s.replicaMu.Lock()
+	rdb := s.replicaDB
+	s.replicaMu.Unlock()
+	if rdb != nil {
+		tablesource.CloseReaderShellCache(rdb)
 	}
 }
 
@@ -2035,7 +2136,7 @@ func (s *Server) handleAddQueriesStream(req RPCRequest, streamW streamWriter) RP
 	// a co-read pool pinned to curr's current frame. No-op for the cold first
 	// hydrate (handled above) or when GO_IVM_WARM_HYDRATE_POOL is off. Ephemeral
 	// — torn down right after AddQueriesStream so the next advance is unaffected.
-	warmPool, warmCR := s.buildWarmReaderPoolLocked(group)
+	warmPool, warmCR := s.buildWarmReaderPoolLocked(group, cgID)
 	if warmPool != nil {
 		defer s.tearDownWarmReaderPool(group, warmPool, warmCR)
 	}
@@ -2360,7 +2461,7 @@ func handleConnection(conn net.Conn, server *Server) {
 			if req.Method == "addQueriesStream" || req.Method == "advanceToHeadStream" {
 				sw = streamW
 			}
-			if !group.trySendReq(clientGroupReq{req: req, respCh: respCh, streamW: sw, group: group}) {
+			if !group.trySendReq(clientGroupReq{req: req, respCh: respCh, streamW: sw, group: group, cgID: cgID}) {
 				enqueueImmediate(rpcError(req.ID, -32000, "client group destroyed"))
 			} else {
 				outC <- pendingResp{respCh: respCh}

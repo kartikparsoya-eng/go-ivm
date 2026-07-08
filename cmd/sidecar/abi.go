@@ -231,6 +231,10 @@ func startABIHostWithServer(server *Server, deliver func(kind int32, payload []b
 	// Pull idle sweeper (ABI v3, D7): auto-cancels pull gates parked past
 	// GO_IVM_PULL_IDLE_TIMEOUT_SEC. Same lifecycle as the reaper.
 	go server.runPullIdleSweeper(reaperCtx)
+	// Wedge watchdog (wedgewatch.go): reports + stack-dumps any CG worker
+	// stuck inside one handler past GO_IVM_WEDGE_WATCHDOG_SEC. Same
+	// lifecycle as the reaper.
+	go server.runWedgeWatchdog(reaperCtx)
 
 	// Observability parity with the socket path (REVIEW-napi-transport O1):
 	// the 10s [GO-IVM][PERF] reporter (what every soak greps) + the pprof
