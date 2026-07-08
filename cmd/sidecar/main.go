@@ -304,15 +304,20 @@ type perfMetrics struct {
 	lastReaderCacheHits   int64
 	lastReaderCacheMisses int64
 
-	// napiDeliverStalls counts deliveries that found the addon's TSFN queue
-	// FULL and entered the cancellable retry loop (rowplane.go
-	// retryDeliver) — the bounded replacement for the pre-ABI-v4 blocking
-	// enqueue that wedged CG workers (G13). Correlates directly with
-	// JS-event-loop stalls. napiDeliverTimeouts counts retries that hit
-	// GO_IVM_DELIVER_TIMEOUT — incident-class, paired with the
-	// [GO-IVM][DELIVER-TIMEOUT] marker.
+	// napiDeliverStalls counts deliveries/flushes that found the addon's
+	// TSFN queue FULL and entered a PARK (rowplane.go parkSlice — stage
+	// hard bound or frame delivery; abi.go deliverPumpFrame). Under ABI v5
+	// staging, ordinary congestion stages records instead of parking, so
+	// this counts genuine waits only. napiDeliverTimeouts counts parks
+	// that hit GO_IVM_DELIVER_TIMEOUT — incident-class, paired with the
+	// [GO-IVM][DELIVER-TIMEOUT] marker. napiStagedRecords counts records
+	// that found the queue full and staged (the congestion volume);
+	// napiBatchFlushes counts kind-5 batch items shipped — staged/batches
+	// is the mean coalescing factor.
 	napiDeliverStalls   atomic.Int64
 	napiDeliverTimeouts atomic.Int64
+	napiStagedRecords   atomic.Int64
+	napiBatchFlushes    atomic.Int64
 }
 
 var metrics = &perfMetrics{}
@@ -514,13 +519,15 @@ func (m *perfMetrics) reportAndReset() {
 	warmSerial := m.readerPoolWarmSerial.Swap(0)
 	deliverStalls := m.napiDeliverStalls.Swap(0)
 	deliverTimeouts := m.napiDeliverTimeouts.Swap(0)
+	stagedRecords := m.napiStagedRecords.Swap(0)
+	batchFlushes := m.napiBatchFlushes.Swap(0)
 	cacheHits, cacheMisses := tablesource.ReaderShellCacheCounters()
 	dHits, dMisses := cacheHits-m.lastReaderCacheHits, cacheMisses-m.lastReaderCacheMisses
 	m.lastReaderCacheHits, m.lastReaderCacheMisses = cacheHits, cacheMisses
 
 	if advCount == 0 && hydCount == 0 && bindCoread == 0 && bindConverge == 0 &&
 		bindSerial == 0 && warmCoread == 0 && warmSerial == 0 && dHits == 0 && dMisses == 0 &&
-		deliverStalls == 0 && deliverTimeouts == 0 {
+		deliverStalls == 0 && deliverTimeouts == 0 && stagedRecords == 0 && batchFlushes == 0 {
 		return
 	}
 
@@ -600,15 +607,18 @@ func (m *perfMetrics) reportAndReset() {
 			dHits, dMisses, reuse)
 	}
 
-	// NAPI deliver backpressure: stalls = deliveries that found the TSFN
-	// queue full and parked in the cancellable retry (bounded — the G13
-	// wedge class is gone); timeouts = retries that outlived
-	// GO_IVM_DELIVER_TIMEOUT (incident — see [GO-IVM][DELIVER-TIMEOUT]).
-	// Sustained stalls track JS-event-loop starvation, the upstream cause.
-	if deliverStalls > 0 || deliverTimeouts > 0 {
+	// NAPI deliver backpressure (ABI v5): staged = records that found the
+	// TSFN queue full and coalesced into the stage (the producer kept
+	// producing — no park); batches = kind-5 items shipped (staged/batches
+	// ≈ coalescing factor); stalls = genuine PARKS (stage hard bound /
+	// frame delivery / pump), event-woken by the drain signal; timeouts =
+	// parks that outlived GO_IVM_DELIVER_TIMEOUT (incident — see
+	// [GO-IVM][DELIVER-TIMEOUT]). Sustained staging tracks JS-event-loop
+	// busyness; sustained STALLS mean even batches can't ship.
+	if deliverStalls > 0 || deliverTimeouts > 0 || stagedRecords > 0 || batchFlushes > 0 {
 		fmt.Fprintf(os.Stderr,
-			"[GO-IVM][PERF-NAPI] 10s window: deliver queue-full stalls=%d timeouts=%d\n",
-			deliverStalls, deliverTimeouts)
+			"[GO-IVM][PERF-NAPI] 10s window: deliver queue-full stalls=%d timeouts=%d staged=%d batchFlushes=%d\n",
+			deliverStalls, deliverTimeouts, stagedRecords, batchFlushes)
 	}
 }
 

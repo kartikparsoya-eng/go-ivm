@@ -19,7 +19,8 @@ import (
 )
 
 // stubReaderPool implements pipelineReaderPool with a K-slot semaphore and
-// records the acquire/release pairing per queryID.
+// records the acquire/release pairing per queryID. releaseCount is the F2
+// progress signal (bumped on every release — or manually by progress tests).
 type stubReaderPool struct {
 	slots chan struct{}
 
@@ -27,6 +28,8 @@ type stubReaderPool struct {
 	acquired  map[string]int
 	released  map[string]int
 	neverGive bool
+
+	releaseCount atomic.Uint64
 }
 
 func newStubReaderPool(k int) *stubReaderPool {
@@ -60,9 +63,12 @@ func (s *stubReaderPool) AcquireForPipeline(queryID string, wait time.Duration) 
 		s.mu.Lock()
 		s.released[queryID]++
 		s.mu.Unlock()
+		s.releaseCount.Add(1)
 		s.slots <- struct{}{}
 	}, true
 }
+
+func (s *stubReaderPool) Releases() uint64 { return s.releaseCount.Load() }
 
 func setPipelineReaderTripwire(t *testing.T, d time.Duration) {
 	t.Helper()
@@ -89,11 +95,11 @@ func newUsersEngine(t *testing.T) *Engine {
 	return eng
 }
 
-// TestAcquirePipelineReader_TripwirePanics: a pool that never grants must
-// trip the wire with a loud, distinctive panic — never a silent fallback,
-// never an unbounded wait.
+// TestAcquirePipelineReader_TripwirePanics: a pool that never grants — and
+// shows ZERO release progress — must trip the wire with a loud, distinctive
+// panic — never a silent fallback, never an unbounded wait.
 func TestAcquirePipelineReader_TripwirePanics(t *testing.T) {
-	setPipelineReaderTripwire(t, 50*time.Millisecond)
+	setPipelineReaderTripwire(t, 100*time.Millisecond)
 	pool := newStubReaderPool(0)
 	pool.neverGive = true
 
@@ -117,6 +123,81 @@ func TestAcquirePipelineReader_TripwirePanics(t *testing.T) {
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("acquirePipelineReader hung past the tripwire")
+	}
+}
+
+// TestAcquirePipelineReader_ProgressResetsDeadline is the F2 pin
+// (parallelism audit 2026-07-10): pool-wide reader releases are PROGRESS —
+// a waiter queued behind a busy-but-moving pool must NOT trip, however long
+// it waits, because the production pull path runs with timeoutMs=0
+// (consumer-driven RPC lifetime) and a wide batch on K readers legitimately
+// queues past any fixed wall bound. Pre-F2 the deadline was fixed: this
+// exact shape — releases flowing, this waiter never granted — panicked the
+// whole batch, the client re-hydrated the same width, and the panic
+// repeated (a self-inflicted hydrate storm). Once progress STOPS, the
+// tripwire must still fire (the genuine-wedge half).
+func TestAcquirePipelineReader_ProgressResetsDeadline(t *testing.T) {
+	setPipelineReaderTripwire(t, 250*time.Millisecond)
+	pool := newStubReaderPool(0) // never grants to the waiter
+	pool.neverGive = true
+
+	// Background "sibling pipelines": releases flow every 50ms — well
+	// inside the 250ms tripwire — for ~4× the tripwire window.
+	stopProgress := make(chan struct{})
+	progressDone := make(chan struct{})
+	go func() {
+		defer close(progressDone)
+		ticker := time.NewTicker(50 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stopProgress:
+				return
+			case <-ticker.C:
+				pool.releaseCount.Add(1)
+			}
+		}
+	}()
+
+	done := make(chan any, 1)
+	start := time.Now()
+	go func() {
+		var recovered any
+		func() {
+			defer func() { recovered = recover() }()
+			_, _ = acquirePipelineReader(pool, "q-wide-batch", nil)
+		}()
+		done <- recovered
+	}()
+
+	// Phase 1: progress flowing — the waiter must survive well past the
+	// tripwire without panicking.
+	select {
+	case recovered := <-done:
+		close(stopProgress)
+		<-progressDone
+		t.Fatalf("waiter terminated after %v DESPITE pool-wide progress: %v "+
+			"(fixed-deadline tripwire — the F2 hydrate-storm shape)",
+			time.Since(start), recovered)
+	case <-time.After(4 * PipelineReaderTripwire):
+		// Survived 4× the tripwire with progress — correct.
+	}
+
+	// Phase 2: progress STOPS — now it is a genuine wedge and must trip
+	// within roughly one tripwire window (+ slack for the wait slice).
+	close(stopProgress)
+	<-progressDone
+	select {
+	case recovered := <-done:
+		if recovered == nil {
+			t.Fatal("waiter returned without panic after progress froze")
+		}
+		msg, _ := recovered.(string)
+		if !strings.Contains(msg, "ZERO pool-wide reader releases") {
+			t.Fatalf("panic = %v, want the zero-progress tripwire message", recovered)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("tripwire did not fire after progress froze — the genuine-wedge half broke")
 	}
 }
 

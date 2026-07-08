@@ -11,7 +11,8 @@ package main
 // slower flushCh→pipe→pump path and could arrive after later row records —
 // reordering the stream. So in row mode:
 //
-//   - row-encodable changes  → abiDeliver kind 2/3 (records)
+//   - row-encodable changes  → abiDeliver kind 2/3 (records), or kind 5
+//     (a batch of staged records — see the STAGING section below)
 //   - fallback changes       → abiDeliver kind 1 (msgpack partial frame,
 //     same RPCResponse shape the pump delivers — the TS client's frame
 //     dispatch cannot tell the difference)
@@ -38,38 +39,62 @@ package main
 // wedge watchdog's self-captured stacks): rp.mu may NEVER be held across a
 // deliver that waits. The addon's TSFN queue is bounded (default 8192) and
 // the pre-v4 deliver used napi_tsfn_blocking — "backpressure like a slow
-// socket" — but a Node event loop starved for minutes (43-46s synchronous
-// TS materializations, observed) parked the deliver in an UNCANCELLABLE
-// cgo call while it held rp.mu: every sibling producer of the RPC piled
-// onto the mutex with gate waiters==0 (invisible to the pull idle
-// sweeper), wg.Wait (engine.go, phase-2 drain) never returned, the CG
+// socket" — but a Node event loop starved for minutes parked the deliver in
+// an UNCANCELLABLE cgo call while it held rp.mu: every sibling producer of
+// the RPC piled onto the mutex with gate waiters==0 (invisible to the pull
+// idle sweeper), wg.Wait (engine.go, phase-2 drain) never returned, the CG
 // worker stayed inFlight forever (reap-proof by design, A4), and every
 // retry for the cgID starved behind it in ~122s lockstep with the TS 120s
 // RPC deadline. A blocked cgo call cannot be interrupted from outside, so
-// the ONLY viable cancellation point is a Go-side retry loop around a
-// NONBLOCKING enqueue (ABI v4):
+// the ONLY viable cancellation point is a Go-side retry around a
+// NONBLOCKING enqueue (ABI v4). Additionally (F1, parallelism audit
+// 2026-07-10): every rp.mu section is DEFER-unlocked and every
+// unlock-for-park window DEFER-relocks — a panic anywhere in the encoder
+// path (groupFor, encodeRow) previously escaped with rp.mu held forever,
+// wedging every sibling producer on the MUTEX (not in a park): no
+// deliver-timeout applied, no gate cancel reaches a mutex wait — the exact
+// convoy shape v4 killed, reintroduced through the panic door.
 //
-//   - the fast path attempts the enqueue UNDER rp.mu with the zero-copy
-//     scratch-aliased payload (deliver copies synchronously on success —
-//     the production steady state pays nothing new);
-//   - on queue-full, the payload is copied, rp.mu is RELEASED, and the
-//     delivery parks in retryDeliver — nonblocking attempts with escalating
-//     sleeps, checking cancellation between attempts (pull-gate cancelled /
-//     group teardown / GO_IVM_DELIVER_TIMEOUT) — so a stalled consumer
-//     costs a bounded, cancellable wait holding NO lock;
-//   - kind-1 frames (owned buffers, no encoder access) deliver entirely
-//     outside rp.mu.
+// STAGING + EVENT-DRIVEN WAKEUP (2026-07-10, the v4 latency-tax fix — the
+// PASS soak's telemetry showed 19,242 queue-full parks in 20 min with NO
+// pathological JS stalls: the two taxes were (1) the poll — v4's escalating
+// 100µs→5ms sleep meant every park ate up to 5ms of dead air after the
+// queue had already drained, ≈40-95s of injected idle concentrated in busy
+// windows; (2) row-granular queue slots — one row per TSFN entry let any
+// ordinary 100-300ms JS busy slice look like congestion at 8192 slots).
+// The boundary is now demand-shaped:
 //
-// Ordering survives the lock release because everything that must stay
-// ordered is single-producer: a group's def and all its records belong to
-// ONE query's producer goroutine (groups are keyed per (queryID, table) —
-// rowrecord.go), and that goroutine delivers sequentially — a payload
-// either enqueues on the spot or the producer parks until it does, so its
-// next payload cannot overtake. Cross-producer interleaving (different
-// queries) was always legal: records are self-describing (reqID + groupID)
-// and the TS accumulator demultiplexes. The terminal "done" still follows
-// everything because the handler returns only after every producer's emit
-// call has returned.
+//   - Queue has room → single-record items, exactly the zero-copy fast
+//     path (first-row latency untouched; the production steady state pays
+//     nothing new).
+//   - Deliver returns FULL → the record is STAGED (owned copy, framed) and
+//     the producer RETURNS TO THE ENGINE — it keeps producing (SQLite
+//     fetch, encode) instead of sleeping. Every subsequent record appends
+//     to the stage (nothing may overtake it) and opportunistically
+//     re-attempts a whole-stage flush (one cheap C call).
+//   - A flush ships the ENTIRE current stage as ONE kind-5 batch item —
+//     always atomically under rp.mu with a nonblocking attempt, so no
+//     flush ever parks holding a partial batch: parked producers all wake
+//     on drain, whoever re-acquires first flushes everything in append
+//     order, and per-producer order is preserved by construction.
+//   - Parks now happen at exactly TWO sites — the stage hard bound
+//     (memory backstop) and frame delivery (frames carry terminal
+//     errors/Finals and cannot be staged) — and they wake EVENT-DRIVEN:
+//     the addon signals goivm_queue_drained (ABI v5) when its queue drains
+//     below the low-water mark, closing the drain channel every parker
+//     selects on. The 10ms tick in the park bounds CANCELLATION detection
+//     only, never wakeup latency.
+//
+// Hydration stays pull: every row reaching this plane already holds a gate
+// credit (the sidecar acquires BEFORE emit), so staged rows never exceed
+// the client-granted window — demand remains the clock. Advance stays
+// push: the stage hard bound + park is the backpressure, now event-woken.
+//
+// WAL-pin note (parallelism audit): an ADVANCE producer parked here holds
+// its prev-tx WAL pin for up to the deliver timeout (150s), which exceeds
+// the 60s advance-budget promise — budget checks are pre-emit only. The
+// park is cancellable (group teardown) and the deadline bounds it; folding
+// the park into the budget clock is future work if soaks show it matters.
 //
 // emit* return false when the stream is DEAD — the delivery was refused
 // (TSFN closing), cancelled (client gone / group teardown), or timed out
@@ -80,6 +105,7 @@ package main
 // same pattern as the economic abort).
 
 import (
+	"encoding/binary"
 	"fmt"
 	"io"
 	"os"
@@ -97,16 +123,71 @@ const (
 	deliverClosed int32 = 2 // TSFN closing/gone; the transport is dead
 )
 
-// deliverTimeoutDefault bounds how long one payload may retry against a
-// full TSFN queue before the stream is declared dead. It must sit ABOVE
-// both the longest observed recoverable JS-loop stall (43-46s synchronous
-// materializations — a 44s hydrate COMPLETED in the incident soak) and the
-// TS 120s RPC deadline (past which the client has abandoned the RPC and
-// usually already fired the pull-gate cancel, which unparks the retry far
-// earlier). Firing therefore means the loop stayed starved beyond any
-// plausible recovery — an incident ([GO-IVM][DELIVER-TIMEOUT]), not load.
-// Env-tunable via GO_IVM_DELIVER_TIMEOUT_SEC (read lazily — the env sync
-// from the embedder happens at goivm_start, after package init).
+// drainBroadcast fans the addon's "TSFN queue drained below its low-water
+// mark" signal (goivm_queue_drained, ABI v5) out to every producer parked
+// on a full queue. close-and-remake semantics: waiters grab the CURRENT
+// channel, the next broadcast closes it (waking everyone), and a fresh
+// channel replaces it for future waiters.
+//
+// Lost-wakeup rule (every parker follows it): grab waitCh() BEFORE the
+// delivery attempt. A drain firing between a failed attempt and the park
+// then closes the very channel the parker already holds — the select falls
+// through immediately instead of waiting a tick.
+type drainBroadcast struct {
+	mu sync.Mutex
+	ch chan struct{}
+}
+
+func newDrainBroadcast() *drainBroadcast {
+	return &drainBroadcast{ch: make(chan struct{})}
+}
+
+func (d *drainBroadcast) waitCh() <-chan struct{} {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.ch
+}
+
+func (d *drainBroadcast) broadcast() {
+	d.mu.Lock()
+	close(d.ch)
+	d.ch = make(chan struct{})
+	d.mu.Unlock()
+}
+
+// tsfnDrain is the process-wide drain signal — one TSFN queue per process,
+// one broadcaster. The napilib export goivm_queue_drained (JS-thread direct
+// call, same class as goivm_stream_credit) invokes broadcast(); tests do too.
+var tsfnDrain = newDrainBroadcast()
+
+// deliverCancelTick bounds how quickly a PARKED producer notices
+// cancellation or its deadline — it is NOT the wakeup latency (wakeup is
+// event-driven via tsfnDrain). v4's escalating 100µs→5ms sleep-poll made
+// every park eat up to 5ms of dead air after the queue had already drained
+// — the "poll tax" the drain broadcast exists to kill.
+const deliverCancelTick = 10 * time.Millisecond
+
+// Stage hard bounds — the memory backstop for records accumulated while
+// the TSFN queue is full (an advance can produce tens of thousands of
+// rows; unbounded staging would buffer the whole diff). Crossing either
+// bound parks the producer until a flush succeeds. Vars so tests can
+// shrink them; production values are deliberately modest — a stage flush
+// is one TSFN item, and the addon caps items at 64MB.
+var (
+	stageMaxRecords = 256
+	stageMaxBytes   = 1 << 20 // 1MB
+)
+
+// deliverTimeoutDefault bounds how long one payload (or the stage) may wait
+// against a full TSFN queue before the stream is declared dead. It must sit
+// ABOVE both the longest observed recoverable JS-loop stall (43-46s
+// synchronous materializations — a 44s hydrate COMPLETED in the incident
+// soak) and the TS 120s RPC deadline (past which the client has abandoned
+// the RPC and usually already fired the pull-gate cancel, which unparks the
+// wait far earlier). Firing therefore means the loop stayed starved beyond
+// any plausible recovery — an incident ([GO-IVM][DELIVER-TIMEOUT]), not
+// load. Env-tunable via GO_IVM_DELIVER_TIMEOUT_SEC (read lazily — the env
+// sync from the embedder happens at goivm_start, after package init).
 const deliverTimeoutDefault = 150 * time.Second
 
 var deliverTimeoutOnce sync.Once
@@ -131,8 +212,9 @@ var deliverLogW io.Writer = os.Stderr
 // rowPlane wraps a rowRecordEncoder with the delivery callback and a mutex
 // (hydrate lanes call onResult concurrently; advance's onResult is already
 // serialized under the engine's flushMu but the lock is cheap insurance).
-// The mutex guards the ENCODER (groupFor / encodeRow / the scratch buffer);
-// it is never held across a waiting delivery — see the file header.
+// The mutex guards the ENCODER (groupFor / encodeRow / the scratch buffer)
+// and the STAGE; it is never held across a waiting delivery — see the file
+// header's lock discipline.
 type rowPlane struct {
 	mu      sync.Mutex
 	enc     *rowRecordEncoder
@@ -141,14 +223,22 @@ type rowPlane struct {
 	// cgID is observability-only (DELIVER-TIMEOUT / dead-stream lines).
 	cgID string
 	// cancelled reports whether this RPC's consumer is gone — checked
-	// between retry attempts while parked on a full TSFN queue. Wired to
+	// between park slices while waiting on a full TSFN queue. Wired to
 	// the group's done channel at construction; the pull path additionally
 	// folds in its gate's cancelled flag (setPullGate). nil = only the
 	// deadline bounds the park (tests).
 	cancelled func() bool
-	// timeout bounds one payload's park (deliverTimeoutDur in production;
-	// tests shrink it directly).
+	// timeout bounds one payload's (or the stage's) wait against a full
+	// queue (deliverTimeoutDur in production; tests shrink it directly).
 	timeout time.Duration
+
+	// stage holds framed records ([u8 kind][u32le len][bytes], kinds 2/3)
+	// that found the queue FULL, awaiting a whole-stage kind-5 batch flush.
+	// Guarded by mu. While non-empty, EVERY record appends here (nothing
+	// may overtake the stage); flushes always ship the entire current
+	// stage atomically under mu — see the file header's STAGING section.
+	stage        []byte
+	stageRecords int
 }
 
 // rowPlaneEngagedOnce emits a single operator-facing line the first time any
@@ -208,57 +298,179 @@ func (rp *rowPlane) setPullGate(gate *streamGate) {
 	}
 }
 
-// retryDeliver parks one OWNED payload against a full TSFN queue:
-// nonblocking attempts with escalating sleeps (100µs → 5ms), checking
-// cancellation between attempts. Holding rp.mu here is FORBIDDEN — this is
-// the wait the lock discipline exists to keep lock-free. Returns false when
-// the stream is dead (closed / cancelled / deadline).
+// noteDeliverTimeout emits the incident marker and bumps the counter.
+func (rp *rowPlane) noteDeliverTimeout(kind int32, payloadLen int) {
+	metrics.napiDeliverTimeouts.Add(1)
+	fmt.Fprintf(deliverLogW,
+		"[GO-IVM][DELIVER-TIMEOUT] cg=%s reqID=%v kind=%d bytes=%d waited=%v — TSFN queue full past the deadline (JS loop starved); failing the stream\n",
+		rp.cgID, rp.reqID, kind, payloadLen, rp.timeout)
+}
+
+// parkSlice waits for a drain signal (event — instant) or one cancellation
+// tick. ch MUST have been grabbed via tsfnDrain.waitCh() BEFORE the failed
+// delivery attempt (the lost-wakeup rule). Holding rp.mu here is FORBIDDEN.
+func parkSlice(ch <-chan struct{}, t *time.Timer) {
+	if !t.Stop() {
+		select {
+		case <-t.C:
+		default:
+		}
+	}
+	t.Reset(deliverCancelTick)
+	select {
+	case <-ch:
+	case <-t.C:
+	}
+}
+
+// retryDeliver parks one OWNED payload against a full TSFN queue: an
+// event-driven wait on the drain broadcast, checking cancellation each
+// tick. Holding rp.mu here is FORBIDDEN — this is the wait the lock
+// discipline exists to keep lock-free. Returns false when the stream is
+// dead (closed / cancelled / deadline).
 func (rp *rowPlane) retryDeliver(kind int32, payload []byte) bool {
 	metrics.napiDeliverStalls.Add(1)
 	deadline := time.Now().Add(rp.timeout)
-	sleep := 100 * time.Microsecond
+	t := time.NewTimer(deliverCancelTick)
+	defer t.Stop()
 	for {
-		if rp.cancelled != nil && rp.cancelled() {
-			return false
-		}
-		if time.Now().After(deadline) {
-			metrics.napiDeliverTimeouts.Add(1)
-			fmt.Fprintf(deliverLogW,
-				"[GO-IVM][DELIVER-TIMEOUT] cg=%s reqID=%v kind=%d bytes=%d waited=%v — TSFN queue full past the deadline (JS loop starved); failing the stream\n",
-				rp.cgID, rp.reqID, kind, len(payload), rp.timeout)
-			return false
-		}
-		time.Sleep(sleep)
-		if sleep < 5*time.Millisecond {
-			sleep *= 2
-		}
+		ch := tsfnDrain.waitCh() // BEFORE the attempt — lost-wakeup rule
 		switch rp.deliver(kind, payload) {
 		case deliverOK:
 			return true
 		case deliverClosed:
 			return false
 		}
+		if rp.cancelled != nil && rp.cancelled() {
+			return false
+		}
+		if time.Now().After(deadline) {
+			rp.noteDeliverTimeout(kind, len(payload))
+			return false
+		}
+		parkSlice(ch, t)
 	}
 }
 
-// sendLocked delivers one payload that may ALIAS the encoder's scratch
-// buffer. Called with rp.mu HELD; returns with rp.mu HELD. The nonblocking
-// attempt runs under the lock (success copies synchronously — the zero-copy
-// fast path). On queue-full it copies the payload, RELEASES rp.mu for the
-// duration of the park, and re-acquires before returning — sibling
-// producers keep encoding+delivering while this one waits.
-func (rp *rowPlane) sendLocked(kind int32, payload []byte) bool {
-	switch rp.deliver(kind, payload) {
-	case deliverOK:
+// stageAppendLocked frames one record onto the stage. Called with rp.mu
+// held. The payload may alias the encoder scratch — the append copies.
+func (rp *rowPlane) stageAppendLocked(kind int32, payload []byte) {
+	metrics.napiStagedRecords.Add(1)
+	var hdr [5]byte
+	hdr[0] = byte(kind)
+	binary.LittleEndian.PutUint32(hdr[1:], uint32(len(payload)))
+	rp.stage = append(rp.stage, hdr[:]...)
+	rp.stage = append(rp.stage, payload...)
+	rp.stageRecords++
+}
+
+// tryFlushStageLocked makes ONE nonblocking whole-stage flush attempt.
+// Returns false only when the transport is dead (CLOSED); FULL leaves the
+// stage intact — the producer keeps producing. Called with rp.mu held.
+func (rp *rowPlane) tryFlushStageLocked() bool {
+	if len(rp.stage) == 0 {
 		return true
+	}
+	switch rp.deliver(abiKindBatch, rp.stage) {
+	case deliverOK:
+		metrics.napiBatchFlushes.Add(1)
+		rp.stage = rp.stage[:0]
+		rp.stageRecords = 0
 	case deliverClosed:
 		return false
 	}
-	owned := append([]byte(nil), payload...)
-	rp.mu.Unlock()
-	ok := rp.retryDeliver(kind, owned)
+	return true
+}
+
+// flushStageLocked flushes the ENTIRE current stage, parking (with rp.mu
+// RELEASED — the F1 defer discipline makes the window panic-safe) until a
+// drain signal frees queue space. Because the attempt always runs under
+// rp.mu against the whole stage, no flush ever ships a partial batch:
+// siblings appending during the park simply grow the batch the next
+// attempt ships, in append order — per-producer order is preserved by
+// construction. Called with rp.mu held; returns with rp.mu held. false =
+// stream dead.
+func (rp *rowPlane) flushStageLocked() bool {
+	if len(rp.stage) == 0 {
+		return true
+	}
+	var deadline time.Time
+	t := time.NewTimer(deliverCancelTick)
+	defer t.Stop()
+	for {
+		ch := tsfnDrain.waitCh() // BEFORE the attempt — lost-wakeup rule
+		switch rp.deliver(abiKindBatch, rp.stage) {
+		case deliverOK:
+			metrics.napiBatchFlushes.Add(1)
+			rp.stage = rp.stage[:0]
+			rp.stageRecords = 0
+			return true
+		case deliverClosed:
+			return false
+		}
+		if deadline.IsZero() {
+			metrics.napiDeliverStalls.Add(1)
+			deadline = time.Now().Add(rp.timeout)
+		}
+		if rp.cancelled != nil && rp.cancelled() {
+			return false
+		}
+		if time.Now().After(deadline) {
+			rp.noteDeliverTimeout(abiKindBatch, len(rp.stage))
+			return false
+		}
+		// Park with rp.mu RELEASED; the defer re-lock keeps the caller's
+		// defer-unlock balanced even if the park path ever panics (F1).
+		func() {
+			rp.mu.Unlock()
+			defer rp.mu.Lock()
+			parkSlice(ch, t)
+		}()
+	}
+}
+
+// sendOrStageLocked routes one record (def or row): direct zero-copy
+// delivery when the stage is empty and the queue has room (the production
+// fast path — deliver copies synchronously on OK, so the payload may alias
+// the encoder scratch); otherwise the record is STAGED (owned copy) and
+// the producer continues — with one opportunistic whole-stage flush
+// attempt so the stage drains promptly once the queue recovers. Crossing
+// the stage hard bound parks until a flush succeeds (memory backstop).
+// Called with rp.mu held; may release it inside flushStageLocked's park.
+// false = stream dead.
+func (rp *rowPlane) sendOrStageLocked(kind int32, payload []byte) bool {
+	if len(rp.stage) == 0 {
+		switch rp.deliver(kind, payload) {
+		case deliverOK:
+			return true
+		case deliverClosed:
+			return false
+		}
+		// FULL → open the stage with this record.
+	}
+	rp.stageAppendLocked(kind, payload)
+	if !rp.tryFlushStageLocked() {
+		return false
+	}
+	if rp.stageRecords >= stageMaxRecords || len(rp.stage) >= stageMaxBytes {
+		return rp.flushStageLocked()
+	}
+	return true
+}
+
+// emitChangesGuarded is the ONLY entry to emitChangesLocked: it owns the
+// panic-safe rp.mu section (F1, parallelism audit 2026-07-10). The v4
+// rewrite had replaced the pre-v4 `defer rp.mu.Unlock()` with bare
+// Lock/Unlock pairs in the emit* callers — a panic anywhere in the encoder
+// path escaped with rp.mu held FOREVER: every sibling producer then
+// blocked on the MUTEX (not in a park), where no deliver-timeout applies
+// and no gate cancel reaches — the exact convoy shape v4 exists to kill,
+// reintroduced via the panic path. Every unlock-for-park window inside
+// (flushStageLocked) defer-relocks, so this defer can never double-unlock.
+func (rp *rowPlane) emitChangesGuarded(changes []engine.RowChange) (fallback []engine.RowChange, ok bool) {
 	rp.mu.Lock()
-	return ok
+	defer rp.mu.Unlock()
+	return rp.emitChangesLocked(changes)
 }
 
 // emitChangesLocked routes one partial's changes. ALL-OR-NOTHING: row
@@ -268,11 +480,11 @@ func (rp *rowPlane) sendLocked(kind int32, payload []byte) bool {
 // header for the reorder this prevents). ok=false means the stream is dead
 // (delivery refused/cancelled/timed out) — the caller must abort the RPC.
 //
-// Called with rp.mu HELD; may release it around a parked delivery
-// (sendLocked); returns with rp.mu HELD. Encoder state is only ever touched
-// under the lock; the group pointer from groupFor stays valid across a
-// release (the map holds pointers, and only THIS producer's queryID can
-// touch its groups).
+// Called with rp.mu HELD (via emitChangesGuarded); may release it around a
+// parked stage flush; returns with rp.mu HELD. Encoder state is only ever
+// touched under the lock; the group pointer from groupFor stays valid
+// across a release (the map holds pointers, and only THIS producer's
+// queryID can touch its groups).
 //
 // Group defs still deliver EAGERLY (before the whole partial's
 // encodability is known): defs are metadata-only — the JS registry just
@@ -288,18 +500,16 @@ func (rp *rowPlane) emitChangesLocked(changes []engine.RowChange) (fallback []en
 	// Fast path — the PRODUCTION case (REVIEW-napi-transport perf #1). rowMode
 	// forces chunkSize=1, so every partial carries exactly one change and the
 	// all-or-nothing buffering below has nothing to protect. deliver copies
-	// synchronously ON SUCCESS (the addon memcpy's the payload before
-	// returning; the test sink copies too — verified), so the record may
-	// alias the encoder's scratch buffer for the in-lock attempt: no recs
-	// slice, no per-row defensive copy (2 allocations/row saved on the
-	// hottest path). Only a queue-full attempt pays a copy (sendLocked). The
-	// def (if any) is delivered — hence copied or owned — before encodeRow
+	// synchronously ON SUCCESS and staging copies on FULL, so the record may
+	// alias the encoder's scratch buffer either way: no recs slice, no
+	// per-row defensive copy (2 allocations/row saved on the hottest path).
+	// The def (if any) is delivered/staged — hence copied — before encodeRow
 	// overwrites the scratch buffer.
 	if len(changes) == 1 {
 		c := &changes[0]
 		g, def := rp.enc.groupFor(c)
 		if def != nil {
-			if !rp.sendLocked(abiKindGroupDef, def) {
+			if !rp.sendOrStageLocked(abiKindGroupDef, def) {
 				return nil, false
 			}
 		}
@@ -307,7 +517,7 @@ func (rp *rowPlane) emitChangesLocked(changes []engine.RowChange) (fallback []en
 		if !encOK {
 			return changes, true // → one frame; no records delivered
 		}
-		if !rp.sendLocked(abiKindRow, rec) {
+		if !rp.sendOrStageLocked(abiKindRow, rec) {
 			return nil, false
 		}
 		return nil, true
@@ -323,7 +533,7 @@ func (rp *rowPlane) emitChangesLocked(changes []engine.RowChange) (fallback []en
 		c := &changes[i]
 		g, def := rp.enc.groupFor(c)
 		if def != nil {
-			if !rp.sendLocked(abiKindGroupDef, def) {
+			if !rp.sendOrStageLocked(abiKindGroupDef, def) {
 				return nil, false
 			}
 		}
@@ -333,20 +543,9 @@ func (rp *rowPlane) emitChangesLocked(changes []engine.RowChange) (fallback []en
 		}
 		recs = append(recs, append([]byte(nil), rec...))
 	}
-	// Phase 2: every change encoded — deliver in order. The records are
-	// owned copies with no encoder access left, so a parked delivery
-	// releases the lock for its whole duration.
+	// Phase 2: every change encoded — deliver in order.
 	for _, rec := range recs {
-		switch rp.deliver(abiKindRow, rec) {
-		case deliverOK:
-			continue
-		case deliverClosed:
-			return nil, false
-		}
-		rp.mu.Unlock()
-		parked := rp.retryDeliver(abiKindRow, rec)
-		rp.mu.Lock()
-		if !parked {
+		if !rp.sendOrStageLocked(abiKindRow, rec) {
 			return nil, false
 		}
 	}
@@ -356,11 +555,23 @@ func (rp *rowPlane) emitChangesLocked(changes []engine.RowChange) (fallback []en
 // deliverFrame msgpack-encodes a partial as a full RPCResponse and delivers
 // it as a kind-1 frame — indistinguishable from a pump-delivered frame to
 // the TS client. Encode errors are converted to an rpcError frame for the
-// same request id (mirrors handleConnection's encodeFrame fallback). Runs
-// entirely OUTSIDE rp.mu (owned buffer, no encoder access); per-producer
-// sequencing keeps it after the caller's records. Returns false when the
-// stream is dead.
+// same request id (mirrors handleConnection's encodeFrame fallback).
+//
+// Frames must not overtake staged records, so the stage is flushed FIRST
+// (parking if the queue stays full — a frame, unlike a record, cannot be
+// staged: it may carry the terminal error/Final the client is waiting on).
+// The frame itself then delivers OUTSIDE rp.mu (owned buffer, no encoder
+// access); per-producer sequencing keeps it after the caller's records.
+// Returns false when the stream is dead.
 func (rp *rowPlane) deliverFrame(partial interface{}) bool {
+	flushed := func() bool {
+		rp.mu.Lock()
+		defer rp.mu.Unlock()
+		return rp.flushStageLocked()
+	}()
+	if !flushed {
+		return false
+	}
 	data, err := mpMarshal(RPCResponse{JSONRPC: "2.0", Result: partial, ID: rp.reqID})
 	if err != nil {
 		data, _ = mpMarshal(rpcError(rp.reqID, -32603, "encode row-mode partial: "+err.Error()))
@@ -390,9 +601,7 @@ func (rp *rowPlane) deliverFrame(partial interface{}) bool {
 // frame via streamW (no records exist, so ordering is trivially preserved).
 // Returns false when the stream is dead — the caller must abort the advance.
 func (rp *rowPlane) emitAdvanceToHeadPartial(r engine.AdvanceStreamPartial, version string, numChanges int) bool {
-	rp.mu.Lock()
-	fallback, ok := rp.emitChangesLocked(r.Changes)
-	rp.mu.Unlock()
+	fallback, ok := rp.emitChangesGuarded(r.Changes)
 	if !ok {
 		return false
 	}
@@ -420,9 +629,7 @@ func (rp *rowPlane) emitAdvanceToHeadPartial(r engine.AdvanceStreamPartial, vers
 // dead — the caller must refuse further results (onResult false → the
 // engine's consumer-refusal unwind).
 func (rp *rowPlane) emitHydratePartial(r engine.QueryResult) bool {
-	rp.mu.Lock()
-	fallback, ok := rp.emitChangesLocked(r.Changes)
-	rp.mu.Unlock()
+	fallback, ok := rp.emitChangesGuarded(r.Changes)
 	if !ok {
 		return false
 	}

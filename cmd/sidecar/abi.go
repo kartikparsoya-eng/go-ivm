@@ -362,8 +362,9 @@ func startABIHostWithServer(server *Server, deliver func(kind int32, payload []b
 // the TS timeout — so unlike the row plane there is no deadline here: the
 // park IS the transport backpressure the pipe chain propagates (and it
 // wedges nothing — the pump is its own goroutine; CG workers hand frames
-// off via respCh and move on). The park stays escapable: host teardown
-// (markClosed → h.closed) or a dying TSFN (deliverClosed) breaks it.
+// off via respCh and move on). The park wakes EVENT-DRIVEN on the addon's
+// drain signal (ABI v5) and stays escapable: host teardown (markClosed →
+// h.closed, checked each pass) or a dying TSFN (deliverClosed) breaks it.
 func (h *abiHost) deliverPumpFrame(kind int32, payload []byte) bool {
 	switch h.deliver(kind, payload) {
 	case deliverOK:
@@ -372,21 +373,23 @@ func (h *abiHost) deliverPumpFrame(kind int32, payload []byte) bool {
 		return false
 	}
 	metrics.napiDeliverStalls.Add(1)
-	sleep := 100 * time.Microsecond
+	t := time.NewTimer(deliverCancelTick)
+	defer t.Stop()
 	for {
-		if h.isClosed() {
-			return false
-		}
-		time.Sleep(sleep)
-		if sleep < 5*time.Millisecond {
-			sleep *= 2
-		}
+		ch := tsfnDrain.waitCh() // BEFORE the attempt — lost-wakeup rule
 		switch h.deliver(kind, payload) {
 		case deliverOK:
 			return true
 		case deliverClosed:
 			return false
 		}
+		if h.isClosed() {
+			return false
+		}
+		// Event-driven park (ABI v5): woken instantly by the addon's drain
+		// signal; the tick only bounds closed-detection latency. Replaces
+		// the v4 escalating sleep-poll (the latency tax).
+		parkSlice(ch, t)
 	}
 }
 

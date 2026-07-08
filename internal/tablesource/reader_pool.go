@@ -9,6 +9,7 @@ import (
 	"os"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -63,9 +64,17 @@ var PoolAcquireTimeout = 5 * time.Second
 // AcquireForPipeline, and every fetch of that pipeline — nested child
 // fetches included — runs on this single conn with INTERLEAVED cursors:
 // SQLite natively supports many live statements on one connection inside one
-// read tx (TS's better-sqlite3 nested iterate() model). database/sql could
-// not express this (one live Rows per *sql.Conn), which is why the pool owns
-// raw conns.
+// read tx (TS's better-sqlite3 nested iterate() model). NOTE (F3,
+// parallelism audit 2026-07-10): database/sql's serialization was
+// empirically OVERSTATED as the raw-conn motivation — conn-prepared
+// statements (conn.PrepareContext → stmt.QueryContext) DO interleave live
+// cursors on one *sql.Conn (verified against mattn). The raw-conn design
+// stands on its real pillars: stmt busy-checkout control for same-SQL
+// nesting (checkoutStmt — database/sql's stmt layer cannot express it),
+// pool-accounting bypass (builds invisible to MaxOpenConns — the
+// 2026-07-06 builder-starves-probe class), driver-level scan (no
+// database/sql convert layer), and shell reuse across pool generations
+// (reader_cache.go).
 //
 // Single-goroutine discipline: a pipeline's drain is one goroutine (iter.Seq
 // is synchronous), so reader state needs no locking. mattn's own internal
@@ -247,6 +256,13 @@ type ReaderPool struct {
 	// pipeline exclusively holds, from AcquireForPipeline to its release.
 	// Read lock-free by every leaf fetch (readerFor) on the hydrate path.
 	bound sync.Map // string → *poolReader
+	// releases counts every reader RETURN to the pool — the pool-wide
+	// PROGRESS signal the engine's admission tripwire keys on (F2,
+	// parallelism audit 2026-07-10): a waiter resets its deadline whenever
+	// this moves, so only a pool with ZERO movement for the whole tripwire
+	// window (a genuine wedge — leaked reader, never-released parked
+	// producer) trips; a busy-but-moving admission queue never false-fires.
+	releases atomic.Uint64
 }
 
 // provisionReader returns one reader with an open (or armed) read tx plus
@@ -439,9 +455,16 @@ func (p *ReaderPool) AcquireForPipeline(queryID string, wait time.Duration) (rel
 	p.bound.Store(queryID, r)
 	return func() {
 		p.bound.Delete(queryID)
+		// Bump BEFORE returning the reader so a waiter woken by the free
+		// send observes the moved counter (progress — see releases).
+		p.releases.Add(1)
 		p.free <- r
 	}, true
 }
+
+// Releases reports the cumulative reader-return count — the engine's
+// pipelineReaderPool progress signal (see the releases field).
+func (p *ReaderPool) Releases() uint64 { return p.releases.Load() }
 
 // readerFor returns the reader bound to a pipeline group, or nil when the
 // group holds none (build-phase fetches, legacy AddQuery hydrates, engine

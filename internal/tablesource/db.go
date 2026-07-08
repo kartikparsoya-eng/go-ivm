@@ -82,11 +82,13 @@ var readPoolDSNs sync.Map // *sql.DB → string (DSN)
 // rawOpenReaderConn opens ONE raw driver connection configured identically
 // to db's pooled connections (same DSN → same pragmas + lower() hook), but
 // OUTSIDE database/sql. Raw conns are the substrate of the Option B reader
-// pool: database/sql serializes a *sql.Conn behind one live Rows, while
-// SQLite itself interleaves many live statements on one connection inside
-// one read tx (TS's better-sqlite3 nested iterate() model). Bypassing the
-// pool also removes the reader-build's db.Conn queueing — pool builds no
-// longer compete with probes for pooled conns.
+// pool. (F3 correction, 2026-07-10: the original motivation — "database/sql
+// serializes a *sql.Conn behind one live Rows" — was empirically overstated:
+// conn-prepared statements interleave live cursors on one *sql.Conn just
+// fine. The real pillars are the stmt busy-checkout cache, the driver-level
+// scan, shell reuse across pool generations, and — load-bearing here —
+// pool-accounting bypass: raw opens are invisible to db's MaxOpenConns, so
+// pool builds no longer compete with probes for pooled conns.)
 //
 // The caller OWNS the returned conn: it is invisible to db's MaxOpenConns
 // accounting and idle reaper, and MUST be closed via driver.Conn.Close.

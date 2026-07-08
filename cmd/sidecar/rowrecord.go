@@ -21,6 +21,15 @@ package main
 //	         can ever arrive again. The client fails all pending RPCs and
 //	         fatals the worker. See abi.go's death watcher. NOT emitted
 //	         on deliberate Shutdown.)
+//	kind 5 = record batch      (row plane, ABI v5; the payload is a
+//	         concatenation of framed sub-records, each
+//	         [u8 kind][u32le len][len bytes] with kind ∈ {2,3}. Produced
+//	         by the row plane's congestion stage (rowplane.go): records
+//	         that found the TSFN queue FULL accumulate and ship as ONE
+//	         queue item, so queue occupancy tracks batches instead of
+//	         rows under pressure. The JS side iterates and dispatches
+//	         each sub-record exactly as if delivered individually —
+//	         order within the batch is the emit order.)
 //
 // Record layouts (all integers little-endian; str = u16 len + UTF-8 bytes,
 // except value strings/blobs which use u32 len):
@@ -65,6 +74,7 @@ const (
 	abiKindGroupDef  = 2
 	abiKindRow       = 3
 	abiKindHostDeath = 4
+	abiKindBatch     = 5
 )
 
 const (

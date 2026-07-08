@@ -13,7 +13,9 @@ Status: **superseded in part (2026-07-08)** · proposal v2 · Owner: TBD · Crea
 > `iterate()` cursors interleaved on it): a pipeline acquires its single
 > reader at start while holding nothing (`ReaderPool.AcquireForPipeline`),
 > every nested fetch rides that reader (`fetchViaBoundReaderStream`, raw
-> driver conns — database/sql's one-Rows-per-conn limit forced the bypass),
+> driver conns — chosen for stmt busy-checkout, pool-accounting bypass, and
+> driver-level scan; the "one live Rows per *sql.Conn" serialization
+> originally cited was empirically overstated for conn-prepared statements),
 > and K = max(hydrateReaders, hydrateLanes) is just the admission width —
 > wider batches queue while holding nothing. Cmax, the per-fetch acquires,
 > and the exhaustion fallback are deleted. The lazy iter.Seq operator

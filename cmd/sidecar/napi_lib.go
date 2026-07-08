@@ -109,7 +109,17 @@ import (
 //	    duplicate delivery → stream corruption), and a v3 library's
 //	    blocking semantics on a v4 addon would silently reintroduce the
 //	    wedge.
-const goivmABIVersion = 4
+//	v5: added goivm_queue_drained (the addon signals when its TSFN queue
+//	    drains below the low-water mark — event-driven producer wakeup
+//	    replacing v4's 100µs→5ms sleep-poll, whose dead air was the
+//	    latency tax the first v4 soak measured: 19,242 parks × up to 5ms)
+//	    and delivery kind 5 (record batch — the row plane stages records
+//	    under congestion and ships them as one queue item; rowplane.go).
+//	    The version gates BOTH: a v4 addon never signals drain (v5
+//	    producers would degrade to tick-polling) and, worse, would hand
+//	    kind-5 batches to a JS side with no batch decoder — dropped
+//	    deliveries → stream corruption.
+const goivmABIVersion = 5
 
 var (
 	abiMu   sync.Mutex
@@ -267,4 +277,21 @@ func goivm_stream_cancel(reqID C.double) {
 		return
 	}
 	h.server.streamGates.cancel(float64(reqID))
+}
+
+// goivm_queue_drained signals that the addon's TSFN queue drained below its
+// low-water mark (ABI v5) — the event-driven wakeup for producers parked on
+// a full queue (rowplane.go parkSlice / abi.go deliverPumpFrame). Replaces
+// v4's sleep-poll, whose up-to-5ms dead air per park was the measured
+// latency tax.
+//
+// Called DIRECTLY on the JS thread (dlsym'd, no TSFN round-trip), from
+// call_js_deliver's drain accounting — same constraints as
+// goivm_stream_credit: the whole path is a leaf-mutex channel close —
+// O(1), allocation-light, never blocks, never touches N-API. Broadcasting
+// with no parked producers is a harmless no-op.
+//
+//export goivm_queue_drained
+func goivm_queue_drained() {
+	tsfnDrain.broadcast()
 }

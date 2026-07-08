@@ -494,45 +494,85 @@ type readerPoolBinder interface {
 // ONE exclusive frame-pinned reader for the pipeline identified by queryID,
 // waiting at most wait; ok=false means the wait elapsed (the caller loops —
 // admission queueing is normal when a batch is wider than the pool — until
-// its tripwire). The returned release returns the reader.
+// its tripwire). The returned release returns the reader. Releases reports
+// the pool's cumulative reader-return count — the PROGRESS signal the
+// tripwire is keyed on (see acquirePipelineReader).
 type pipelineReaderPool interface {
 	AcquireForPipeline(queryID string, wait time.Duration) (release func(), ok bool)
+	Releases() uint64
 }
 
 // PipelineReaderTripwire bounds how long one hydrate pipeline may QUEUE at
-// the pool's admission gate before the engine treats the wait as a wedge and
-// PANICS (recovered into the RPC error path by the hydrate recover — a loud,
-// clean batch failure, never a silent fallback).
+// the pool's admission gate WITHOUT ANY POOL-WIDE PROGRESS before the
+// engine treats the wait as a wedge and PANICS (recovered into the RPC
+// error path by the hydrate recover — a loud, clean batch failure, never a
+// silent fallback).
 //
 // Queueing here is NORMAL: under Option B each pipeline holds exactly one
 // reader acquired while holding nothing, so a batch wider than the pool's K
 // waits its turn exactly like TS's queries queue behind the view-syncer's
-// single conn (K=1). A wait that outlives this bound therefore means a
-// reader leaked or a parked producer never released (idle-sweep failure) —
-// a capacity/lifecycle BUG. 120s matches the TS RPC deadline: past it the
-// RPC is dead anyway. Var so tests can shrink it.
+// single conn (K=1). And the wait can LEGITIMATELY be long (F2,
+// parallelism audit 2026-07-10): the production pull path runs with
+// timeoutMs=0 — a consumer-driven RPC lifetime (go-ivm-client.ts
+// addQueriesStreamPull), NOT the 120s bound this deadline was originally
+// justified against — so a wide batch (say 50 queries on K=8) with heavy
+// results and a slow-but-alive consumer can keep every reader busy past
+// ANY fixed wall bound while queries 9..50 queue healthily. A fixed
+// deadline panicked the WHOLE batch on that shape; the client re-hydrated
+// the same width and it repeated — a self-inflicted hydrate storm on
+// exactly the load profile the parallel machinery exists for.
+//
+// The tripwire is therefore PROGRESS-based: acquirePipelineReader resets
+// its deadline whenever the pool's release counter moves. It fires only
+// after PipelineReaderTripwire of ZERO reader releases pool-wide — a
+// genuinely wedged pool (leaked reader, a parked producer whose
+// cancellation never fired) shows zero progress and still trips; a
+// busy-but-moving admission queue never false-fires. This also composes
+// correctly with the deliver-side bounds: a real JS-loop stall freezes
+// every producer (zero releases) and trips here, or is unwound earlier by
+// the deliver timeout (150s) / gate cancel. Var so tests can shrink it.
 var PipelineReaderTripwire = 120 * time.Second
 
 // acquirePipelineReader blocks until the bound pool grants queryID its
 // exclusive reader, the RPC is cancelled (returns ok=false — the caller
-// abandons the hydrate), or PipelineReaderTripwire elapses (panics; see the
-// var doc). rp must be non-nil. cancelled may be nil (non-cancellable
-// callers — AddQueries).
+// abandons the hydrate), or PipelineReaderTripwire elapses WITH NO
+// pool-wide progress (panics; see the var doc). rp must be non-nil.
+// cancelled may be nil (non-cancellable callers — AddQueries).
 func acquirePipelineReader(rp pipelineReaderPool, queryID string, cancelled *atomic.Bool) (release func(), ok bool) {
+	// Wait slices bound cancellation/progress-check latency, not wakeup
+	// latency (AcquireForPipeline itself unblocks the instant a reader
+	// frees). Scaled to the tripwire so tests with tiny tripwires stay
+	// fast; production (120s) clamps to 1s — the historical slice.
+	slice := PipelineReaderTripwire / 4
+	if slice > time.Second {
+		slice = time.Second
+	}
+	if slice < 10*time.Millisecond {
+		slice = 10 * time.Millisecond
+	}
 	deadline := time.Now().Add(PipelineReaderTripwire)
+	lastReleases := rp.Releases()
 	for {
-		// 1s slices so cancellation is noticed promptly while queued.
-		if release, ok := rp.AcquireForPipeline(queryID, time.Second); ok {
+		if release, ok := rp.AcquireForPipeline(queryID, slice); ok {
 			return release, true
 		}
 		if cancelled != nil && cancelled.Load() {
 			return nil, false
 		}
+		// Progress-based deadline (F2): any reader release anywhere in the
+		// pool proves the machine is moving — this waiter is queued behind
+		// legitimate work, not wedged. Only a frozen counter lets the
+		// deadline expire.
+		if cur := rp.Releases(); cur != lastReleases {
+			lastReleases = cur
+			deadline = time.Now().Add(PipelineReaderTripwire)
+			continue
+		}
 		if time.Now().After(deadline) {
 			panic(fmt.Sprintf(
-				"reader-pool admission tripwire: pipeline %q waited %v for a reader — "+
-					"a reader leaked or a parked producer never released (pool sized below "+
-					"concurrent-hydrate width is queueing, not this); failing the batch loudly",
+				"reader-pool admission tripwire: pipeline %q waited %v with ZERO pool-wide reader releases — "+
+					"a reader leaked or a parked producer's cancellation never fired (busy pools reset this "+
+					"deadline on every release; queueing is not what trips it); failing the batch loudly",
 				queryID, PipelineReaderTripwire))
 		}
 	}
