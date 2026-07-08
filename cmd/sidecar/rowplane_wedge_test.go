@@ -601,3 +601,90 @@ func TestPullCredit_FlushBeforeParkPreventsStalemate(t *testing.T) {
 		t.Fatalf("delivered rows = %d, want %d (staged rows lost?)", got, window+1)
 	}
 }
+
+// TestRowPlane_MultiParkerWake_NoEmptyBatch pins the multi-parker wake
+// (review LOW, 2026-07-10): two producers parked in a stage flush, queue
+// recovers, the FIRST to re-acquire mu ships the ENTIRE stage (flushes are
+// whole-stage atomic) — the second must recognize its work is already done
+// and return, NOT deliver the now-empty stage as a zero-record kind-5
+// (a wasted TSFN slot during exactly the congestion window slots are
+// scarce, a phantom napiBatchFlushes bump, and — queue still FULL — a
+// producer re-parking to deliver nothing). Red-proof: removing
+// flushStageLocked's loop-top emptiness re-check makes the loser ship an
+// empty batch — verified during development.
+func TestRowPlane_MultiParkerWake_NoEmptyBatch(t *testing.T) {
+	setStageBounds(t, 2, 1<<20) // def+row crosses the bound → park in flush
+	s := newScriptedSink(deliverFull)
+	rp := wedgeTestPlane(t, s, 30*time.Second)
+
+	// Two producers of the same RPC (distinct queryIDs → distinct defs),
+	// both against the FULL queue: each stages its records, crosses the
+	// bound, and parks in flushStageLocked (mu released while parked, so
+	// they interleave).
+	var wg sync.WaitGroup
+	results := make([]bool, 2)
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			q := fmt.Sprintf("q%d", idx+1)
+			results[idx] = rp.emitHydratePartial(engine.QueryResult{
+				QueryID: q, Changes: []engine.RowChange{rcAdd(q, "a")},
+			})
+		}(i)
+	}
+	time.Sleep(100 * time.Millisecond) // both demonstrably parked (10ms retry slices)
+
+	// Queue recovers; both wake and race for mu. The winner ships the
+	// whole stage; the loser's stage view is empty.
+	s.setMode(deliverOK)
+	tsfnDrain.broadcast()
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("producers did not complete after queue recovery")
+	}
+	for i, ok := range results {
+		if !ok {
+			t.Fatalf("producer %d reported stream death on a recovered queue", i)
+		}
+	}
+
+	// THE pin: no zero-record kind-5 anywhere; exactly one real batch.
+	var batches, emptyBatches, defs, rows int
+	s.mu.Lock()
+	for i, k := range s.kinds {
+		switch k {
+		case abiKindBatch:
+			batches++
+			kinds, _ := decodeBatch(t, s.payloads[i])
+			if len(kinds) == 0 {
+				emptyBatches++
+			}
+			for _, sk := range kinds {
+				switch sk {
+				case abiKindGroupDef:
+					defs++
+				case abiKindRow:
+					rows++
+				}
+			}
+		case abiKindGroupDef:
+			defs++
+		case abiKindRow:
+			rows++
+		}
+	}
+	s.mu.Unlock()
+	if emptyBatches != 0 {
+		t.Fatalf("%d empty kind-5 batch(es) delivered — the losing parker shipped the already-flushed stage", emptyBatches)
+	}
+	if batches != 1 {
+		t.Fatalf("batches = %d, want exactly 1 (the winner's whole-stage flush)", batches)
+	}
+	if defs != 2 || rows != 2 {
+		t.Fatalf("delivered defs=%d rows=%d, want 2/2 (records lost or duplicated)", defs, rows)
+	}
+}

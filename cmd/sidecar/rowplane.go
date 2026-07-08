@@ -161,10 +161,15 @@ func (d *drainBroadcast) broadcast() {
 var tsfnDrain = newDrainBroadcast()
 
 // deliverCancelTick bounds how quickly a PARKED producer notices
-// cancellation or its deadline — it is NOT the wakeup latency (wakeup is
-// event-driven via tsfnDrain). v4's escalating 100µs→5ms sleep-poll made
-// every park eat up to 5ms of dead air after the queue had already drained
-// — the "poll tax" the drain broadcast exists to kill.
+// cancellation or its deadline — wakeup is normally event-driven via
+// tsfnDrain, so this is NOT the typical wakeup latency. (One narrow
+// exception, on record: the addon sets its FULL latch after a failed
+// enqueue's decrement, so a drain that completes inside that gap can lose
+// the episode's signal — the tick then doubles as the recovery re-attempt,
+// worst case one tick of extra latency, never a hang.) v4's escalating
+// 100µs→5ms sleep-poll made every park eat up to 5ms of dead air after the
+// queue had already drained — the "poll tax" the drain broadcast exists to
+// kill.
 const deliverCancelTick = 10 * time.Millisecond
 
 // Stage hard bounds — the memory backstop for records accumulated while
@@ -398,6 +403,17 @@ func (rp *rowPlane) flushStageLocked() bool {
 	t := time.NewTimer(deliverCancelTick)
 	defer t.Stop()
 	for {
+		// Re-check after every park (multi-parker wake, review LOW
+		// 2026-07-10): flushes are whole-stage atomic under mu, so a sibling
+		// parker that re-acquired FIRST may have shipped the entire stage —
+		// this parker's work is done. Without the re-check it delivered the
+		// now-empty stage as a zero-record kind-5: a wasted TSFN slot during
+		// exactly the congestion window slots are scarce, a phantom
+		// napiBatchFlushes bump, and (queue still FULL) a producer
+		// re-parking to deliver nothing.
+		if len(rp.stage) == 0 {
+			return true
+		}
 		ch := tsfnDrain.waitCh() // BEFORE the attempt — lost-wakeup rule
 		switch rp.deliver(abiKindBatch, rp.stage) {
 		case deliverOK:
