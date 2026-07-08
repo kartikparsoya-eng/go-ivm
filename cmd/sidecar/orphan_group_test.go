@@ -52,7 +52,7 @@ func TestGetGroup_CreateWhenAbsent(t *testing.T) {
 		t.Error("expected done initialized on new group")
 	}
 	// Worker is started — calling shutdownGroup must not hang.
-	s.shutdownGroup(g)
+	s.shutdownGroup(g, "test-cg", "test")
 }
 
 // TestRemoveGroup_NoOrphanAfterConcurrentLookup simulates the race the

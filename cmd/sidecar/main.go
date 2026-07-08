@@ -833,6 +833,11 @@ type ClientGroup struct {
 type clientGroupReq struct {
 	req    RPCRequest
 	respCh chan RPCResponse
+	// enqueuedAt is when trySendReq accepted the request into reqC — the
+	// worker computes FIFO queue-wait from it (teardown-window measurement:
+	// a destroy queued behind a long hydrate/advance is the dominant term
+	// of the TS-side zombie window, so it must be attributable).
+	enqueuedAt time.Time
 	// streamW is set for streaming methods (currently addQueriesStream).
 	// The handler emits partial frames via streamW; the final frame still
 	// goes through respCh and the per-request writer goroutine.
@@ -1349,7 +1354,7 @@ func (s *Server) reapIdleGroups(cutoff time.Time) int {
 		s.saveEpochLocked(c.id, current)
 		delete(s.groups, c.id)
 		s.mu.Unlock()
-		s.shutdownGroup(c.g)
+		s.shutdownGroup(c.g, c.id, "reaper")
 		reaped++
 	}
 	return reaped
@@ -1412,6 +1417,17 @@ func (g *ClientGroup) worker(s *Server) {
 		g.inFlight.Store(true) // A4: reap-proof while the handler runs
 		var start time.Time
 		method := req.req.Method
+
+		// Teardown-window measurement: the destroy RPC's FIFO queue-wait is
+		// the TS zombie window's dominant Go-side term when the worker is
+		// busy (the CG worker serializes handlers, so a destroy behind an
+		// in-flight hydrate/advance waits for ALL of it). Logged per destroy
+		// — destroys are CG-lifecycle-rate, not row-rate. The msgpack
+		// re-parse for the cgID is destroy-only, off every hot path.
+		if method == "destroy" && !req.enqueuedAt.IsZero() {
+			fmt.Fprintf(os.Stderr, "[GO-IVM][TEARDOWN] destroy dequeued cg=%s queueWait=%v\n",
+				extractClientGroupID(req.req), time.Since(req.enqueuedAt))
+		}
 
 		// advanceToHeadStream is THE advance: TS ships no changes; Go derives
 		// + applies its own diff. Counted here so [GO-IVM][PERF] lines report
@@ -1521,6 +1537,7 @@ func (g *ClientGroup) trySendReq(req clientGroupReq) bool {
 	default:
 	}
 	g.lastUsedNs.Store(time.Now().UnixNano())
+	req.enqueuedAt = time.Now()
 	select {
 	case g.reqC <- req:
 		return true
@@ -1550,7 +1567,7 @@ func (s *Server) removeGroup(id string) {
 	delete(s.groups, id)
 	s.mu.Unlock()
 	if g != nil {
-		s.shutdownGroup(g)
+		s.shutdownGroup(g, id, "destroy-rpc")
 	}
 }
 
@@ -1558,12 +1575,19 @@ func (s *Server) removeGroup(id string) {
 // exit via close(done), then closes the engine. Idempotent via closeOnce
 // so concurrent removeGroup / closeAll don't race on the close.
 //
+// id/reason are observability-only (teardown-window measurement): every
+// teardown logs one [GO-IVM][TEARDOWN] line with per-phase timings so the
+// TS zombie-window (view-syncer stop → ServiceRunner delete, which awaits
+// this via the destroy RPC — pipeline-driver.ts:1147 MED-5) can be
+// classified into mu-wait vs actual cleanup cost.
+//
 // Does NOT close reqC — closing the data channel would race with concurrent
 // trySendReq calls and panic on send-after-close. The worker treats `done`
 // as the exit signal and drains any remaining buffered requests with an
 // error response before returning. New senders past this point see done
 // closed and bail out without touching reqC.
-func (s *Server) shutdownGroup(g *ClientGroup) {
+func (s *Server) shutdownGroup(g *ClientGroup, id, reason string) {
+	t0 := time.Now()
 	g.closeOnce.Do(func() {
 		close(g.done)
 	})
@@ -1575,21 +1599,38 @@ func (s *Server) shutdownGroup(g *ClientGroup) {
 	// and the teardown proceeds. Owner is the group POINTER, so this can
 	// never touch a re-created generation of the same cgID.
 	s.streamGates.cancelOwner(g)
+	gatesDone := time.Now()
 	// Engine cleanup needs g.mu because handlers also take it (and we may
 	// race with a handler that just dequeued before done was closed; the
 	// handler will finish and respCh-send before re-entering the worker
 	// loop, at which point the drain branch fires).
 	g.mu.Lock()
+	muAcquired := time.Now()
+	poolK := 0
+	if g.readerPool != nil {
+		poolK = g.readerPool.Size()
+	}
 	s.tearDownReaderPool(g)
+	poolDone := time.Now()
 	if g.eng != nil {
 		g.eng.Close()
 		g.eng = nil
 	}
+	engDone := time.Now()
 	if g.snap != nil {
 		g.snap.Destroy()
 		g.snap = nil
 	}
+	snapDone := time.Now()
 	g.mu.Unlock()
+	fmt.Fprintf(os.Stderr,
+		"[GO-IVM][TEARDOWN] cg=%s reason=%s total=%v gates=%v muWait=%v pool=%v(k=%d) eng=%v snap=%v\n",
+		id, reason, snapDone.Sub(t0),
+		gatesDone.Sub(t0),
+		muAcquired.Sub(gatesDone),
+		poolDone.Sub(muAcquired), poolK,
+		engDone.Sub(poolDone),
+		snapDone.Sub(engDone))
 }
 
 // closeAll shuts down all engines and their worker goroutines.
@@ -1601,8 +1642,8 @@ func (s *Server) closeAll() {
 	}
 	s.groups = make(map[string]*ClientGroup)
 	s.mu.Unlock()
-	for _, g := range groups {
-		s.shutdownGroup(g)
+	for id, g := range groups {
+		s.shutdownGroup(g, id, "close-all")
 	}
 }
 
@@ -2144,7 +2185,14 @@ func (s *Server) handleDestroy(req RPCRequest) RPCResponse {
 	// not microseconds.
 	group := s.getGroup(cgID, false)
 	if group != nil {
+		// The worker serializes this CG's handlers, so this Lock is normally
+		// free; contention here means the REAPER (or a concurrent teardown
+		// path) holds g.mu — worth a breadcrumb when it stalls the destroy.
+		muWait0 := time.Now()
 		group.mu.Lock()
+		if w := time.Since(muWait0); w > 5*time.Millisecond {
+			fmt.Fprintf(os.Stderr, "[GO-IVM][TEARDOWN] cg=%s destroy epoch-check muWait=%v\n", cgID, w)
+		}
 		if resp, stale := checkInitEpoch(group, req.ID, p.InitEpoch); stale {
 			group.mu.Unlock()
 			return resp
