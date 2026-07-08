@@ -41,6 +41,7 @@ import (
 	"errors"
 	"fmt"
 	"iter"
+	"os"
 	"slices"
 	"sort"
 	"strings"
@@ -200,6 +201,10 @@ type Source struct {
 	// the owning queryID right before each Connect during a pipeline
 	// build). Guarded by s.mu. See parallel_fanout.go.
 	nextConnectGroup string
+
+	// poolFallbackLogOnce rate-limits the pool-exhaustion fallback log to
+	// one line per Source (see notePoolFallback).
+	poolFallbackLogOnce sync.Once
 }
 
 // cachedStmt pairs a prepared statement with the recency tick of its last
@@ -257,6 +262,28 @@ type presenceKey struct {
 // See the probe block in NewWithContext for the full rationale (2026-07-07
 // soak incident). Negative results are never stored.
 var probedTables sync.Map // presenceKey → struct{}
+
+// poolStreamFallbacks counts pool-exhaustion serial fallbacks (the bounded
+// acquire in fetchViaPoolStream/fetchViaPool timing out) across all Sources.
+// Observability for soaks: a nonzero delta means hydrate concurrency
+// exceeded the frame-pinned pool's K and the hold-and-wait breaker engaged.
+var poolStreamFallbacks atomic.Int64
+
+// PoolStreamFallbackCount reports the cumulative pool-exhaustion serial
+// fallback count (see poolStreamFallbacks).
+func PoolStreamFallbackCount() int64 { return poolStreamFallbacks.Load() }
+
+// notePoolFallback records one pool-exhaustion serial fallback: bumps the
+// package counter and logs ONCE per Source (a deadlocked batch trips
+// hundreds of waiters at once — per-occurrence logging would flood).
+func (s *Source) notePoolFallback() {
+	poolStreamFallbacks.Add(1)
+	s.poolFallbackLogOnce.Do(func() {
+		fmt.Fprintf(os.Stderr,
+			"[GO-IVM] reader pool exhausted past %v on %q — hydrate fetch falling back to the serial bound conn (same frame; further fallbacks for this table counted, not logged)\n",
+			PoolAcquireTimeout, s.tableName)
+	})
+}
 
 // New constructs a Source for tableName.
 //
@@ -1394,7 +1421,18 @@ func (s *Source) fetchForConn(req ivm.FetchRequest, conn *connection) []ivm.Node
 	if pool := s.readerPool.Load(); pool != nil {
 		return s.fetchViaPool(req, conn, pool)
 	}
+	return s.fetchSerial(req, conn)
+}
 
+// fetchSerial is the single-conn locked read — fetchForConn minus the pool
+// dispatch. Split out so the pool paths' exhaustion FALLBACK can reach the
+// serial read directly: routing the fallback through fetchForConn would
+// re-enter the pool branch and recurse. It is also what the pool-exhaustion
+// fallback relies on for deadlock-freedom: the read borrows the conn, drains
+// the cursor EAGERLY under s.mu, and releases before yielding anything — no
+// cursor is ever held across a consumer yield, so this fetch can never
+// participate in a hold-and-wait cycle.
+func (s *Source) fetchSerial(req ivm.FetchRequest, conn *connection) []ivm.Node {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -1841,9 +1879,37 @@ func (s *Source) fetchViaPoolStream(req ivm.FetchRequest, conn *connection, pool
 			req.Start,
 			req.MultiConstraints,
 		)
-		r, err := pool.acquire(s.ctx)
+		// BOUNDED acquire + serial fallback (2026-07-07 G13-residual wedge,
+		// root-caused from live goroutine dumps): the pull-mode hydrate
+		// (engine addQueriesStreamChunked, D6) runs one goroutine PER QUERY —
+		// not P lanes — so a large addQueries batch can hold-and-wait far
+		// past K = P × Cmax: every reader held by a lane that needs another
+		// reader for its nested child fetch. With the old unbounded
+		// acquire(s.ctx) (s.ctx is Background in production) that was a
+		// PERMANENT deadlock: 184/212 goroutines parked here in the two
+		// wedged workers, the RPC handler never returned, group.mu stayed
+		// held forever, and every later init/destroy for the CG timed out at
+		// the TS 120s RPC bound in lockstep. Bounding the acquire and
+		// falling back to fetchSerial — the SAME pinned frame via the bound
+		// conn (byte-identical read, see fetchViaPool's doc), eager
+		// borrow-drain-release so it cannot join the wait cycle — turns the
+		// deadlock into a bounded slow path: one waiter times out, completes
+		// serially, its ancestors release readers, and the cycle drains.
+		acqCtx, cancelAcq := context.WithTimeout(s.ctx, PoolAcquireTimeout)
+		r, err := pool.acquire(acqCtx)
+		cancelAcq()
 		if err != nil {
-			panic(fmt.Sprintf("tablesource.Source.Fetch %s: pool acquire: %v", s.tableName, err))
+			if s.ctx.Err() != nil {
+				// Source torn down — propagate, do not read a dead source.
+				panic(fmt.Sprintf("tablesource.Source.Fetch %s: pool acquire: %v", s.tableName, err))
+			}
+			s.notePoolFallback()
+			for _, n := range s.fetchSerial(req, conn) {
+				if !yield(n) {
+					return
+				}
+			}
+			return
 		}
 		defer pool.release(r)
 		stmt, err := r.prepared(s.ctx, q.SQL)
@@ -1911,9 +1977,18 @@ func (s *Source) fetchViaPool(req ivm.FetchRequest, conn *connection, pool *Read
 		req.Start,
 		req.MultiConstraints,
 	)
-	r, err := pool.acquire(s.ctx)
+	// Same bounded acquire + serial fallback as fetchViaPoolStream (the
+	// G13-residual hold-and-wait breaker) — this eager variant is reachable
+	// via direct fetchForConn callers with a pool still bound.
+	acqCtx, cancelAcq := context.WithTimeout(s.ctx, PoolAcquireTimeout)
+	r, err := pool.acquire(acqCtx)
+	cancelAcq()
 	if err != nil {
-		panic(fmt.Sprintf("tablesource.Source.Fetch %s: pool acquire: %v", s.tableName, err))
+		if s.ctx.Err() != nil {
+			panic(fmt.Sprintf("tablesource.Source.Fetch %s: pool acquire: %v", s.tableName, err))
+		}
+		s.notePoolFallback()
+		return s.fetchSerial(req, conn)
 	}
 	defer pool.release(r)
 	stmt, err := r.prepared(s.ctx, q.SQL)
