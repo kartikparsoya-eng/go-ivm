@@ -17,7 +17,10 @@ package tablesource
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
+	"errors"
 	"fmt"
+	"io"
 	"slices"
 	"testing"
 
@@ -64,7 +67,9 @@ func TestConvertFilterLiteralTypedByLiteral(t *testing.T) {
 // distinct SQL text per length — each pinning a compiled sqlite3_stmt on
 // the C heap for the reader's whole life. Pre-fix the map was unbounded;
 // post-fix it holds ≤ stmtCachePerConnCap entries and evicts the coldest
-// quarter, with hot shapes surviving.
+// quarter, with hot shapes surviving. Exercised through the Option B
+// checkout/return cycle (checkout removes from the map; RETURN is the
+// insert — and thus the eviction trigger).
 func TestPoolReaderStmtCacheBounded(t *testing.T) {
 	path := newWALFixture(t)
 	db, err := Open(path, OpenOptions{})
@@ -76,18 +81,20 @@ func TestPoolReaderStmtCacheBounded(t *testing.T) {
 	// Construct the reader directly (the pool's converge loop needs a full
 	// replica with _zero.replicationState; the cache under test is purely
 	// per-reader and identical either way).
-	conn, err := db.Conn(context.Background())
+	dc, err := rawOpenReaderConn(db)
 	if err != nil {
-		t.Fatalf("conn: %v", err)
+		t.Fatalf("rawOpenReaderConn: %v", err)
 	}
-	r := &poolReader{conn: conn, stmts: map[string]*poolStmt{}}
+	r := &poolReader{dc: dc, stmts: map[string]*poolStmt{}}
 	defer r.close(context.Background())
 
 	prepare := func(q string) {
 		t.Helper()
-		if _, err := r.prepared(context.Background(), q); err != nil {
-			t.Fatalf("prepared(%q): %v", q, err)
+		st, err := r.checkoutStmt(context.Background(), q)
+		if err != nil {
+			t.Fatalf("checkoutStmt(%q): %v", q, err)
 		}
+		r.returnStmt(q, st, true)
 	}
 
 	// A hot shape, re-touched throughout: must survive every eviction.
@@ -113,14 +120,22 @@ func TestPoolReaderStmtCacheBounded(t *testing.T) {
 		t.Fatal("hot (recently-used) shape was evicted; eviction must drop coldest first")
 	}
 	// Cached stmts must still be usable after evictions.
-	st, err := r.prepared(context.Background(), hot)
+	st, err := r.checkoutStmt(context.Background(), hot)
 	if err != nil {
-		t.Fatalf("prepared(hot) after evictions: %v", err)
+		t.Fatalf("checkoutStmt(hot) after evictions: %v", err)
 	}
-	var n int
-	if err := st.QueryRow("nope").Scan(&n); err != sql.ErrNoRows {
-		t.Fatalf("hot stmt query: err = %v, want ErrNoRows", err)
+	rows, err := queryStmt(context.Background(), st, []any{"nope"})
+	if err != nil {
+		r.returnStmt(hot, st, false)
+		t.Fatalf("hot stmt query: %v", err)
 	}
+	if err := rows.Next(make([]driver.Value, 1)); !errors.Is(err, io.EOF) {
+		rows.Close()
+		r.returnStmt(hot, st, false)
+		t.Fatalf("hot stmt rows: err = %v, want io.EOF (no rows)", err)
+	}
+	rows.Close()
+	r.returnStmt(hot, st, true)
 }
 
 // TestSourceFetchCompoundMultiConstraints (M9b): the compound

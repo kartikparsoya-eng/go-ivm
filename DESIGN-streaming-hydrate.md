@@ -1,6 +1,23 @@
 # DESIGN: True Streaming Hydrate for Go-IVM
 
-Status: proposal v2 · Owner: TBD · Created 2026-06-29 · Replaces v1
+Status: **superseded in part (2026-07-08)** · proposal v2 · Owner: TBD · Created 2026-06-29 · Replaces v1
+
+> **Supersession note (Option B, 2026-07-08).** §3 (lanes + K = P × Cmax) and
+> the §3d deadlock-freedom proof described the PER-FETCH reader-acquire model:
+> every leaf fetch borrowed a pool reader, so nested fetches held readers
+> while acquiring more, and K = P × Cmax was the sizing that kept that
+> hold-and-wait acyclic. ABI v3's pull mode (one goroutine per query, D6 in
+> DESIGN-duplex-streaming.md) broke the P-lane premise and reintroduced the
+> deadlock (2026-07-07 wedge). The shipped model is now **one reader per
+> hydrate pipeline** (TS's resource shape: one conn per view-syncer, nested
+> `iterate()` cursors interleaved on it): a pipeline acquires its single
+> reader at start while holding nothing (`ReaderPool.AcquireForPipeline`),
+> every nested fetch rides that reader (`fetchViaBoundReaderStream`, raw
+> driver conns — database/sql's one-Rows-per-conn limit forced the bypass),
+> and K = max(hydrateReaders, hydrateLanes) is just the admission width —
+> wider batches queue while holding nothing. Cmax, the per-fetch acquires,
+> and the exhaustion fallback are deleted. The lazy iter.Seq operator
+> plumbing this doc designed (§2, §4+) is unchanged and shipped.
 
 Convert Go-IVM hydrate from eager `Fetch() []Node` to lazy `iter.Seq[Node]`
 — matching TS's `fetch(): Stream<Node | 'yield'>` (`operator.ts:43`,

@@ -197,6 +197,16 @@ type Engine struct {
 	// parallelThreshold: if a source has more connections than this, fan-out in parallel
 	parallelThreshold int
 
+	// hydratePool holds the reader pool currently bound to the leaf sources
+	// (BindTableSourcesToReaderPool), narrowed to the per-pipeline acquire
+	// surface. Option B: each hydrate goroutine acquires ONE exclusive
+	// frame-pinned reader here at its start (wait-while-holding-nothing) and
+	// every leaf fetch of that pipeline — nested included — rides it with
+	// interleaved cursors. atomic so the drain goroutines (outside e.mu)
+	// read it lock-free; nil when no pool is bound. Stores a
+	// *pipelineReaderPool (pointer so a typed-nil interface can't sneak in).
+	hydratePool atomic.Pointer[pipelineReaderPool]
+
 	// minRowVersions: per-table minRowVersion forwarded from TS-side
 	// tableSpec.minRowVersion (set after a RESET during incremental catchup).
 	// Used to bump an emitted row's _0_version up to minRowVersion when the
@@ -472,35 +482,101 @@ func (e *Engine) UnbindTableSources() {
 // readerPoolBinder is implemented by sources that can route their hydrate reads
 // through a CG-shared frame-pinned reader pool (tablesource.Source). The pool is
 // passed as `any` so this package need not import internal/tablesource (which
-// imports this package — that would cycle). MemorySource adapters don't
-// implement it.
+// would couple the engine to one leaf implementation). MemorySource adapters
+// don't implement it.
 type readerPoolBinder interface {
 	BindReaderPool(pool any)
 	UnbindReaderPool()
 }
 
+// pipelineReaderPool is the per-pipeline acquire surface of the bound reader
+// pool (implemented by tablesource.ReaderPool). AcquireForPipeline borrows
+// ONE exclusive frame-pinned reader for the pipeline identified by queryID,
+// waiting at most wait; ok=false means the wait elapsed (the caller loops —
+// admission queueing is normal when a batch is wider than the pool — until
+// its tripwire). The returned release returns the reader.
+type pipelineReaderPool interface {
+	AcquireForPipeline(queryID string, wait time.Duration) (release func(), ok bool)
+}
+
+// PipelineReaderTripwire bounds how long one hydrate pipeline may QUEUE at
+// the pool's admission gate before the engine treats the wait as a wedge and
+// PANICS (recovered into the RPC error path by the hydrate recover — a loud,
+// clean batch failure, never a silent fallback).
+//
+// Queueing here is NORMAL: under Option B each pipeline holds exactly one
+// reader acquired while holding nothing, so a batch wider than the pool's K
+// waits its turn exactly like TS's queries queue behind the view-syncer's
+// single conn (K=1). A wait that outlives this bound therefore means a
+// reader leaked or a parked producer never released (idle-sweep failure) —
+// a capacity/lifecycle BUG. 120s matches the TS RPC deadline: past it the
+// RPC is dead anyway. Var so tests can shrink it.
+var PipelineReaderTripwire = 120 * time.Second
+
+// acquirePipelineReader blocks until the bound pool grants queryID its
+// exclusive reader, the RPC is cancelled (returns ok=false — the caller
+// abandons the hydrate), or PipelineReaderTripwire elapses (panics; see the
+// var doc). rp must be non-nil. cancelled may be nil (non-cancellable
+// callers — AddQueries).
+func acquirePipelineReader(rp pipelineReaderPool, queryID string, cancelled *atomic.Bool) (release func(), ok bool) {
+	deadline := time.Now().Add(PipelineReaderTripwire)
+	for {
+		// 1s slices so cancellation is noticed promptly while queued.
+		if release, ok := rp.AcquireForPipeline(queryID, time.Second); ok {
+			return release, true
+		}
+		if cancelled != nil && cancelled.Load() {
+			return nil, false
+		}
+		if time.Now().After(deadline) {
+			panic(fmt.Sprintf(
+				"reader-pool admission tripwire: pipeline %q waited %v for a reader — "+
+					"a reader leaked or a parked producer never released (pool sized below "+
+					"concurrent-hydrate width is queueing, not this); failing the batch loudly",
+				queryID, PipelineReaderTripwire))
+		}
+	}
+}
+
 // BindTableSourcesToReaderPool routes every leaf source's hydrate reads through
-// pool — a set of connections all pinned to one WAL frame — so the per-query
-// hydrate goroutines read in parallel instead of serializing on the single
-// bound conn. Bind ONLY during the advance-free cold-start window; pair with
-// UnbindTableSourcesReaderPool before the first advance (the pool's pinned frame
-// goes stale once curr rotates). pool is the opaque *tablesource.ReaderPool.
+// pool — a set of connections all pinned to one WAL frame. Option B resource
+// model: the pool grants ONE exclusive reader per hydrate pipeline
+// (AcquireForPipeline at hydrate start, keyed by queryID), and every leaf
+// fetch of that pipeline rides its reader with interleaved cursors; fetches
+// outside any bound pipeline (build-phase scalar-resolver executor) read the
+// serial bound conn on the same frame. Bind ONLY during advance-free hydrate
+// windows; pair with UnbindTableSourcesReaderPool before the first advance
+// (the pool's pinned frame goes stale once curr rotates). pool is the opaque
+// *tablesource.ReaderPool.
 func (e *Engine) BindTableSourcesToReaderPool(pool any) {
 	for _, src := range e.sourcesView() {
 		if b, ok := src.(readerPoolBinder); ok {
 			b.BindReaderPool(pool)
 		}
 	}
+	if rp, ok := pool.(pipelineReaderPool); ok && rp != nil {
+		e.hydratePool.Store(&rp)
+	}
 }
 
 // UnbindTableSourcesReaderPool detaches the reader pool from every leaf source;
 // reads revert to the single-conn path. Does not Close the pool.
 func (e *Engine) UnbindTableSourcesReaderPool() {
+	e.hydratePool.Store(nil)
 	for _, src := range e.sourcesView() {
 		if b, ok := src.(readerPoolBinder); ok {
 			b.UnbindReaderPool()
 		}
 	}
+}
+
+// boundPipelineReaderPool returns the per-pipeline acquire surface of the
+// currently bound reader pool, or nil.
+func (e *Engine) boundPipelineReaderPool() pipelineReaderPool {
+	if p := e.hydratePool.Load(); p != nil {
+		return *p
+	}
+	return nil
 }
 
 // GetMemorySource returns the registered MemorySource for tableName, or nil
@@ -720,11 +796,11 @@ func (e *Engine) AddQueries(queries []QuerySpec) ([]QueryResult, error) {
 	built := e.buildBatchLocked(queries)
 
 	// Phase 2: Hydrate all pipelines via P worker lanes (bounded parallelism).
-	// P bounds both the goroutine count and — with K = P × Cmax reader-pool
-	// connections — the concurrent-cursor demand. See
-	// DESIGN-streaming-hydrate.md §3a/§3d.
+	// When a reader pool is bound, each pipeline additionally acquires its ONE
+	// exclusive reader before draining (Option B — see addQueriesStreamChunked).
 	results := make([]QueryResult, len(built))
 	mrv := e.minRowVersions
+	rp := e.boundPipelineReaderPool()
 	// C1: a panic inside a hydrate goroutine (e.g. pkValue on a nil-PK row)
 	// cannot be caught by the RPC handler's recover — panics don't cross
 	// goroutine boundaries, so an uncaught one aborts the WHOLE multi-CG
@@ -759,6 +835,13 @@ func (e *Engine) AddQueries(queries []QuerySpec) ([]QueryResult, error) {
 							hydratePanics[job.idx] = r
 						}
 					}()
+					if rp != nil {
+						release, ok := acquirePipelineReader(rp, job.entry.queryID, nil)
+						if !ok {
+							return // unreachable with nil cancelled; defensive
+						}
+						defer release()
+					}
 					start := time.Now()
 					hydration := bumpRowVersions(hydrateEntry(job.entry), mrv)
 					timingMs := float64(time.Since(start).Microseconds()) / 1000.0
@@ -839,13 +922,13 @@ func (e *Engine) AddQueriesStreamChunked(
 //     hydrate-lane pool. A pull producer parks on client demand (the
 //     sidecar's onResult blocks in streamGate.acquire); parking a shared
 //     lane would starve sibling queries for client-think-time. Pull
-//     concurrency is client-bounded by credits, so the P-lane bound is
-//     redundant here; non-pull hydrates keep the pool (K = P × Cmax).
-//   - The reader-demand bound shifts accordingly: a pull batch can demand
-//     up to len(queries) concurrent readers instead of P. The sidecar's
-//     warm-pool sizing already uses ConservativeHydrateCmaxForSpecs which
-//     is per-spec, and pool acquisition falls back to serial when
-//     exhausted — bounded degradation, not failure.
+//     concurrency is client-bounded by credits.
+//   - Reader demand is one reader per RUNNING pipeline (Option B): each
+//     goroutine acquires its single reader at start (holding nothing) and
+//     queues at admission when the batch is wider than the pool — bounded
+//     parallelism, never a fallback, never a mid-flight acquire. A parked
+//     producer keeps its reader until the client drains it or the idle
+//     sweep cancels the stream — the same residual hold as today, bounded.
 func (e *Engine) AddQueriesStreamPull(
 	queries []QuerySpec,
 	chunkSize int,
@@ -902,9 +985,16 @@ func (e *Engine) addQueriesStreamChunked(
 	// goroutine per query in pull mode — see AddQueriesStreamPull),
 	// streaming per-query results in chunks as each query's fetch
 	// progresses. Each query may emit multiple chunks (one per
-	// hydrateChunkSize RowChanges); the last chunk has Final=true. P
-	// bounds both goroutine count and connection demand (K = P × Cmax;
-	// see DESIGN-streaming-hydrate.md §3a/§3d).
+	// hydrateChunkSize RowChanges); the last chunk has Final=true.
+	//
+	// Reader discipline (Option B): when a frame-pinned pool is bound, each
+	// pipeline acquires ONE exclusive reader at its start — waiting while
+	// holding NOTHING — and every leaf fetch of that pipeline (nested child
+	// fetches included) rides it with interleaved cursors. A batch wider
+	// than the pool's K queues at admission, exactly like TS's queries
+	// queue behind the view-syncer's single conn. Mid-flight reader
+	// acquires do not exist, so the hold-and-wait deadlock class (readers
+	// held while waiting for more readers) is structurally gone.
 	//
 	// The consumer streams each node as Fetch yields it — no intermediate
 	// slices.Collect materialization. Go-side peak memory is bounded by the
@@ -920,6 +1010,7 @@ func (e *Engine) addQueriesStreamChunked(
 	// whole RPC, so one refusal means the client abandoned the whole call);
 	// other producers notice at their next flush or job pickup and stop.
 	var cancelled atomic.Bool
+	rp := e.boundPipelineReaderPool()
 
 	hydrateOne := func(idx int, entry *pipelineEntry) {
 		defer func() {
@@ -927,6 +1018,13 @@ func (e *Engine) addQueriesStreamChunked(
 				hydratePanics[idx] = r
 			}
 		}()
+		if rp != nil {
+			release, ok := acquirePipelineReader(rp, entry.queryID, &cancelled)
+			if !ok {
+				return // RPC cancelled while queued — nothing emitted for this query
+			}
+			defer release()
+		}
 		start := time.Now()
 		var chunk []RowChange
 		chunkBytes := 0
@@ -1162,16 +1260,16 @@ var defaultChunkSize = envChunkSize("GO_IVM_CHUNK_SIZE", 100)
 var hydrateChunkSize = envChunkSize("GO_IVM_HYDRATE_CHUNK_SIZE", defaultChunkSize)
 
 // hydrateLanes is the number of worker lanes (P) that hydrate queries in
-// parallel. Replaces the unbounded per-query goroutine spawn with P workers
-// draining a job channel, bounding both goroutine count and — with K = P ×
-// Cmax reader-pool connections — concurrent-cursor demand. See
-// DESIGN-streaming-hydrate.md §3a/§3d.
+// parallel on the non-pull path. Replaces the unbounded per-query goroutine
+// spawn with P workers draining a job channel. Under Option B each running
+// pipeline holds exactly ONE pool reader (acquired at start while holding
+// nothing), so lanes bound goroutine count and the pool's K ≥ P sizing
+// (sidecar: K = max(hydrateReaders, hydrateLanes)) merely avoids admission
+// queueing — K < P is safe, just less parallel.
 //
 // Default 4; GO_IVM_PARALLELISM is the ONE production parallelism knob (it
 // also sizes the sidecar's reader-pool floor at 2×P — see newServerFromEnv);
-// GO_IVM_HYDRATE_LANES overrides the lane count individually. The pool must
-// be sized to at least P (K = P × Cmax; Cmax=1 while operators are eager →
-// K=P) so every lane can always acquire a reader (deadlock-freedom: §3d).
+// GO_IVM_HYDRATE_LANES overrides the lane count individually.
 var hydrateLanes = envChunkSize("GO_IVM_HYDRATE_LANES", envChunkSize("GO_IVM_PARALLELISM", 4))
 
 // softChunkBytes is the estimated-payload budget per streamed partial frame.

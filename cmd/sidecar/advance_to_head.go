@@ -188,29 +188,29 @@ const readerPoolBuildSlotCap = 2
 // NewReaderPool handles the internal convergence (converge-upward) so all K
 // readers agree on one frame without requiring a pre-computed target version.
 // Returns (pool, nil) on success, (nil, nil) when the feature is off
-// (hydrateReaders<=1), or (nil, err) on a hard failure. The caller MUST verify
+// (k<=1), or (nil, err) on a hard failure. The caller MUST verify
 // pool.Version() matches the Snapshotter's curr and retry if not. MUST hold
 // group.mu.
-func (s *Server) buildReaderPoolLocked(cur *snapshotter.Snapshot, cmax int) (*tablesource.ReaderPool, *tablesource.CoRead, error) {
-	// Pool size K = max(hydrateReaders, hydrateLanes × Cmax). Each of the P
-	// worker lanes may need up to Cmax concurrent readers (e.g. a 2-deep
-	// join holds a parent cursor while fetching the child → 2 readers per
-	// lane). K = P × Cmax guarantees every lane can acquire all the readers
-	// it needs without blocking (deadlock-freedom: §3d). When both
-	// hydrateReaders and hydrateLanes×cmax are ≤1, the feature is off.
-	if cmax < 1 {
-		cmax = 1
-	}
+func (s *Server) buildReaderPoolLocked(cur *snapshotter.Snapshot) (*tablesource.ReaderPool, *tablesource.CoRead, error) {
+	// Pool size K = max(hydrateReaders, hydrateLanes) — the concurrent-
+	// hydrate ADMISSION width. Option B resource model: each hydrate
+	// pipeline holds exactly ONE reader for its whole drain (nested fetches
+	// ride the same conn with interleaved cursors), so K bounds how many
+	// pipelines hydrate in parallel; wider batches queue at
+	// AcquireForPipeline while holding nothing (TS's model is the K=1
+	// degenerate case — one conn per view-syncer). The old K = P × Cmax
+	// concurrent-cursor sizing — and the whole Cmax AST walk — dissolved
+	// with the per-fetch acquires.
 	k := s.hydrateReaders
-	if lanesCmax := s.hydrateLanes * cmax; lanesCmax > k {
-		k = lanesCmax
+	if s.hydrateLanes > k {
+		k = s.hydrateLanes
 	}
 	if k <= 1 {
 		return nil, nil, nil // feature off: serial by design, not a failure
 	}
-	// Bound concurrent builds (see Server.readerPoolBuildSlots): under a
-	// churn burst, unbounded builders hold-and-wait each other into the
-	// PoolAcquireTimeout; two at a time complete in milliseconds each.
+	// Bound concurrent builds (see Server.readerPoolBuildSlots): a build
+	// burst opening K raw conns each is bounded fd/page-cache churn; two at
+	// a time complete in milliseconds each.
 	release, ok := s.tryAcquireBuildSlot(coldBuildSlotWait)
 	if !ok {
 		return nil, nil, nil // slots busy → serial hydrate (bounded degrade)
@@ -271,20 +271,20 @@ func (s *Server) tearDownReaderPool(group *ClientGroup) {
 //
 // Safe because handleAddQueriesStream holds group.mu for the whole call and
 // advances also take group.mu, so curr cannot rotate mid-hydrate: the co-read
-// frame stays identical to the Source's bound frame (fetchViaPool's invariant).
+// frame stays identical to the Source's bound frame (the bound-reader read's
+// invariant — see fetchViaBoundReaderStream).
 //
 // Returns (pool, coread) bound and ready, or (nil, nil) when warm pooling is
 // off / not applicable / co-read unavailable. The caller MUST pair a non-nil
 // return with tearDownWarmReaderPool after AddQueriesStream. The pool is NOT
 // stored on the group (it is per-call); group.readerPool is the cold pool's
 // slot and is left untouched. MUST hold group.mu.
-func (s *Server) buildWarmReaderPoolLocked(group *ClientGroup, cmax int) (*tablesource.ReaderPool, *tablesource.CoRead) {
-	if cmax < 1 {
-		cmax = 1
-	}
+func (s *Server) buildWarmReaderPoolLocked(group *ClientGroup) (*tablesource.ReaderPool, *tablesource.CoRead) {
+	// K = admission width (see buildReaderPoolLocked — Option B: one reader
+	// per hydrate pipeline, wider batches queue while holding nothing).
 	k := s.hydrateReaders
-	if lanesCmax := s.hydrateLanes * cmax; lanesCmax > k {
-		k = lanesCmax
+	if s.hydrateLanes > k {
+		k = s.hydrateLanes
 	}
 	// GO_IVM_WARM_HYDRATE_POOL=false is the operator KILL SWITCH for this
 	// production default. The gate must stay wired even though the default
@@ -306,26 +306,15 @@ func (s *Server) buildWarmReaderPoolLocked(group *ClientGroup, cmax int) (*table
 		return nil, nil
 	}
 	// A cold pool is still bound (queries hydrated but no advance yet). It is
-	// already pinned to curr's frame and bound on the sources, so this warm add's
-	// fetches ALREADY run through it — but only reuse it if it is big enough
-	// for THIS batch's concurrent-cursor demand.
-	//
-	// C2 (scale review): the cold pool's K was sized for the FIRST batch's
-	// Cmax. A second addQueriesStream arriving before the first advance
-	// hydrates through that pool; if this batch's joins are deeper
-	// (P × Cmax(new) > K), every hydrate lane can end up holding parent
-	// readers while blocked in acquire for a child — a resource deadlock
-	// with group.mu and the engine lock held. acquire's only unblock is the
-	// Source's CG-lifetime ctx, and CG teardown itself needs group.mu, so
-	// the wedge is unkillable and queues destroys + the reaper behind it.
-	// Rebuild the cold pool at the same frame with the larger K; on any
-	// rebuild failure tear the undersized pool down and hydrate serially —
-	// slower, never deadlocked.
+	// already pinned to curr's frame and bound on the sources, so this warm
+	// add's pipelines acquire their readers from it directly. Under Option B
+	// ANY bound pool suffices for any batch — a pipeline needs exactly ONE
+	// reader regardless of join depth (nested fetches interleave cursors on
+	// it), and a batch wider than the pool queues at admission while holding
+	// nothing. The old K ≥ P × Cmax(new) resize dance (scale-review C2 —
+	// rebuildColdReaderPoolLocked) dissolved with the per-fetch acquires it
+	// existed to keep deadlock-free.
 	if group.readerPool != nil {
-		if group.readerPool.Size() >= k {
-			return nil, nil // cold pool covers this batch's demand
-		}
-		s.rebuildColdReaderPoolLocked(group, cmax)
 		return nil, nil
 	}
 
@@ -396,61 +385,6 @@ func (s *Server) tearDownWarmReaderPool(group *ClientGroup, pool *tablesource.Re
 	}
 }
 
-// rebuildColdReaderPoolLocked replaces a still-bound cold pool with one sized
-// for a LARGER concurrent-cursor demand (scale-review C2), pinned to the SAME
-// frame — pre-first-advance curr has not rotated, and group.mu (held) blocks
-// advances for the duration. Uses the cold-build recipe (co-read fast path,
-// converge fallback) + the same version-match verification as
-// refreshSnapForInitialHydrateLocked: a converge pool that ratcheted past
-// curr's frame is discarded rather than bound (it would desync the new
-// queries from the live pipelines' frame).
-//
-// Every failure path tears the undersized pool down: serial reads on the
-// bound conn are slow but deadlock-free, whereas leaving the small pool
-// bound reproduces the acquire wedge this exists to prevent. MUST hold
-// group.mu.
-func (s *Server) rebuildColdReaderPoolLocked(group *ClientGroup, cmax int) {
-	oldK := group.readerPool.Size()
-	cur, cerr := group.snap.Current()
-	if cerr != nil {
-		s.tearDownReaderPool(group)
-		metrics.recordReaderPoolBind(poolBindSerial, 1)
-		return
-	}
-	pool, cr, perr := s.buildReaderPoolLocked(cur, cmax)
-	if perr != nil || pool == nil {
-		s.tearDownReaderPool(group)
-		metrics.recordReaderPoolBind(poolBindSerial, 1)
-		return
-	}
-	if pool.Version() != cur.Version() {
-		// Converge fallback landed on a newer head than the live pipelines'
-		// frame — binding it would hydrate the new queries at the wrong
-		// frame. Serial instead.
-		pool.Close()
-		if cr != nil {
-			cr.Free()
-		}
-		s.tearDownReaderPool(group)
-		metrics.recordReaderPoolBind(poolBindSerial, 1)
-		return
-	}
-	// Swap: unbind + close the undersized pool, then bind the bigger one.
-	s.tearDownReaderPool(group)
-	group.readerPool = pool
-	group.readerPoolBoundAt = time.Now()
-	group.coread = cr
-	group.eng.BindTableSourcesToReaderPool(pool)
-	outcome, via := poolBindConverge, "converge"
-	if cr != nil {
-		outcome, via = poolBindCoread, "coread"
-	}
-	metrics.recordReaderPoolBind(outcome, 1)
-	fmt.Fprintf(os.Stderr,
-		"[GO-IVM][POOL] cold-pool resize via %s: readers %d→%d (cmax=%d) frame=%s\n",
-		via, oldK, pool.Size(), cmax, pool.Version())
-}
-
 // buildSnapshotterSpecs maps the init table schemas to snapshotter.TableSpecs.
 // UniqueKeys falls back to the primary key when TS sent none (the Diff needs at
 // least the PK to find unique-conflict prevValues on a set).
@@ -511,7 +445,7 @@ func readAllTableNames(db *sql.DB) (map[string]bool, error) {
 //
 // No-op once any pipeline exists: re-pinning curr would desync hydrated
 // pipelines. MUST hold group.mu.
-func (s *Server) refreshSnapForInitialHydrateLocked(cgID string, group *ClientGroup, specs []engine.QuerySpec) {
+func (s *Server) refreshSnapForInitialHydrateLocked(cgID string, group *ClientGroup) {
 	if group.snap == nil || group.eng == nil {
 		return
 	}
@@ -529,22 +463,24 @@ func (s *Server) refreshSnapForInitialHydrateLocked(cgID string, group *ClientGr
 	group.eng.BindTableSourcesToConn(cur.Conn())
 
 	// Streaming-by-default (this branch): ALWAYS build the frame-pinned reader
-	// pool for cold hydrate so every leaf streams row-at-a-time via
-	// fetchViaPoolStream instead of materializing through fetchForConn. K = P ×
-	// Cmax (buildReaderPoolLocked) sizes it for parallel streaming; with the
-	// default hydrateLanes=4, K ≥ 4 even when GO_IVM_HYDRATE_READERS is unset, so
-	// there is NO readers<=1 eager fallback on the hydrate path. The only eager
-	// (materializing) reader left is fetchForConn on the ADVANCE/overlay path,
-	// where the pool is deliberately torn down (tearDownReaderPool) — it must stay
-	// eager there to splice in-flight pushes (s.overlay). GO_IVM_HYDRATE_READERS
-	// now only RAISES K above P×Cmax; it can no longer disable streaming.
+	// pool for cold hydrate so every pipeline streams row-at-a-time on its own
+	// exclusive reader (fetchViaBoundReaderStream) instead of materializing
+	// through fetchForConn. K = max(hydrateReaders, hydrateLanes) is the
+	// concurrent-hydrate admission width (buildReaderPoolLocked — Option B:
+	// one reader per pipeline, nested fetches interleave cursors on it); with
+	// the default hydrateLanes=4, K ≥ 4 even when GO_IVM_HYDRATE_READERS is
+	// unset, so there is NO readers<=1 eager fallback on the hydrate path. The
+	// only eager (materializing) reader left is fetchForConn on the
+	// ADVANCE/overlay path, where the pool is deliberately torn down
+	// (tearDownReaderPool) — it must stay eager there to splice in-flight
+	// pushes (s.overlay). GO_IVM_HYDRATE_READERS now only RAISES K; it can no
+	// longer disable streaming.
 
 	// Build pool at curr's current (init-time) frame. The coread-fast path
 	// latches K readers to this frame; the converge-fallback path would
 	// ratchet to head (a different frame), so on misalignment we stay serial
 	// rather than hydrating at a frame that doesn't match TS.
-	cmax := engine.ConservativeHydrateCmaxForSpecs(specs)
-	pool, cr, perr := s.buildReaderPoolLocked(cur, cmax)
+	pool, cr, perr := s.buildReaderPoolLocked(cur)
 	if perr != nil || pool == nil {
 		if s.hydrateReaders > 1 {
 			metrics.recordReaderPoolBind(poolBindSerial, 1)

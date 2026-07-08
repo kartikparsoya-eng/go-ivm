@@ -1,13 +1,15 @@
 package tablesource
 
-// Pins for the bounded pool-acquisition contract (PoolAcquireTimeout) — the
-// 2026-07-06 ART incident fix. Under read-pool exhaustion:
-//   - reader-pool builds must fail within the bound and unwind every held
-//     conn (callers then fall back to serial hydrate), instead of
-//     hold-and-wait deadlocking against other builders forever;
-//   - the Source constructor's presence probe must fail within the bound
-//     (handleInit surfaces a fast rpcError), instead of wedging the CG
-//     worker until the TS-side 120s RPC timeout and leaking the goroutine.
+// Pins for the bounded-acquisition contract (PoolAcquireTimeout) and the
+// Option B decoupling of pool builds from the shared read pool:
+//   - reader-pool builds open RAW driver conns (rawOpenReaderConn) that do
+//     not queue on database/sql, so a build must SUCCEED even when every
+//     pooled conn is held elsewhere — the structural fix for the 2026-07-06
+//     ART incident (concurrent builders hold-and-wait deadlocking on the
+//     shared pool and starving handleInit's probe);
+//   - the Source constructor's presence probe still rides the shared pool
+//     and must fail within the bound (handleInit surfaces a fast rpcError),
+//     instead of wedging the CG worker until the TS-side 120s RPC timeout.
 
 import (
 	"context"
@@ -50,40 +52,32 @@ func setPoolAcquireTimeout(t *testing.T, d time.Duration) {
 	t.Cleanup(func() { PoolAcquireTimeout = saved })
 }
 
-// TestNewReaderPool_ExhaustedPoolFailsFastAndUnwinds: with every pool conn
-// held elsewhere, the build must error within the bound (not block), and a
-// retry after release must succeed with the full K — proving the failed
-// build released everything it had acquired.
-func TestNewReaderPool_ExhaustedPoolFailsFastAndUnwinds(t *testing.T) {
+// TestNewReaderPool_BuildsDespiteExhaustedSharedPool: with every pooled conn
+// held elsewhere, the build must SUCCEED — raw driver opens are invisible to
+// database/sql's MaxOpenConns, so pool builds no longer compete with probes
+// or other pooled work. (Pre-Option-B this same shape deadlocked builders
+// against each other and could only fail fast; the whole class is gone.)
+func TestNewReaderPool_BuildsDespiteExhaustedSharedPool(t *testing.T) {
 	path := seedReplicaWithStateVersion(t, "0000000001")
 	db, err := Open(path, OpenOptions{MaxOpenConns: 2, MaxIdleConns: 2})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
 	t.Cleanup(func() { db.Close() })
-	setPoolAcquireTimeout(t, 300*time.Millisecond)
+	setPoolAcquireTimeout(t, 2*time.Second)
 
 	release := holdConns(t, db, 2)
-	start := time.Now()
-	pool, perr := NewReaderPool(context.Background(), db, "", 2)
-	elapsed := time.Since(start)
-	if perr == nil {
-		pool.Close()
-		release()
-		t.Fatal("NewReaderPool succeeded against a fully-held pool")
-	}
-	if elapsed > 3*time.Second {
-		t.Fatalf("build blocked %v — the acquire bound did not apply", elapsed)
-	}
-	release()
-
-	// Recovery: the full K must be acquirable again (nothing leaked).
-	pool, perr = NewReaderPool(context.Background(), db, "", 2)
+	defer release()
+	pool, perr := NewReaderPool(context.Background(), db, "", 4)
 	if perr != nil {
-		t.Fatalf("post-release build failed (leaked conns from the aborted build?): %v", perr)
+		t.Fatalf("NewReaderPool against a fully-held shared pool must succeed "+
+			"(raw opens bypass database/sql): %v", perr)
 	}
-	if pool.Size() != 2 {
-		t.Fatalf("pool size = %d, want 2", pool.Size())
+	if pool.Size() != 4 {
+		t.Fatalf("pool size = %d, want 4", pool.Size())
+	}
+	if pool.Version() != "0000000001" {
+		t.Fatalf("pool version = %q, want the seeded stateVersion", pool.Version())
 	}
 	pool.Close()
 }

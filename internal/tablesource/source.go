@@ -36,12 +36,14 @@ package tablesource
 // produce the correct ordering on their own.
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"errors"
 	"fmt"
+	"io"
 	"iter"
-	"os"
 	"slices"
 	"sort"
 	"strings"
@@ -186,13 +188,16 @@ type Source struct {
 
 	// readerPool, when non-nil, is a CG-shared pool of read connections ALL
 	// pinned to the same WAL frame (one stateVersion). It is bound ONLY during
-	// the advance-free cold-start hydrate window (GO_IVM_HYDRATE_READERS>1),
-	// where it lets the per-query hydrate goroutines read this Source in
-	// parallel instead of serializing on the single bound externalConn. While
-	// bound, fetchForConn takes the lock-free fetchViaPool path: the pool is
-	// bound only when no Push is in flight, so s.overlay is always nil and the
+	// advance-free hydrate windows (cold-start first hydrate, warm adds).
+	// Option B resource model: each hydrate pipeline holds ONE exclusive
+	// reader (pool.AcquireForPipeline, keyed by the engine's queryID group
+	// tag) and every fetch of that pipeline — nested included — rides it with
+	// interleaved cursors (fetchViaBoundReaderStream). Fetches outside a
+	// bound pipeline (build-phase scalar-resolver executor, legacy AddQuery)
+	// read the serial bound conn instead — the SAME pinned frame. While
+	// bound, no Push is in flight, so s.overlay is always nil and the
 	// per-connection fields read during a fetch are immutable post-Connect.
-	// atomic so fetchForConn can read it without s.mu. Set/cleared via
+	// atomic so fetches can read it without s.mu. Set/cleared via
 	// BindReaderPool / UnbindReaderPool (engine.BindTableSourcesToReaderPool).
 	readerPool atomic.Pointer[ReaderPool]
 
@@ -201,10 +206,6 @@ type Source struct {
 	// the owning queryID right before each Connect during a pipeline
 	// build). Guarded by s.mu. See parallel_fanout.go.
 	nextConnectGroup string
-
-	// poolFallbackLogOnce rate-limits the pool-exhaustion fallback log to
-	// one line per Source (see notePoolFallback).
-	poolFallbackLogOnce sync.Once
 }
 
 // cachedStmt pairs a prepared statement with the recency tick of its last
@@ -262,28 +263,6 @@ type presenceKey struct {
 // See the probe block in NewWithContext for the full rationale (2026-07-07
 // soak incident). Negative results are never stored.
 var probedTables sync.Map // presenceKey → struct{}
-
-// poolStreamFallbacks counts pool-exhaustion serial fallbacks (the bounded
-// acquire in fetchViaPoolStream/fetchViaPool timing out) across all Sources.
-// Observability for soaks: a nonzero delta means hydrate concurrency
-// exceeded the frame-pinned pool's K and the hold-and-wait breaker engaged.
-var poolStreamFallbacks atomic.Int64
-
-// PoolStreamFallbackCount reports the cumulative pool-exhaustion serial
-// fallback count (see poolStreamFallbacks).
-func PoolStreamFallbackCount() int64 { return poolStreamFallbacks.Load() }
-
-// notePoolFallback records one pool-exhaustion serial fallback: bumps the
-// package counter and logs ONCE per Source (a deadlocked batch trips
-// hundreds of waiters at once — per-occurrence logging would flood).
-func (s *Source) notePoolFallback() {
-	poolStreamFallbacks.Add(1)
-	s.poolFallbackLogOnce.Do(func() {
-		fmt.Fprintf(os.Stderr,
-			"[GO-IVM] reader pool exhausted past %v on %q — hydrate fetch falling back to the serial bound conn (same frame; further fallbacks for this table counted, not logged)\n",
-			PoolAcquireTimeout, s.tableName)
-	})
-}
 
 // New constructs a Source for tableName.
 //
@@ -1365,7 +1344,20 @@ func (i *sourceInput) Destroy() {
 
 func (i *sourceInput) Fetch(req ivm.FetchRequest) iter.Seq[ivm.Node] {
 	if pool := i.src.readerPool.Load(); pool != nil {
-		return i.src.fetchViaPoolStream(req, i.conn, pool)
+		if r := pool.readerFor(i.conn.group); r != nil {
+			// Option B hydrate leaf: this connection's pipeline holds an
+			// exclusive frame-pinned reader — every fetch of the pipeline
+			// (nested child fetches included) rides it with interleaved
+			// cursors, exactly TS's one-conn better-sqlite3 model.
+			return i.src.fetchViaBoundReaderStream(req, i.conn, r)
+		}
+		// Pool bound but this fetch is outside any bound pipeline — the
+		// build-phase scalar-resolver executor (runs under e.mu before any
+		// hydrate goroutine exists) or a legacy AddQuery hydrate. Fall
+		// through to the serial bound-conn read: the SAME pinned frame
+		// (pool.Version() == the bound curr's version — verified at bind),
+		// serialized under s.mu, deadlock-free (this goroutine holds no
+		// reader while it waits on s.mu; the eager read borrows nothing).
 	}
 	// Streaming advance-time leaf fetch: yields rows from a live SQLite
 	// cursor on the prev-tx conn instead of materializing the whole result
@@ -1407,19 +1399,16 @@ func (s *Source) disconnect(c *connection) {
 // connections that have already received the push via Output.Push
 // don't re-see it via overlay (their lastPushedEpoch matches/exceeds).
 func (s *Source) fetchForConn(req ivm.FetchRequest, conn *connection) []ivm.Node {
-	// Cold-start parallel-hydrate fast path: when a frame-pinned reader pool is
-	// bound (GO_IVM_HYDRATE_READERS>1), read via a borrowed pool conn WITHOUT
-	// holding s.mu. Every pool conn is pinned at the same stateVersion as this
-	// Source's bound frame, so the read is byte-identical to the single-conn
-	// path — it just runs concurrently with sibling queries' fetches. The pool
-	// is bound only during the advance-free hydrate window, so there is no
-	// in-flight Push (s.overlay is nil) and no prev-tx writeChange to observe.
-	// When a reader pool is bound, sourceInput.Fetch dispatches directly to
-	// fetchViaPoolStream (lazy, row-at-a-time) before reaching here. This
-	// pool check remains as a defensive fallback for any direct fetchForConn
-	// caller that might execute with a pool still bound.
+	// Hydrate-window dispatch, mirroring sourceInput.Fetch: when this
+	// connection's pipeline holds an exclusive bound reader (Option B), the
+	// eager read runs on that reader; otherwise — pool bound but fetch
+	// outside any bound pipeline (build-phase executor, legacy AddQuery), or
+	// no pool at all — it runs on the serial bound conn. Both sit on the
+	// same pinned frame.
 	if pool := s.readerPool.Load(); pool != nil {
-		return s.fetchViaPool(req, conn, pool)
+		if r := pool.readerFor(conn.group); r != nil {
+			return s.fetchViaBoundReader(req, conn, r)
+		}
 	}
 	return s.fetchSerial(req, conn)
 }
@@ -1570,7 +1559,7 @@ func (s *Source) fetchSerial(req ivm.FetchRequest, conn *connection) []ivm.Node 
 // of materializing the whole result set the way fetchForConn does. This is
 // the Go analog of TS's leaf during push processing — statement.iterate()
 // wrapped by generateWithOverlay (zqlite table-source.ts #fetch) — and the
-// advance-side counterpart of fetchViaPoolStream: a parent Join can hold this
+// advance-side counterpart of fetchViaBoundReaderStream: a parent Join can hold this
 // cursor open while it fetches a child, so a large fan-out streams cursor →
 // operator → flatten → wire chunk with nothing fully co-resident.
 //
@@ -1846,26 +1835,54 @@ func (s *Source) invalidColumnPanic(col string) {
 		col, s.tableName, strings.Join(names, ", ")))
 }
 
-// fetchViaPool is the lock-free hydrate read: it borrows a frame-pinned reader
-// from the bound pool, runs the SELECT on it via the reader's own prepared-stmt
-// cache, and returns the materialised Nodes. No s.mu is taken — every field
-// touched (s.tableName/columns/primaryKey, conn.sort/filterCondition/
-// filterPredicate) is immutable for the lifetime of the bound pool, and the
-// borrowed reader is exclusive to this call. The overlay path is intentionally
-// absent: the pool is bound only in the advance-free window, so no Push is in
-// flight (invariant asserted by the engine's bind/unbind discipline).
-// fetchViaPoolStream is the LAZY hydrate read: it borrows a frame-pinned
-// reader from the bound pool, runs the SELECT, and yields each row one at a
-// time via iter.Seq — the reader and sql.Rows stay open across the entire
-// iteration, so a parent Join can hold this cursor while fetching a child.
-// This is the actual memory win: no []Node is materialised. The pool is
-// sized K = P × Cmax to guarantee enough readers for every lane's concurrent
-// cursors (§3d).
+// driverRowToIVM converts one raw driver.Value row into an ivm.Row,
+// applying the same per-column coercion (sqlite.FromSQLiteType) and
+// unknown-column tripwire as scanRows. []byte values are cloned first —
+// database/sql clones driver []byte before handing it to Scan (drivers may
+// reuse buffers); mattn's are fresh GoBytes copies, but the clone keeps the
+// raw path byte-identical to the pooled one.
+func (s *Source) driverRowToIVM(dest []driver.Value, colNames []string) ivm.Row {
+	row := make(ivm.Row, len(colNames))
+	for i, c := range colNames {
+		cs, ok := s.columns[c]
+		if !ok {
+			s.invalidColumnPanic(c)
+		}
+		v := dest[i]
+		if b, isBytes := v.([]byte); isBytes {
+			v = bytes.Clone(b)
+		}
+		row[c] = sqlite.FromSQLiteType(v, cs.Type)
+	}
+	return row
+}
+
+// fetchViaBoundReaderStream is the LAZY Option B hydrate read: it runs the
+// SELECT on the pipeline's exclusively-held raw reader and yields each row
+// one at a time via iter.Seq — the driver cursor stays open across the
+// entire iteration, so a parent Join holds this cursor while fetching a
+// child ON THE SAME READER (SQLite interleaves live statements on one
+// connection natively; database/sql couldn't express this, which is why the
+// reader is a raw driver.Conn). This is TS's resource model verbatim: one
+// connection per view-syncer, nested statement.iterate() cursors.
 //
-// No s.mu is taken — every field touched is immutable for the lifetime of
-// the bound pool (same invariant as fetchViaPool). The overlay path is
-// intentionally absent: the pool is bound only in the advance-free window.
-func (s *Source) fetchViaPoolStream(req ivm.FetchRequest, conn *connection, pool *ReaderPool) iter.Seq[ivm.Node] {
+// NO acquire happens here — the reader was bound at hydrate start
+// (AcquireForPipeline, wait-while-holding-nothing), so this fetch can never
+// participate in a hold-and-wait cycle. Same-SQL nesting is safe via the
+// reader's checkout stmt cache (one sqlite3_stmt is one cursor; a nested
+// same-shape fetch prepares a transient duplicate — see poolReader).
+//
+// No s.mu is taken — every field touched (s.tableName/columns/primaryKey,
+// conn.sort/filterCondition/filterPredicate/group) is immutable for the
+// lifetime of the bound pool, and the reader is exclusive to this pipeline's
+// single drain goroutine. The overlay path is intentionally absent: the pool
+// is bound only in the advance-free window, so no Push is in flight
+// (invariant asserted by the engine's bind/unbind discipline).
+//
+// Uses s.ctx (CG lifetime) per the Source ctx contract — a teardown mid-
+// cursor surfaces as a panic that the engine's hydrate recovery converts to
+// a clean error frame.
+func (s *Source) fetchViaBoundReaderStream(req ivm.FetchRequest, conn *connection, r *poolReader) iter.Seq[ivm.Node] {
 	return func(yield func(ivm.Node) bool) {
 		// Unordered connections issue NO ORDER BY — see fetchForConn.
 		order := conn.sort
@@ -1879,72 +1896,36 @@ func (s *Source) fetchViaPoolStream(req ivm.FetchRequest, conn *connection, pool
 			req.Start,
 			req.MultiConstraints,
 		)
-		// BOUNDED acquire + serial fallback (2026-07-07 G13-residual wedge,
-		// root-caused from live goroutine dumps): the pull-mode hydrate
-		// (engine addQueriesStreamChunked, D6) runs one goroutine PER QUERY —
-		// not P lanes — so a large addQueries batch can hold-and-wait far
-		// past K = P × Cmax: every reader held by a lane that needs another
-		// reader for its nested child fetch. With the old unbounded
-		// acquire(s.ctx) (s.ctx is Background in production) that was a
-		// PERMANENT deadlock: 184/212 goroutines parked here in the two
-		// wedged workers, the RPC handler never returned, group.mu stayed
-		// held forever, and every later init/destroy for the CG timed out at
-		// the TS 120s RPC bound in lockstep. Bounding the acquire and
-		// falling back to fetchSerial — the SAME pinned frame via the bound
-		// conn (byte-identical read, see fetchViaPool's doc), eager
-		// borrow-drain-release so it cannot join the wait cycle — turns the
-		// deadlock into a bounded slow path: one waiter times out, completes
-		// serially, its ancestors release readers, and the cycle drains.
-		acqCtx, cancelAcq := context.WithTimeout(s.ctx, PoolAcquireTimeout)
-		r, err := pool.acquire(acqCtx)
-		cancelAcq()
+		stmt, err := r.checkoutStmt(s.ctx, q.SQL)
 		if err != nil {
-			if s.ctx.Err() != nil {
-				// Source torn down — propagate, do not read a dead source.
-				panic(fmt.Sprintf("tablesource.Source.Fetch %s: pool acquire: %v", s.tableName, err))
-			}
-			s.notePoolFallback()
-			for _, n := range s.fetchSerial(req, conn) {
-				if !yield(n) {
-					return
-				}
-			}
-			return
-		}
-		defer pool.release(r)
-		stmt, err := r.prepared(s.ctx, q.SQL)
-		if err != nil {
-			panic(fmt.Sprintf("tablesource.Source.Fetch %s: pool prepare: %v\nSQL: %s",
+			panic(fmt.Sprintf("tablesource.Source.Fetch %s: reader prepare: %v\nSQL: %s",
 				s.tableName, err, q.SQL))
 		}
-		rows, err := stmt.QueryContext(s.ctx, q.Params...)
+		// healthy flips false on any cursor-level error so returnStmt closes
+		// the suspect stmt instead of caching it. Defers run LIFO: rows.Close
+		// (registered below) resets the stmt BEFORE returnStmt caches it.
+		healthy := true
+		defer func() { r.returnStmt(q.SQL, stmt, healthy) }()
+		rows, err := queryStmt(s.ctx, stmt, q.Params)
 		if err != nil {
-			panic(fmt.Sprintf("tablesource.Source.Fetch %s: pool query: %v\nSQL: %s",
+			healthy = false
+			panic(fmt.Sprintf("tablesource.Source.Fetch %s: reader query: %v\nSQL: %s",
 				s.tableName, err, q.SQL))
 		}
 		defer rows.Close()
-		colNames, err := rows.Columns()
-		if err != nil {
-			panic(fmt.Sprintf("tablesource.Source.Fetch %s: pool columns: %v", s.tableName, err))
-		}
-		raw := make([]any, len(colNames))
-		ptrs := make([]any, len(colNames))
-		for i := range raw {
-			ptrs[i] = &raw[i]
-		}
-		for rows.Next() {
-			if err := rows.Scan(ptrs...); err != nil {
-				panic(fmt.Sprintf("tablesource.Source.Fetch %s: scan: %v",
+		colNames := rows.Columns()
+		dest := make([]driver.Value, len(colNames))
+		for {
+			err := rows.Next(dest)
+			if errors.Is(err, io.EOF) {
+				return
+			}
+			if err != nil {
+				healthy = false
+				panic(fmt.Sprintf("tablesource.Source.Fetch %s: reader rows: %v",
 					s.tableName, err))
 			}
-			row := make(ivm.Row, len(colNames))
-			for i, c := range colNames {
-				cs, ok := s.columns[c]
-				if !ok {
-					s.invalidColumnPanic(c)
-				}
-				row[c] = sqlite.FromSQLiteType(raw[i], cs.Type)
-			}
+			row := s.driverRowToIVM(dest, colNames)
 			if conn.filterPredicate != nil && !conn.filterPredicate(row) {
 				continue
 			}
@@ -1952,69 +1933,27 @@ func (s *Source) fetchViaPoolStream(req ivm.FetchRequest, conn *connection, pool
 				return
 			}
 		}
-		if err := rows.Err(); err != nil {
-			panic(fmt.Sprintf("tablesource.Source.Fetch %s: rows: %v",
-				s.tableName, err))
-		}
 	}
 }
 
-// fetchViaPool is the EAGER pool read (returns []ivm.Node). It is the
-// defensive fallback for callers that invoke fetchForConn directly with a
-// pool still bound; sourceInput.Fetch normally takes the streaming
-// fetchViaPoolStream path instead. Kept for correctness — no caller should
-// reach it via sourceInput.Fetch, but a direct fetchForConn caller might.
-func (s *Source) fetchViaPool(req ivm.FetchRequest, conn *connection, pool *ReaderPool) []ivm.Node {
-	// Unordered connections issue NO ORDER BY — see fetchForConn.
-	order := conn.sort
-	q := sqlite.BuildSelectQuery(
-		s.tableName,
-		s.columns,
-		req.Constraint,
-		conn.filterCondition,
-		order,
-		req.Reverse,
-		req.Start,
-		req.MultiConstraints,
-	)
-	// Same bounded acquire + serial fallback as fetchViaPoolStream (the
-	// G13-residual hold-and-wait breaker) — this eager variant is reachable
-	// via direct fetchForConn callers with a pool still bound.
-	acqCtx, cancelAcq := context.WithTimeout(s.ctx, PoolAcquireTimeout)
-	r, err := pool.acquire(acqCtx)
-	cancelAcq()
-	if err != nil {
-		if s.ctx.Err() != nil {
-			panic(fmt.Sprintf("tablesource.Source.Fetch %s: pool acquire: %v", s.tableName, err))
-		}
-		s.notePoolFallback()
-		return s.fetchSerial(req, conn)
+// fetchViaBoundReader is the EAGER Option B read (returns []ivm.Node) — the
+// fetchForConn dispatch for direct eager callers running inside a bound
+// pipeline. Semantically identical to draining fetchViaBoundReaderStream
+// into a slice; kept separate so the eager path needs no iter plumbing.
+func (s *Source) fetchViaBoundReader(req ivm.FetchRequest, conn *connection, r *poolReader) []ivm.Node {
+	var out []ivm.Node
+	for n := range s.fetchViaBoundReaderStream(req, conn, r) {
+		out = append(out, n)
 	}
-	defer pool.release(r)
-	stmt, err := r.prepared(s.ctx, q.SQL)
-	if err != nil {
-		panic(fmt.Sprintf("tablesource.Source.Fetch %s: pool prepare: %v\nSQL: %s",
-			s.tableName, err, q.SQL))
-	}
-	rows, err := stmt.QueryContext(s.ctx, q.Params...)
-	if err != nil {
-		panic(fmt.Sprintf("tablesource.Source.Fetch %s: pool query: %v\nSQL: %s",
-			s.tableName, err, q.SQL))
-	}
-	defer rows.Close()
-	colNames, err := rows.Columns()
-	if err != nil {
-		panic(fmt.Sprintf("tablesource.Source.Fetch %s: pool columns: %v", s.tableName, err))
-	}
-	return s.scanRows(rows, colNames, conn, req, false)
+	return out
 }
 
-// BindReaderPool binds a CG-shared frame-pinned reader pool for the cold-start
-// parallel-hydrate window. pool is passed as `any` so engine/ (which must not
-// import this package — that would cycle) can fan it out across its leaf
-// sources via BindTableSourcesToReaderPool. A nil or wrong-typed value is
-// ignored. MUST be paired with UnbindReaderPool before the first advance (after
-// which the pool's pinned frame is stale).
+// BindReaderPool binds a CG-shared frame-pinned reader pool for the
+// parallel-hydrate windows (cold start, warm adds). pool is passed as `any`
+// so engine/ (which must not import this package — that would cycle) can fan
+// it out across its leaf sources via BindTableSourcesToReaderPool. A nil or
+// wrong-typed value is ignored. MUST be paired with UnbindReaderPool before
+// the first advance (after which the pool's pinned frame is stale).
 func (s *Source) BindReaderPool(pool any) {
 	if p, ok := pool.(*ReaderPool); ok && p != nil {
 		s.readerPool.Store(p)

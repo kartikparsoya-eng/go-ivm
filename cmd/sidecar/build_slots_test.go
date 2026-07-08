@@ -81,10 +81,10 @@ func TestWarmBuild_ReleasesSlot(t *testing.T) {
 	group.mu.Lock()
 	// Model the production warm shape: the first advance tears down the
 	// cold pool; warm adds build against a pool-less live CG. Without this
-	// the fixture's cold pool (K ≥ warm k) short-circuits at "cold pool
-	// covers this batch's demand" and the slot path never runs.
+	// the fixture's cold pool short-circuits at the "cold pool still bound"
+	// reuse guard and the slot path never runs.
 	srv.tearDownReaderPool(group)
-	pool, cr := srv.buildWarmReaderPoolLocked(group, 2)
+	pool, cr := srv.buildWarmReaderPoolLocked(group)
 	group.mu.Unlock()
 	if pool != nil {
 		srv.tearDownWarmReaderPool(group, pool, cr)
@@ -107,7 +107,7 @@ func TestWarmBuild_SkipsToSerialWhenSlotsBusy(t *testing.T) {
 	srv.tearDownReaderPool(group)
 	skipsBefore := metrics.readerPoolBuildSlotSkips.Load()
 	start := time.Now()
-	pool, cr := srv.buildWarmReaderPoolLocked(group, 2)
+	pool, cr := srv.buildWarmReaderPoolLocked(group)
 	elapsed := time.Since(start)
 	if pool != nil || cr != nil {
 		srv.tearDownWarmReaderPool(group, pool, cr)
@@ -135,7 +135,7 @@ func TestColdBuild_BoundedWaitThenSerialWhenSlotsBusy(t *testing.T) {
 		t.Fatalf("snap.Current: %v", cerr)
 	}
 	start := time.Now()
-	pool, cr, err := srv.buildReaderPoolLocked(cur, 2)
+	pool, cr, err := srv.buildReaderPoolLocked(cur)
 	elapsed := time.Since(start)
 	if err != nil {
 		t.Fatalf("cold build errored (want clean serial fallback): %v", err)

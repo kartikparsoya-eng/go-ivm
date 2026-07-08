@@ -3,12 +3,16 @@ package tablesource
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
+	"errors"
 	"fmt"
+	"io"
 	"path/filepath"
 	"slices"
 	"sort"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/kartikparsoya-eng/go-ivm/ivm"
 )
@@ -78,6 +82,96 @@ func nodeIDs(nodes []ivm.Node) []int64 {
 	return out
 }
 
+// rawScalarIntErr runs a single-value query on a poolReader's raw conn and
+// returns the first column of the first row as int64.
+func rawScalarIntErr(r *poolReader, query string) (int64, error) {
+	st, err := r.checkoutStmt(context.Background(), query)
+	if err != nil {
+		return 0, fmt.Errorf("prepare %q: %w", query, err)
+	}
+	defer r.returnStmt(query, st, true)
+	rows, err := queryStmt(context.Background(), st, nil)
+	if err != nil {
+		return 0, fmt.Errorf("query %q: %w", query, err)
+	}
+	defer rows.Close()
+	dest := make([]driver.Value, len(rows.Columns()))
+	if err := rows.Next(dest); err != nil {
+		return 0, fmt.Errorf("next %q: %w", query, err)
+	}
+	n, _ := dest[0].(int64)
+	return n, nil
+}
+
+// rawScalarInt is rawScalarIntErr with t.Fatalf on error.
+func rawScalarInt(t *testing.T, r *poolReader, query string) int64 {
+	t.Helper()
+	n, err := rawScalarIntErr(r, query)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+// rawScalarString runs a single-value query and returns the first column of
+// the first row as a string.
+func rawScalarString(t *testing.T, r *poolReader, query string) string {
+	t.Helper()
+	st, err := r.checkoutStmt(context.Background(), query)
+	if err != nil {
+		t.Fatalf("prepare %q: %v", query, err)
+	}
+	defer r.returnStmt(query, st, true)
+	rows, err := queryStmt(context.Background(), st, nil)
+	if err != nil {
+		t.Fatalf("query %q: %v", query, err)
+	}
+	defer rows.Close()
+	dest := make([]driver.Value, len(rows.Columns()))
+	if err := rows.Next(dest); err != nil {
+		t.Fatalf("next %q: %v", query, err)
+	}
+	switch v := dest[0].(type) {
+	case string:
+		return v
+	case []byte:
+		return string(v)
+	default:
+		t.Fatalf("scalar %q has type %T, want string", query, dest[0])
+		return ""
+	}
+}
+
+// rawCountUsers runs `SELECT count(*) FROM users` on a poolReader's raw
+// conn — the test-side stand-in for a leaf read on the reader.
+func rawCountUsers(t *testing.T, r *poolReader) int64 {
+	t.Helper()
+	st, err := r.checkoutStmt(context.Background(), "SELECT count(*) FROM users")
+	if err != nil {
+		t.Fatalf("rawCountUsers prepare: %v", err)
+	}
+	defer r.returnStmt("SELECT count(*) FROM users", st, true)
+	rows, err := queryStmt(context.Background(), st, nil)
+	if err != nil {
+		t.Fatalf("rawCountUsers query: %v", err)
+	}
+	defer rows.Close()
+	dest := make([]driver.Value, 1)
+	if err := rows.Next(dest); err != nil {
+		t.Fatalf("rawCountUsers next: %v", err)
+	}
+	n, _ := dest[0].(int64)
+	// Drain to EOF so the stmt resets cleanly on rows.Close.
+	for {
+		if err := rows.Next(make([]driver.Value, 1)); errors.Is(err, io.EOF) {
+			break
+		} else if err != nil {
+			t.Fatalf("rawCountUsers drain: %v", err)
+		}
+	}
+	return n
+}
+
 // TestReaderPool_PinsAllToVersion: a pool built at the seeded version opens K
 // readers, each validated to that version, each able to query.
 func TestReaderPool_PinsAllToVersion(t *testing.T) {
@@ -101,25 +195,26 @@ func TestReaderPool_PinsAllToVersion(t *testing.T) {
 	if len(pool.all) != k {
 		t.Fatalf("pool has %d readers, want %d", len(pool.all), k)
 	}
-	// Borrow every reader at once (proves K independent conns) and read on each.
-	borrowed := make([]*poolReader, 0, k)
+	// Borrow every reader at once via the per-pipeline admission gate
+	// (proves K independent raw conns) and read on each.
+	releases := make([]func(), 0, k)
 	for i := 0; i < k; i++ {
-		r, aerr := pool.acquire(context.Background())
-		if aerr != nil {
-			t.Fatalf("acquire %d: %v", i, aerr)
+		group := fmt.Sprintf("q%d", i)
+		release, ok := pool.AcquireForPipeline(group, time.Second)
+		if !ok {
+			t.Fatalf("AcquireForPipeline %d did not grant", i)
 		}
-		var n int
-		if qerr := r.conn.QueryRowContext(context.Background(),
-			"SELECT count(*) FROM users").Scan(&n); qerr != nil {
-			t.Fatalf("reader %d query: %v", i, qerr)
+		releases = append(releases, release)
+		r := pool.readerFor(group)
+		if r == nil {
+			t.Fatalf("readerFor(%q) = nil after acquire", group)
 		}
-		if n != 5 {
+		if n := rawCountUsers(t, r); n != 5 {
 			t.Fatalf("reader %d saw %d users, want 5", i, n)
 		}
-		borrowed = append(borrowed, r)
 	}
-	for _, r := range borrowed {
-		pool.release(r)
+	for _, release := range releases {
+		release()
 	}
 }
 
@@ -148,10 +243,10 @@ func TestReaderPool_ConvergesToHead_IgnoresStaleTarget(t *testing.T) {
 	}
 }
 
-// TestSourceFetch_PoolEqualsSingleConn: the lock-free pool path returns exactly
+// TestSourceFetch_PoolEqualsSingleConn: the bound-reader path returns exactly
 // the same Nodes as the locked single-conn path, across plain / sorted /
-// reverse / filtered / limited fetches. This is the correctness oracle: the
-// pool is pure parallelism, output must be byte-identical.
+// reverse / filtered fetches. This is the correctness oracle: the pool is
+// pure parallelism, output must be byte-identical.
 func TestSourceFetch_PoolEqualsSingleConn(t *testing.T) {
 	path := seedReplicaWithStateVersion(t, "v1")
 
@@ -184,7 +279,8 @@ func TestSourceFetch_PoolEqualsSingleConn(t *testing.T) {
 			inA := srcA.Connect(c.sort, nil, c.pred, nil)
 			want := nodeIDs(slices.Collect(inA.Fetch(c.req)))
 
-			// Pool path.
+			// Bound-reader path: the connection's pipeline group holds an
+			// exclusive reader (the engine's hydrateOne discipline).
 			srcB := newUserSourceAt(t, path)
 			poolDB, err := Open(path, OpenOptions{})
 			if err != nil {
@@ -197,8 +293,22 @@ func TestSourceFetch_PoolEqualsSingleConn(t *testing.T) {
 			}
 			defer pool.Close()
 			srcB.BindReaderPool(pool)
+			srcB.SetNextConnectGroup("q1")
 			inB := srcB.Connect(c.sort, nil, c.pred, nil)
+
+			// Pool bound but pipeline NOT acquired: the fetch must route to
+			// the serial bound conn (build-phase shape) and still be correct.
+			serialGot := nodeIDs(slices.Collect(inB.Fetch(c.req)))
+			if !slices.Equal(serialGot, want) {
+				t.Fatalf("unacquired-group fetch = %v, want %v (serial route broken)", serialGot, want)
+			}
+
+			release, ok := pool.AcquireForPipeline("q1", time.Second)
+			if !ok {
+				t.Fatal("AcquireForPipeline did not grant")
+			}
 			got := nodeIDs(slices.Collect(inB.Fetch(c.req)))
+			release()
 
 			if len(got) != len(want) {
 				t.Fatalf("pool path len=%d ids=%v, single-conn len=%d ids=%v",
@@ -221,9 +331,11 @@ func TestSourceFetch_PoolEqualsSingleConn(t *testing.T) {
 	}
 }
 
-// TestSourceFetch_PoolConcurrent: many goroutines fetching the SAME source
-// through the pool concurrently all get the full correct result. Run under
-// -race to prove the lock-free read path has no data races on Source state.
+// TestSourceFetch_PoolConcurrent: many pipelines fetching the SAME source
+// through the pool concurrently all get the full correct result. 32
+// pipelines against K=8 exercises admission queueing (each waits holding
+// nothing until a reader frees). Run under -race to prove the lock-free read
+// path has no data races on Source state.
 func TestSourceFetch_PoolConcurrent(t *testing.T) {
 	path := seedReplicaWithStateVersion(t, "v7")
 	src := newUserSourceAt(t, path)
@@ -240,15 +352,27 @@ func TestSourceFetch_PoolConcurrent(t *testing.T) {
 	src.BindReaderPool(pool)
 
 	// Distinct connections (distinct pipelines), like distinct queries in one
-	// hydrate batch, all reading this source concurrently.
+	// hydrate batch, all reading this source concurrently — each holding its
+	// OWN exclusive reader for its whole drain.
 	const goroutines = 32
 	var wg sync.WaitGroup
 	errs := make([]error, goroutines)
 	for g := 0; g < goroutines; g++ {
+		group := fmt.Sprintf("q%d", g)
+		src.SetNextConnectGroup(group)
 		in := src.Connect(ivm.Ordering{{"id", "asc"}}, nil, nil, nil)
 		wg.Add(1)
-		go func(idx int, input ivm.Input) {
+		go func(idx int, group string, input ivm.Input) {
 			defer wg.Done()
+			var release func()
+			for {
+				var ok bool
+				release, ok = pool.AcquireForPipeline(group, time.Second)
+				if ok {
+					break
+				}
+			}
+			defer release()
 			ids := nodeIDs(slices.Collect(input.Fetch(ivm.FetchRequest{})))
 			sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
 			want := []int64{1, 2, 3, 4, 5}
@@ -259,7 +383,7 @@ func TestSourceFetch_PoolConcurrent(t *testing.T) {
 			if !ok {
 				errs[idx] = fmt.Errorf("goroutine %d got %v, want %v", idx, ids, want)
 			}
-		}(g, in)
+		}(g, group, in)
 	}
 	wg.Wait()
 	for _, e := range errs {

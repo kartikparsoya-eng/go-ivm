@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 )
 
 // seedWal2Replica seeds a wal2-mode replica with the _zero.replicationState
@@ -126,35 +127,31 @@ func TestCoReadPool_PinsAllToAnchorFrame(t *testing.T) {
 	}
 
 	// All K readers should still see 3 rows (anchor's frame), not 4.
-	borrowed := make([]*poolReader, 0, k)
+	releases := make([]func(), 0, k)
 	for i := 0; i < k; i++ {
-		r, aerr := pool.acquire(context.Background())
-		if aerr != nil {
-			t.Fatalf("acquire %d: %v", i, aerr)
+		group := fmt.Sprintf("q%d", i)
+		release, ok := pool.AcquireForPipeline(group, time.Second)
+		if !ok {
+			t.Fatalf("AcquireForPipeline %d did not grant", i)
 		}
-		var count int
-		if qerr := r.conn.QueryRowContext(context.Background(),
-			"SELECT count(*) FROM users").Scan(&count); qerr != nil {
-			t.Fatalf("reader %d query: %v", i, qerr)
-		}
-		if count != 3 {
+		releases = append(releases, release)
+		r := pool.readerFor(group)
+		if count := rawScalarInt(t, r, "SELECT count(*) FROM users"); count != 3 {
 			t.Fatalf("reader %d saw %d users, want 3 (anchor's frame)", i, count)
 		}
-		borrowed = append(borrowed, r)
 	}
-	for _, r := range borrowed {
-		pool.release(r)
+	for _, release := range releases {
+		release()
 	}
 
 	// PRAGMA integrity_check on one reader.
-	r, _ := pool.acquire(context.Background())
-	defer pool.release(r)
-	var integrity string
-	if err := r.conn.QueryRowContext(context.Background(),
-		"PRAGMA integrity_check").Scan(&integrity); err != nil {
-		t.Fatalf("integrity_check: %v", err)
+	release, ok := pool.AcquireForPipeline("integrity", time.Second)
+	if !ok {
+		t.Fatal("AcquireForPipeline(integrity) did not grant")
 	}
-	if integrity != "ok" {
+	defer release()
+	r := pool.readerFor("integrity")
+	if integrity := rawScalarString(t, r, "PRAGMA integrity_check"); integrity != "ok" {
 		t.Fatalf("integrity_check = %q, want ok", integrity)
 	}
 }
@@ -213,16 +210,20 @@ func TestCoReadPool_ConcurrentReads(t *testing.T) {
 		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
-			r, aerr := pool.acquire(context.Background())
-			if aerr != nil {
-				errs[idx] = aerr
-				return
+			group := fmt.Sprintf("q%d", idx)
+			var release func()
+			for {
+				var ok bool
+				release, ok = pool.AcquireForPipeline(group, time.Second)
+				if ok {
+					break
+				}
 			}
-			defer pool.release(r)
-			var count int
-			if qerr := r.conn.QueryRowContext(context.Background(),
-				"SELECT count(*) FROM users").Scan(&count); qerr != nil {
-				errs[idx] = qerr
+			defer release()
+			r := pool.readerFor(group)
+			count, err := rawScalarIntErr(r, "SELECT count(*) FROM users")
+			if err != nil {
+				errs[idx] = err
 				return
 			}
 			if count != 3 {
@@ -433,31 +434,28 @@ func TestCoReadPool_ColdHydrateCrossTablePin(t *testing.T) {
 
 	// (3) Every reader must see the anchor's consistent cross-table cut
 	// (users=3, orders=2, stateVersion=v1) — NOT the writer's v2/4/3.
-	borrowed := make([]*poolReader, 0, k)
+	releases := make([]func(), 0, k)
 	for i := 0; i < k; i++ {
-		r, aerr := pool.acquire(ctx)
-		if aerr != nil {
-			t.Fatalf("acquire %d: %v", i, aerr)
+		group := fmt.Sprintf("cut%d", i)
+		release, ok := pool.AcquireForPipeline(group, time.Second)
+		if !ok {
+			t.Fatalf("AcquireForPipeline %d did not grant", i)
 		}
-		var users, orders int
-		var ver string
-		if err := r.conn.QueryRowContext(ctx, "SELECT count(*) FROM users").Scan(&users); err != nil {
-			t.Fatalf("reader %d users: %v", i, err)
-		}
-		if err := r.conn.QueryRowContext(ctx, "SELECT count(*) FROM orders").Scan(&orders); err != nil {
-			t.Fatalf("reader %d orders: %v", i, err)
-		}
-		if err := r.conn.QueryRowContext(ctx, stateVersionSQL).Scan(&ver); err != nil {
-			t.Fatalf("reader %d version: %v", i, err)
+		releases = append(releases, release)
+		r := pool.readerFor(group)
+		users := rawScalarInt(t, r, "SELECT count(*) FROM users")
+		orders := rawScalarInt(t, r, "SELECT count(*) FROM orders")
+		ver, verr := r.readStateVersion(ctx)
+		if verr != nil {
+			t.Fatalf("reader %d version: %v", i, verr)
 		}
 		if users != 3 || orders != 2 || ver != anchorVersion {
 			t.Fatalf("reader %d saw users=%d orders=%d ver=%q; want 3/2/%q (skew or unpinned frame)",
 				i, users, orders, ver, anchorVersion)
 		}
-		borrowed = append(borrowed, r)
 	}
-	for _, r := range borrowed {
-		pool.release(r)
+	for _, release := range releases {
+		release()
 	}
 }
 

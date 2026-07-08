@@ -20,6 +20,7 @@ package tablesource
 
 import (
 	"database/sql"
+	"database/sql/driver"
 	"fmt"
 	"strconv"
 	"sync"
@@ -44,6 +45,15 @@ import (
 // so every conn the pools open behaves like TS's replica connection.
 const goivmDriverName = "sqlite3_goivm"
 
+// goivmDriverInstance is the very driver value registered under
+// goivmDriverName. Kept package-visible so the reader pool can open RAW
+// driver connections (bypassing database/sql — Option B: one reader per
+// hydrate goroutine with interleaved cursors) that carry the identical
+// per-conn setup: SQLiteDriver.Open parses the same DSN pragmas
+// (_busy_timeout, _query_only, _case_sensitive_like, _cache_size) and runs
+// the same ConnectHook (Unicode lower()). Set once by registerGoivmDriver.
+var goivmDriverInstance *sqlite3.SQLiteDriver
+
 var registerGoivmDriver = sync.OnceValues(func() (string, error) {
 	// Resolve the REAL→TEXT rendering mode of the linked SQLite before any
 	// connection (and therefore any lower() UDF call) can exist. Probed by
@@ -54,13 +64,46 @@ var registerGoivmDriver = sync.OnceValues(func() (string, error) {
 		return "", err
 	}
 	realTextDigits = digits
-	sql.Register(goivmDriverName, &sqlite3.SQLiteDriver{
+	goivmDriverInstance = &sqlite3.SQLiteDriver{
 		ConnectHook: func(conn *sqlite3.SQLiteConn) error {
 			return conn.RegisterFunc("lower", unicodeLowerSQL, true)
 		},
-	})
+	}
+	sql.Register(goivmDriverName, goivmDriverInstance)
 	return goivmDriverName, nil
 })
+
+// readPoolDSNs maps each pool opened by Open/OpenWritable to the DSN it was
+// opened with, so rawOpenReaderConn can mint raw driver conns with the exact
+// same per-conn pragmas + ConnectHook. Keyed by the *sql.DB pointer (like
+// probedTables): entries are a string each, bounded by pool count.
+var readPoolDSNs sync.Map // *sql.DB → string (DSN)
+
+// rawOpenReaderConn opens ONE raw driver connection configured identically
+// to db's pooled connections (same DSN → same pragmas + lower() hook), but
+// OUTSIDE database/sql. Raw conns are the substrate of the Option B reader
+// pool: database/sql serializes a *sql.Conn behind one live Rows, while
+// SQLite itself interleaves many live statements on one connection inside
+// one read tx (TS's better-sqlite3 nested iterate() model). Bypassing the
+// pool also removes the reader-build's db.Conn queueing — pool builds no
+// longer compete with probes for pooled conns.
+//
+// The caller OWNS the returned conn: it is invisible to db's MaxOpenConns
+// accounting and idle reaper, and MUST be closed via driver.Conn.Close.
+func rawOpenReaderConn(db *sql.DB) (driver.Conn, error) {
+	dsnAny, ok := readPoolDSNs.Load(db)
+	if !ok {
+		return nil, fmt.Errorf("tablesource: rawOpenReaderConn: db was not opened by tablesource.Open/OpenWritable (no DSN recorded)")
+	}
+	if goivmDriverInstance == nil {
+		return nil, fmt.Errorf("tablesource: rawOpenReaderConn: goivm driver not registered")
+	}
+	dc, err := goivmDriverInstance.Open(dsnAny.(string))
+	if err != nil {
+		return nil, fmt.Errorf("tablesource: rawOpenReaderConn: %w", err)
+	}
+	return dc, nil
+}
 
 // probeRealTextDigits asks the linked SQLite how it renders REAL→TEXT and
 // maps the answer to the sqliteRealText mode (see realtext.go). CAST runs
@@ -280,6 +323,7 @@ func Open(path string, opts OpenOptions) (*sql.DB, error) {
 		db.Close()
 		return nil, err
 	}
+	readPoolDSNs.Store(db, dsn)
 	return db, nil
 }
 
@@ -382,5 +426,6 @@ func OpenWritable(path string, opts OpenOptions) (*sql.DB, error) {
 		db.Close()
 		return nil, err
 	}
+	readPoolDSNs.Store(db, dsn)
 	return db, nil
 }

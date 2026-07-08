@@ -42,6 +42,7 @@ import "C"
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"errors"
 	"fmt"
 	"sync"
@@ -232,27 +233,43 @@ func CaptureCoReadFromConn(conn *sql.Conn) (*CoRead, error) {
 // the conn without a *sql.Tx wrapper.
 func (cr *CoRead) armConn(conn *sql.Conn) error {
 	return conn.Raw(func(driverConn any) error {
-		raw, err := rawSQLiteHandle(driverConn)
-		if err != nil {
-			return err
-		}
-		schema := C.CString("main")
-		defer C.free(unsafe.Pointer(schema))
-		cr.mu.Lock()
-		defer cr.mu.Unlock()
-		if cr.freed {
-			return errors.New("armConn: coread is freed")
-		}
-		rc := C.sqlite3_wal2_coread_open(raw, schema, cr.handle)
-		if rc != 0 {
-			return fmt.Errorf("sqlite3_wal2_coread_open rc=%d", int(rc))
-		}
-		return nil
+		return cr.armRaw(driverConn)
 	})
 }
 
-// NewCoReadReaderPool opens k read connections from db, all armed onto the
-// same wal2 co-located read point (cr). Unlike NewReaderPool (converge-upward),
+// armRawConn is armConn for a RAW driver conn (the Option B reader pool owns
+// driver.Conn directly — no *sql.Conn, no conn.Raw scope to thread through).
+// The conn must have an active deferred BEGIN (autoCommit=0, txnState=NONE),
+// exactly like armConn's contract.
+func (cr *CoRead) armRawConn(dc driver.Conn) error {
+	return cr.armRaw(dc)
+}
+
+// armRaw is the shared body: resolve the mattn conn's *C.sqlite3 and arm it
+// onto the coread's read point under cr.mu (a concurrent Free must not yank
+// the handle mid-call — use-after-free at the C boundary).
+func (cr *CoRead) armRaw(driverConn any) error {
+	raw, err := rawSQLiteHandle(driverConn)
+	if err != nil {
+		return err
+	}
+	schema := C.CString("main")
+	defer C.free(unsafe.Pointer(schema))
+	cr.mu.Lock()
+	defer cr.mu.Unlock()
+	if cr.freed {
+		return errors.New("armConn: coread is freed")
+	}
+	rc := C.sqlite3_wal2_coread_open(raw, schema, cr.handle)
+	if rc != 0 {
+		return fmt.Errorf("sqlite3_wal2_coread_open rc=%d", int(rc))
+	}
+	return nil
+}
+
+// NewCoReadReaderPool opens k RAW read connections (rawOpenReaderConn — same
+// DSN, outside database/sql; see NewReaderPool), all armed onto the same
+// wal2 co-located read point (cr). Unlike NewReaderPool (converge-upward),
 // this requires no convergence — every reader is latched to the anchor's
 // frame by the coread handle. The caller MUST ensure the anchor (whose conn
 // produced cr) stays alive for the pool's lifetime.
@@ -263,14 +280,13 @@ func NewCoReadReaderPool(ctx context.Context, db *sql.DB, cr *CoRead, k int) (*R
 	if k < 1 {
 		k = 1
 	}
-	// Bound the whole build — hold-and-wait across concurrent builders on
-	// an exhausted read pool was a permanent deadlock (2026-07-06 ART
-	// incident; see PoolAcquireTimeout). Error paths below unwind every
-	// held reader; the callers fall back to serial hydrate. closeCtx: the
-	// unwinds must not reuse the possibly-expired build ctx (see
-	// NewReaderPool's note — a skipped ROLLBACK returns a WAL-pinning conn
-	// to the pool). WithoutCancel, no fresh deadline: one anchored here
-	// would itself be expired by unwind time.
+	// Bound the whole build. Raw opens don't queue on any conn pool (the
+	// hold-and-wait class the deadline was born for is structurally gone —
+	// see PoolAcquireTimeout's history), but a BEGIN or the arming read can
+	// still stall on WAL-lock contention; a bounded build failure degrades
+	// cleanly to serial hydrate. closeCtx: the unwinds must not reuse the
+	// possibly-expired build ctx (a skipped ROLLBACK would leave a pinned
+	// read tx open for the instant before dc.Close).
 	ctx, cancel := context.WithTimeout(ctx, PoolAcquireTimeout)
 	defer cancel()
 	closeCtx := context.WithoutCancel(ctx)
@@ -278,42 +294,37 @@ func NewCoReadReaderPool(ctx context.Context, db *sql.DB, cr *CoRead, k int) (*R
 	readers := make([]*poolReader, k)
 	var version string
 	for i := 0; i < k; i++ {
-		conn, err := db.Conn(ctx)
+		dc, err := rawOpenReaderConn(db)
 		if err != nil {
 			for j := 0; j < i; j++ {
 				readers[j].close(closeCtx)
 			}
-			return nil, fmt.Errorf("coread reader pool: acquire conn %d: %w", i, err)
+			return nil, fmt.Errorf("coread reader pool: open raw conn %d: %w", i, err)
 		}
+		readers[i] = &poolReader{dc: dc, stmts: map[string]*poolStmt{}}
 		// Deferred BEGIN: sets autoCommit=0 without taking a read lock
 		// (txnState stays NONE), so coread_open can arm + begin the read.
-		if _, err := conn.ExecContext(ctx, "BEGIN"); err != nil {
-			_ = conn.Close()
-			for j := 0; j < i; j++ {
+		if err := readers[i].rawExec(ctx, "BEGIN"); err != nil {
+			for j := 0; j <= i; j++ {
 				readers[j].close(closeCtx)
 			}
 			return nil, fmt.Errorf("coread reader pool: BEGIN conn %d: %w", i, err)
 		}
 		// Arm the conn onto the coread's frame. This latches the read tx
 		// at the anchor's frame inside walTryBeginRead.
-		if err := cr.armConn(conn); err != nil {
-			_, _ = conn.ExecContext(closeCtx, "ROLLBACK")
-			_ = conn.Close()
-			for j := 0; j < i; j++ {
+		if err := cr.armRawConn(dc); err != nil {
+			for j := 0; j <= i; j++ {
 				readers[j].close(closeCtx)
 			}
 			return nil, fmt.Errorf("coread reader pool: arm conn %d: %w", i, err)
 		}
-		var ver string
-		if err := conn.QueryRowContext(ctx, stateVersionSQL).Scan(&ver); err != nil {
-			_, _ = conn.ExecContext(closeCtx, "ROLLBACK")
-			_ = conn.Close()
-			for j := 0; j < i; j++ {
+		ver, err := readers[i].readStateVersion(ctx)
+		if err != nil {
+			for j := 0; j <= i; j++ {
 				readers[j].close(closeCtx)
 			}
 			return nil, fmt.Errorf("coread reader pool: read stateVersion conn %d: %w", i, err)
 		}
-		readers[i] = &poolReader{conn: conn, stmts: map[string]*poolStmt{}}
 		if i == 0 {
 			version = ver
 		} else if ver != version {

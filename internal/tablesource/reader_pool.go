@@ -3,8 +3,12 @@ package tablesource
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
+	"errors"
 	"fmt"
+	"os"
 	"sort"
+	"sync"
 	"time"
 )
 
@@ -29,45 +33,66 @@ const stateVersionSQL = `SELECT stateVersion FROM "_zero.replicationState"`
 // quiescent replica and bounded under sustained writes.
 const maxConvergeAttempts = 10
 
-// PoolAcquireTimeout bounds EVERY conn acquisition a reader-pool build (or
-// the Source constructor's presence probe) performs against the shared
-// replica read pool. Var (not const) so tests can shrink the window.
+// PoolAcquireTimeout bounds a reader-pool BUILD (raw opens + BEGINs +
+// converge reads) and the Source constructor's presence probe against the
+// shared replica read pool. Var (not const) so tests can shrink the window.
 //
-// Load-bearing (2026-07-06 ART incident): pool builds acquire K conns ONE AT
-// A TIME while holding the ones already acquired — hold-and-wait. With
-// unbounded contexts, N concurrent builders under read-pool exhaustion each
-// held partial sets and blocked in db.Conn forever: a permanent deadlock
-// that also starved handleInit's probe (blocked 120s until the TS RPC
-// timeout, then leaked — goroutine dumps showed builders + inits wedged
-// 19+ minutes after the burst). Every builder caller already has a serial
-// fallback (cold: converge→serial; warm: co-read→serial) and init failure
-// is a clean rpcError — the deadline converts the deadlock into a bounded
-// stall + degrade, and the first builder to time out releases its holds,
-// letting the others complete. Same idiom as ensurePrevTxLocked's bounded
-// writable-pool acquire (an earlier incident, same shape).
+// History: this deadline was introduced when pool builds acquired K conns
+// from the SHARED database/sql read pool one at a time while holding the
+// ones already acquired — hold-and-wait across concurrent builders under
+// read-pool exhaustion was a permanent deadlock (2026-07-06 ART incident).
+// Option B's raw driver opens don't queue on any pool, so the build-time
+// hold-and-wait class is structurally gone; the deadline is kept because a
+// BEGIN/converge read can still stall on WAL-lock contention, and a bounded
+// build failure degrades cleanly to serial hydrate.
 var PoolAcquireTimeout = 5 * time.Second
 
-// poolReader is one frame-pinned read connection plus its own prepared-statement
-// cache. It is borrowed exclusively (one goroutine at a time) via ReaderPool,
-// so it needs no internal locking — the per-reader stmt cache replaces the
-// s.mu-guarded Source.stmtCache used on the single-conn path.
+// PipelineAcquireTripwire documentation lives with the acquire LOOP in
+// engine/ (engine.PipelineReaderTripwire): under Option B a hydrate pipeline
+// acquires its ONE reader while holding nothing, so queueing at
+// AcquireForPipeline is the normal admission behavior when a batch is wider
+// than K (TS's model is K=1 — every query queues behind the single conn).
+// The engine's tripwire firing therefore means something is genuinely stuck
+// (a parked producer never released, a leaked reader) — a BUG, not load:
+// the engine PANICS loudly. Never a silent fallback — mid-flight acquires no
+// longer exist, so there is nothing to fall back to.
+
+// poolReader is one frame-pinned RAW read connection (driver.Conn — outside
+// database/sql, see rawOpenReaderConn) plus its own prepared-statement cache.
+// It is bound exclusively to ONE hydrate pipeline at a time via
+// AcquireForPipeline, and every fetch of that pipeline — nested child
+// fetches included — runs on this single conn with INTERLEAVED cursors:
+// SQLite natively supports many live statements on one connection inside one
+// read tx (TS's better-sqlite3 nested iterate() model). database/sql could
+// not express this (one live Rows per *sql.Conn), which is why the pool owns
+// raw conns.
 //
-// The cache is BOUNDED (napi review M4): IN-clause SQL shapes vary by list
-// LENGTH — `IN (?,?)` vs `IN (?,?,?)` are distinct texts — so a batched
+// Single-goroutine discipline: a pipeline's drain is one goroutine (iter.Seq
+// is synchronous), so reader state needs no locking. mattn's own internal
+// mutexes cover its C-level bookkeeping.
+//
+// The stmt cache is BOUNDED (napi review M4): IN-clause SQL shapes vary by
+// list LENGTH — `IN (?,?)` vs `IN (?,?,?)` are distinct texts — so a batched
 // flipped-join hydrate with varying key-set sizes mints unbounded distinct
 // shapes, each pinning a compiled sqlite3_stmt on the C heap (invisible to
 // Go's allocator and GOMEMLIMIT) for the reader's lifetime. Same bound and
 // eviction policy as Source.stmtCache (stmtCachePerConnCap, evict the
-// least-recently-USED quarter): warm pools survive across a whole
-// addQueries batch, and cold-start pools across the entire initial-hydrate
-// window, so "torn down soon anyway" does not bound the growth.
+// least-recently-USED quarter).
 //
-// Eviction closing an in-use stmt cannot happen: fetchViaPool drains each
-// SELECT eagerly (scanRows materialises before returning), so no cursor is
-// open when the NEXT prepared() call — the only eviction trigger — runs on
-// this exclusively-borrowed reader.
+// CHECKOUT semantics (the Option B sine-qua-non — mirrors TS zqlite's
+// StatementCache and Source.checkoutSelectLocked): one sqlite3_stmt is ONE
+// cursor. Interleaving works at the CONNECTION level, but nested fetches
+// with the SAME SQL and different binds (self-referential joins, a repeated
+// table+shape in one tree) would collide on a shared stmt — re-binding a
+// live stmt silently RESETS its open cursor (verified experimentally on the
+// Source cache: silent row corruption, no error; better-sqlite3 throws
+// "statement is busy" for the same reason). checkoutStmt REMOVES the stmt
+// from the cache while its cursor is open; a same-SQL nested checkout simply
+// prepares a fresh duplicate. returnStmt hands it back (or closes it when
+// the slot was re-filled first). Eviction can never close a checked-out
+// stmt: checked-out stmts are not in the map.
 type poolReader struct {
-	conn  *sql.Conn
+	dc    driver.Conn
 	stmts map[string]*poolStmt
 	tick  uint64
 }
@@ -75,31 +100,90 @@ type poolReader struct {
 // poolStmt pairs a prepared statement with its last-use tick for the
 // eviction scan (mirrors Source.cachedStmt).
 type poolStmt struct {
-	st       *sql.Stmt
+	st       driver.Stmt
 	lastTick uint64
 }
 
-func (r *poolReader) prepared(ctx context.Context, query string) (*sql.Stmt, error) {
+// rawExec runs a no-result statement (BEGIN/ROLLBACK) on the raw conn.
+func (r *poolReader) rawExec(ctx context.Context, query string) error {
+	ec, ok := r.dc.(driver.ExecerContext)
+	if !ok {
+		return fmt.Errorf("reader conn does not implement driver.ExecerContext")
+	}
+	_, err := ec.ExecContext(ctx, query, nil)
+	return err
+}
+
+// readStateVersion reads the replica's stateVersion on the raw conn (the
+// frame-identifying read — see stateVersionSQL).
+func (r *poolReader) readStateVersion(ctx context.Context) (string, error) {
+	qc, ok := r.dc.(driver.QueryerContext)
+	if !ok {
+		return "", fmt.Errorf("reader conn does not implement driver.QueryerContext")
+	}
+	rows, err := qc.QueryContext(ctx, stateVersionSQL, nil)
+	if err != nil {
+		return "", err
+	}
+	defer rows.Close()
+	dest := make([]driver.Value, 1)
+	if err := rows.Next(dest); err != nil {
+		return "", fmt.Errorf("stateVersion row: %w", err)
+	}
+	switch v := dest[0].(type) {
+	case string:
+		return v, nil
+	case []byte:
+		return string(v), nil
+	default:
+		return "", fmt.Errorf("stateVersion has unexpected type %T", dest[0])
+	}
+}
+
+// checkoutStmt returns a prepared statement for query, preparing a fresh one
+// when the cache has none (first use, or the cached one is checked out by an
+// enclosing same-SQL cursor). The stmt is REMOVED from the cache until
+// returnStmt — see the poolReader doc for why sharing a live stmt corrupts.
+func (r *poolReader) checkoutStmt(ctx context.Context, query string) (driver.Stmt, error) {
 	r.tick++
 	if e, ok := r.stmts[query]; ok {
-		e.lastTick = r.tick
+		delete(r.stmts, query)
 		return e.st, nil
 	}
-	st, err := r.conn.PrepareContext(ctx, query)
-	if err != nil {
-		return nil, err
+	pc, ok := r.dc.(driver.ConnPrepareContext)
+	if !ok {
+		return nil, fmt.Errorf("reader conn does not implement driver.ConnPrepareContext")
 	}
+	return pc.PrepareContext(ctx, query)
+}
+
+// returnStmt hands a checked-out stmt back to the cache. Closed instead of
+// cached when (a) healthy=false — the caller saw a cursor error and the
+// stmt's state is suspect — or (b) another checkout of the same SQL returned
+// first (at most one cached stmt per shape; the transient duplicate from a
+// same-SQL nested fetch dies here). Inserting past stmtCachePerConnCap
+// evicts the least-recently-used quarter.
+func (r *poolReader) returnStmt(query string, st driver.Stmt, healthy bool) {
+	if !healthy {
+		_ = st.Close()
+		return
+	}
+	if _, occupied := r.stmts[query]; occupied {
+		_ = st.Close()
+		return
+	}
+	r.tick++
 	r.stmts[query] = &poolStmt{st: st, lastTick: r.tick}
 	if len(r.stmts) > stmtCachePerConnCap {
 		r.evictColdest()
 	}
-	return st, nil
 }
 
 // evictColdest closes and drops the least-recently-used quarter of the
 // cache. Runs only when a NEW shape lands on a full cache; steady-state
 // reuse of existing shapes never triggers it. The just-inserted entry has
-// the highest tick, so it always survives.
+// the highest tick, so it always survives. Checked-out stmts are not in the
+// map and can never be evicted mid-cursor.
 func (r *poolReader) evictColdest() {
 	type kv struct {
 		sql  string
@@ -124,36 +208,41 @@ func (r *poolReader) close(ctx context.Context) {
 	for _, e := range r.stmts {
 		_ = e.st.Close()
 	}
-	_, _ = r.conn.ExecContext(ctx, "ROLLBACK")
-	_ = r.conn.Close()
+	r.stmts = nil
+	_ = r.rawExec(ctx, "ROLLBACK")
+	_ = r.dc.Close()
 }
 
-// ReaderPool is a set of K read connections ALL pinned to the same WAL frame —
-// the frame whose stateVersion == Version(). It is the wal2-viable replacement
-// for the dead sqlite3_snapshot_open shared-handle pool: instead of a C handle,
-// every connection independently BEGINs and is validated (re-pinned if needed)
-// to the one target stateVersion.
+// ReaderPool is a set of K raw read connections ALL pinned to the same WAL
+// frame — the frame whose stateVersion == Version(). It is the wal2-viable
+// replacement for the dead sqlite3_snapshot_open shared-handle pool: instead
+// of a C handle, every connection independently BEGINs and is validated
+// (re-pinned if needed) to the one target stateVersion.
 //
-// Cold-start hydrate routes its per-query fetches across the pool so they run
-// in parallel while staying on one consistent frame. Borrow with acquire,
-// return with release; each borrow is exclusive, so the SQL read runs lock-free.
-//
-// Deadlock-freedom: the pool is sized K = P × Cmax where P is the number of
-// worker lanes and Cmax is the max concurrent-cursor demand per query. In the
-// eager model (Phase 0/1, compat shims), Cmax=1 → K=P. In the lazy model
-// (Phase 2+), Cmax = join depth + union breadth + EXISTS probes. Worst case:
-// P lanes each hold Cmax−1 readers → P×(Cmax−1) held, P free → all acquire.
-// See DESIGN-streaming-hydrate.md §3d.
+// Resource model (Option B — TS parity): each hydrate pipeline acquires ONE
+// reader at its start via AcquireForPipeline (wait-while-holding-nothing —
+// structurally deadlock-free) and runs EVERY fetch of that pipeline, nested
+// included, on that single reader with interleaved cursors. K therefore
+// bounds concurrent-hydrate WIDTH, not cursor demand: a batch wider than K
+// simply queues at admission (TS's model is the K=1 degenerate case — one
+// conn per view-syncer, queries hydrate sequentially). Mid-flight reader
+// acquires no longer exist, which eliminates the hold-and-wait deadlock
+// class (readers held while waiting for more readers) outright.
 type ReaderPool struct {
 	free    chan *poolReader
 	all     []*poolReader
 	version string
+	// bound maps a pipeline group (the engine's queryID) to the reader that
+	// pipeline exclusively holds, from AcquireForPipeline to its release.
+	// Read lock-free by every leaf fetch (readerFor) on the hydrate path.
+	bound sync.Map // string → *poolReader
 }
 
-// NewReaderPool opens k read connections from db, all converged onto the same
-// WAL frame. Instead of requiring a pre-determined wantVersion (the old strategy
-// that lost the race when the replicator advanced past it), it uses a
-// "converge-to-latest" strategy:
+// NewReaderPool opens k RAW read connections (rawOpenReaderConn — same DSN,
+// outside database/sql), all converged onto the same WAL frame. Instead of
+// requiring a pre-determined wantVersion (the old strategy that lost the
+// race when the replicator advanced past it), it uses a "converge-to-latest"
+// strategy:
 //
 //  1. Open all K readers — each BEGINs and reads whatever stateVersion it lands on.
 //  2. Find the max version V_max among all readers.
@@ -172,18 +261,16 @@ func NewReaderPool(ctx context.Context, db *sql.DB, _ string, k int) (*ReaderPoo
 	if k < 1 {
 		k = 1
 	}
-	// Bound the whole build (acquires + BEGINs + converge reads): see
+	// Bound the whole build (opens + BEGINs + converge reads): see
 	// PoolAcquireTimeout. On expiry the error paths below unwind every
-	// already-held reader and the caller falls back to serial hydrate.
+	// already-opened reader and the caller falls back to serial hydrate.
 	//
 	// closeCtx: the unwind paths MUST NOT reuse the (possibly just-expired)
 	// build ctx — close(expiredCtx) fails the ROLLBACK instantly without
-	// executing it, returning conns to the pool with OPEN read txs. mattn's
-	// ResetSession discards such conns, but only at their NEXT checkout —
-	// until then each one pins a WAL frame (wal2 switch deferral → WAL
-	// growth → uniform read slowdown). WithoutCancel (no fresh deadline:
-	// one anchored at build start would itself be expired by unwind time,
-	// and a read-tx ROLLBACK takes no locks — it cannot meaningfully hang).
+	// executing it. Raw conns are closed outright here (not returned to any
+	// pool), so a skipped ROLLBACK would only matter for the instant before
+	// dc.Close — but WithoutCancel keeps the unwind semantics identical to
+	// the Source paths (see NewCoReadReaderPool's note).
 	ctx, cancel := context.WithTimeout(ctx, PoolAcquireTimeout)
 	defer cancel()
 	closeCtx := context.WithoutCancel(ctx)
@@ -192,29 +279,27 @@ func NewReaderPool(ctx context.Context, db *sql.DB, _ string, k int) (*ReaderPoo
 	versions := make([]string, k)
 
 	for i := 0; i < k; i++ {
-		conn, err := db.Conn(ctx)
+		dc, err := rawOpenReaderConn(db)
 		if err != nil {
 			for j := 0; j < i; j++ {
 				readers[j].close(closeCtx)
 			}
-			return nil, fmt.Errorf("reader pool: acquire conn %d: %w", i, err)
+			return nil, fmt.Errorf("reader pool: open raw conn %d: %w", i, err)
 		}
-		if _, err := conn.ExecContext(ctx, "BEGIN"); err != nil {
-			_ = conn.Close()
-			for j := 0; j < i; j++ {
+		readers[i] = &poolReader{dc: dc, stmts: map[string]*poolStmt{}}
+		if err := readers[i].rawExec(ctx, "BEGIN"); err != nil {
+			for j := 0; j <= i; j++ {
 				readers[j].close(closeCtx)
 			}
 			return nil, fmt.Errorf("reader pool: BEGIN conn %d: %w", i, err)
 		}
-		var ver string
-		if err := conn.QueryRowContext(ctx, stateVersionSQL).Scan(&ver); err != nil {
-			_ = conn.Close()
-			for j := 0; j < i; j++ {
+		ver, err := readers[i].readStateVersion(ctx)
+		if err != nil {
+			for j := 0; j <= i; j++ {
 				readers[j].close(closeCtx)
 			}
 			return nil, fmt.Errorf("reader pool: read stateVersion conn %d: %w", i, err)
 		}
-		readers[i] = &poolReader{conn: conn, stmts: map[string]*poolStmt{}}
 		versions[i] = ver
 	}
 
@@ -228,20 +313,20 @@ func NewReaderPool(ctx context.Context, db *sql.DB, _ string, k int) (*ReaderPoo
 		allMatch := true
 		for i, r := range readers {
 			if versions[i] != maxVer {
-				if _, err := r.conn.ExecContext(ctx, "ROLLBACK"); err != nil {
+				if err := r.rawExec(ctx, "ROLLBACK"); err != nil {
 					for _, r2 := range readers {
 						r2.close(closeCtx)
 					}
 					return nil, fmt.Errorf("reader pool: converge ROLLBACK: %w", err)
 				}
-				if _, err := r.conn.ExecContext(ctx, "BEGIN"); err != nil {
+				if err := r.rawExec(ctx, "BEGIN"); err != nil {
 					for _, r2 := range readers {
 						r2.close(closeCtx)
 					}
 					return nil, fmt.Errorf("reader pool: converge BEGIN: %w", err)
 				}
-				var ver string
-				if err := r.conn.QueryRowContext(ctx, stateVersionSQL).Scan(&ver); err != nil {
+				ver, err := r.readStateVersion(ctx)
+				if err != nil {
 					for _, r2 := range readers {
 						r2.close(closeCtx)
 					}
@@ -272,36 +357,120 @@ func NewReaderPool(ctx context.Context, db *sql.DB, _ string, k int) (*ReaderPoo
 	return nil, fmt.Errorf("reader pool: could not converge %d readers after %d attempts", k, maxConvergeAttempts)
 }
 
-// acquire borrows an exclusive frame-pinned reader, blocking until one frees or
-// ctx is cancelled.
-func (p *ReaderPool) acquire(ctx context.Context) (*poolReader, error) {
+// AcquireForPipeline borrows one exclusive frame-pinned reader for the
+// pipeline identified by queryID (the engine's per-query group tag), waiting
+// at most wait for one to free. On success the reader is registered in
+// p.bound so every leaf fetch carrying that group (sourceInput.Fetch →
+// conn.group) rides it; the returned release unbinds and returns the reader.
+// ok=false means the wait elapsed with no reader free — the caller decides
+// whether to keep waiting (admission queueing is NORMAL when a batch is
+// wider than K) or to trip the wedge alarm (PipelineAcquireTripwire).
+//
+// The waiter holds NOTHING while blocked — this is the whole deadlock-freedom
+// argument (wait-while-holding-nothing; see the ReaderPool doc).
+func (p *ReaderPool) AcquireForPipeline(queryID string, wait time.Duration) (release func(), ok bool) {
+	var r *poolReader
 	select {
-	case r := <-p.free:
-		return r, nil
-	case <-ctx.Done():
-		return nil, ctx.Err()
+	case r = <-p.free:
+	default:
+		t := time.NewTimer(wait)
+		select {
+		case r = <-p.free:
+			t.Stop()
+		case <-t.C:
+			return nil, false
+		}
 	}
+	if prev, loaded := p.bound.Load(queryID); loaded && prev != nil {
+		// A pipeline group may hold at most one reader — a double acquire
+		// for the same queryID means the engine's acquire/release pairing
+		// broke. Fail loud: silently replacing the binding would strand the
+		// previous reader.
+		p.free <- r
+		panic(fmt.Sprintf("ReaderPool.AcquireForPipeline: group %q already holds a reader", queryID))
+	}
+	p.bound.Store(queryID, r)
+	return func() {
+		p.bound.Delete(queryID)
+		p.free <- r
+	}, true
 }
 
-// release returns a reader to the pool.
-func (p *ReaderPool) release(r *poolReader) {
-	p.free <- r
+// readerFor returns the reader bound to a pipeline group, or nil when the
+// group holds none (build-phase fetches, legacy AddQuery hydrates, engine
+// callers outside a bound pipeline) — the caller then reads through the
+// serial bound conn, which sits on the SAME pinned frame.
+func (p *ReaderPool) readerFor(group string) *poolReader {
+	if group == "" {
+		return nil
+	}
+	v, ok := p.bound.Load(group)
+	if !ok {
+		return nil
+	}
+	r, _ := v.(*poolReader)
+	return r
 }
 
 // Version is the stateVersion every reader in the pool is pinned at.
 func (p *ReaderPool) Version() string { return p.version }
 
-// Size is the number of readers (K) the pool was built with. Callers use it
-// to check a still-bound pool against a NEW batch's concurrent-cursor demand
-// (K must stay ≥ P × Cmax for the deadlock-freedom argument above).
+// Size is the number of readers (K) the pool was built with — the
+// concurrent-hydrate admission width under Option B (batches wider than K
+// queue at AcquireForPipeline).
 func (p *ReaderPool) Size() int { return len(p.all) }
 
 // Close rolls back and closes every reader. Safe to call on a partially-built
 // pool (NewReaderPool calls it on the error path).
+//
+// Lifecycle invariant: the owner (sidecar ClientGroup) tears the pool down
+// only under group.mu, which every hydrate RPC holds for its whole duration —
+// so no reader can be borrowed when Close runs. Violations are a lifecycle
+// bug upstream; Close reports them loudly rather than freeing conns with
+// live cursors (a use-after-free at the C boundary).
 func (p *ReaderPool) Close() {
+	if n := len(p.free); p.all != nil && n != len(p.all) {
+		fmt.Fprintf(os.Stderr,
+			"[GO-IVM][POOL] BUG: ReaderPool.Close with %d/%d readers still borrowed — closing anyway; borrowers hold dead conns\n",
+			len(p.all)-n, len(p.all))
+	}
 	ctx := context.Background()
 	for _, r := range p.all {
 		r.close(ctx)
 	}
 	p.all = nil
+}
+
+// namedDriverArgs converts BuildSelectQuery params to positional
+// driver.NamedValues, applying the same DefaultParameterConverter
+// database/sql applies for drivers without a NamedValueChecker (mattn has
+// none) — so raw driver-level binds are byte-identical to the pooled path.
+func namedDriverArgs(params []any) ([]driver.NamedValue, error) {
+	if len(params) == 0 {
+		return nil, nil
+	}
+	out := make([]driver.NamedValue, len(params))
+	for i, p := range params {
+		v, err := driver.DefaultParameterConverter.ConvertValue(p)
+		if err != nil {
+			return nil, fmt.Errorf("arg %d (%T): %w", i, p, err)
+		}
+		out[i] = driver.NamedValue{Ordinal: i + 1, Value: v}
+	}
+	return out, nil
+}
+
+// queryStmt runs a checked-out driver.Stmt with params. mattn implements
+// driver.StmtQueryContext, so ctx cancellation (CG teardown) interrupts a
+// blocked step exactly as the database/sql path did.
+func queryStmt(ctx context.Context, st driver.Stmt, params []any) (driver.Rows, error) {
+	args, err := namedDriverArgs(params)
+	if err != nil {
+		return nil, err
+	}
+	qc, ok := st.(driver.StmtQueryContext)
+	if !ok {
+		return nil, errors.New("reader stmt does not implement driver.StmtQueryContext")
+	}
+	return qc.QueryContext(ctx, args)
 }

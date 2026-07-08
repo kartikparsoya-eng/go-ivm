@@ -918,19 +918,21 @@ type Server struct {
 	// per-init AppID field).
 	appID string
 
-	// hydrateReaders is GO_IVM_HYDRATE_READERS — the size of the per-CG
-	// frame-pinned reader pool used to parallelize cold-start hydrate (drive
-	// mode only). 1 (default) keeps the legacy single-conn serial path: no pool
-	// is built and the feature is fully dark. >1 builds a K-connection pool at
-	// init (all pinned to curr's stateVersion) so the per-query hydrate
-	// goroutines read in parallel; torn down at the first advance.
+	// hydrateReaders is GO_IVM_HYDRATE_READERS — the size floor of the per-CG
+	// frame-pinned reader pool used to parallelize hydrate (drive mode only).
+	// Option B resource model: K = max(hydrateReaders, hydrateLanes) is the
+	// concurrent-hydrate ADMISSION width — each pipeline holds exactly ONE
+	// reader for its whole drain (nested fetches interleave cursors on it);
+	// batches wider than K queue at AcquireForPipeline while holding nothing.
+	// K<=1 keeps the legacy single-conn serial path: no pool is built. The
+	// cold pool is torn down at the first advance.
 	hydrateReaders int
 
 	// hydrateLanes is GO_IVM_HYDRATE_LANES — the number of worker lanes (P)
-	// that hydrate queries in parallel. Replaces the unbounded per-query
-	// goroutine spawn with P workers. The reader pool is sized to at least P
-	// (K = P × Cmax; Cmax=1 while operators are eager → K=P) so every lane
-	// can always acquire a reader. Default 4. 1 = serial (legacy).
+	// that hydrate queries in parallel on the non-pull path. Also a floor for
+	// the reader-pool width (K = max(hydrateReaders, hydrateLanes)) so every
+	// lane can hold its one pipeline reader without queueing. Default 4.
+	// 1 = serial (legacy).
 	hydrateLanes int
 
 	// warmHydratePoolEnabled extends the parallel-hydrate reader pool to WARM
@@ -2028,12 +2030,12 @@ func (s *Server) handleAddQueriesStream(req RPCRequest, streamW streamWriter) RP
 	// On the Final frame, ChunkIndex+1 is the total chunk count for that
 	// query — engine_streaming_test.go locks in the invariant that Final
 	// is always on the last (highest-ChunkIndex) frame.
-	s.refreshSnapForInitialHydrateLocked(cgID, group, specs)
+	s.refreshSnapForInitialHydrateLocked(cgID, group)
 	// Warm hydrate (live-pipeline CG): parallelize the added queries' fetches on
 	// a co-read pool pinned to curr's current frame. No-op for the cold first
 	// hydrate (handled above) or when GO_IVM_WARM_HYDRATE_POOL is off. Ephemeral
 	// — torn down right after AddQueriesStream so the next advance is unaffected.
-	warmPool, warmCR := s.buildWarmReaderPoolLocked(group, engine.ConservativeHydrateCmaxForSpecs(specs))
+	warmPool, warmCR := s.buildWarmReaderPoolLocked(group)
 	if warmPool != nil {
 		defer s.tearDownWarmReaderPool(group, warmPool, warmCR)
 	}
