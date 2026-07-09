@@ -664,7 +664,7 @@ func chunkStats(c []int) (p50, p95, max int) {
 // (REVIEW-final MED-CROSS-5).
 const (
 	sidecarVersion     = "0.7.0"
-	sidecarProtocolRev = 11 // bumped: row-set signature deltas on final streamed hydrate/advance frames.
+	sidecarProtocolRev = 12 // bumped: advanceToHeadStream header frame.
 )
 
 // rpcCodeStaleInitEpoch signals that a mutating RPC arrived with an

@@ -156,6 +156,48 @@ func TestRowPlane_AllEncodablePartialStaysOnRecordPlane(t *testing.T) {
 	}
 }
 
+func TestRowPlane_AdvanceHeaderUsesFramePlane(t *testing.T) {
+	col := newSinkCollector()
+	rp := rowPlaneForTest(t, col, 8)
+
+	if !rp.deliverFrame(advanceToHeadStreamPartial{
+		ChunkIndex: 0,
+		Final:      false,
+		Header:     true,
+		Version:    "v1",
+		NumChanges: 2,
+	}) {
+		t.Fatal("deliverFrame(header) returned false")
+	}
+	rp.emitAdvanceToHeadPartial(engine.AdvanceStreamPartial{
+		Changes: []engine.RowChange{rcAdd("q1", "a")},
+	}, "v1", 2)
+
+	col.mu.Lock()
+	entries := append([]sinkEntry(nil), col.entries...)
+	col.mu.Unlock()
+	if len(entries) < 2 {
+		t.Fatalf("entries = %d, want at least header + row", len(entries))
+	}
+	if entries[0].kind != abiKindFrame {
+		t.Fatalf("first entry kind = %d, want header frame kind %d", entries[0].kind, abiKindFrame)
+	}
+	resp := decodeResp(t, entries[0].payload)
+	m, ok := resp.Result.(map[string]interface{})
+	if !ok {
+		t.Fatalf("header result = %#v, want map", resp.Result)
+	}
+	if header, _ := m["header"].(bool); !header {
+		t.Fatalf("first frame header = %v, want true", m["header"])
+	}
+	if final, _ := m["final"].(bool); final {
+		t.Fatal("header frame must not be final")
+	}
+	if entries[1].kind == abiKindFrame {
+		t.Fatalf("second entry was another frame; want row-plane record after header")
+	}
+}
+
 // TestRowPlane_MixedFinalPartialCarriesEverything: a FINAL partial with
 // mixed encodability ships one Final frame with all its changes and zero
 // records — the terminal signal and the fallback rows must not split.

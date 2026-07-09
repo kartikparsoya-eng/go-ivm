@@ -443,19 +443,27 @@ func TestAdvanceToHeadStream_RowModeTruncateResetViaStreamW(t *testing.T) {
 		t.Errorf("result = %v, want \"done\"", resp.Result)
 	}
 
-	if len(*frames) != 2 {
-		t.Fatalf("want header + reset streamW frames, got %d", len(*frames))
+	if len(*frames) != 1 {
+		t.Fatalf("want reset streamW frame only, got %d", len(*frames))
 	}
-	if !(*frames)[0].Header {
-		t.Fatalf("first frame must be Header, got %+v", (*frames)[0])
-	}
-	f := (*frames)[1]
+	f := (*frames)[0]
 	if !f.Final || f.Reset == nil || f.Reset.Reason != "truncation" || f.Version != "0000000002" {
 		t.Errorf("reset frame wrong: %+v", f)
 	}
 	// No records were produced (the abort precedes the engine apply).
 	col.mu.Lock()
 	defer col.mu.Unlock()
+	if len(col.entries) == 0 {
+		t.Fatal("missing row-plane header frame")
+	}
+	headerResp := decodeResp(t, col.entries[0].payload)
+	header, ok := headerResp.Result.(map[string]interface{})
+	if !ok {
+		t.Fatalf("row-plane header result = %#v, want map", headerResp.Result)
+	}
+	if isHeader, _ := header["header"].(bool); !isHeader {
+		t.Fatalf("first row-plane frame must be Header, got %+v", header)
+	}
 	for _, e := range col.entries {
 		if e.kind == abiKindRow || e.kind == abiKindGroupDef {
 			t.Fatalf("unexpected record delivery on the reset path: kind=%d", e.kind)

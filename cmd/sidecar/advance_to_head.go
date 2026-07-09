@@ -684,13 +684,13 @@ func (s *Server) handleAdvanceToHeadStream(req RPCRequest, streamW streamWriter)
 	abort.setNumChanges(numChanges) // same count TS's formula uses (SnapshotDiff.changes)
 	var emittedPartial bool
 
-	streamW(req.ID, advanceToHeadStreamPartial{
+	headerPartial := advanceToHeadStreamPartial{
 		ChunkIndex: 0,
 		Final:      false,
 		Header:     true,
 		Version:    version,
 		NumChanges: numChanges,
-	})
+	}
 
 	// finishStream maps the engine's returned error to the wire per the
 	// cursor-error split above. Shared by the rowMode and frame branches.
@@ -733,6 +733,10 @@ func (s *Server) handleAdvanceToHeadStream(req RPCRequest, streamW streamWriter)
 	// as kind-1 frames on the same ordered queue; "done" follows via the
 	// pipe (see rowplane.go's ordering invariant).
 	if rp := newRowPlane(s, req.ID, p.RowMode, cgID, group.done); rp != nil {
+		if !rp.deliverFrame(headerPartial) {
+			return rpcError(req.ID, -32000,
+				"advanceToHeadStream: row-plane delivery dead before header")
+		}
 		streamErr := group.eng.AdvanceStreamChunkedSeqClocked(changesSeq, 1, abort.clock(), func(r engine.AdvanceStreamPartial) {
 			// Per-partial budget checkpoint: a panic here escapes
 			// AdvanceStreamChunkedSeq cleanly (engine stays reusable — see
@@ -768,6 +772,8 @@ func (s *Server) handleAdvanceToHeadStream(req RPCRequest, streamW streamWriter)
 		rebindCurr()
 		return finishStream(streamErr)
 	}
+
+	streamW(req.ID, headerPartial)
 
 	sigAcc := NewRowSigAccumulator()
 	streamErr := group.eng.AdvanceStreamChunkedSeqClocked(changesSeq, 0, abort.clock(), func(r engine.AdvanceStreamPartial) {
