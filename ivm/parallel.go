@@ -1,16 +1,10 @@
 package ivm
 
-// The key insight: during genPush, the overlay is read-only by all connections.
-// Each connection's pipeline is independent — no shared mutable state between
-// pipelines during a single push. This makes parallelization semantically safe.
-//
-// This file provides GenPushParallel as an alternative to the sequential genPush.
-// Enable it by setting MemorySource.Parallel = true.
-
 import "sync"
 
-// GenPushParallel pushes a change to all connections concurrently.
-// Each connection's pipeline runs in its own goroutine.
+// GenPushParallel pushes a change concurrently across connection groups.
+// Connections in the same group run serially because they may share one
+// query's operator state; different groups may run concurrently.
 func (ms *MemorySource) GenPushParallel(change SourceChange) {
 	// Validate (same as sequential) — the panic propagates out of the
 	// engine unrecovered (TS assert-throw → teardown disposition).
@@ -50,7 +44,8 @@ func (ms *MemorySource) GenPushParallel(change SourceChange) {
 	// so an unpushed connection must never look pushed — pre-bumping made a
 	// concurrent fetch through a not-yet-pushed connection wrongly apply the
 	// overlay (computeOverlays: LastPushedEpoch >= overlay.Epoch ⇒ splice).
-	// Each goroutine bumps its own connection right before FilterPush.
+	// Each group goroutine bumps a connection right before that connection's
+	// FilterPush.
 	ms.connsMu.RLock()
 	var activeConns []*Connection
 	for _, conn := range ms.connections {
@@ -70,38 +65,53 @@ func (ms *MemorySource) GenPushParallel(change SourceChange) {
 	ms.overlay.Store(&Overlay{Epoch: epoch, Change: change})
 	defer ms.overlay.Store(nil)
 
-	// For single connection, skip goroutine overhead
-	if len(activeConns) == 1 {
-		conn := activeConns[0]
-		conn.LastPushedEpoch.Store(int64(epoch))
-		outputChange := ms.sourceChangeToChange(change)
-		FilterPush(outputChange, conn.Output, conn.Input, conn.FilterPredicate)
+	var groups [][]*Connection
+	groupIdx := make(map[string]int, 8)
+	for _, conn := range activeConns {
+		gi, ok := groupIdx[conn.Group]
+		if !ok {
+			gi = len(groups)
+			groupIdx[conn.Group] = gi
+			groups = append(groups, nil)
+		}
+		groups[gi] = append(groups[gi], conn)
+	}
+
+	pushGroup := func(group []*Connection) {
+		for _, conn := range group {
+			conn.LastPushedEpoch.Store(int64(epoch))
+			outputChange := ms.sourceChangeToChange(change)
+			FilterPush(outputChange, conn.Output, conn.Input, conn.FilterPredicate)
+		}
+	}
+
+	if len(groups) == 1 {
+		pushGroup(groups[0])
 		return
 	}
 
-	// Fan-out to goroutines. wg.Wait happens-before the read of `panics`,
-	// so direct-slot writes from each goroutine are safe without a channel.
+	// Fan-out groups to goroutines. wg.Wait happens-before the read of
+	// `panics`, so direct-slot writes from each goroutine are safe without a
+	// channel.
 	//
 	// Per-goroutine recover is load-bearing: a panic on a spawned goroutine
 	// terminates the entire Go runtime (panic-on-goroutine is fatal — no
-	// outer caller's recover can catch it). Capture per slot and re-raise
-	// the first (connection order) on the caller's goroutine so the panic
-	// unwinds through the engine in the ordinary single-goroutine scope.
-	panics := make([]any, len(activeConns))
+	// outer caller's recover can catch it). Capture per group slot and
+	// re-raise the first group-order panic on the caller's goroutine so the
+	// panic unwinds through the engine in the ordinary single-goroutine scope.
+	panics := make([]any, len(groups))
 	var wg sync.WaitGroup
-	for i, conn := range activeConns {
+	for i, group := range groups {
 		wg.Add(1)
-		go func(idx int, c *Connection) {
+		go func(idx int, group []*Connection) {
 			defer wg.Done()
 			defer func() {
 				if r := recover(); r != nil {
 					panics[idx] = r
 				}
 			}()
-			c.LastPushedEpoch.Store(int64(epoch))
-			outputChange := ms.sourceChangeToChange(change)
-			FilterPush(outputChange, c.Output, c.Input, c.FilterPredicate)
-		}(i, conn)
+			pushGroup(group)
+		}(i, group)
 	}
 	wg.Wait()
 
@@ -113,6 +123,12 @@ func (ms *MemorySource) GenPushParallel(change SourceChange) {
 			panic(p)
 		}
 	}
+}
+
+func (ms *MemorySource) SetNextConnectGroup(group string) {
+	ms.connsMu.Lock()
+	ms.nextConnectGroup = group
+	ms.connsMu.Unlock()
 }
 
 // SetParallel enables or disables parallel push on this source.

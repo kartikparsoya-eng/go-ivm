@@ -78,13 +78,14 @@ type memorySourceAdapter struct {
 	ms *ivm.MemorySource
 }
 
-func (a *memorySourceAdapter) TableName() string                     { return a.ms.TableName() }
-func (a *memorySourceAdapter) PrimaryKey() []string                  { return a.ms.PrimaryKey() }
-func (a *memorySourceAdapter) NormalizeRow(row ivm.Row)              { a.ms.NormalizeRow(row) }
+func (a *memorySourceAdapter) TableName() string        { return a.ms.TableName() }
+func (a *memorySourceAdapter) PrimaryKey() []string     { return a.ms.PrimaryKey() }
+func (a *memorySourceAdapter) NormalizeRow(row ivm.Row) { a.ms.NormalizeRow(row) }
 func (a *memorySourceAdapter) Push(sc ivm.SourceChange) { a.ms.Push(sc) }
 func (a *memorySourceAdapter) Connect(sort ivm.Ordering, filter *builder.Condition, filterPredicate func(ivm.Row) bool, splitEditKeys map[string]bool) ivm.Input {
 	return a.ms.Connect(sort, filterPredicate, splitEditKeys)
 }
+func (a *memorySourceAdapter) SetNextConnectGroup(group string) { a.ms.SetNextConnectGroup(group) }
 
 // Close is a no-op: MemorySource holds no external resource (no SQLite conn or
 // open tx). Present only to satisfy engine.Source so the tablesource leaf's
@@ -2096,8 +2097,7 @@ type engineSource struct {
 	source Source
 	// group is the owning query's ID — the parallel-advance serialization
 	// unit. Threaded to the source at Connect time via the optional
-	// connGroupTagger interface (tablesource implements it; MemorySource
-	// doesn't and keeps its own threshold-based parallel fanout).
+	// connGroupTagger interface.
 	group string
 }
 

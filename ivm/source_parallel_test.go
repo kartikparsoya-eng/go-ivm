@@ -3,7 +3,10 @@ package ivm_test
 // results to sequential fan-out. This is the core correctness guarantee.
 
 import (
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/kartikparsoya-eng/go-ivm/ivm"
 )
@@ -208,6 +211,71 @@ func TestParallelFanOutWithFilter(t *testing.T) {
 	if len(so2.changes) != 0 {
 		t.Errorf("expected 0 changes for nameStartsB filter, got %d", len(so2.changes))
 	}
+}
+
+type serialGuardOutput struct {
+	active *atomic.Int32
+}
+
+func (o serialGuardOutput) Push(change ivm.Change, pusher ivm.InputBase) {
+	if o.active.Add(1) > 1 {
+		panic("same-group memory-source connections pushed concurrently")
+	}
+	time.Sleep(10 * time.Millisecond)
+	o.active.Add(-1)
+}
+
+func TestParallelFanOutSerializesUntaggedConnections(t *testing.T) {
+	src := newTestSource()
+	src.Push(ivm.MakeSourceChangeAdd(ivm.Row{"id": "1", "name": "alice", "age": float64(30)}))
+
+	var active atomic.Int32
+	c1 := src.Connect(nil, nil, nil)
+	c1.SetOutput(serialGuardOutput{active: &active})
+	c2 := src.Connect(nil, nil, nil)
+	c2.SetOutput(serialGuardOutput{active: &active})
+
+	src.SetParallel(true, 2)
+	src.Push(ivm.MakeSourceChangeAdd(ivm.Row{"id": "2", "name": "bob", "age": float64(25)}))
+}
+
+type hookOutput struct {
+	hook func()
+}
+
+func (o hookOutput) Push(change ivm.Change, pusher ivm.InputBase) {
+	o.hook()
+}
+
+func TestParallelFanOutRunsTaggedGroupsConcurrently(t *testing.T) {
+	src := newTestSource()
+	src.Push(ivm.MakeSourceChangeAdd(ivm.Row{"id": "1", "name": "alice", "age": float64(30)}))
+
+	var arrivals sync.WaitGroup
+	arrivals.Add(2)
+	release := make(chan struct{})
+	go func() {
+		arrivals.Wait()
+		close(release)
+	}()
+	rendezvous := func() {
+		arrivals.Done()
+		select {
+		case <-release:
+		case <-time.After(10 * time.Second):
+			panic("tagged groups did not run concurrently")
+		}
+	}
+
+	src.SetNextConnectGroup("q1")
+	c1 := src.Connect(nil, nil, nil)
+	c1.SetOutput(hookOutput{hook: rendezvous})
+	src.SetNextConnectGroup("q2")
+	c2 := src.Connect(nil, nil, nil)
+	c2.SetOutput(hookOutput{hook: rendezvous})
+
+	src.SetParallel(true, 2)
+	src.Push(ivm.MakeSourceChangeAdd(ivm.Row{"id": "2", "name": "bob", "age": float64(25)}))
 }
 
 // BenchmarkParallelVsSequential measures the speedup from parallel fan-out.

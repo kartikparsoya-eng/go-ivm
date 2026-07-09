@@ -73,6 +73,7 @@ type Connection struct {
 	SplitEditKeys   map[string]bool
 	CompareRows     Comparator
 	FilterPredicate func(Row) bool
+	Group           string
 	// LastPushedEpoch is the most recent pushEpoch delivered to this
 	// connection — bumped immediately before the connection's FilterPush,
 	// per connection, exactly like TS (memory-source.ts:625-629). Atomic
@@ -109,6 +110,7 @@ type MemorySource struct {
 	parallel          bool
 	parallelThreshold int // min connections to trigger parallel (default 2)
 	nextConnID        int
+	nextConnectGroup  string
 	// converter, if set, replaces the default partial-coverage NormalizeRow
 	// behavior with a per-column conversion (e.g. sqlite.FromSQLiteType).
 	// REVIEW-ts-integration CRITICAL-3 / REVIEW-porting MEDIUM-2.
@@ -193,12 +195,15 @@ func (ms *MemorySource) Connect(connSort Ordering, filterPredicate func(Row) boo
 	ms.connsMu.Lock()
 	ms.nextConnID++
 	connID := ms.nextConnID
+	group := ms.nextConnectGroup
+	ms.nextConnectGroup = ""
 	conn := &Connection{
 		Sort:            connSort,
 		SplitEditKeys:   splitEditKeys,
 		CompareRows:     compareRows,
 		FilterPredicate: filterPredicate,
 		ConnID:          connID,
+		Group:           group,
 	}
 
 	si := &SourceInput{

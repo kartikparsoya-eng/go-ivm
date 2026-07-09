@@ -49,8 +49,10 @@ func TestParallelPush_ErrorPanicRecovered(t *testing.T) {
 	// Two connections so parallel fan-out triggers (default threshold = 2).
 	// First connection: well-behaved (records the change). Second: panics
 	// with a source-drift error, simulating Take's stale-bound assert.
+	src.SetNextConnectGroup("q1")
 	c1 := src.Connect(nil, nil, nil)
 	c1.SetOutput(&collectOutput{})
+	src.SetNextConnectGroup("q2")
 	c2 := src.Connect(nil, nil, nil)
 	driftPanic := ivm.SourceDriftError("test", "Edit", map[string]ivm.Value{"id": "1"}, 1)
 	c2.SetOutput(&panickingOutput{panicWith: driftPanic})
@@ -86,8 +88,10 @@ func TestParallelPush_StringPanicRecovered(t *testing.T) {
 	src := newTestSource()
 	src.Push(ivm.MakeSourceChangeAdd(ivm.Row{"id": "1", "name": "a", "age": float64(1)}))
 
+	src.SetNextConnectGroup("q1")
 	c1 := src.Connect(nil, nil, nil)
 	c1.SetOutput(&collectOutput{})
+	src.SetNextConnectGroup("q2")
 	c2 := src.Connect(nil, nil, nil)
 	c2.SetOutput(&panickingOutput{panicWith: "programmer bug: index out of range"})
 
@@ -121,11 +125,14 @@ func TestParallelPush_FirstPanicInOrderWins(t *testing.T) {
 	// Three connections, two of which panic. Order of activeConns
 	// iteration is insertion-order; both panics are captured before the
 	// re-raise scan.
+	src.SetNextConnectGroup("q1")
 	c1 := src.Connect(nil, nil, nil)
 	c1.SetOutput(&panickingOutput{panicWith: ivm.SourceDriftError(
 		"test", "Edit", map[string]ivm.Value{"id": "1"}, 1)})
+	src.SetNextConnectGroup("q2")
 	c2 := src.Connect(nil, nil, nil)
 	c2.SetOutput(&collectOutput{})
+	src.SetNextConnectGroup("q3")
 	c3 := src.Connect(nil, nil, nil)
 	c3.SetOutput(&panickingOutput{panicWith: "later connection's panic"})
 
