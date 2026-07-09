@@ -46,6 +46,7 @@ import (
 	"iter"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1134,7 +1135,7 @@ func (s *Source) writeChangeLocked(change ivm.SourceChange) error {
 			if _, err := conn.ExecContext(ctx, s.updateSQL, args...); err != nil {
 				return fmt.Errorf("UPDATE: %w", err)
 			}
-			s.trackAdded(change.Row)
+			s.trackAdded(merged)
 			return nil
 		}
 		// PK changed: DELETE + INSERT.
@@ -1217,11 +1218,64 @@ func (s *Source) ClearBatchState() {
 }
 
 func (s *Source) pkKey(row ivm.Row) string {
-	parts := make([]string, len(s.primaryKey))
-	for i, k := range s.primaryKey {
-		parts[i] = fmt.Sprintf("%v", row[k])
+	var b strings.Builder
+	for _, k := range s.primaryKey {
+		appendPKKeyPart(&b, row[k])
 	}
-	return strings.Join(parts, "\x00")
+	return b.String()
+}
+
+func appendPKKeyPart(b *strings.Builder, v ivm.Value) {
+	switch x := v.(type) {
+	case nil:
+		b.WriteString("n;")
+	case string:
+		b.WriteByte('s')
+		b.WriteString(strconv.Itoa(len(x)))
+		b.WriteByte(':')
+		b.WriteString(x)
+	case bool:
+		if x {
+			b.WriteString("b1;")
+		} else {
+			b.WriteString("b0;")
+		}
+	case float64:
+		b.WriteByte('d')
+		b.WriteString(strconv.FormatFloat(x, 'g', -1, 64))
+		b.WriteByte(';')
+	case int:
+		appendPKKeyPart(b, float64(x))
+	case int8:
+		appendPKKeyPart(b, float64(x))
+	case int16:
+		appendPKKeyPart(b, float64(x))
+	case int32:
+		appendPKKeyPart(b, float64(x))
+	case int64:
+		appendPKKeyPart(b, float64(x))
+	case uint:
+		appendPKKeyPart(b, float64(x))
+	case uint8:
+		appendPKKeyPart(b, float64(x))
+	case uint16:
+		appendPKKeyPart(b, float64(x))
+	case uint32:
+		appendPKKeyPart(b, float64(x))
+	case uint64:
+		appendPKKeyPart(b, float64(x))
+	case []byte:
+		b.WriteByte('B')
+		b.WriteString(strconv.Itoa(len(x)))
+		b.WriteByte(':')
+		b.Write(x)
+	default:
+		repr := fmt.Sprintf("%T:%#v", v, v)
+		b.WriteByte('x')
+		b.WriteString(strconv.Itoa(len(repr)))
+		b.WriteByte(':')
+		b.WriteString(repr)
+	}
 }
 
 // canUseUpdate returns true if the edit can use UPDATE (PK unchanged

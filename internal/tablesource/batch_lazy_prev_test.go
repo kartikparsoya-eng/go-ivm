@@ -72,6 +72,37 @@ func TestPushRemoveAfterEditRewritesRow_TableSource(t *testing.T) {
 	}
 }
 
+func TestPushRemoveAfterPartialEditCarriesMergedRow_TableSource(t *testing.T) {
+	src, db := newUserSource(t)
+	defer db.Close()
+	rowA, _ := lazyPrevRows()
+	patch := ivm.Row{"id": float64(1), "name": "alicia"}
+
+	in := src.Connect(nil, nil, nil, nil)
+	rec := &recordingOutput{}
+	in.SetOutput(rec)
+
+	src.Push(ivm.MakeSourceChangeEdit(patch, rowA))
+	src.Push(ivm.MakeSourceChangeRemove(rowA))
+
+	if len(rec.pushed) != 2 {
+		t.Fatalf("got %d pushed changes, want 2", len(rec.pushed))
+	}
+	second := rec.pushed[1]
+	if second.Type != ivm.ChangeTypeRemove {
+		t.Fatalf("second change type = %d, want Remove", second.Type)
+	}
+	if got := second.Node.Row["name"]; got != "alicia" {
+		t.Fatalf("Remove row.name = %v, want alicia (batch-current prev value)", got)
+	}
+	if got := second.Node.Row["score"]; got != float64(90) {
+		t.Fatalf("Remove row.score = %v, want 90 (merged unchanged value)", got)
+	}
+	if got := second.Node.Row["active"]; got != true {
+		t.Fatalf("Remove row.active = %v, want true (merged unchanged value)", got)
+	}
+}
+
 // The split decision runs in Source.Push BEFORE fanout and must see the
 // resolved OldRow: the second Edit(C, C) has equal split keys → single Edit,
 // not Remove+Add. Pre-fix Go split on the stale A-vs-C comparison.
