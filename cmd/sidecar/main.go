@@ -664,7 +664,7 @@ func chunkStats(c []int) (p50, p95, max int) {
 // (REVIEW-final MED-CROSS-5).
 const (
 	sidecarVersion     = "0.7.0"
-	sidecarProtocolRev = 10 // bumped: removal sweep — loadRows/advanceToHead(unary)/advanceStream/refreshSnapshot/pipelineCount deleted; memory mode and the socket transport removed. A rev-9 TS client calling any of them must fail the handshake loudly instead of getting -32601 at runtime. Rev 9 introduced the positional wire encoding (positional.go).
+	sidecarProtocolRev = 11 // bumped: row-set signature deltas on final streamed hydrate/advance frames.
 )
 
 // rpcCodeStaleInitEpoch signals that a mutating RPC arrived with an
@@ -2133,6 +2133,7 @@ type addQueriesStreamPartial struct {
 	ChunkIndex int             `json:"chunkIndex"`
 	Final      bool            `json:"final"`
 	TimingMs   float64         `json:"timingMs"`
+	SigDelta   string          `json:"sigDelta,omitempty"`
 }
 
 func (s *Server) handleAddQueriesStream(req RPCRequest, streamW streamWriter) RPCResponse {
@@ -2248,19 +2249,25 @@ func (s *Server) handleAddQueriesStream(req RPCRequest, streamW streamWriter) RP
 		}
 		return RPCResponse{JSONRPC: "2.0", Result: "done", ID: req.ID}
 	}
+	sigAcc := NewRowSigAccumulator()
 	err := group.eng.AddQueriesStream(specs, func(r engine.QueryResult) {
+		sigAcc.accumulateChanges(r.Changes)
 		pc := toPositional(r.Changes)
-		streamW(req.ID, addQueriesStreamPartial{
+		part := addQueriesStreamPartial{
 			QueryID:    r.QueryID,
 			Dict:       pc.Dict,
 			Rows:       pc.Rows,
 			ChunkIndex: r.ChunkIndex,
 			Final:      r.Final,
 			TimingMs:   r.TimingMs,
-		})
+		}
 		if r.Final {
+			if sig, ok := sigAcc.deltaHex(r.QueryID); ok {
+				part.SigDelta = sig
+			}
 			metrics.recordHydrateChunks(r.ChunkIndex + 1)
 		}
+		streamW(req.ID, part)
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[GO-IVM] addQueriesStream ERROR cg=%s: %v\n", cgID, err)

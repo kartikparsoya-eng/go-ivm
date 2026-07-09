@@ -223,6 +223,7 @@ var deliverLogW io.Writer = os.Stderr
 type rowPlane struct {
 	mu      sync.Mutex
 	enc     *rowRecordEncoder
+	sig     *RowSigAccumulator
 	deliver func(kind int32, payload []byte) int32
 	reqID   interface{}
 	// cgID is observability-only (DELIVER-TIMEOUT / dead-stream lines).
@@ -272,6 +273,7 @@ func newRowPlane(s *Server, reqID interface{}, want bool, cgID string, done <-ch
 	})
 	rp := &rowPlane{
 		enc:     newRowRecordEncoder(rid),
+		sig:     NewRowSigAccumulator(),
 		deliver: s.abiDeliver,
 		reqID:   reqID,
 		cgID:    cgID,
@@ -664,6 +666,7 @@ func (rp *rowPlane) deliverFrame(partial interface{}) bool {
 // frame via streamW (no records exist, so ordering is trivially preserved).
 // Returns false when the stream is dead — the caller must abort the advance.
 func (rp *rowPlane) emitAdvanceToHeadPartial(r engine.AdvanceStreamPartial, version string, numChanges int) bool {
+	rp.sig.accumulateChanges(r.Changes)
 	fallback, ok := rp.emitChangesGuarded(r.Changes)
 	if !ok {
 		return false
@@ -682,6 +685,7 @@ func (rp *rowPlane) emitAdvanceToHeadPartial(r engine.AdvanceStreamPartial, vers
 	if r.Final {
 		part.Version = version
 		part.NumChanges = numChanges
+		part.SigDeltas = rp.sig.allDeltasHex()
 	}
 	return rp.deliverFrame(part)
 }
@@ -692,6 +696,7 @@ func (rp *rowPlane) emitAdvanceToHeadPartial(r engine.AdvanceStreamPartial, vers
 // dead — the caller must refuse further results (onResult false → the
 // engine's consumer-refusal unwind).
 func (rp *rowPlane) emitHydratePartial(r engine.QueryResult) bool {
+	rp.sig.accumulateChanges(r.Changes)
 	fallback, ok := rp.emitChangesGuarded(r.Changes)
 	if !ok {
 		return false
@@ -700,12 +705,18 @@ func (rp *rowPlane) emitHydratePartial(r engine.QueryResult) bool {
 		return true
 	}
 	pc := toPositional(fallback)
-	return rp.deliverFrame(addQueriesStreamPartial{
+	part := addQueriesStreamPartial{
 		QueryID:    r.QueryID,
 		Dict:       pc.Dict,
 		Rows:       pc.Rows,
 		ChunkIndex: r.ChunkIndex,
 		Final:      r.Final,
 		TimingMs:   r.TimingMs,
-	})
+	}
+	if r.Final {
+		if sig, ok := rp.sig.deltaHex(r.QueryID); ok {
+			part.SigDelta = sig
+		}
+	}
+	return rp.deliverFrame(part)
 }

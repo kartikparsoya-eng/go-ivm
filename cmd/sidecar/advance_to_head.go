@@ -516,9 +516,10 @@ type advanceToHeadStreamPartial struct {
 	Final      bool                 `json:"final"`
 	Timings    []engine.TableTiming `json:"timings,omitempty"`
 	// Final-frame-only metadata (omitted on non-final partials):
-	Version    string     `json:"version,omitempty"`
-	NumChanges int        `json:"numChanges,omitempty"`
-	Reset      *resetWire `json:"reset,omitempty"`
+	Version    string            `json:"version,omitempty"`
+	NumChanges int               `json:"numChanges,omitempty"`
+	Reset      *resetWire        `json:"reset,omitempty"`
+	SigDeltas  map[string]string `json:"sigDeltas,omitempty"`
 }
 
 // handleAdvanceToHeadStream is THE advance (Go-primary drive). It derives
@@ -757,12 +758,14 @@ func (s *Server) handleAdvanceToHeadStream(req RPCRequest, streamW streamWriter)
 		return finishStream(streamErr)
 	}
 
+	sigAcc := NewRowSigAccumulator()
 	streamErr := group.eng.AdvanceStreamChunkedSeqClocked(changesSeq, 0, abort.clock(), func(r engine.AdvanceStreamPartial) {
 		checkAdvanceBudget(budgetDeadline, budgetOn, "apply", cgID)
 		if aerr := abort.check(); aerr != nil {
 			panic(aerr) // TS checkpoint 2 — see the rowMode branch
 		}
 		emittedPartial = true
+		sigAcc.accumulateChanges(r.Changes)
 		pc := toPositional(r.Changes)
 		part := advanceToHeadStreamPartial{
 			Dict:       pc.Dict,
@@ -774,6 +777,7 @@ func (s *Server) handleAdvanceToHeadStream(req RPCRequest, streamW streamWriter)
 		if r.Final {
 			part.Version = version
 			part.NumChanges = numChanges
+			part.SigDeltas = sigAcc.allDeltasHex()
 			// One advanceToHeadStream call → one record on the terminal frame;
 			// Final's ChunkIndex+1 is the total chunk count for this call.
 			metrics.recordAdvanceChunks(r.ChunkIndex + 1)
