@@ -270,17 +270,14 @@ func TestToSQLiteType_JSONNonStringValues(t *testing.T) {
 		{"array", []interface{}{float64(1), float64(2)}, `[1,2]`},
 		{"number", float64(42), `42`},
 		{"bool", true, `true`},
-		{"null", nil, ""},
+		// JSON.stringify(null) === 'null' (query-builder.ts:287) — TS stores the
+		// TEXT 'null' for a null json value, never SQL NULL. This case used to pin
+		// the buggy nil→nil short-circuit.
+		{"null", nil, `null`},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			got := ToSQLiteType(c.in, "json")
-			if c.in == nil {
-				if got != nil {
-					t.Fatalf("ToSQLiteType(nil, json) = %#v, want nil", got)
-				}
-				return
-			}
 			gotStr, ok := got.(string)
 			if !ok {
 				t.Fatalf("ToSQLiteType(%v, json) = %T, want string", c.in, got)
@@ -356,10 +353,12 @@ func TestJSONWriteReadRoundTrip_AllShapes(t *testing.T) {
 			}
 		})
 	}
-	// nil short-circuits in ToSQLiteType (stored as SQL NULL), so it never
-	// reaches the json marshal path; assert that explicitly.
-	if got := ToSQLiteType(nil, "json"); got != nil {
-		t.Fatalf("ToSQLiteType(nil, json) = %#v, want nil", got)
+	// nil does NOT short-circuit: TS's json arm JSON.stringify's null into the
+	// TEXT 'null' (query-builder.ts:287), so the stored form is "null", which
+	// round-trips back to nil via JSON.parse. Pinned in detail by
+	// TestToSQLiteType_NullJSONStoresJSONNullText.
+	if got := ToSQLiteType(nil, "json"); got != "null" {
+		t.Fatalf("ToSQLiteType(nil, json) = %#v, want the TEXT \"null\"", got)
 	}
 }
 

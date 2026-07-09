@@ -538,12 +538,20 @@ func nullableAwareRangeComparison(field string, op string, col ColumnSchema) str
 }
 
 // ToSQLiteType converts a Go value to SQLite-compatible type.
+//
+// Mirrors TS toSQLiteType (query-builder.ts:278-289), which has NO top-level
+// null short-circuit — null handling is per-arm: boolean maps null→null
+// explicitly, number/string/null pass it through, and the json arm
+// JSON.stringify's it. A former top-level `if v == nil { return nil }` here
+// silently overrode the json arm, storing SQL NULL where TS stores the TEXT
+// 'null' (the one on-disk divergence found by the porting-correctness review).
 func ToSQLiteType(v ivm.Value, colType string) interface{} {
-	if v == nil {
-		return nil
-	}
 	switch colType {
 	case "boolean":
+		// TS: `v === null ? null : v ? 1 : 0` (query-builder.ts:281).
+		if v == nil {
+			return nil
+		}
 		if b, ok := v.(bool); ok {
 			if b {
 				return 1
@@ -552,11 +560,13 @@ func ToSQLiteType(v ivm.Value, colType string) interface{} {
 		}
 		return v
 	case "json":
-		// ALWAYS marshal — never passthrough. TS's toSQLiteType ALWAYS
-		// JSON.stringify's (query-builder.ts:192), even for a string, so a JSON
-		// string value is stored as "\"x\"" not bare x. A bare-string passthrough
-		// here is what made FromSQLiteType panic on the next read ("Payment
-		// Failures" → invalid JSON).
+		// ALWAYS marshal — never passthrough, and NO nil short-circuit. TS's
+		// toSQLiteType ALWAYS JSON.stringify's (query-builder.ts:287), even for
+		// a string, so a JSON string value is stored as "\"x\"" not bare x. A
+		// bare-string passthrough here is what made FromSQLiteType panic on the
+		// next read ("Payment Failures" → invalid JSON). And JSON.stringify(null)
+		// === 'null', so a null json value is stored as the 4-char TEXT 'null',
+		// never SQL NULL — json.Marshal(nil) == "null" matches exactly.
 		b, err := json.Marshal(v)
 		if err != nil {
 			// json.Marshal rejects NaN/±Inf; JSON.stringify encodes them as the
