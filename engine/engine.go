@@ -73,6 +73,10 @@ type Source interface {
 	Close() error
 }
 
+type pushObserverSource interface {
+	HasPushObservers() bool
+}
+
 // memorySourceAdapter wraps *ivm.MemorySource to implement Source.
 type memorySourceAdapter struct {
 	ms *ivm.MemorySource
@@ -1468,6 +1472,9 @@ func (e *Engine) Advance(changes []SnapshotChange) *AdvanceResult {
 			if !ok {
 				continue // no pipelines read this table
 			}
+			if obs, ok := source.(pushObserverSource); ok && !obs.HasPushObservers() {
+				continue
+			}
 
 			sourceChanges := snapshotToSourceChanges(change, source)
 
@@ -1796,6 +1803,9 @@ func (e *Engine) advanceStreamChunkedSeq(
 			source, ok := sources[change.Table]
 			if !ok {
 				continue // no pipelines read this table
+			}
+			if obs, ok := source.(pushObserverSource); ok && !obs.HasPushObservers() {
+				continue
 			}
 
 			sourceChanges := snapshotToSourceChanges(change, source)

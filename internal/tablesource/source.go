@@ -460,14 +460,7 @@ func (s *Source) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.closeAllCachedStmtsLocked()
-	if s.prevConn != nil {
-		if s.prevTxStarted {
-			_, _ = s.prevConn.ExecContext(context.Background(), "ROLLBACK")
-			s.prevTxStarted = false
-		}
-		_ = s.prevConn.Close()
-		s.prevConn = nil
-	}
+	s.closePrevConnLocked()
 	return nil
 }
 
@@ -630,6 +623,20 @@ func (s *Source) closeCachedStmtsForConnLocked(conn *sql.Conn) {
 	delete(s.stmtCache, conn)
 }
 
+func (s *Source) closePrevConnLocked() {
+	if s.prevConn == nil {
+		s.prevTxStarted = false
+		return
+	}
+	s.closeCachedStmtsForConnLocked(s.prevConn)
+	if s.prevTxStarted {
+		_, _ = s.prevConn.ExecContext(context.Background(), "ROLLBACK")
+	}
+	_ = s.prevConn.Close()
+	s.prevConn = nil
+	s.prevTxStarted = false
+}
+
 // closeAllCachedStmtsLocked finalizes every cached statement across all conns.
 // Used at Source teardown. MUST be called with s.mu held.
 func (s *Source) closeAllCachedStmtsLocked() {
@@ -743,6 +750,10 @@ func (s *Source) OnAdvanceEnd() {
 		return
 	}
 	s.prevTxStarted = false
+	if len(s.connections) == 0 {
+		s.closePrevConnLocked()
+		return
+	}
 
 	// EAGERLY re-pin the prev snapshot here — do NOT defer to the next
 	// Push/Fetch. This is the crux of TS Snapshotter.resetToHead's timing
@@ -857,6 +868,19 @@ func (s *Source) Connect(
 	s.connections = append(s.connections, conn)
 	s.mu.Unlock()
 	return in
+}
+
+// HasPushObservers reports whether an advance push can reach any registered
+// query pipeline. Engine uses this to skip eager all-table maintenance for
+// tables TS would not have a TableSource for at all.
+func (s *Source) HasPushObservers() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.hasPushObserversLocked()
+}
+
+func (s *Source) hasPushObserversLocked() bool {
+	return len(s.connections) > 0
 }
 
 // Push fans the change through every subscribed connection AND applies

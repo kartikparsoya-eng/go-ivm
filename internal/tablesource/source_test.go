@@ -1054,6 +1054,46 @@ func TestDestroyRemovesConnection(t *testing.T) {
 	}
 }
 
+func TestOnAdvanceEndWithNoConnectionsReleasesPrevConn(t *testing.T) {
+	src, db := newUserSource(t)
+	defer db.Close()
+	defer src.Close()
+
+	in := src.Connect(nil, nil, nil, nil)
+	in.SetOutput(&recordingOutput{})
+	src.Push(ivm.MakeSourceChangeAdd(ivm.Row{
+		"id":     float64(4),
+		"name":   "dana",
+		"score":  float64(60),
+		"active": true,
+	}))
+
+	src.mu.Lock()
+	hadPrev := src.prevConn != nil && src.prevTxStarted
+	src.mu.Unlock()
+	if !hadPrev {
+		t.Fatal("observed Push did not open prev tx before destroy")
+	}
+
+	in.Destroy()
+
+	src.mu.Lock()
+	stillPinned := src.prevConn != nil && src.prevTxStarted
+	src.mu.Unlock()
+	if !stillPinned {
+		t.Fatal("last disconnect released prev tx before advance boundary")
+	}
+
+	src.OnAdvanceEnd()
+
+	src.mu.Lock()
+	defer src.mu.Unlock()
+	if src.prevConn != nil || src.prevTxStarted {
+		t.Fatalf("idle OnAdvanceEnd kept prev tx: prevConn=%v prevTxStarted=%v",
+			src.prevConn != nil, src.prevTxStarted)
+	}
+}
+
 // TestOnAdvanceEndSkipsRollbackWhenOverlaySet pins the Fix #4 TOCTOU guard.
 // RefreshSnapshot reads s.overlay WITHOUT holding s.mu, so a Push can install
 // the overlay in the window between that unlocked read and OnAdvanceEnd

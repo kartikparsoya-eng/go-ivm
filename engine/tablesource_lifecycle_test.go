@@ -120,6 +120,27 @@ func advanceStream(t *testing.T, eng *Engine, changes []SnapshotChange) int {
 	return total
 }
 
+func TestTableSourceLifecycle_AdvanceSkipsUnobservedSource(t *testing.T) {
+	eng := newTicketsTableEngine(t, 1)
+
+	var frames []AdvanceStreamPartial
+	err := eng.AdvanceStream([]SnapshotChange{ticketAdd(99)}, func(p AdvanceStreamPartial) {
+		frames = append(frames, p)
+	})
+	if err != nil {
+		t.Fatalf("AdvanceStream: %v", err)
+	}
+	if len(frames) != 1 || !frames[0].Final {
+		t.Fatalf("frames = %+v, want one final-only frame", frames)
+	}
+	if len(frames[0].Changes) != 0 {
+		t.Fatalf("unobserved source emitted %d changes", len(frames[0].Changes))
+	}
+	if len(frames[0].Timings) != 0 {
+		t.Fatalf("unobserved source recorded %d timings, want 0", len(frames[0].Timings))
+	}
+}
+
 // The core TS-driven lifecycle: hydrate → advance → remove (TTL expiry) →
 // advance while removed → re-add (client re-issues) → advance again.
 //
