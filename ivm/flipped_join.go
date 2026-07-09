@@ -530,9 +530,7 @@ func (fj *FlippedJoin) pushChildChange(change Change, exists bool) {
 		return
 	}
 
-	parentNodes := slices.Collect(fj.parent.Fetch(FetchRequest{Constraint: constraint}))
-
-	for _, parentNode := range parentNodes {
+	for parentNode := range fj.parent.Fetch(FetchRequest{Constraint: constraint}) {
 		fj.inprogressChildChange = &change
 		fj.inprogressChildChangePosition = parentNode.Row
 
