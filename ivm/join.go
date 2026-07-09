@@ -257,19 +257,15 @@ func (j *Join) processParentNode(parentNodeRow Row, parentNodeRelations map[stri
 				j.inprogressChildChangePosition != nil &&
 				j.schema.CompareRows(parentNodeRow, j.inprogressChildChangePosition) > 0 {
 
-				nodes := slices.Collect(j.child.Fetch(FetchRequest{Constraint: constraint}))
 				childSchema := j.child.GetSchema()
-				var overlaid []Node
+				nodes := j.child.Fetch(FetchRequest{Constraint: constraint})
+				var overlaid iter.Seq[Node]
 				if childSchema.Sort == nil {
-					overlaid = GenerateWithOverlayUnordered(nodes, *j.inprogressChildChange, childSchema)
+					overlaid = GenerateWithOverlayUnorderedSeq(nodes, *j.inprogressChildChange, childSchema)
 				} else {
-					overlaid = GenerateWithOverlay(nodes, *j.inprogressChildChange, childSchema)
+					overlaid = GenerateWithOverlaySeq(nodes, *j.inprogressChildChange, childSchema)
 				}
-				for _, n := range overlaid {
-					if !yield(n) {
-						return
-					}
-				}
+				overlaid(yield)
 				return
 			}
 

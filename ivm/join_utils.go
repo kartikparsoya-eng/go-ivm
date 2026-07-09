@@ -42,147 +42,148 @@ func BuildJoinConstraint(sourceRow Row, sourceKey, targetKey CompoundKey) *Const
 	return &c
 }
 
+func GenerateWithOverlaySeq(nodes iter.Seq[Node], overlay Change, schema *SourceSchema) iter.Seq[Node] {
+	return func(yield func(Node) bool) {
+		applied := false
+		editOldApplied := false
+		editNewApplied := false
+
+		for node := range nodes {
+			yieldNode := true
+			if !applied {
+				switch overlay.Type {
+				case ChangeTypeAdd:
+					if schema.CompareRows(overlay.Node.Row, node.Row) == 0 {
+						applied = true
+						yieldNode = false
+					}
+				case ChangeTypeRemove:
+					if schema.CompareRows(overlay.Node.Row, node.Row) < 0 {
+						applied = true
+						if !yield(overlay.Node) {
+							return
+						}
+					}
+				case ChangeTypeEdit:
+					if !editOldApplied && schema.CompareRows(overlay.OldNode.Row, node.Row) < 0 {
+						editOldApplied = true
+						if editNewApplied {
+							applied = true
+						}
+						if !yield(*overlay.OldNode) {
+							return
+						}
+					}
+					if !editNewApplied && schema.CompareRows(overlay.Node.Row, node.Row) == 0 {
+						editNewApplied = true
+						if editOldApplied {
+							applied = true
+						}
+						yieldNode = false
+					}
+				case ChangeTypeChild:
+					if schema.CompareRows(overlay.Node.Row, node.Row) == 0 {
+						applied = true
+						childRelName := overlay.Child.RelationshipName
+						childChange := overlay.Child.Change
+						childSchema := schema.Relationships[childRelName]
+						origStream := node.Relationships[childRelName]
+						newRels, newOrder := SetRelationship(node.Relationships, node.RelOrder, childRelName, func() iter.Seq[Node] {
+							return GenerateWithOverlaySeq(origStream(), childChange, childSchema)
+						})
+						if !yield(Node{Row: node.Row, Relationships: newRels, RelOrder: newOrder}) {
+							return
+						}
+						yieldNode = false
+					}
+				}
+			}
+			if yieldNode && !yield(node) {
+				return
+			}
+		}
+
+		if !applied {
+			if overlay.Type == ChangeTypeRemove {
+				applied = true
+				if !yield(overlay.Node) {
+					return
+				}
+			} else if overlay.Type == ChangeTypeEdit {
+				if !editNewApplied {
+					panic("GenerateWithOverlay: edit overlay new node was never applied")
+				}
+				editOldApplied = true
+				applied = true
+				if !yield(*overlay.OldNode) {
+					return
+				}
+			}
+		}
+
+		if !applied {
+			panic("GenerateWithOverlay: overlay was never applied to any fetched node")
+		}
+
+		_ = editOldApplied
+	}
+}
+
 // GenerateWithOverlay applies an overlay change to a stream of nodes (ordered).
 func GenerateWithOverlay(nodes []Node, overlay Change, schema *SourceSchema) []Node {
-	var result []Node
-	applied := false
-	editOldApplied := false
-	editNewApplied := false
+	return slices.Collect(GenerateWithOverlaySeq(slices.Values(nodes), overlay, schema))
+}
 
-	for _, node := range nodes {
-		yieldNode := true
-		if !applied {
-			switch overlay.Type {
-			case ChangeTypeAdd:
-				if schema.CompareRows(overlay.Node.Row, node.Row) == 0 {
-					applied = true
-					yieldNode = false
-				}
-			case ChangeTypeRemove:
-				if schema.CompareRows(overlay.Node.Row, node.Row) < 0 {
-					applied = true
-					result = append(result, overlay.Node)
-				}
-			case ChangeTypeEdit:
-				if !editOldApplied && schema.CompareRows(overlay.OldNode.Row, node.Row) < 0 {
-					editOldApplied = true
-					if editNewApplied {
-						applied = true
-					}
-					result = append(result, *overlay.OldNode)
-				}
-				if !editNewApplied && schema.CompareRows(overlay.Node.Row, node.Row) == 0 {
-					editNewApplied = true
-					if editOldApplied {
-						applied = true
-					}
-					yieldNode = false
-				}
-			case ChangeTypeChild:
-				if schema.CompareRows(overlay.Node.Row, node.Row) == 0 {
-					applied = true
-					// Apply child overlay to the matching relationship.
-					// {...node.relationships, [childRelName]: overlaid} — the
-					// name already exists on the node, so RelOrder is unchanged.
-					childRelName := overlay.Child.RelationshipName
-					childChange := overlay.Child.Change
-					childSchema := schema.Relationships[childRelName]
-					origStream := node.Relationships[childRelName]
-					newRels, newOrder := SetRelationship(node.Relationships, node.RelOrder, childRelName, func() iter.Seq[Node] {
-						return func(yield func(Node) bool) {
-							origNodes := slices.Collect(origStream())
-							overlaid := GenerateWithOverlay(origNodes, childChange, childSchema)
-							for _, n := range overlaid {
-								if !yield(n) {
-									return
-								}
-							}
-						}
-					})
-					result = append(result, Node{Row: node.Row, Relationships: newRels, RelOrder: newOrder})
-					yieldNode = false
-				}
-			}
-		}
-		if yieldNode {
-			result = append(result, node)
-		}
-	}
-
-	if !applied {
+func GenerateWithOverlayUnorderedSeq(nodes iter.Seq[Node], overlay Change, schema *SourceSchema) iter.Seq[Node] {
+	return func(yield func(Node) bool) {
 		if overlay.Type == ChangeTypeRemove {
-			applied = true
-			result = append(result, overlay.Node)
-		} else if overlay.Type == ChangeTypeEdit {
-			if !editNewApplied {
-				panic("GenerateWithOverlay: edit overlay new node was never applied")
+			if !yield(overlay.Node) {
+				return
 			}
-			editOldApplied = true
-			applied = true
-			result = append(result, *overlay.OldNode)
+		} else if overlay.Type == ChangeTypeEdit {
+			if !yield(*overlay.OldNode) {
+				return
+			}
+		}
+
+		suppressed := false
+		for node := range nodes {
+			if !suppressed {
+				if overlay.Type == ChangeTypeAdd || overlay.Type == ChangeTypeEdit {
+					if RowEqualsForCompoundKey(overlay.Node.Row, node.Row, schema.PrimaryKey) {
+						suppressed = true
+						continue
+					}
+				}
+				if overlay.Type == ChangeTypeChild {
+					if RowEqualsForCompoundKey(overlay.Node.Row, node.Row, schema.PrimaryKey) {
+						suppressed = true
+						childRelName := overlay.Child.RelationshipName
+						childChange := overlay.Child.Change
+						childSchema := schema.Relationships[childRelName]
+						origStream := node.Relationships[childRelName]
+						newRels, newOrder := SetRelationship(node.Relationships, node.RelOrder, childRelName, func() iter.Seq[Node] {
+							return GenerateWithOverlaySeq(origStream(), childChange, childSchema)
+						})
+						if !yield(Node{Row: node.Row, Relationships: newRels, RelOrder: newOrder}) {
+							return
+						}
+						continue
+					}
+				}
+			}
+			if !yield(node) {
+				return
+			}
+		}
+
+		if !suppressed && overlay.Type != ChangeTypeRemove {
+			panic("GenerateWithOverlayUnordered: overlay was never applied to any fetched node")
 		}
 	}
-
-	if !applied {
-		panic("GenerateWithOverlay: overlay was never applied to any fetched node")
-	}
-
-	_ = editOldApplied // used for documentation; TS asserts both are true at end
-
-	return result
 }
 
 // GenerateWithOverlayUnordered applies an overlay change to an unordered stream.
 func GenerateWithOverlayUnordered(nodes []Node, overlay Change, schema *SourceSchema) []Node {
-	var result []Node
-
-	// Eager inject for remove/edit
-	if overlay.Type == ChangeTypeRemove {
-		result = append(result, overlay.Node)
-	} else if overlay.Type == ChangeTypeEdit {
-		result = append(result, *overlay.OldNode)
-	}
-
-	suppressed := false
-	for _, node := range nodes {
-		if !suppressed {
-			if overlay.Type == ChangeTypeAdd || overlay.Type == ChangeTypeEdit {
-				if RowEqualsForCompoundKey(overlay.Node.Row, node.Row, schema.PrimaryKey) {
-					suppressed = true
-					continue
-				}
-			}
-			if overlay.Type == ChangeTypeChild {
-				if RowEqualsForCompoundKey(overlay.Node.Row, node.Row, schema.PrimaryKey) {
-					suppressed = true
-					// {...node.relationships, [childRelName]: overlaid} — the
-					// name already exists on the node, so RelOrder is unchanged.
-					childRelName := overlay.Child.RelationshipName
-					childChange := overlay.Child.Change
-					childSchema := schema.Relationships[childRelName]
-					origStream := node.Relationships[childRelName]
-					newRels, newOrder := SetRelationship(node.Relationships, node.RelOrder, childRelName, func() iter.Seq[Node] {
-						return func(yield func(Node) bool) {
-							origNodes := slices.Collect(origStream())
-							overlaid := GenerateWithOverlay(origNodes, childChange, childSchema)
-							for _, n := range overlaid {
-								if !yield(n) {
-									return
-								}
-							}
-						}
-					})
-					result = append(result, Node{Row: node.Row, Relationships: newRels, RelOrder: newOrder})
-					continue
-				}
-			}
-		}
-		result = append(result, node)
-	}
-
-	if !suppressed && overlay.Type != ChangeTypeRemove {
-		panic("GenerateWithOverlayUnordered: overlay was never applied to any fetched node")
-	}
-
-	return result
+	return slices.Collect(GenerateWithOverlayUnorderedSeq(slices.Values(nodes), overlay, schema))
 }
