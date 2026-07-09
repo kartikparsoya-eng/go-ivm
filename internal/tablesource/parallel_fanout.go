@@ -62,11 +62,11 @@ import (
 	"github.com/kartikparsoya-eng/go-ivm/ivm"
 )
 
-// ParallelAdvance gates the per-query parallel fanout. Production default
-// ON (the whole point of grouping connections); GO_IVM_PARALLEL_ADVANCE=false
-// reverts to the serial loop. Exported as a var so engine-level tests can
-// toggle it without env plumbing.
-var ParallelAdvance = os.Getenv("GO_IVM_PARALLEL_ADVANCE") != "false"
+// ParallelAdvance gates the per-query parallel fanout. Production default is
+// serial for TS-faithful cross-query emission order; operators can opt into the
+// previous concurrent fanout with GO_IVM_PARALLEL_ADVANCE=true while the
+// deterministic reduce layer is still a separate design.
+var ParallelAdvance = os.Getenv("GO_IVM_PARALLEL_ADVANCE") == "true"
 
 // ParallelAdvanceWorkers bounds how many query groups push concurrently per
 // source-change. Follows the ONE parallelism knob (GO_IVM_PARALLELISM,

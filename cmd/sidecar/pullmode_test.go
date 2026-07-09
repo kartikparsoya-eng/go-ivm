@@ -19,8 +19,8 @@ package main
 //   - D7 idle sweep cancels a parked stream (same unwind as cancel).
 //   - Teardown-cancels-gates: host Shutdown completes while a pull
 //     producer is parked (pre-hook this deadlocks on group.mu).
-//   - pullMode without rowMode degrades to the plain streaming path
-//     (no gate registered, frames flow ungated).
+//   - pullMode without rowMode is rejected: the production pull contract is
+//     mandatory once requested, never silently downgraded to ungated frames.
 
 import (
 	"fmt"
@@ -393,31 +393,40 @@ func TestPullMode_ShutdownUnparksProducer(t *testing.T) {
 	}
 }
 
-// TestPullMode_WithoutRowModeDegrades: pullMode without the row plane
-// (rowMode=false) is IGNORED — the RPC streams ordinary frames to
-// completion with no gate registered. This is the rollout-safety property:
-// pull engages only where credits can actually flow.
-func TestPullMode_WithoutRowModeDegrades(t *testing.T) {
+// TestPullMode_WithoutRowModeErrors: pullMode without the row plane
+// (rowMode=false) is a protocol error. The JS prod path requires NAPI row
+// records and pull credit; silently downgrading here reintroduces the eager
+// buffered path this contract removes.
+func TestPullMode_WithoutRowModeErrors(t *testing.T) {
 	const nRows = 10
 	srv, col, _, send := startPullHost(t, nRows)
 
 	send(3, "addQueriesStream", pullQueryParams(true, false))
 
 	deadline := time.Now().Add(10 * time.Second)
+	var got RPCResponse
 	for {
 		if srv.streamGates.size() != 0 {
 			t.Fatal("gate registered for a non-rowMode RPC — pull must require the row plane")
 		}
 		if _, found := frameFor(col, t, 3, func(r RPCResponse) bool {
-			s, ok := r.Result.(string)
-			return ok && s == "done"
+			return r.Error != nil
 		}); found {
+			got, _ = frameFor(col, t, 3, func(r RPCResponse) bool {
+				return r.Error != nil
+			})
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("non-rowMode pull RPC never completed")
+			t.Fatal("non-rowMode pull RPC never returned an error")
 		}
 		time.Sleep(5 * time.Millisecond)
+	}
+	if got.Error.Code != -32000 {
+		t.Fatalf("error code = %d, want -32000 (%s)", got.Error.Code, got.Error.Message)
+	}
+	if !strings.Contains(got.Error.Message, "pullMode requires row-mode NAPI transport") {
+		t.Fatalf("error = %q, want mandatory row-mode message", got.Error.Message)
 	}
 	if got := countKind(col, abiKindRow); got != 0 {
 		t.Fatalf("non-rowMode RPC produced %d row records, want 0 (frames only)", got)

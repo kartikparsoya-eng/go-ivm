@@ -2195,57 +2195,66 @@ func (s *Server) handleAddQueriesStream(req RPCRequest, streamW streamWriter) RP
 	// chunkSize=1; each query's Final partial still ships as a kind-1 frame
 	// (per-query TimingMs + completion signal). onResult runs concurrently
 	// from hydrate lanes — rowPlane's mutex serializes the encoder.
-	if rp := newRowPlane(s, req.ID, p.RowMode, cgID, group.done); rp != nil {
+	rp := newRowPlane(s, req.ID, p.RowMode, cgID, group.done)
+	if p.PullMode && rp == nil {
+		return rpcError(req.ID, -32000,
+			"addQueriesStream: pullMode requires row-mode NAPI transport")
+	}
+	if rp != nil {
 		// Pull mode (ABI v3): register the per-RPC demand gate. Row-BEARING
 		// deliveries acquire one credit each; group defs, Final frames, and
 		// error frames ride free (D3 — gating them deadlocks: the client is
 		// waiting for exactly those to decide whether to grant). The gate's
 		// touch keeps the group reaper-proof while the client actively
-		// pulls. gate==nil (NaN reqID / duplicate) degrades to ungated.
+		// pulls. Failure to register the gate is a protocol error for
+		// pullMode rather than a fallback to ungated delivery.
 		if p.PullMode {
 			rid, _ := numericReqID(req.ID) // non-numeric already refused by newRowPlane
-			if gate := s.streamGates.register(rid, group, int64(p.PullWindow), func() {
+			gate := s.streamGates.register(rid, group, int64(p.PullWindow), func() {
 				group.lastUsedNs.Store(time.Now().UnixNano())
-			}); gate != nil {
-				// The gate's cancel must also unpark a delivery stuck on a
-				// full TSFN queue (the cond broadcast only reaches gate
-				// waiters) — fold it into the plane's cancellation check.
-				rp.setPullGate(gate)
-				defer s.streamGates.unregister(rid)
-				err := group.eng.AddQueriesStreamPull(specs, 1, func(r engine.QueryResult) bool {
-					if len(r.Changes) > 0 && !acquirePullCredit(gate, rp) {
-						// Cancelled (client .return(), teardown, or idle
-						// timeout), or the pre-park stage flush failed: refuse
-						// — the engine breaks the fetch range and unwinds
-						// (D4). Nothing more is emitted for this RPC except
-						// the terminal error frame. acquirePullCredit flushes
-						// staged rows BEFORE parking on client demand — a
-						// park with a non-empty stage is the credit-park
-						// stalemate (see rowplane.go).
-						return false
-					}
-					if !rp.emitHydratePartial(r) {
-						// Stream dead mid-delivery (TSFN closed, client gone,
-						// or deliver timeout — the G13 wedge class, now a
-						// bounded refusal): same unwind as a gate cancel.
-						return false
-					}
-					if r.Final {
-						metrics.recordHydrateChunks(r.ChunkIndex + 1)
-					}
-					return true
-				})
-				if err != nil {
-					// ErrStreamCancelled lands here too: a plain -32000
-					// terminal error frame (I9 — client-initiated, never
-					// reset-classified; hydrateErrorResponse only special-
-					// cases DataError). The client already left; the frame
-					// is bookkeeping symmetry and rides the ungated path.
-					fmt.Fprintf(os.Stderr, "[GO-IVM] addQueriesStream(pullMode) ERROR cg=%s: %v\n", cgID, err)
-					return hydrateErrorResponse(req.ID, "addQueriesStream: ", err)
-				}
-				return RPCResponse{JSONRPC: "2.0", Result: "done", ID: req.ID}
+			})
+			if gate == nil {
+				return rpcError(req.ID, -32000,
+					"addQueriesStream: pull gate registration failed")
 			}
+			// The gate's cancel must also unpark a delivery stuck on a
+			// full TSFN queue (the cond broadcast only reaches gate
+			// waiters) — fold it into the plane's cancellation check.
+			rp.setPullGate(gate)
+			defer s.streamGates.unregister(rid)
+			err := group.eng.AddQueriesStreamPull(specs, 1, func(r engine.QueryResult) bool {
+				if len(r.Changes) > 0 && !acquirePullCredit(gate, rp) {
+					// Cancelled (client .return(), teardown, or idle
+					// timeout), or the pre-park stage flush failed: refuse
+					// — the engine breaks the fetch range and unwinds
+					// (D4). Nothing more is emitted for this RPC except
+					// the terminal error frame. acquirePullCredit flushes
+					// staged rows BEFORE parking on client demand — a
+					// park with a non-empty stage is the credit-park
+					// stalemate (see rowplane.go).
+					return false
+				}
+				if !rp.emitHydratePartial(r) {
+					// Stream dead mid-delivery (TSFN closed, client gone,
+					// or deliver timeout — the G13 wedge class, now a
+					// bounded refusal): same unwind as a gate cancel.
+					return false
+				}
+				if r.Final {
+					metrics.recordHydrateChunks(r.ChunkIndex + 1)
+				}
+				return true
+			})
+			if err != nil {
+				// ErrStreamCancelled lands here too: a plain -32000
+				// terminal error frame (I9 — client-initiated, never
+				// reset-classified; hydrateErrorResponse only special-
+				// cases DataError). The client already left; the frame
+				// is bookkeeping symmetry and rides the ungated path.
+				fmt.Fprintf(os.Stderr, "[GO-IVM] addQueriesStream(pullMode) ERROR cg=%s: %v\n", cgID, err)
+				return hydrateErrorResponse(req.ID, "addQueriesStream: ", err)
+			}
+			return RPCResponse{JSONRPC: "2.0", Result: "done", ID: req.ID}
 		}
 		err := group.eng.AddQueriesStreamChunked(specs, 1, func(r engine.QueryResult) bool {
 			if !rp.emitHydratePartial(r) {

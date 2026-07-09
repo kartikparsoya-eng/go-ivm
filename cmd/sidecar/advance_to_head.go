@@ -37,6 +37,12 @@ type advanceToHeadParams struct {
 	// when the in-process transport is active AND the request ID is numeric;
 	// otherwise silently degrades to the ordinary frame path.
 	RowMode bool `json:"rowMode,omitempty"`
+	// PullMode opts row-mode advance into the ABI v3 credit gate. Row-bearing
+	// deliveries consume one credit; header/final/error frames ride free.
+	PullMode bool `json:"pullMode,omitempty"`
+	// PullWindow is the opening credit count for PullMode. 0 parks before the
+	// first row until the client grants explicit credit.
+	PullWindow int `json:"pullWindow,omitempty"`
 	// TotalHydrationTimeMs arms TS's economic advancement-abort for this
 	// call (see advance_abort.go): the measured cost of re-hydrating every
 	// pipeline in the CG, i.e. the price of the reset an abort triggers.
@@ -739,7 +745,26 @@ func (s *Server) handleAdvanceToHeadStream(req RPCRequest, streamW streamWriter)
 	// the terminal Final (carrying Version/NumChanges/Timings) ship
 	// as kind-1 frames on the same ordered queue; "done" follows via the
 	// pipe (see rowplane.go's ordering invariant).
-	if rp := newRowPlane(s, req.ID, p.RowMode, cgID, group.done); rp != nil {
+	rp := newRowPlane(s, req.ID, p.RowMode, cgID, group.done)
+	if p.PullMode && rp == nil {
+		return rpcError(req.ID, -32000,
+			"advanceToHeadStream: pullMode requires row-mode NAPI transport")
+	}
+	if rp != nil {
+		var gate *streamGate
+		if p.PullMode {
+			rid, _ := numericReqID(req.ID) // non-numeric already refused by newRowPlane
+			g := s.streamGates.register(rid, group, int64(p.PullWindow), func() {
+				group.lastUsedNs.Store(time.Now().UnixNano())
+			})
+			if g == nil {
+				return rpcError(req.ID, -32000,
+					"advanceToHeadStream: pull gate registration failed")
+			}
+			gate = g
+			rp.setPullGate(gate)
+			defer s.streamGates.unregister(rid)
+		}
 		if !rp.deliverFrame(headerPartial) {
 			return rpcError(req.ID, -32000,
 				"advanceToHeadStream: row-plane delivery dead before header")
@@ -756,6 +781,9 @@ func (s *Server) handleAdvanceToHeadStream(req RPCRequest, streamW streamWriter)
 			// message (panicErrorCode/panicErrorMessage).
 			if aerr := abort.check(); aerr != nil {
 				panic(aerr)
+			}
+			if gate != nil && len(r.Changes) > 0 && !acquirePullCredit(gate, rp) {
+				panic(fmt.Errorf("advanceToHeadStream cg=%s: stream cancelled while waiting for pull credit", cgID))
 			}
 			emittedPartial = true
 			if !rp.emitAdvanceToHeadPartial(r, version, numChanges) {
