@@ -919,6 +919,7 @@ func (e *Engine) AddQueries(queries []QuerySpec) ([]QueryResult, error) {
 	}
 	wg.Wait()
 	if err := firstHydratePanic(built, hydratePanics); err != nil {
+		e.removeBuiltQueriesLocked(built)
 		return nil, err
 	}
 
@@ -1223,13 +1224,11 @@ func (e *Engine) addQueriesStreamChunked(
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if err := firstHydratePanic(built, hydratePanics); err != nil {
+		e.removeBuiltQueriesLocked(built)
 		return err
 	}
 	if cancelled.Load() {
-		// Pipelines stay registered, exactly like the panic path: the TS
-		// side rejects the whole addQueriesStream (I3 all-or-nothing) and
-		// a retry re-adds the queries (buildAndRegisterLocked removes the
-		// stale entry first).
+		e.removeBuiltQueriesLocked(built)
 		return ErrStreamCancelled
 	}
 
@@ -1411,6 +1410,15 @@ func (e *Engine) removeQueryLocked(queryID string) {
 		entry.delegate.cgs.Destroy()
 	}
 	delete(e.pipelines, queryID)
+}
+
+func (e *Engine) removeBuiltQueriesLocked(built []*pipelineEntry) {
+	for _, entry := range built {
+		if entry == nil {
+			continue
+		}
+		e.removeQueryLocked(entry.queryID)
+	}
 }
 
 // Advance processes a batch of snapshot changes through all affected sources.

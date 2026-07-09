@@ -53,6 +53,9 @@ func TestAddQueries_HydratePanic_ReturnsError(t *testing.T) {
 	if !strings.Contains(err.Error(), "hydrate panic") || !strings.Contains(err.Error(), "primary-key") {
 		t.Fatalf("error should name the hydrate panic + nil PK; got: %v", err)
 	}
+	if got := len(eng.pipelines); got != 0 {
+		t.Fatalf("hydrate panic must unregister the failed query; %d pipeline(s) leaked", got)
+	}
 }
 
 func TestAddQueriesStream_HydratePanic_ReturnsError(t *testing.T) {
@@ -63,6 +66,9 @@ func TestAddQueriesStream_HydratePanic_ReturnsError(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "hydrate panic") {
 		t.Fatalf("error should name the hydrate panic; got: %v", err)
+	}
+	if got := len(eng.pipelines); got != 0 {
+		t.Fatalf("stream hydrate panic must unregister the failed query; %d pipeline(s) leaked", got)
 	}
 }
 

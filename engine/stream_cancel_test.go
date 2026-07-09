@@ -66,6 +66,9 @@ func TestStreamCancel_StopsProductionAndReturnsErr(t *testing.T) {
 	if got := calls.Load(); got != 4 {
 		t.Fatalf("onResult called %d times, want exactly 4 (3 accepted + 1 refused)", got)
 	}
+	if got := len(eng.pipelines); got != 0 {
+		t.Fatalf("cancelled hydrate must unregister the partially hydrated query; %d pipeline(s) leaked", got)
+	}
 }
 
 // TestStreamCancel_TableSourceReleasesReader pins I7 on the production
@@ -87,6 +90,9 @@ func TestStreamCancel_TableSourceReleasesReader(t *testing.T) {
 		})
 	if !errors.Is(err, ErrStreamCancelled) {
 		t.Fatalf("err = %v, want ErrStreamCancelled", err)
+	}
+	if got := len(eng.pipelines); got != 0 {
+		t.Fatalf("cancelled table-source hydrate must unregister the partially hydrated query; %d pipeline(s) leaked", got)
 	}
 
 	// The abandoned cursor must be closed: a fresh hydrate re-reads all
