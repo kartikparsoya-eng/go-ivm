@@ -1966,22 +1966,6 @@ func (s *Server) handleInit(req RPCRequest) RPCResponse {
 	group.mu.Lock()
 	defer group.mu.Unlock()
 
-	// Close previous engine if re-initializing this group
-	if group.eng != nil {
-		group.eng.Close()
-	}
-	// Tear down a previous Snapshotter (re-init re-pins from scratch).
-	if group.snap != nil {
-		group.snap.Destroy()
-		group.snap = nil
-		group.snapSpecs = nil
-		group.snapAllNames = nil
-	}
-
-	// Bump epoch BEFORE we create the new engine so any in-flight mutation
-	// from the prior epoch is rejected even if it races the engine swap.
-	currentEpoch := group.initEpoch.Add(1)
-
 	// Storage path (per client group)
 	storagePath := p.Storage
 	if storagePath == "" {
@@ -1995,7 +1979,17 @@ func (s *Server) handleInit(req RPCRequest) RPCResponse {
 	if err != nil {
 		return rpcError(req.ID, -32000, "create engine: "+err.Error())
 	}
-	group.eng = eng
+	committed := false
+	var snapState *initSnapshotterState
+	defer func() {
+		if committed {
+			return
+		}
+		_ = eng.Close()
+		if snapState != nil {
+			snapState.destroy()
+		}
+	}()
 
 	// For each table: register the tablesource.Source leaf over the shared
 	// replica pool — the SQLite file is authoritative; init carries schema
@@ -2041,9 +2035,15 @@ func (s *Server) handleInit(req RPCRequest) RPCResponse {
 	// TS-shipped advance path removed there is no fallback for a CG whose
 	// snapshotter failed to build — fail the init loudly instead (TS's own
 	// Snapshotter constructor throws on failure, tearing the syncer down).
-	if err := s.buildSnapshotterLocked(group, &p); err != nil {
+	snapState, err = s.buildSnapshotterState(&p)
+	if err != nil {
 		return rpcError(req.ID, -32000, "snapshotter init: "+err.Error())
 	}
+	// Drive: the engine's tablesource leaves read from the Snapshotter's
+	// frame, not their own per-Source tx. Sticky-bind them to curr now so the
+	// initial hydrate reads the same frame the Snapshotter is pinned at. Each
+	// advance flips the binding to prev for the apply, then back to curr.
+	eng.BindTableSourcesToConn(snapState.current.Conn())
 
 	// Report the snapshotter's pinned stateVersion — the frame the FIRST
 	// hydrate reads at (refreshSnapForInitialHydrateLocked deliberately does
@@ -2053,10 +2053,24 @@ func (s *Server) handleInit(req RPCRequest) RPCResponse {
 	// the cvr.ts:778 "Expected CVR version to have been bumped" teardown
 	// (gen-6). Fail loudly if the just-built snapshotter can't report it:
 	// silently omitting the field would resurrect that bug for this CG.
-	cur, cerr := group.snap.Current()
-	if cerr != nil {
-		return rpcError(req.ID, -32000, "snapshotter current: "+cerr.Error())
+	cur := snapState.current
+
+	// Init commits atomically: the old generation stays live until every new
+	// generation step above has succeeded. Only now do we tear down old
+	// resources, publish eng/snap/specs, and bump initEpoch.
+	s.tearDownReaderPool(group)
+	if group.eng != nil {
+		group.eng.Close()
 	}
+	if group.snap != nil {
+		group.snap.Destroy()
+	}
+	group.eng = eng
+	group.snap = snapState.snap
+	group.snapSpecs = snapState.specs
+	group.snapAllNames = snapState.allNames
+	currentEpoch := group.initEpoch.Add(1)
+	committed = true
 
 	return RPCResponse{
 		JSONRPC: "2.0",

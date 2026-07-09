@@ -85,21 +85,31 @@ func checkAdvanceBudget(deadline time.Time, on bool, phase, cgID string) {
 	}
 }
 
-// buildSnapshotterLocked constructs and pins this group's Snapshotter. MUST be
-// called with group.mu held (it is, from handleInit). Pins curr at the current
-// replica head — the same frame the hydrate reads from.
-func (s *Server) buildSnapshotterLocked(group *ClientGroup, p *initParams) error {
-	// Re-init: drop any reader pool left over from a prior snapshotter (its
-	// frame is about to be replaced).
-	s.tearDownReaderPool(group)
+type initSnapshotterState struct {
+	snap     *snapshotter.Snapshotter
+	specs    map[string]*snapshotter.TableSpec
+	allNames map[string]bool
+	current  *snapshotter.Snapshot
+}
 
+func (st *initSnapshotterState) destroy() {
+	if st != nil && st.snap != nil {
+		st.snap.Destroy()
+		st.snap = nil
+	}
+}
+
+// buildSnapshotterState constructs and pins a Snapshotter without publishing it
+// to the ClientGroup. handleInit swaps it in only after the full init generation
+// has succeeded.
+func (s *Server) buildSnapshotterState(p *initParams) (*initSnapshotterState, error) {
 	db, err := s.getReplicaDB()
 	if err != nil {
-		return fmt.Errorf("replica not ready: %w", err)
+		return nil, fmt.Errorf("replica not ready: %w", err)
 	}
 	writableDB := s.getReplicaWritableDB()
 	if writableDB == nil {
-		return fmt.Errorf("writable replica pool not ready")
+		return nil, fmt.Errorf("writable replica pool not ready")
 	}
 
 	appID := p.AppID
@@ -109,11 +119,11 @@ func (s *Server) buildSnapshotterLocked(group *ClientGroup, p *initParams) error
 
 	snap, err := snapshotter.New(writableDB, appID)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if err := snap.Init(); err != nil {
 		snap.Destroy()
-		return fmt.Errorf("snapshotter init: %w", err)
+		return nil, fmt.Errorf("snapshotter init: %w", err)
 	}
 
 	// allTableNames is the full replicated table set (from sqlite_master), so
@@ -123,28 +133,20 @@ func (s *Server) buildSnapshotterLocked(group *ClientGroup, p *initParams) error
 	allNames, err := readAllTableNames(db)
 	if err != nil {
 		snap.Destroy()
-		return fmt.Errorf("read table names: %w", err)
+		return nil, fmt.Errorf("read table names: %w", err)
+	}
+	cur, err := snap.Current()
+	if err != nil {
+		snap.Destroy()
+		return nil, fmt.Errorf("snapshotter current: %w", err)
 	}
 
-	group.snap = snap
-	group.snapSpecs = buildSnapshotterSpecs(p.Tables)
-	group.snapAllNames = allNames
-
-	// Drive: the engine's tablesource leaves read from the
-	// Snapshotter's frame, not their own per-Source tx. Sticky-bind them to
-	// curr now so the initial hydrate (addQuery) reads the same frame the
-	// Snapshotter is pinned at. Each advance flips the binding to prev for
-	// the apply, then back to curr.
-	if cur, cerr := snap.Current(); cerr == nil {
-		group.eng.BindTableSourcesToConn(cur.Conn())
-		// NOTE: the cold-start reader pool is built later, at the first-hydrate
-		// refresh seam (refreshSnapForInitialHydrateLocked), NOT here. Building
-		// it at init pinned a stateVersion the drive-mode replicator advanced
-		// past before hydrate arrived, so the pin failed and every cold batch
-		// fell back to serial single-conn reads. Building it together with the
-		// curr-refresh, on the same fresh frame, is what lets the pin land.
-	}
-	return nil
+	return &initSnapshotterState{
+		snap:     snap,
+		specs:    buildSnapshotterSpecs(p.Tables),
+		allNames: allNames,
+		current:  cur,
+	}, nil
 }
 
 // poolSerialLogW is the sink for the [GO-IVM][POOL-SERIAL] incident marker

@@ -8,7 +8,12 @@ package main
 // rows written after that pin, and cvr.ts:778 ("Expected CVR version to have
 // been bumped above original") tears the client group down.
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/kartikparsoya-eng/go-ivm/builder"
+	"github.com/kartikparsoya-eng/go-ivm/ivm"
+)
 
 // initResultVersion extracts the "version" field from a handleInit response.
 func initResultVersion(t *testing.T, resp RPCResponse) string {
@@ -79,4 +84,58 @@ func TestHandleInit_ReInitReportsFreshPin(t *testing.T) {
 	if got := initResultVersion(t, resp); got != "0000000002" {
 		t.Fatalf("re-init version = %q, want 0000000002 (fresh pin)", got)
 	}
+}
+
+func TestHandleInit_FailedReInitLeavesCommittedGenerationLive(t *testing.T) {
+	srv, _ := newIssueServer(t)
+	const cgID = "cg-init-atomic"
+
+	resp := srv.handleInit(RPCRequest{
+		Method: "init", ID: 1,
+		Params: mustMarshal(t, issueInitParams(cgID)),
+	})
+	if resp.Error != nil {
+		t.Fatalf("initial init error: %+v", resp.Error)
+	}
+	group := srv.getGroup(cgID, false)
+	if group == nil {
+		t.Fatal("group missing after initial init")
+	}
+	epoch := group.initEpoch.Load()
+	eng := group.eng
+	snap := group.snap
+	if epoch == 0 || eng == nil || snap == nil {
+		t.Fatalf("initial generation incomplete: epoch=%d eng=%p snap=%p", epoch, eng, snap)
+	}
+
+	bad := issueInitParams(cgID)
+	bad.Tables["missing_table"] = bad.Tables["issue"]
+	resp = srv.handleInit(RPCRequest{
+		Method: "init", ID: 2,
+		Params: mustMarshal(t, bad),
+	})
+	if resp.Error == nil {
+		t.Fatalf("bad re-init unexpectedly succeeded: %#v", resp.Result)
+	}
+
+	group = srv.getGroup(cgID, false)
+	if group == nil {
+		t.Fatal("group missing after failed re-init")
+	}
+	if got := group.initEpoch.Load(); got != epoch {
+		t.Fatalf("failed re-init changed epoch: got %d, want %d", got, epoch)
+	}
+	if group.eng != eng {
+		t.Fatalf("failed re-init replaced engine: got %p, want %p", group.eng, eng)
+	}
+	if group.snap != snap {
+		t.Fatalf("failed re-init replaced snapshotter: got %p, want %p", group.snap, snap)
+	}
+	if _, err := group.snap.Current(); err != nil {
+		t.Fatalf("committed snapshotter not live after failed re-init: %v", err)
+	}
+
+	hydrateOneStreamOK(t, srv, cgID, "q-after-failed-init",
+		builder.AST{Table: "issue", OrderBy: ivm.Ordering{{"id", "asc"}}},
+		epoch)
 }

@@ -25,8 +25,6 @@ package main
 import (
 	"testing"
 	"time"
-
-	"github.com/kartikparsoya-eng/go-ivm/sqlite"
 )
 
 func TestABIHost_RowModeHandlerPanicSurvivesAndClassifies(t *testing.T) {
@@ -41,16 +39,9 @@ func TestABIHost_RowModeHandlerPanicSurvivesAndClassifies(t *testing.T) {
 		}
 	}
 
-	send(1, "init", initParams{
-		ClientGroupID: "cg-panic",
-		Storage:       t.TempDir() + "/storage.db",
-		Tables: map[string]tableSchemaParams{
-			"users": {
-				Columns:    map[string]sqlite.ColumnSchema{"id": {Type: "string"}},
-				PrimaryKey: []string{"id"},
-			},
-		},
-	})
+	init := issueInitParams("cg-panic")
+	init.Storage = t.TempDir() + "/storage.db"
+	send(1, "init", init)
 	// rowMode addQueriesStream against an UNKNOWN table → builder.BuildPipeline
 	// panics *ivm.DataError during the (pre-hydrate) build, before any record
 	// is emitted. handleStreamWithRecover must convert it to a -32102 frame.
