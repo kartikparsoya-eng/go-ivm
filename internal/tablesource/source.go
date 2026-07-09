@@ -187,6 +187,12 @@ type Source struct {
 	// return; the eviction scan sorts on it. Guarded by s.mu.
 	stmtCacheTick uint64
 
+	// pushStmtCache memoizes the fixed drift/write statements used by Push:
+	// checkExists, insert, delete, update. Unlike SELECT fetch statements these
+	// never hold open cursors across callbacks and Source.Push serializes their
+	// use under s.mu, so they can stay checked in and be reused directly.
+	pushStmtCache map[*sql.Conn]map[string]*sql.Stmt
+
 	// readerPool, when non-nil, is a CG-shared pool of read connections ALL
 	// pinned to the same WAL frame (one stateVersion). It is bound ONLY during
 	// advance-free hydrate windows (cold-start first hydrate, warm adds).
@@ -277,25 +283,23 @@ func New(db *sql.DB, writableDB *sql.DB, tableName string, columns map[string]sq
 	return NewWithContext(context.Background(), db, writableDB, tableName, columns, primaryKey)
 }
 
-// NewWithContext constructs a Source whose SQLite operations are cancellable
-// via the provided context. Use this when the caller owns a CG-scoped context
-// that should abort in-flight queries on teardown.
-func NewWithContext(parent context.Context, db *sql.DB, writableDB *sql.DB, tableName string, columns map[string]sqlite.ColumnSchema, primaryKey []string) (*Source, error) {
+func Validate(db *sql.DB, tableName string, columns map[string]sqlite.ColumnSchema, primaryKey []string) error {
+	return ValidateWithContext(context.Background(), db, tableName, columns, primaryKey)
+}
+
+func ValidateWithContext(parent context.Context, db *sql.DB, tableName string, columns map[string]sqlite.ColumnSchema, primaryKey []string) error {
 	if db == nil {
-		return nil, fmt.Errorf("tablesource.New: db is nil")
-	}
-	if writableDB == nil {
-		return nil, fmt.Errorf("tablesource.New: writableDB is nil")
+		return fmt.Errorf("tablesource.New: db is nil")
 	}
 	if tableName == "" {
-		return nil, fmt.Errorf("tablesource.New: tableName is empty")
+		return fmt.Errorf("tablesource.New: tableName is empty")
 	}
 	if len(primaryKey) == 0 {
-		return nil, fmt.Errorf("tablesource.New %s: primaryKey is empty", tableName)
+		return fmt.Errorf("tablesource.New %s: primaryKey is empty", tableName)
 	}
 	for _, k := range primaryKey {
 		if _, ok := columns[k]; !ok {
-			return nil, fmt.Errorf(
+			return fmt.Errorf(
 				"tablesource.New %s: primary key %q is not in columns",
 				tableName, k)
 		}
@@ -355,13 +359,26 @@ func NewWithContext(parent context.Context, db *sql.DB, writableDB *sql.DB, tabl
 			// this cleanly separates "queued too long on the pool" from
 			// "the table is not in the replica".
 			if probeCtx.Err() == context.DeadlineExceeded {
-				return nil, fmt.Errorf(
+				return fmt.Errorf(
 					"tablesource.New %s: presence probe timed out after %v — replica read pool exhausted?: %w",
 					tableName, PoolAcquireTimeout, probeErr)
 			}
-			return nil, fmt.Errorf("tablesource.New %s: table not found: %w", tableName, probeErr)
+			return fmt.Errorf("tablesource.New %s: table not found: %w", tableName, probeErr)
 		}
 		probedTables.Store(pkey, struct{}{})
+	}
+	return nil
+}
+
+// NewWithContext constructs a Source whose SQLite operations are cancellable
+// via the provided context. Use this when the caller owns a CG-scoped context
+// that should abort in-flight queries on teardown.
+func NewWithContext(parent context.Context, db *sql.DB, writableDB *sql.DB, tableName string, columns map[string]sqlite.ColumnSchema, primaryKey []string) (*Source, error) {
+	if writableDB == nil {
+		return nil, fmt.Errorf("tablesource.New: writableDB is nil")
+	}
+	if err := ValidateWithContext(parent, db, tableName, columns, primaryKey); err != nil {
+		return nil, err
 	}
 
 	// Pre-compute the column ordering used for INSERT VALUES (...) and
@@ -608,19 +625,53 @@ func (s *Source) returnSelectStmt(conn *sql.Conn, query string, st *sql.Stmt) {
 	s.mu.Unlock()
 }
 
+func (s *Source) pushStmtLocked(conn *sql.Conn, query string) (*sql.Stmt, error) {
+	bySQL := s.pushStmtCache[conn]
+	if bySQL == nil {
+		if s.pushStmtCache == nil {
+			s.pushStmtCache = make(map[*sql.Conn]map[string]*sql.Stmt, 3)
+		}
+		bySQL = make(map[string]*sql.Stmt, 4)
+		s.pushStmtCache[conn] = bySQL
+	}
+	if st := bySQL[query]; st != nil {
+		return st, nil
+	}
+	st, err := conn.PrepareContext(s.ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	bySQL[query] = st
+	return st, nil
+}
+
+func (s *Source) execPushStmtLocked(conn *sql.Conn, query string, args ...interface{}) error {
+	st, err := s.pushStmtLocked(conn, query)
+	if err != nil {
+		return err
+	}
+	_, err = st.ExecContext(s.ctx, args...)
+	return err
+}
+
 // closeCachedStmtsForConnLocked finalizes and drops every prepared statement
 // cached against conn. Called immediately before conn is closed so the
 // compiled sqlite3_stmts are released and a later conn that happens to reuse
 // the same pointer can't hit a stale entry. MUST be called with s.mu held.
 func (s *Source) closeCachedStmtsForConnLocked(conn *sql.Conn) {
 	bySQL := s.stmtCache[conn]
-	if bySQL == nil {
-		return
+	if bySQL != nil {
+		for _, e := range bySQL {
+			_ = e.st.Close()
+		}
+		delete(s.stmtCache, conn)
 	}
-	for _, e := range bySQL {
-		_ = e.st.Close()
+	if pushBySQL := s.pushStmtCache[conn]; pushBySQL != nil {
+		for _, st := range pushBySQL {
+			_ = st.Close()
+		}
+		delete(s.pushStmtCache, conn)
 	}
-	delete(s.stmtCache, conn)
 }
 
 func (s *Source) closePrevConnLocked() {
@@ -646,6 +697,12 @@ func (s *Source) closeAllCachedStmtsLocked() {
 		}
 	}
 	s.stmtCache = nil
+	for _, bySQL := range s.pushStmtCache {
+		for _, st := range bySQL {
+			_ = st.Close()
+		}
+	}
+	s.pushStmtCache = nil
 }
 
 // ensurePrevTxLocked makes sure prevConn is acquired and a tx is open.
@@ -1093,8 +1150,13 @@ func (s *Source) driftCheckLocked(change ivm.SourceChange) (driftErr error, prob
 // already run by the time genPushAndWrite reaches the drift check.
 func (s *Source) existsLocked(row ivm.Row) (bool, error) {
 	args := s.rowToPKArgs(row)
+	conn := s.activeConn()
+	st, err := s.pushStmtLocked(conn, s.checkExistsSQL)
+	if err != nil {
+		return false, fmt.Errorf("checkExists prepare: %w", err)
+	}
 	var one int
-	err := s.activeConn().QueryRowContext(context.Background(), s.checkExistsSQL, args...).Scan(&one)
+	err = st.QueryRowContext(s.ctx, args...).Scan(&one)
 	switch {
 	case err == nil:
 		return one == 1, nil
@@ -1133,12 +1195,11 @@ func (s *Source) countLocked() int {
 //
 // MUST be called with s.mu held (so prevConn is single-flight).
 func (s *Source) writeChangeLocked(change ivm.SourceChange) error {
-	ctx := context.Background()
 	conn := s.activeConn()
 	switch change.Type {
 	case ivm.ChangeTypeAdd:
 		args := s.rowToInsertArgs(change.Row)
-		if _, err := conn.ExecContext(ctx, s.insertSQL, args...); err != nil {
+		if err := s.execPushStmtLocked(conn, s.insertSQL, args...); err != nil {
 			return fmt.Errorf("INSERT: %w", err)
 		}
 		s.trackAdded(change.Row)
@@ -1146,7 +1207,7 @@ func (s *Source) writeChangeLocked(change ivm.SourceChange) error {
 
 	case ivm.ChangeTypeRemove:
 		args := s.rowToPKArgs(change.Row)
-		if _, err := conn.ExecContext(ctx, s.deleteSQL, args...); err != nil {
+		if err := s.execPushStmtLocked(conn, s.deleteSQL, args...); err != nil {
 			return fmt.Errorf("DELETE: %w", err)
 		}
 		s.trackRemoved(change.Row)
@@ -1156,7 +1217,7 @@ func (s *Source) writeChangeLocked(change ivm.SourceChange) error {
 		if s.canUseUpdate(change.OldRow, change.Row) {
 			merged := mergeRow(change.OldRow, change.Row)
 			args := append(s.rowToNonPKArgs(merged), s.rowToPKArgs(merged)...)
-			if _, err := conn.ExecContext(ctx, s.updateSQL, args...); err != nil {
+			if err := s.execPushStmtLocked(conn, s.updateSQL, args...); err != nil {
 				return fmt.Errorf("UPDATE: %w", err)
 			}
 			s.trackAdded(merged)
@@ -1164,12 +1225,12 @@ func (s *Source) writeChangeLocked(change ivm.SourceChange) error {
 		}
 		// PK changed: DELETE + INSERT.
 		delArgs := s.rowToPKArgs(change.OldRow)
-		if _, err := conn.ExecContext(ctx, s.deleteSQL, delArgs...); err != nil {
+		if err := s.execPushStmtLocked(conn, s.deleteSQL, delArgs...); err != nil {
 			return fmt.Errorf("EDIT.DELETE: %w", err)
 		}
 		s.trackRemoved(change.OldRow)
 		insArgs := s.rowToInsertArgs(change.Row)
-		if _, err := conn.ExecContext(ctx, s.insertSQL, insArgs...); err != nil {
+		if err := s.execPushStmtLocked(conn, s.insertSQL, insArgs...); err != nil {
 			return fmt.Errorf("EDIT.INSERT: %w", err)
 		}
 		s.trackAdded(change.Row)

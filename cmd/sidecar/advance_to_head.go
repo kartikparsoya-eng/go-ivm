@@ -389,9 +389,16 @@ func buildSnapshotterSpecs(tables map[string]tableSchemaParams) map[string]*snap
 // readAllTableNames returns every base table in the replica (sqlite_master),
 // used as the Diff's allTableNames set.
 func readAllTableNames(db *sql.DB) (map[string]bool, error) {
-	rows, err := db.QueryContext(context.Background(),
+	ctx, cancel := context.WithTimeout(context.Background(), tablesource.PoolAcquireTimeout)
+	defer cancel()
+	rows, err := db.QueryContext(ctx,
 		`SELECT name FROM sqlite_master WHERE type='table'`)
 	if err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return nil, fmt.Errorf(
+				"presence probe timed out after %v while reading table names — replica read pool exhausted?: %w",
+				tablesource.PoolAcquireTimeout, err)
+		}
 		return nil, err
 	}
 	defer rows.Close()

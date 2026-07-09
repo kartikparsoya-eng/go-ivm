@@ -1094,6 +1094,38 @@ func TestOnAdvanceEndWithNoConnectionsReleasesPrevConn(t *testing.T) {
 	}
 }
 
+func TestPushCachesPreparedDriftAndWriteStatements(t *testing.T) {
+	src, db := newUserSource(t)
+	defer db.Close()
+
+	src.Push(ivm.MakeSourceChangeAdd(ivm.Row{
+		"id":     float64(4),
+		"name":   "dana",
+		"score":  float64(60),
+		"active": true,
+	}))
+
+	src.mu.Lock()
+	if src.prevConn == nil {
+		src.mu.Unlock()
+		t.Fatal("Push did not acquire prev conn")
+	}
+	cached := len(src.pushStmtCache[src.prevConn])
+	src.mu.Unlock()
+	if cached < 2 {
+		t.Fatalf("push stmt cache size = %d, want at least checkExists + insert", cached)
+	}
+
+	if err := src.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	src.mu.Lock()
+	defer src.mu.Unlock()
+	if src.pushStmtCache != nil {
+		t.Fatalf("push stmt cache not cleared on Close: %#v", src.pushStmtCache)
+	}
+}
+
 // TestOnAdvanceEndSkipsRollbackWhenOverlaySet pins the Fix #4 TOCTOU guard.
 // RefreshSnapshot reads s.overlay WITHOUT holding s.mu, so a Push can install
 // the overlay in the window between that unlocked read and OnAdvanceEnd

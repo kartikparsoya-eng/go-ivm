@@ -1972,9 +1972,25 @@ func (s *Server) handleInit(req RPCRequest) RPCResponse {
 		storagePath = ":memory:"
 	}
 
+	replicaDB, err := s.getReplicaDB()
+	if err != nil {
+		return rpcError(req.ID, -32000, "replica not ready: "+err.Error())
+	}
+	writableDB := s.getReplicaWritableDB()
+	if writableDB == nil {
+		return rpcError(req.ID, -32000, "writable replica pool not ready")
+	}
+	tables := p.Tables
 	eng, err := engine.NewEngine(engine.EngineConfig{
 		StoragePath:       storagePath,
 		ParallelThreshold: parallelThreshold,
+		SourceFactory: func(tableName string) (engine.Source, error) {
+			schema, ok := tables[tableName]
+			if !ok {
+				return nil, nil
+			}
+			return tablesource.New(replicaDB, writableDB, tableName, schema.Columns, schema.PrimaryKey)
+		},
 	})
 	if err != nil {
 		return rpcError(req.ID, -32000, "create engine: "+err.Error())
@@ -1991,32 +2007,15 @@ func (s *Server) handleInit(req RPCRequest) RPCResponse {
 		}
 	}()
 
-	// For each table: register the tablesource.Source leaf over the shared
-	// replica pool — the SQLite file is authoritative; init carries schema
-	// only.
 	minRowVersions := make(map[string]string)
 	for tableName, schema := range p.Tables {
+		if err := tablesource.Validate(replicaDB, tableName, schema.Columns, schema.PrimaryKey); err != nil {
+			return rpcError(req.ID, -32000,
+				"tablesource.Validate for "+tableName+": "+err.Error())
+		}
 		if schema.MinRowVersion != "" {
 			minRowVersions[tableName] = schema.MinRowVersion
 		}
-
-		db, err := s.getReplicaDB()
-		if err != nil {
-			return rpcError(req.ID, -32000,
-				"replica not ready: "+err.Error())
-		}
-		writableDB := s.getReplicaWritableDB()
-		if writableDB == nil {
-			return rpcError(req.ID, -32000,
-				"writable replica pool not ready")
-		}
-		src, err := tablesource.New(db, writableDB, tableName, schema.Columns, schema.PrimaryKey)
-		if err != nil {
-			return rpcError(req.ID, -32000,
-				"tablesource.New for "+tableName+": "+err.Error())
-		}
-		eng.RegisterSource(src)
-
 		// Forward unique-key metadata for the scalar-subquery resolver
 		// (scalar resolution is upstream of the leaf source).
 		if len(schema.UniqueKeys) > 0 {

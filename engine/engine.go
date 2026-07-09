@@ -73,6 +73,11 @@ type Source interface {
 	Close() error
 }
 
+// SourceFactory lazily constructs the leaf source for a table the first time a
+// query build asks for it. This mirrors TS PipelineDriver.#getSource(): tables
+// that no live query touches never get a source and never enter advance push.
+type SourceFactory func(tableName string) (Source, error)
+
 type pushObserverSource interface {
 	HasPushObservers() bool
 }
@@ -110,16 +115,17 @@ type SnapshotChange struct {
 
 // AdvanceResult is returned by Engine.Advance().
 //
-// Timings is one entry per (table, sourceChange) — the same granularity TS
-// records to its `ivm.advance-time` histogram. Lets TS attribute wall time to
-// the responsible table/op instead of seeing a single opaque RPC duration.
+// Timings is one entry per snapshot diff entry, matching TS's advance timing
+// boundary: one changed replica row can expand to remove+add source changes,
+// but the observable advance budget is charged once for that original row.
 type AdvanceResult struct {
 	Changes []RowChange
 	Timings []TableTiming
 }
 
-// TableTiming reports the wall time spent processing a single source change
-// for a table during Engine.Advance.
+// TableTiming reports the wall time spent processing a snapshot diff entry for
+// a table during Engine.Advance. ChangeT is the final derived source change
+// type for that row (for example, a remove+add conflict reports add).
 type TableTiming struct {
 	Table   string  `json:"table"`
 	ChangeT int     `json:"type"` // ivm.ChangeType (0=add,1=remove,2=edit)
@@ -196,6 +202,8 @@ type Engine struct {
 	storage   *sqlite.DatabaseStorage
 	closed    bool // set true by Close; guards against post-Close calls
 
+	sourceFactory SourceFactory
+
 	// tableUniqueKeys: per-table list of unique key column sets. Used by the
 	// scalar-subquery resolver to detect "simple" subqueries — those whose
 	// WHERE constrains all columns of at least one unique key, guaranteeing
@@ -217,6 +225,11 @@ type Engine struct {
 	// read it lock-free; nil when no pool is bound. Stores a
 	// *pipelineReaderPool (pointer so a typed-nil interface can't sneak in).
 	hydratePool atomic.Pointer[pipelineReaderPool]
+
+	// boundConn is the Snapshotter-owned frame connection currently bound to
+	// table sources. Lazy sources created while this is non-nil must inherit the
+	// binding or cold/warm hydrate would read a different frame from older leaves.
+	boundConn atomic.Pointer[sql.Conn]
 
 	// minRowVersions: per-table minRowVersion forwarded from TS-side
 	// tableSpec.minRowVersion (set after a RESET during incremental catchup).
@@ -279,6 +292,7 @@ func bumpRowVersions(changes []RowChange, mrv map[string]string) []RowChange {
 type EngineConfig struct {
 	StoragePath       string // path for operator storage DB
 	ParallelThreshold int    // min connections for parallel fan-out (default: 2, set below when 0)
+	SourceFactory     SourceFactory
 }
 
 // NewEngine creates a new IVM engine.
@@ -306,6 +320,7 @@ func NewEngine(cfg EngineConfig) (*Engine, error) {
 		storage:           storage,
 		tableUniqueKeys:   make(map[string][][]string),
 		parallelThreshold: threshold,
+		sourceFactory:     cfg.SourceFactory,
 	}
 	empty := make(map[string]Source)
 	e.sources.Store(&empty)
@@ -400,6 +415,8 @@ func (e *Engine) Close() error {
 			firstErr = err
 		}
 	}
+	e.boundConn.Store(nil)
+	e.hydratePool.Store(nil)
 	e.sources.Store(nil)
 	e.tableUniqueKeys = nil
 	if e.storage != nil {
@@ -420,13 +437,52 @@ func (e *Engine) RegisterSource(source Source) {
 	if e.closed {
 		return
 	}
+	e.registerSourceLocked(source)
+}
+
+func (e *Engine) registerSourceLocked(source Source) {
 	cur := e.sourcesView()
 	next := make(map[string]Source, len(cur)+1)
 	for k, v := range cur {
 		next[k] = v
 	}
+	e.applyCurrentBindingsLocked(source)
 	next[source.TableName()] = source
 	e.sources.Store(&next)
+}
+
+func (e *Engine) ensureSourceLocked(tableName string) (Source, bool) {
+	if source, ok := e.sourcesView()[tableName]; ok {
+		return source, true
+	}
+	if e.sourceFactory == nil {
+		return nil, false
+	}
+	source, err := e.sourceFactory(tableName)
+	if err != nil {
+		panic(fmt.Sprintf("create source for table %q: %v", tableName, err))
+	}
+	if source == nil {
+		return nil, false
+	}
+	if source.TableName() != tableName {
+		panic(fmt.Sprintf("source factory for table %q returned source for table %q", tableName, source.TableName()))
+	}
+	e.registerSourceLocked(source)
+	return source, true
+}
+
+func (e *Engine) applyCurrentBindingsLocked(source Source) {
+	if conn := e.boundConn.Load(); conn != nil {
+		if b, ok := source.(connBinder); ok {
+			b.BindConn(conn)
+		}
+	}
+	if pool := e.hydratePool.Load(); pool != nil {
+		if b, ok := source.(readerPoolBinder); ok {
+			b.BindReaderPool(*pool)
+		}
+	}
 }
 
 // signalAdvanceEnd notifies every registered source that the current
@@ -474,6 +530,9 @@ type connBinder interface {
 // the exact frame it was derived against (no independent per-Source re-pin, no
 // frame-timing drift). Must be paired with UnbindTableSources after the advance.
 func (e *Engine) BindTableSourcesToConn(conn *sql.Conn) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.boundConn.Store(conn)
 	for _, src := range e.sourcesView() {
 		if b, ok := src.(connBinder); ok {
 			b.BindConn(conn)
@@ -483,6 +542,9 @@ func (e *Engine) BindTableSourcesToConn(conn *sql.Conn) {
 
 // UnbindTableSources detaches every connBinder leaf from its external conn.
 func (e *Engine) UnbindTableSources() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.boundConn.Store(nil)
 	for _, src := range e.sourcesView() {
 		if b, ok := src.(connBinder); ok {
 			b.UnbindConn()
@@ -600,19 +662,23 @@ func acquirePipelineReader(rp pipelineReaderPool, queryID string, cancelled *ato
 // (the pool's pinned frame goes stale once curr rotates). pool is the opaque
 // *tablesource.ReaderPool.
 func (e *Engine) BindTableSourcesToReaderPool(pool any) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if rp, ok := pool.(pipelineReaderPool); ok && rp != nil {
+		e.hydratePool.Store(&rp)
+	}
 	for _, src := range e.sourcesView() {
 		if b, ok := src.(readerPoolBinder); ok {
 			b.BindReaderPool(pool)
 		}
-	}
-	if rp, ok := pool.(pipelineReaderPool); ok && rp != nil {
-		e.hydratePool.Store(&rp)
 	}
 }
 
 // UnbindTableSourcesReaderPool detaches the reader pool from every leaf source;
 // reads revert to the single-conn path. Does not Close the pool.
 func (e *Engine) UnbindTableSourcesReaderPool() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	e.hydratePool.Store(nil)
 	for _, src := range e.sourcesView() {
 		if b, ok := src.(readerPoolBinder); ok {
@@ -1466,7 +1532,6 @@ func (e *Engine) Advance(changes []SnapshotChange) *AdvanceResult {
 		// Snapshot sources once; COW + atomic.Pointer guarantees this slice
 		// stays consistent for the duration of the advance loop.
 		sources := e.sourcesView()
-		// Group changes by table for potential cross-table parallelism (future)
 		for _, change := range changes {
 			source, ok := sources[change.Table]
 			if !ok {
@@ -1477,23 +1542,22 @@ func (e *Engine) Advance(changes []SnapshotChange) *AdvanceResult {
 			}
 
 			sourceChanges := snapshotToSourceChanges(change, source)
+			if len(sourceChanges) == 0 {
+				continue
+			}
 
-			// Push each source change and collect streamer output. Time each
-			// one individually so TS can attribute wall time to the
-			// responsible (table, op) pair — matches the granularity of TS's
-			// #advanceTime histogram (pipeline-driver.ts:2545).
+			start := time.Now()
 			for _, sc := range sourceChanges {
-				start := time.Now()
 				source.Push(sc)
 				rowChanges := e.streamer.Stream()
-				ms := float64(time.Since(start).Microseconds()) / 1000.0
 				allRowChanges = append(allRowChanges, rowChanges...)
-				timings = append(timings, TableTiming{
-					Table:   change.Table,
-					ChangeT: int(sc.Type),
-					Ms:      ms,
-				})
 			}
+			ms := float64(time.Since(start).Microseconds()) / 1000.0
+			timings = append(timings, TableTiming{
+				Table:   change.Table,
+				ChangeT: int(sourceChanges[len(sourceChanges)-1].Type),
+				Ms:      ms,
+			})
 		}
 	}()
 
@@ -1523,17 +1587,17 @@ var advanceChunkSize = envChunkSize("GO_IVM_ADVANCE_CHUNK_SIZE", defaultChunkSiz
 
 // AdvanceStream is the streaming variant of Advance: same source-push +
 // streamer-drain loop, but flushes a partial frame every advanceChunkSize
-// accumulated RowChanges instead of buffering the whole AdvanceResult in
-// one msgpack frame. The TS client reassembles the frames into the same
-// AdvanceResult shape Advance returns, so view-syncer code is agnostic to
-// which path was used.
+// accumulated RowChanges instead of buffering the whole AdvanceResult in one
+// msgpack frame. Production callers consume the stream directly; the legacy
+// buffered client path can still reassemble the same final shape Advance
+// returns.
 //
 // Frame invariants (mirror AddQueriesStream):
 //   - exactly one frame has Final=true (always the last)
 //   - ChunkIndex is monotonically increasing per call starting at 0
 //   - Timings is populated only on the Final frame
 //   - empty advances still emit one frame with Final=true (no changes,
-//     no timings) so the TS accumulator has a uniform completion signal
+//     no timings) so stream consumers have a uniform completion signal
 //
 // Like AddQueriesStream, this reduces Go-side memory pressure (each chunk
 // is encoded + flushed + freed before the next accumulates) and improves
@@ -1809,19 +1873,16 @@ func (e *Engine) advanceStreamChunkedSeq(
 			}
 
 			sourceChanges := snapshotToSourceChanges(change, source)
+			if len(sourceChanges) == 0 {
+				continue
+			}
 
+			start := time.Now()
 			for _, sc := range sourceChanges {
-				start := time.Now()
 				source.Push(sc)
 				rowChanges := e.streamer.Stream()
-				ms := float64(time.Since(start).Microseconds()) / 1000.0
 				pending = append(pending, rowChanges...)
 				pendingBytes += estimateRowChangesBytes(rowChanges)
-				timings = append(timings, TableTiming{
-					Table:   change.Table,
-					ChangeT: int(sc.Type),
-					Ms:      ms,
-				})
 
 				// Flush mid-batch if we've crossed the chunk threshold —
 				// row count OR estimated bytes (fat rows blow the 64MB wire
@@ -1834,6 +1895,12 @@ func (e *Engine) advanceStreamChunkedSeq(
 					flush(false)
 				}
 			}
+			ms := float64(time.Since(start).Microseconds()) / 1000.0
+			timings = append(timings, TableTiming{
+				Table:   change.Table,
+				ChangeT: int(sourceChanges[len(sourceChanges)-1].Type),
+				Ms:      ms,
+			})
 		}
 	}()
 
@@ -2083,7 +2150,7 @@ type engineDelegate struct {
 // query share spine operators and MUST push serially; connections of
 // different queries share nothing above the source and may push in parallel.
 func (d *engineDelegate) GetSource(tableName string) builder.Source {
-	source, ok := d.engine.sourcesView()[tableName]
+	source, ok := d.engine.ensureSourceLocked(tableName)
 	if !ok {
 		return nil
 	}
