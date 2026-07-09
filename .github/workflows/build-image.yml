@@ -125,9 +125,13 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           context: .
+          platforms: linux/amd64
           # PRs build but don't push — verifies the Dockerfile still
           # compiles before merging.
           push: ${{ github.event_name != 'pull_request' }}
+          build-args: |
+            GO_IVM_BUILD_SHA=${{ github.sha }}
+            GO_IVM_BUILD_REF=${{ github.ref_name }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
@@ -135,7 +139,7 @@ jobs:
 
   # After a successful push of a new sidecar image, trigger the downstream
   # mono-better build so it rebuilds its zero-cache+go image against the
-  # freshly published go-ivm:feat-snapshotter-in-go binary. Without this,
+  # freshly published Go-primary feature image. Without this,
   # a marker commit to mono-better could race the go-ivm publish job and
   # bundle the previous binary.
   #

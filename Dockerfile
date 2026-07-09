@@ -7,6 +7,8 @@
 # in-process transport). The socket-transport sidecar binary was removed
 # in the RPC-surface removal sweep (protocolRev 10) — cmd/sidecar's main()
 # is a stub and no runnable binary ships here.
+ARG GO_IVM_BUILD_SHA=unknown
+ARG GO_IVM_BUILD_REF=unknown
 
 # Stage: libgoivm.so — the c-shared library for the in-process (NAPI)
 # transport. Built on BOOKWORM (glibc), NOT alpine: the consumer is the
@@ -34,6 +36,8 @@
 #   napilib                    — compile the cgo //export ABI shims
 #                                (cmd/sidecar/napi_lib.go).
 FROM golang:1.25-bookworm AS libgoivm-builder
+ARG GO_IVM_BUILD_SHA
+ARG GO_IVM_BUILD_REF
 
 WORKDIR /src
 
@@ -71,10 +75,19 @@ RUN CGO_ENABLED=1 GOOS=linux go build \
     -o /libgoivm.so \
     ./cmd/sidecar
 
+RUN printf 'go_ivm_build_sha=%s\ngo_ivm_build_ref=%s\n' \
+    "$GO_IVM_BUILD_SHA" "$GO_IVM_BUILD_REF" > /libgoivm.buildinfo
+
 # Minimal artifact-carrier image. alpine keeps a shell for inspection;
 # nothing here is meant to run — the .so is glibc-linked for the
 # node:22-slim consumer, which pulls it via COPY --from / bind-mount in
 # mono's Dockerfile.go-ivm.
 FROM alpine:3.20
+ARG GO_IVM_BUILD_SHA
+ARG GO_IVM_BUILD_REF
+
+LABEL org.opencontainers.image.revision="${GO_IVM_BUILD_SHA}"
+LABEL org.opencontainers.image.source-ref="${GO_IVM_BUILD_REF}"
 
 COPY --from=libgoivm-builder /libgoivm.so /usr/local/lib/libgoivm.so
+COPY --from=libgoivm-builder /libgoivm.buildinfo /usr/local/lib/libgoivm.buildinfo
