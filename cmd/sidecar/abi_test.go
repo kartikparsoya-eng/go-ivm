@@ -101,14 +101,15 @@ func TestABIHost_InitAdvanceRoundTrip(t *testing.T) {
 		t.Fatalf("send advanceToHeadStream: %v", err)
 	}
 	// The replica is already at head, so the advance emits exactly: 1
-	// terminal partial (final=true, empty changes) + 1 "done" response —
-	// both must arrive through the pump in order (single flusher FIFO).
-	frames = col.waitFrames(t, 3, 10*time.Second)
+	// metadata header + 1 terminal partial (final=true, empty changes) +
+	// 1 "done" response — all must arrive through the pump in order
+	// (single flusher FIFO).
+	frames = col.waitFrames(t, 4, 10*time.Second)
 	partial := decodeResp(t, frames[1])
 	if partial.Error != nil {
-		t.Fatalf("partial carried error: %+v", partial.Error)
+		t.Fatalf("header carried error: %+v", partial.Error)
 	}
-	done := decodeResp(t, frames[2])
+	done := decodeResp(t, frames[3])
 	if done.Error != nil {
 		t.Fatalf("done carried error: %+v", done.Error)
 	}

@@ -501,10 +501,10 @@ func (s *Server) refreshSnapForInitialHydrateLocked(cgID string, group *ClientGr
 }
 
 // advanceToHeadStreamPartial is the on-wire partial frame for
-// advanceToHeadStream: chunked RowChanges + chunkIndex + final + per-final
-// timings, plus the Version + NumChanges the engine's stream doesn't know
-// about — those ride the Final frame only. The TS accumulator reassembles the
-// frames into one AdvanceToHeadResult.
+// advanceToHeadStream: an optional metadata header, chunked RowChanges +
+// chunkIndex + final + per-final timings. Version + NumChanges ride the header
+// so TS can stamp the CVR updater before row streaming starts; they also ride
+// the Final frame as the authoritative completion metadata.
 //
 // Reset is mutually exclusive with streamed changes: when the derived diff
 // aborts on a reset/truncate/permissions-change there are no RowChanges, so the
@@ -516,8 +516,9 @@ type advanceToHeadStreamPartial struct {
 	Rows       [][]interface{}      `json:"r,omitempty"`
 	ChunkIndex int                  `json:"chunkIndex"`
 	Final      bool                 `json:"final"`
+	Header     bool                 `json:"header,omitempty"`
 	Timings    []engine.TableTiming `json:"timings,omitempty"`
-	// Final-frame-only metadata (omitted on non-final partials):
+	// Header + Final metadata (omitted on row-bearing non-final partials):
 	Version    string            `json:"version,omitempty"`
 	NumChanges int               `json:"numChanges,omitempty"`
 	Reset      *resetWire        `json:"reset,omitempty"`
@@ -682,6 +683,14 @@ func (s *Server) handleAdvanceToHeadStream(req RPCRequest, streamW streamWriter)
 	numChanges := diff.Changes
 	abort.setNumChanges(numChanges) // same count TS's formula uses (SnapshotDiff.changes)
 	var emittedPartial bool
+
+	streamW(req.ID, advanceToHeadStreamPartial{
+		ChunkIndex: 0,
+		Final:      false,
+		Header:     true,
+		Version:    version,
+		NumChanges: numChanges,
+	})
 
 	// finishStream maps the engine's returned error to the wire per the
 	// cursor-error split above. Shared by the rowMode and frame branches.

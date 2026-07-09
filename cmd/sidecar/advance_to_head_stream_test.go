@@ -32,26 +32,37 @@ func collectAdvanceToHeadStreamFrames() (streamWriter, *[]advanceToHeadStreamPar
 }
 
 // assertStreamFrameInvariants checks the frame invariants common to every
-// successful advanceToHeadStream: ≥1 frame, monotonic chunkIndex from 0,
-// exactly one Final=true and it's the LAST frame, version/numChanges only on
-// the final.
+// successful advanceToHeadStream: ≥1 frame, at most one leading Header,
+// monotonic data/final chunkIndex from 0, exactly one Final=true and it's the
+// LAST frame, version/numChanges only on the header/final metadata frames.
 func assertStreamFrameInvariants(t *testing.T, frames []advanceToHeadStreamPartial) {
 	t.Helper()
 	if len(frames) == 0 {
 		t.Fatalf("no frames emitted")
 	}
 	finals := 0
+	dataIndex := 0
 	for i, f := range frames {
-		if f.ChunkIndex != i {
-			t.Errorf("frame %d: chunkIndex = %d, want %d (must be monotonic from 0)", i, f.ChunkIndex, i)
+		if f.Header {
+			if i != 0 {
+				t.Errorf("Header frame at index %d, want leading frame only", i)
+			}
+			if f.Final {
+				t.Errorf("Header frame must not be Final")
+			}
+			continue
 		}
+		if f.ChunkIndex != dataIndex {
+			t.Errorf("frame %d: chunkIndex = %d, want data index %d (must be monotonic from 0)", i, f.ChunkIndex, dataIndex)
+		}
+		dataIndex++
 		if f.Final {
 			finals++
 			if i != len(frames)-1 {
 				t.Errorf("Final=true on frame %d but it is not the last (of %d)", i, len(frames))
 			}
 		} else {
-			// version / numChanges ride the Final frame ONLY.
+			// version / numChanges ride metadata frames only.
 			if f.Version != "" {
 				t.Errorf("non-final frame %d carries Version=%q (must be empty)", i, f.Version)
 			}
@@ -114,10 +125,13 @@ func TestAdvanceToHeadStream_SkipsNonSyncableTable(t *testing.T) {
 	if resp.Error != nil {
 		t.Fatalf("advanceToHeadStream error (non-syncable should be skipped, not errored): %+v", resp.Error)
 	}
-	if len(*frames) != 1 {
-		t.Fatalf("want exactly 1 (empty Final) frame, got %d: %+v", len(*frames), *frames)
+	if len(*frames) != 2 {
+		t.Fatalf("want header + empty Final frames, got %d: %+v", len(*frames), *frames)
 	}
-	f := (*frames)[0]
+	if !(*frames)[0].Header {
+		t.Fatalf("first frame must be Header, got %+v", (*frames)[0])
+	}
+	f := (*frames)[1]
 	if !f.Final || len(f.Rows) != 0 {
 		t.Fatalf("want an empty Final frame (lmids skipped), got %+v", f)
 	}
@@ -163,10 +177,13 @@ func TestAdvanceToHeadStream_DriveTruncateEmitsResetFrame(t *testing.T) {
 		t.Errorf("result = %v, want \"done\"", resp.Result)
 	}
 
-	if len(*frames) != 1 {
-		t.Fatalf("want exactly 1 (reset) frame, got %d: %+v", len(*frames), *frames)
+	if len(*frames) != 2 {
+		t.Fatalf("want header + reset frame, got %d: %+v", len(*frames), *frames)
 	}
-	f := (*frames)[0]
+	if !(*frames)[0].Header {
+		t.Fatalf("first frame must be Header, got %+v", (*frames)[0])
+	}
+	f := (*frames)[1]
 	if !f.Final {
 		t.Errorf("reset frame must be Final")
 	}
@@ -362,8 +379,11 @@ func TestAdvanceToHeadStream_RowMode(t *testing.T) {
 			if !ok {
 				t.Fatalf("kind-1 frame result not a map: %#v", respF.Result)
 			}
+			if header, _ := m["header"].(bool); header {
+				continue
+			}
 			if fin, _ := m["final"].(bool); !fin {
-				t.Fatalf("only the Final partial may ship as a frame in row mode, got: %#v", m)
+				t.Fatalf("only Header/Final partials may ship as frames in row mode, got: %#v", m)
 			}
 			finalSeen = true
 			if v, _ := m["version"].(string); v != "0000000002" {
@@ -423,10 +443,13 @@ func TestAdvanceToHeadStream_RowModeTruncateResetViaStreamW(t *testing.T) {
 		t.Errorf("result = %v, want \"done\"", resp.Result)
 	}
 
-	if len(*frames) != 1 {
-		t.Fatalf("want exactly 1 (reset) streamW frame, got %d", len(*frames))
+	if len(*frames) != 2 {
+		t.Fatalf("want header + reset streamW frames, got %d", len(*frames))
 	}
-	f := (*frames)[0]
+	if !(*frames)[0].Header {
+		t.Fatalf("first frame must be Header, got %+v", (*frames)[0])
+	}
+	f := (*frames)[1]
 	if !f.Final || f.Reset == nil || f.Reset.Reason != "truncation" || f.Version != "0000000002" {
 		t.Errorf("reset frame wrong: %+v", f)
 	}
