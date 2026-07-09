@@ -344,17 +344,14 @@ func TestABIHost_ShutdownDoesNotDeliverDeathRecord(t *testing.T) {
 	}
 }
 
-// TestNewServerFromEnv_ParallelismKnob covers the consolidated production
-// env contract (shared by BOTH entry points — socket main() and the NAPI
-// host): GO_IVM_PARALLELISM is the one parallelism knob (lanes=P,
-// readers=2×P), warm-hydrate pool defaults ON, and the per-facet legacy
-// vars still override individually.
+// TestNewServerFromEnv_ParallelismKnob covers the production env contract
+// shared by BOTH entry points — socket main() and the NAPI host.
 func TestNewServerFromEnv_ParallelismKnob(t *testing.T) {
 	replicaPath := makeReplicaPathOnly(t)
 	clearEnv := func(t *testing.T) {
 		t.Setenv("GO_IVM_REPLICA_DB_PATH", replicaPath)
 		for _, k := range []string{
-			"GO_IVM_PARALLELISM",
+			"GO_IVM_HYDRATE_PARALLELISM", "GO_IVM_PARALLELISM",
 			"GO_IVM_HYDRATE_READERS", "GO_IVM_HYDRATE_LANES",
 			"GO_IVM_WARM_HYDRATE_POOL",
 		} {
@@ -376,9 +373,34 @@ func TestNewServerFromEnv_ParallelismKnob(t *testing.T) {
 		}
 	})
 
-	t.Run("GO_IVM_PARALLELISM scales both facets", func(t *testing.T) {
+	t.Run("GO_IVM_HYDRATE_PARALLELISM scales hydrate facets", func(t *testing.T) {
 		clearEnv(t)
-		t.Setenv("GO_IVM_PARALLELISM", "6")
+		t.Setenv("GO_IVM_HYDRATE_PARALLELISM", "6")
+		srv, err := newServerFromEnv()
+		if err != nil {
+			t.Fatalf("newServerFromEnv: %v", err)
+		}
+		if srv.hydrateLanes != 6 || srv.hydrateReaders != 12 {
+			t.Errorf("lanes=%d readers=%d, want 6/12", srv.hydrateLanes, srv.hydrateReaders)
+		}
+	})
+
+	t.Run("legacy GO_IVM_PARALLELISM remains hydrate fallback", func(t *testing.T) {
+		clearEnv(t)
+		t.Setenv("GO_IVM_PARALLELISM", "5")
+		srv, err := newServerFromEnv()
+		if err != nil {
+			t.Fatalf("newServerFromEnv: %v", err)
+		}
+		if srv.hydrateLanes != 5 || srv.hydrateReaders != 10 {
+			t.Errorf("lanes=%d readers=%d, want 5/10", srv.hydrateLanes, srv.hydrateReaders)
+		}
+	})
+
+	t.Run("hydrate-specific knob wins over legacy knob", func(t *testing.T) {
+		clearEnv(t)
+		t.Setenv("GO_IVM_PARALLELISM", "5")
+		t.Setenv("GO_IVM_HYDRATE_PARALLELISM", "6")
 		srv, err := newServerFromEnv()
 		if err != nil {
 			t.Fatalf("newServerFromEnv: %v", err)
@@ -390,7 +412,7 @@ func TestNewServerFromEnv_ParallelismKnob(t *testing.T) {
 
 	t.Run("legacy per-facet vars override the knob", func(t *testing.T) {
 		clearEnv(t)
-		t.Setenv("GO_IVM_PARALLELISM", "6")
+		t.Setenv("GO_IVM_HYDRATE_PARALLELISM", "6")
 		t.Setenv("GO_IVM_HYDRATE_READERS", "3")
 		t.Setenv("GO_IVM_HYDRATE_LANES", "2")
 		srv, err := newServerFromEnv()

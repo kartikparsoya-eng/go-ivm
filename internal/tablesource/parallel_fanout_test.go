@@ -63,6 +63,45 @@ func withFanoutKnobs(t *testing.T, parallel bool, workers int) {
 	ParallelAdvance, ParallelAdvanceWorkers = parallel, workers
 }
 
+func TestAdvanceParallelismFromEnv(t *testing.T) {
+	clearEnv := func(t *testing.T) {
+		t.Setenv("GO_IVM_ADVANCE_PARALLELISM", "")
+		t.Setenv("GO_IVM_PARALLELISM", "")
+	}
+
+	t.Run("default", func(t *testing.T) {
+		clearEnv(t)
+		if got := advanceParallelismFromEnv(); got != 4 {
+			t.Fatalf("advanceParallelismFromEnv() = %d, want 4", got)
+		}
+	})
+
+	t.Run("advance-specific knob", func(t *testing.T) {
+		clearEnv(t)
+		t.Setenv("GO_IVM_ADVANCE_PARALLELISM", "7")
+		if got := advanceParallelismFromEnv(); got != 7 {
+			t.Fatalf("advanceParallelismFromEnv() = %d, want 7", got)
+		}
+	})
+
+	t.Run("legacy fallback", func(t *testing.T) {
+		clearEnv(t)
+		t.Setenv("GO_IVM_PARALLELISM", "5")
+		if got := advanceParallelismFromEnv(); got != 5 {
+			t.Fatalf("advanceParallelismFromEnv() = %d, want 5", got)
+		}
+	})
+
+	t.Run("advance-specific wins over legacy", func(t *testing.T) {
+		clearEnv(t)
+		t.Setenv("GO_IVM_PARALLELISM", "5")
+		t.Setenv("GO_IVM_ADVANCE_PARALLELISM", "7")
+		if got := advanceParallelismFromEnv(); got != 7 {
+			t.Fatalf("advanceParallelismFromEnv() = %d, want 7", got)
+		}
+	})
+}
+
 // Groups run concurrently (rendezvous proves overlap) and same-group conns
 // run serially (per-group active counter never exceeds 1).
 func TestFanOutParallelAcrossGroupsSerialWithin(t *testing.T) {

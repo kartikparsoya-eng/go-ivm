@@ -72,20 +72,18 @@ func newServerFromEnv() (*Server, error) {
 
 	server := NewServer(replicaPath)
 	server.appID = os.Getenv("GO_IVM_APP_ID")
-	// ONE parallelism knob: GO_IVM_PARALLELISM (default 4) sets the hydrate
-	// lane count (P — the engine package reads the SAME env for its lane
-	// workers, so the two stay in lockstep) and the reader-pool floor
-	// (K = 2×P; default 4 lanes / 8 readers is the prod-validated shape from
-	// the Dockerfile rollout). GO_IVM_HYDRATE_LANES / GO_IVM_HYDRATE_READERS
-	// override the facets individually for A/B work.
-	parallelism := 4
-	if v := os.Getenv("GO_IVM_PARALLELISM"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			parallelism = n
-		}
-	}
-	server.hydrateLanes = parallelism
-	server.hydrateReaders = 2 * parallelism
+	// Hydrate parallelism is split from advance parallelism. The legacy
+	// GO_IVM_PARALLELISM remains a backward-compatible fallback, while
+	// GO_IVM_HYDRATE_PARALLELISM is the hydrate-specific production knob:
+	// lanes=P and reader-pool floor K=2×P. GO_IVM_HYDRATE_LANES /
+	// GO_IVM_HYDRATE_READERS still override the individual hydrate facets.
+	hydrateParallelism := envFirstPositiveInt(
+		4,
+		"GO_IVM_HYDRATE_PARALLELISM",
+		"GO_IVM_PARALLELISM",
+	)
+	server.hydrateLanes = hydrateParallelism
+	server.hydrateReaders = 2 * hydrateParallelism
 	if v := os.Getenv("GO_IVM_HYDRATE_READERS"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 1 {
 			server.hydrateReaders = n
@@ -112,6 +110,17 @@ func newServerFromEnv() (*Server, error) {
 		nonDefault("GO_IVM_PARALLEL_ADVANCE=true (concurrent advance fanout)")
 	}
 	return server, nil
+}
+
+func envFirstPositiveInt(def int, names ...string) int {
+	for _, name := range names {
+		if v := os.Getenv(name); v != "" {
+			if n, err := strconv.Atoi(v); err == nil && n > 0 {
+				return n
+			}
+		}
+	}
+	return def
 }
 
 // abiHost owns one in-process "connection": the net.Pipe pair, the send

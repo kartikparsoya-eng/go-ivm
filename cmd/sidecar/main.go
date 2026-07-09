@@ -977,8 +977,9 @@ type Server struct {
 	// per-init AppID field).
 	appID string
 
-	// hydrateReaders is GO_IVM_HYDRATE_READERS — the size floor of the per-CG
-	// frame-pinned reader pool used to parallelize hydrate (drive mode only).
+	// hydrateReaders is the per-CG frame-pinned reader-pool floor used to
+	// parallelize hydrate (drive mode only). It defaults to
+	// 2×GO_IVM_HYDRATE_PARALLELISM and is overridden by GO_IVM_HYDRATE_READERS.
 	// Option B resource model: K = max(hydrateReaders, hydrateLanes) is the
 	// concurrent-hydrate ADMISSION width — each pipeline holds exactly ONE
 	// reader for its whole drain (nested fetches interleave cursors on it);
@@ -987,11 +988,12 @@ type Server struct {
 	// cold pool is torn down at the first advance.
 	hydrateReaders int
 
-	// hydrateLanes is GO_IVM_HYDRATE_LANES — the number of worker lanes (P)
-	// that hydrate queries in parallel on the non-pull path. Also a floor for
-	// the reader-pool width (K = max(hydrateReaders, hydrateLanes)) so every
-	// lane can hold its one pipeline reader without queueing. Default 4.
-	// 1 = serial (legacy).
+	// hydrateLanes is the number of worker lanes (P) that hydrate queries in
+	// parallel on the non-pull path. It defaults to
+	// GO_IVM_HYDRATE_PARALLELISM and is overridden by GO_IVM_HYDRATE_LANES.
+	// Also a floor for the reader-pool width (K = max(hydrateReaders,
+	// hydrateLanes)) so every lane can hold its one pipeline reader without
+	// queueing. Default 4. 1 = serial (legacy).
 	hydrateLanes int
 
 	// warmHydratePoolEnabled extends the parallel-hydrate reader pool to WARM

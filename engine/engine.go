@@ -38,6 +38,17 @@ func envChunkSize(name string, def int) int {
 	return n
 }
 
+func envFirstPositiveInt(def int, names ...string) int {
+	for _, name := range names {
+		if v := os.Getenv(name); v != "" {
+			if n, err := strconv.Atoi(v); err == nil && n > 0 {
+				return n
+			}
+		}
+	}
+	return def
+}
+
 // ErrEngineClosed is returned by Engine methods invoked after Close().
 // Streaming methods (AddQueriesStream, AdvanceStream) check this so a
 // late-arriving RPC doesn't silently produce an empty result against a
@@ -1402,10 +1413,14 @@ var hydrateChunkSize = envChunkSize("GO_IVM_HYDRATE_CHUNK_SIZE", defaultChunkSiz
 // (sidecar: K = max(hydrateReaders, hydrateLanes)) merely avoids admission
 // queueing — K < P is safe, just less parallel.
 //
-// Default 4; GO_IVM_PARALLELISM is the ONE production parallelism knob (it
-// also sizes the sidecar's reader-pool floor at 2×P — see newServerFromEnv);
+// Default 4; GO_IVM_HYDRATE_PARALLELISM is the hydrate-specific production
+// knob, with legacy GO_IVM_PARALLELISM retained as fallback. The sidecar uses
+// the same fallback chain to size its reader-pool floor at 2×P.
 // GO_IVM_HYDRATE_LANES overrides the lane count individually.
-var hydrateLanes = envChunkSize("GO_IVM_HYDRATE_LANES", envChunkSize("GO_IVM_PARALLELISM", 4))
+var hydrateLanes = envChunkSize(
+	"GO_IVM_HYDRATE_LANES",
+	envFirstPositiveInt(4, "GO_IVM_HYDRATE_PARALLELISM", "GO_IVM_PARALLELISM"),
+)
 
 // softChunkBytes is the estimated-payload budget per streamed partial frame.
 // The row-count caps (hydrateChunkSize / advanceChunkSize) bound COUNT but

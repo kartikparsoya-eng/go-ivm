@@ -72,7 +72,7 @@ func threadSelf() uint64 {
 }
 
 // maxSlots bounds concurrently registered threads. Production shape is
-// 1 coordinator + GO_IVM_PARALLELISM fanout workers (default 4); 32 leaves
+// 1 coordinator + GO_IVM_ADVANCE_PARALLELISM fanout workers (default 4); 32 leaves
 // generous headroom. Overflow degrades gracefully: Begin falls back to an
 // unregistered bracket whose delta still lands at end() — only mid-bracket
 // Checkpoint freshness is lost for that thread.
