@@ -18,7 +18,6 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
-
 )
 
 // TestGetReplicaDB_NoCacheMissBlock confirms that when no replica path is

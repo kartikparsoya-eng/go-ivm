@@ -538,7 +538,7 @@ func fp2Convert10(m uint64, e, n int) (d uint64, p10 int) {
 		h >>= uint(-(e + pwr10to2(p) + 2)) // in [0,62] per C asserts
 		d = (h + (h << 1 & 2)) >> 1
 	} else {
-		d = h >> uint(-(e+pwr10to2(p)+1))
+		d = h >> uint(-(e + pwr10to2(p) + 1))
 	}
 	return d, -p
 }

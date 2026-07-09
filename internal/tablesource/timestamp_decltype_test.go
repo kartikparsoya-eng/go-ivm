@@ -103,7 +103,7 @@ func TestFetchShipsRawEpochMsForNullableTemporalColumns(t *testing.T) {
 	// preFix documents what the UnixMilli reversal used to ship.
 	cases := []struct {
 		name   string
-		stored any     // INTEGER cell (or nil)
+		stored any       // INTEGER cell (or nil)
 		want   ivm.Value // shipped value ("number" logical type → float64)
 	}{
 		{"epoch-ms 1 (1970-01-01T00:00:00.001Z; pre-fix 1000)", int64(1), float64(1)},

@@ -485,8 +485,8 @@ func TestABIHost_RowModeHydrateEndToEnd(t *testing.T) {
 			if s, ok := resp.Result.(string); ok && s == "done" {
 				if !sawFinalFrame {
 					t.Fatal("ORDERING VIOLATION: done before final partial")
-			}
-			sawDone = true
+				}
+				sawDone = true
 				continue
 			}
 			m, ok := resp.Result.(map[string]interface{})
@@ -777,8 +777,8 @@ func TestNumericReqID_ExactnessGuard(t *testing.T) {
 	}{
 		{float64(42), 42},
 		{int(7), 7},
-		{int64(exact), float64(exact)},        // 2^53 itself is exact
-		{int64(-exact), float64(-exact)},      // and its negative
+		{int64(exact), float64(exact)},   // 2^53 itself is exact
+		{int64(-exact), float64(-exact)}, // and its negative
 		{uint64(uint64(exact)), float64(exact)},
 		{int32(-5), -5},
 		{uint32(9), 9},

@@ -182,6 +182,7 @@ func TestTableSourceLifecycle_AddAdvanceRemoveReAdd(t *testing.T) {
 //     into a hydrate would tear the frame the CVR was built against.
 //   - AFTER rotation it must be VISIBLE — a re-pin that misses replicator
 //     commits = permanent staleness.
+//
 // This is the Go port of TS Snapshotter.resetToHead timing (snapshotter.ts).
 func TestTableSourceLifecycle_ExternalCommitVisibleToRehydrate(t *testing.T) {
 	const seed = 5

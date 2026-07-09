@@ -174,7 +174,7 @@ func sqlUnicodeLower(s string) string {
 // Per-type contract (matches ext/icu icuCaseFunc16 + sqlite3_value_text):
 //   - NULL → NULL (ICU returns without setting a result). mattn delivers
 //     SQLITE_NULL as a nil []byte; a genuine empty BLOB arrives as a
-//     non-nil empty slice, so X'' still lowers to ''.
+//     non-nil empty slice, so an empty blob literal still lowers to an empty string.
 //   - TEXT/BLOB → full Unicode case mapping including context-sensitive
 //     rules (Greek final sigma "ΟΔΟΣ"→"οδος"), locale-independent.
 //     strings.ToLower applies only simple unconditional mappings and would

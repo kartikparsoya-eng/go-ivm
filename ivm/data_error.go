@@ -5,11 +5,12 @@ import "fmt"
 // DataError marks a DETERMINISTIC, NON-RETRYABLE failure that a full pipeline
 // rebuild cannot fix — the input (replica data OR query AST) is fixed, so a
 // reset re-reads/re-builds the same input and re-panics. Two sources:
-//   1. Replica data that can't be represented in the JS value model: a
-//      non-JSON string in a json/array column, an integer beyond JS
-//      MAX_SAFE_INTEGER, a cross-type comparison.
-//   2. An unsupported query shape the builder can't compile: an unknown
-//      condition type / operator, or a table with no source.
+//  1. Replica data that can't be represented in the JS value model: a
+//     non-JSON string in a json/array column, an integer beyond JS
+//     MAX_SAFE_INTEGER, a cross-type comparison.
+//  2. An unsupported query shape the builder can't compile: an unknown
+//     condition type / operator, or a table with no source.
+//
 // These panics are recovered by the sidecar and mapped to RPC code -32102
 // (RPC_CODE_DATA_ERROR on the TS side) so the view-syncer TEARS DOWN the
 // offending client group — like TS-native's UnsupportedValueError throw —

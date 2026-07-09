@@ -7,7 +7,6 @@ import (
 	"os"
 	"sync"
 	"testing"
-
 )
 
 // TestMultiGroupParallel verifies that multiple client groups can
