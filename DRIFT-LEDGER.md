@@ -28,8 +28,8 @@ Take.
 
 Status: Intentional Go hardening, not yet ported back to TS.
 
-Go rejects operators outside its explicit SQL operator whitelist and emits a
-safe no-match predicate (`1=0`). See `sqlite/query_builder.go:291-306`.
+Go rejects operators outside its explicit SQL operator whitelist with
+`*ivm.DataError` before SQL formatting. See `sqlite/query_builder.go:277-306`.
 
 Current TS zqlite compiles `filter.op` with `sql.__dangerous__rawValue` on the
 generic condition path, after special-casing `IN` and LIKE-family operators.
@@ -37,8 +37,29 @@ See `mono/packages/zqlite/src/query-builder.ts:194-223`. The protocol schema
 defines the supported operator set at `mono/packages/zero-protocol/src/ast.ts:37-50`.
 
 Reason: Go's sidecar accepts ASTs over the client boundary; whitelisting avoids
-raw SQL operator interpolation from untrusted input.
+raw SQL operator interpolation from untrusted input. The error classification is
+deliberate: an unsupported query shape is deterministic and should tear down the
+client group rather than silently producing an empty result.
 
-Required follow-up: align TS with the same whitelist/error policy, or change Go
-from silent no-match to the agreed typed error once the TS-side classifier and
-wire behavior are specified.
+Required follow-up: align TS with the same whitelist/error policy, or move the
+shared validation to AST ingress so both implementations reject the same op set
+with the same typed error.
+
+## D3: Malformed Condition-Type Rejection
+
+Status: Intentional Go hardening, not yet ported back to TS.
+
+Go rejects condition trees whose `type` is not `simple`, `and`, or `or` with
+`*ivm.DataError`. See `sqlite/query_builder.go:241-275`.
+
+Current TS zqlite relies on the typed AST union and has no runtime `default`
+branch in `filtersToSQL`. See
+`mono/packages/zqlite/src/query-builder.ts:169-191`.
+
+Reason: Go receives decoded client AST data at runtime. Treating an unknown type
+as `TRUE` widened malformed queries; rejecting it preserves fail-closed behavior
+without letting invalid input reach SQL generation.
+
+Required follow-up: align TS with an explicit runtime rejection or move the
+shared validation to AST ingress so Go and TS classify malformed condition types
+identically.

@@ -3,6 +3,8 @@ package sqlite
 import (
 	"strings"
 	"testing"
+
+	"github.com/kartikparsoya-eng/go-ivm/ivm"
 )
 
 // S4 parity tests for the simpleConditionToSQL Op whitelist. cond.Op arrives
@@ -11,9 +13,8 @@ import (
 //  1. Every whitelisted op still generates the SAME SQL it did before the
 //     whitelist (no generated-SQL regression — especially the ILIKE→LIKE and
 //     IN→json_each special-cases).
-//  2. A malicious op is neutralized to "1=0" with no interpolation of the
-//     payload (no injection).
-//  3. The neutralization never panics on a client-input path.
+//  2. A malicious op is rejected before interpolation (no injection).
+//  3. The rejection is a typed, deterministic data error.
 
 // colLit builds a simple "col <op> literal" condition.
 func colLit(col, op string, lit interface{}) *Condition {
@@ -106,10 +107,9 @@ func TestSimpleCondition_INJsonEach(t *testing.T) {
 	}
 }
 
-func TestSimpleCondition_UnknownOpNeutralizedNoInjection(t *testing.T) {
-	// The injection case: a client-sent op carrying SQL. It must be neutralized
-	// to "1=0" with NO interpolation of the payload — the payload string must
-	// not appear anywhere in the output SQL.
+func TestSimpleCondition_UnknownOpPanicsDataError(t *testing.T) {
+	// The injection case: a client-sent op carrying SQL. It must be rejected
+	// before any SQL can be formatted with the payload.
 	payloads := []string{
 		"; DROP TABLE x; --",
 		")) OR 1=1 --",
@@ -121,21 +121,35 @@ func TestSimpleCondition_UnknownOpNeutralizedNoInjection(t *testing.T) {
 	for _, p := range payloads {
 		t.Run(p, func(t *testing.T) {
 			defer func() {
-				if r := recover(); r != nil {
-					t.Fatalf("op=%q: panicked (must not on client-input path): %v", p, r)
+				r := recover()
+				if r == nil {
+					t.Fatalf("op=%q: expected *ivm.DataError panic", p)
+				}
+				if _, ok := r.(*ivm.DataError); !ok {
+					t.Fatalf("op=%q: panic value = %T, want *ivm.DataError", p, r)
+				}
+				if !strings.Contains(r.(error).Error(), "unsupported condition operator") {
+					t.Fatalf("op=%q: panic message = %q, want unsupported operator", p, r)
 				}
 			}()
-			got, params := simpleConditionToSQL(colLit("col", p, "x"))
-			if got != "1=0" {
-				t.Fatalf("op=%q: got %q, want 1=0", p, got)
-			}
-			if len(params) != 0 {
-				t.Fatalf("op=%q: params=%v, want nil (no-match carries no params)", p, params)
-			}
-			// The payload must not leak into the SQL.
-			if strings.Contains(got, p) && p != "" {
-				t.Fatalf("op=%q: payload leaked into output %q", p, got)
-			}
+			simpleConditionToSQL(colLit("col", p, "x"))
 		})
 	}
+}
+
+func TestFiltersToSQL_UnknownConditionTypePanicsDataError(t *testing.T) {
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("unknown condition type must panic *ivm.DataError")
+		}
+		if _, ok := r.(*ivm.DataError); !ok {
+			t.Fatalf("panic value = %T, want *ivm.DataError", r)
+		}
+		if !strings.Contains(r.(error).Error(), "unsupported condition type") {
+			t.Fatalf("panic message = %q, want unsupported condition type", r)
+		}
+	}()
+
+	filtersToSQL(&Condition{Type: "correlatedSubquery"})
 }

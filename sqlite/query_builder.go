@@ -271,7 +271,7 @@ func filtersToSQL(cond *Condition) (string, []interface{}) {
 		}
 		return "(" + strings.Join(parts, " OR ") + ")", params
 	}
-	return "TRUE", nil
+	panic(ivm.NewDataError("unsupported condition type %q", cond.Type))
 }
 
 // allowedOps is the exhaustive set of operators simpleConditionToSQL will
@@ -279,15 +279,10 @@ func filtersToSQL(cond *Condition) (string, []interface{}) {
 // (the sidecar accepts addQuery with an `ast` field over the wire), so it is
 // untrusted and was previously interpolated raw at the Sprintf below — a
 // malicious op like "; DROP TABLE x; --" would be spliced straight into the
-// query. The whitelist closes that: any op not in this set is treated as
-// unsupported and short-circuits to "1=0" (a safe no-match that interpolates
-// NO client data), rather than panicking — this is a client-input boundary
-// shared across an entire client group, and a bad op must not take the engine
-// down (same reasoning as matchLike returning false on a bad pattern). The
-// no-match is observable as an empty result; a genuinely-unsupported op query
-// simply yields no rows. Every op the Zero client emits is listed here; if a
-// new op is added upstream it must be added to this set or it will silently
-// no-match.
+// query. The whitelist closes that: any op not in this set panics with
+// *ivm.DataError before SQL formatting, so it is a deterministic client/query
+// error instead of a silent empty result. Every op the Zero client emits is
+// listed here; new protocol ops must be added explicitly with parity tests.
 var allowedOps = map[string]bool{
 	"=": true, "!=": true, ">": true, "<": true, ">=": true, "<=": true,
 	"LIKE": true, "NOT LIKE": true,
@@ -300,9 +295,9 @@ var allowedOps = map[string]bool{
 func simpleConditionToSQL(cond *Condition) (string, []interface{}) {
 	op := cond.Op
 	// S4: reject any operator outside the whitelist BEFORE it reaches the
-	// Sprintf that interpolates op raw. Safe no-match, no crash, no injection.
+	// Sprintf that interpolates op raw. Typed data error, no injection.
 	if !allowedOps[op] {
-		return "1=0", nil
+		panic(ivm.NewDataError("unsupported condition operator %q", op))
 	}
 	if op == "LIKE" || op == "NOT LIKE" || op == "ILIKE" || op == "NOT ILIKE" {
 		return likeConditionToSQL(cond, op)
