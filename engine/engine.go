@@ -160,12 +160,18 @@ type companionEntry struct {
 	matchedRow ivm.Row // captured by the executor at resolve time; nil = no match
 	childField string
 
-	// resolvedValue is the scalar's child-field value captured at resolve
-	// time (nil == SQL/JS null, which is also what an unmatched subquery
-	// resolves to — TS stores the same single resolvedValue with no
-	// separate "matched" flag). The companion's advance-time output
-	// compares each push's child value against this.
-	resolvedValue ivm.Value
+	// resolvedValue + resolvedUndefined model TS's TRI-STATE resolvedValue
+	// (LiteralValue | null | undefined — resolve-scalar-subqueries.ts:21-23):
+	// resolvedUndefined=true ⇔ TS undefined (no row matched,
+	// pipeline-driver.ts:1195-1199); resolvedUndefined=false with
+	// resolvedValue=nil ⇔ TS null (row matched but the child field was NULL,
+	// the `?? null` at pipeline-driver.ts:1203). The companion's advance-time
+	// output compares each push's child value against this pair with TS's
+	// strict-=== semantics, where null !== undefined (scalarValuesEqual,
+	// pipeline-driver.ts:3025-3034) — so a no-match → matched-NULL transition
+	// RESETS. A single nil-conflated field suppressed exactly that reset.
+	resolvedValue     ivm.Value
+	resolvedUndefined bool
 }
 
 // Engine is the IVM engine that manages sources, pipelines, and the advance loop.
@@ -661,7 +667,7 @@ func (e *Engine) AddQuery(queryID string, ast builder.AST) ([]RowChange, float64
 	// Hydrate: fetch current state and return as ADD changes (plus any
 	// resolver-recorded companion rows).
 	start := time.Now()
-	hydration := bumpRowVersions(hydrateEntry(entry), e.minRowVersions)
+	hydration := hydrateEntry(entry, e.minRowVersions)
 	timingMs := float64(time.Since(start).Microseconds()) / 1000.0
 
 	// HIGH-11: wire companion outputs after hydrate.
@@ -706,11 +712,15 @@ func (e *Engine) buildAndRegisterLocked(queryID string, ast builder.AST) *pipeli
 			ce.matchedRow = firstNode.Row
 			value = firstNode.Row[childField]
 		}
-		// Capture the resolved scalar value so the companion's advance-time
+		// Capture the resolved scalar TRI-STATE so the companion's advance-time
 		// output can detect a later change (port of TS CompanionPipeline's
-		// resolvedValue). nil means the subquery matched no row (or matched
-		// a null) — both are SQL/JS null, exactly as TS treats them.
+		// resolvedValue, which is undefined when the subquery matched no row and
+		// null when it matched a row whose child field was NULL —
+		// resolve-scalar-subqueries.ts:21-23). Go models undefined as
+		// resolvedUndefined=true; a matched row's missing/NULL child field is
+		// nil, exactly TS's `?? null` collapse (pipeline-driver.ts:1203).
 		ce.resolvedValue = value
+		ce.resolvedUndefined = !matched
 		companions = append(companions, ce)
 		return value, matched
 	}
@@ -791,8 +801,9 @@ func (e *Engine) wireCompanionOutputsLocked(entry *pipelineEntry) {
 				queryID: entry.queryID,
 				schema:  ce.schema,
 			},
-			childField:    ce.childField,
-			resolvedValue: ce.resolvedValue,
+			childField:        ce.childField,
+			resolvedValue:     ce.resolvedValue,
+			resolvedUndefined: ce.resolvedUndefined,
 		})
 	}
 }
@@ -800,15 +811,24 @@ func (e *Engine) wireCompanionOutputsLocked(entry *pipelineEntry) {
 // hydrateEntry fetches the main pipeline's current state and emits all
 // matched companion rows as ADDs under the same queryID. Caller is
 // responsible for timing.
-func hydrateEntry(entry *pipelineEntry) []RowChange {
+//
+// The minRowVersion bump applies to MAIN-pipeline rows only, mirroring TS
+// placement: the bump lives inside #streamNodes (pipeline-driver.ts:2843-2850),
+// which hydrate main rows traverse (hydrateInternal → Streamer,
+// pipeline-driver.ts:2981-2994) but hydrate companion rows BYPASS — they are
+// yielded directly (pipeline-driver.ts:1661-1670) with their stored _0_version
+// unbumped. (Advance-path companion changes DO flow through the TS Streamer,
+// pipeline-driver.ts:1729, so the advance-path bump stays engine-wide.)
+func hydrateEntry(entry *pipelineEntry, mrv map[string]string) []RowChange {
 	var hydration []RowChange
 	for node := range entry.pipeline.Input.Fetch(ivm.FetchRequest{}) {
 		hydration = append(hydration, streamNodes(entry.queryID, entry.schema, RowChangeAdd, node)...)
 	}
+	hydration = bumpRowVersions(hydration, mrv)
 	// Companion rows: emit each matched subquery row as an ADD so the
 	// client can re-evaluate its own EXISTS against the same data the
 	// resolver saw. Unmatched companions contribute nothing — there is
-	// no row to ship.
+	// no row to ship. Appended AFTER the bump — never bumped (see above).
 	for _, ce := range entry.companions {
 		if ce.matchedRow == nil {
 			continue
@@ -883,7 +903,7 @@ func (e *Engine) AddQueries(queries []QuerySpec) ([]QueryResult, error) {
 						defer release()
 					}
 					start := time.Now()
-					hydration := bumpRowVersions(hydrateEntry(job.entry), mrv)
+					hydration := hydrateEntry(job.entry, mrv)
 					timingMs := float64(time.Since(start).Microseconds()) / 1000.0
 					results[job.idx] = QueryResult{
 						QueryID:    job.entry.queryID,
@@ -1079,7 +1099,7 @@ func (e *Engine) addQueriesStreamChunked(
 			}
 			if !onResult(QueryResult{
 				QueryID:    entry.queryID,
-				Changes:    bumpRowVersions(chunk, mrv),
+				Changes:    chunk,
 				ChunkIndex: chunkIndex,
 				Final:      final,
 				TimingMs:   timingMs,
@@ -1099,7 +1119,10 @@ func (e *Engine) addQueriesStreamChunked(
 		}
 
 		for node := range entry.pipeline.Input.Fetch(ivm.FetchRequest{}) {
-			nodeChanges := streamNodes(entry.queryID, entry.schema, RowChangeAdd, node)
+			// Bump per node batch — the TS #streamNodes placement (see
+			// hydrateEntry): main-pipeline hydrate rows are bumped, the
+			// companion rows appended below are NOT.
+			nodeChanges := bumpRowVersions(streamNodes(entry.queryID, entry.schema, RowChangeAdd, node), mrv)
 			chunk = append(chunk, nodeChanges...)
 			chunkBytes += estimateRowChangesBytes(nodeChanges)
 			if len(chunk) >= chunkSize || chunkBytes >= softChunkBytes {
@@ -1123,7 +1146,9 @@ func (e *Engine) addQueriesStreamChunked(
 		// They're tagged with the same queryID + each companion's own
 		// schema (table name), so the streamer/client demultiplex
 		// correctly. Chunk-bounded so a query with many companions
-		// still respects hydrateChunkSize.
+		// still respects hydrateChunkSize. NEVER bumped: TS yields
+		// hydrate companion rows directly, bypassing the #streamNodes
+		// minRowVersion bump (pipeline-driver.ts:1661-1670).
 		for _, ce := range entry.companions {
 			if ce.matchedRow == nil {
 				continue
@@ -1910,8 +1935,9 @@ func (po *pipelineOutput) Push(change ivm.Change, pusher ivm.InputBase) {
 // accumulate exactly as the plain pipelineOutput would.
 type companionOutput struct {
 	pipelineOutput
-	childField    string
-	resolvedValue ivm.Value
+	childField        string
+	resolvedValue     ivm.Value
+	resolvedUndefined bool // TS resolvedValue === undefined (no row matched at resolve)
 }
 
 // ScalarResetError is the panic a companionOutput raises when a resolved
@@ -1958,30 +1984,33 @@ func jsScalarString(v ivm.Value, undefined bool) string {
 }
 
 func (co *companionOutput) Push(change ivm.Change, pusher ivm.InputBase) {
-	changed := false
 	var newValue ivm.Value
 	newUndefined := false
 	switch change.Type {
 	case ivm.ChangeTypeAdd, ivm.ChangeTypeEdit:
 		// New scalar value is the child field of the pushed (new) node.
-		// TS: newValue = change.node.row[childField] ?? null.
+		// TS: newValue = change.node.row[childField] ?? null
+		// (pipeline-driver.ts:1705-1710) — never undefined for ADD/EDIT; Go's
+		// missing-key nil is exactly the `?? null` collapse.
 		newValue = change.Node.Row[co.childField]
-		changed = !scalarValuesEqual(newValue, co.resolvedValue)
 	case ivm.ChangeTypeRemove:
-		// TS: newValue = undefined for REMOVE, and scalarValuesEqual(
-		// undefined, resolvedValue) is always false (resolvedValue is never
-		// undefined) — so removing the scalar's source row always resets.
-		changed = true
+		// TS: newValue = undefined for REMOVE (pipeline-driver.ts:1711-1712).
+		// Against resolvedUndefined (no row matched at resolve time) that is
+		// EQUAL — undefined === undefined → no reset, accumulate; against a
+		// null or literal resolvedValue it is unequal → reset. (The
+		// resolved-undefined REMOVE is unreachable through real advances — a
+		// row entering the empty match set resets first via ADD — but the
+		// comparison is TS's, not a hardwired `changed = true`.)
 		newUndefined = true
 	case ivm.ChangeTypeChild:
 		// TS returns [] for CHILD: a relationship-only change does not move
 		// the scalar value — neither accumulate nor reset.
 		return
 	}
-	if changed {
+	if !scalarValuesEqual(newValue, newUndefined, co.resolvedValue, co.resolvedUndefined) {
 		panic(&ScalarResetError{
 			Table:    co.schema.TableName,
-			Resolved: jsScalarString(co.resolvedValue, false),
+			Resolved: jsScalarString(co.resolvedValue, co.resolvedUndefined),
 			New:      jsScalarString(newValue, newUndefined),
 		})
 	}
@@ -1989,13 +2018,23 @@ func (co *companionOutput) Push(change ivm.Change, pusher ivm.InputBase) {
 }
 
 // scalarValuesEqual ports TS's scalarValuesEqual (pipeline-driver.ts:3029-3034,
-// strict `a === b`) for the resolved-scalar child-field comparison. Go's
-// interface `==` matches JS `===` for scalar literals (the only thing a
-// resolvable scalar subquery yields), with nil == SQL/JS null. The recover
-// guards the rare non-comparable dynamic type (JSON map/slice would panic
-// on ==); treating those as unequal mirrors TS's reference-inequality for
-// object-typed values (→ reset), which is the safe direction.
-func scalarValuesEqual(a, b ivm.Value) (eq bool) {
+// strict `a === b` over LiteralValue | null | undefined). JS === distinguishes
+// undefined from null — "undefined === undefined (no row matched), null ===
+// null (row matched but field was NULL)" (pipeline-driver.ts:3025-3027) — so
+// each side carries an explicit undefined flag: flags differ → unequal; both
+// undefined → equal; otherwise Go's interface `==` matches JS === for scalar
+// literals (the only thing a resolvable scalar subquery yields), with nil ==
+// SQL/JS null. The recover guards the rare non-comparable dynamic type (JSON
+// map/slice would panic on ==); treating those as unequal mirrors TS's
+// reference-inequality for object-typed values (→ reset), which is the safe
+// direction.
+func scalarValuesEqual(a ivm.Value, aUndefined bool, b ivm.Value, bUndefined bool) (eq bool) {
+	if aUndefined != bUndefined {
+		return false
+	}
+	if aUndefined {
+		return true
+	}
 	defer func() {
 		if recover() != nil {
 			eq = false

@@ -219,13 +219,27 @@ func streamChangesInto(emit func(RowChange), queryID string, schema *ivm.SourceS
 				Row:     change.Node.Row,
 			})
 		case ivm.ChangeTypeChild:
-			// Child: recurse into the relationship
-			if change.Child != nil && schema.Relationships != nil {
-				childSchema := schema.Relationships[change.Child.RelationshipName]
-				if childSchema != nil {
-					streamChangesInto(emit, queryID, childSchema, []ivm.Change{change.Child.Change})
-				}
+			// Child: recurse into the relationship. TS resolves it with
+			// must(schema.relationships[child.relationshipName])
+			// (pipeline-driver.ts:2798-2802) — a CHILD change naming a
+			// relationship its schema doesn't know is a pipeline-construction
+			// bug, and TS THROWS → CG teardown. The old `if childSchema != nil`
+			// guard silently DROPPED the descendant change instead: silent data
+			// loss where TS fails loud, and inconsistent with streamNodesInto's
+			// identical-class panic below. (streamer audit F2.)
+			if change.Child == nil {
+				// TS would TypeError reading child.relationshipName of undefined.
+				panic(fmt.Sprintf(
+					"streamChangesInto: CHILD change for table %q carries no child payload",
+					schema.TableName))
 			}
+			childSchema := schema.Relationships[change.Child.RelationshipName]
+			if childSchema == nil {
+				panic(fmt.Sprintf(
+					"streamChangesInto: CHILD change for table %q references relationship %q missing from schema",
+					schema.TableName, change.Child.RelationshipName))
+			}
+			streamChangesInto(emit, queryID, childSchema, []ivm.Change{change.Child.Change})
 		}
 	}
 }

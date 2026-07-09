@@ -318,15 +318,24 @@ func TestAddQuery_RemoveQueryCleansCompanions(t *testing.T) {
 }
 
 // TestAddQuery_ScalarNoMatchToMatchedNullThenValue exercises the no-match →
-// matched-NULL → matched-value transition the review flagged as a regression.
+// matched-NULL → matched-value lifecycle with TS's tri-state resolvedValue.
 //
-// Hydrate with NO matching user (users empty) bakes ALWAYS_FALSE, so the issue
-// is filtered out. A later INSERT of users{id:u1, name:NULL} moves the scalar
-// from "no row" to "row, NULL value" — but scalarValuesEqual(nil, nil)==true
-// (engine.go:1419, matching TS null===null), so NO reset fires and the issue
-// stays filtered. The output is identical to the no-match state: matched-NULL
-// is a no-op, NOT a regression. Only when the value becomes non-NULL
-// (name: NULL→"Zoe") does the baked literal genuinely go stale and a reset fire.
+// Hydrate with NO matching user (users empty) resolves undefined
+// (pipeline-driver.ts:1195-1199) and bakes ALWAYS_FALSE, so the issue is
+// filtered out. A later INSERT of users{id:u1, name:NULL} moves the scalar
+// from "no row" (undefined) to "row, NULL value" (null) — and TS's
+// scalarValuesEqual is strict ===, where null !== undefined
+// (pipeline-driver.ts:3025-3034), so a reset FIRES ("undefined -> null").
+// TS then rebuilds the pipeline against the advanced replica: the re-resolve
+// sees matched-NULL → null, and the re-baked predicate is the SAME
+// ALWAYS_FALSE (resolve-scalar-subqueries.ts:171-174) — the issue stays
+// filtered; the reset changed the companion's resolved state, not the rows.
+// Only when the value then becomes non-NULL (name: NULL→"Zoe") does the baked
+// literal go stale again and a second reset fire ("null -> Zoe").
+//
+// (An earlier version of this test pinned NO reset for the first transition,
+// justified as "matching TS null===null" — wrong: TS compares null ===
+// undefined there, which is false. The streaming/advance audit's F1.)
 func TestAddQuery_ScalarNoMatchToMatchedNullThenValue(t *testing.T) {
 	// users starts EMPTY — the scalar subquery (id='u1') matches nothing.
 	users := ivm.NewMemorySource("users",
@@ -370,7 +379,8 @@ func TestAddQuery_ScalarNoMatchToMatchedNullThenValue(t *testing.T) {
 		},
 	}
 
-	// Hydrate: no match → ALWAYS_FALSE baked → no issue rows emitted.
+	// Hydrate: no match → resolvedValue undefined, ALWAYS_FALSE baked → no
+	// issue rows emitted.
 	changes, _, err := eng.AddQuery("q", ast)
 	if err != nil {
 		t.Fatal(err)
@@ -381,29 +391,45 @@ func TestAddQuery_ScalarNoMatchToMatchedNullThenValue(t *testing.T) {
 		}
 	}
 
-	// Transition 1: INSERT users{id:u1, name:NULL} — matched, but value NULL.
-	// scalarValuesEqual(nil, resolvedValue=nil)==true → NO reset, issue stays
-	// filtered (output-equivalent to the no-match state).
-	res := eng.Advance([]SnapshotChange{
+	// Transition 1: INSERT users{id:u1, name:NULL} — matched, value NULL.
+	// scalarValuesEqual(null, undefined) is false (strict ===) → RESET.
+	sre := advanceScalarResetPanic(t, eng, []SnapshotChange{
 		{Table: "users", NextValue: ivm.Row{"id": "u1", "name": nil}},
 	})
-	for _, c := range res.Changes {
+	if got := sre.Error(); got != "Scalar subquery value changed for users: undefined -> null" {
+		t.Fatalf("unexpected first reset message: %q", got)
+	}
+
+	// Mimic the TS reset lifecycle: the view-syncer destroys the pipelines,
+	// the replica finishes advancing (the reset panic aborted the engine push
+	// BEFORE the source write — genPushAndWrite pushes then writes — so apply
+	// the pending insert directly, as the replica would hold it), and the
+	// query re-registers, re-running the resolver against current truth.
+	eng.RemoveQuery("q")
+	users.BulkInsert([]ivm.Row{{"id": "u1", "name": nil}})
+	changes, _, err = eng.AddQuery("q", ast)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Re-resolve sees matched-NULL → resolvedValue null → the SAME
+	// ALWAYS_FALSE predicate: the issue stays filtered (output-equivalent to
+	// no-match), and the companion row now ships.
+	for _, c := range changes {
 		if c.Table == "issues" {
-			t.Fatalf("matched-NULL must not surface an issue row (ALWAYS_FALSE still holds); got %+v", c)
+			t.Fatalf("matched-NULL re-hydrate must emit zero issue rows (ALWAYS_FALSE); got %+v", c)
 		}
 	}
 
-	// Transition 2: EDIT users{id:u1} name NULL→"Zoe" — now the baked literal
-	// is genuinely stale, so a scalar-subquery reset MUST fire.
-	sre := advanceScalarResetPanic(t, eng, []SnapshotChange{
+	// Transition 2: EDIT users{id:u1} name NULL→"Zoe" — the baked literal is
+	// genuinely stale again → second reset, now null -> Zoe.
+	sre = advanceScalarResetPanic(t, eng, []SnapshotChange{
 		{
 			Table:      "users",
 			PrevValues: []ivm.Row{{"id": "u1", "name": nil}},
 			NextValue:  ivm.Row{"id": "u1", "name": "Zoe"},
 		},
 	})
-	// null renders as JS String(null) in the TS-mirrored message.
 	if got := sre.Error(); got != "Scalar subquery value changed for users: null -> Zoe" {
-		t.Fatalf("unexpected reset message: %q", got)
+		t.Fatalf("unexpected second reset message: %q", got)
 	}
 }
