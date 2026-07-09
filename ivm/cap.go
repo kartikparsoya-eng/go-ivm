@@ -313,7 +313,8 @@ func GetCapStateKey(partitionKey PartitionKey, rowOrConstraint Row) string {
 			values = append(values, rowOrConstraint[key])
 		}
 	}
-	b, err := json.Marshal(values)
+	// jsonKeyBytes mirrors JSON.stringify (cap.ts:312): NaN/±Inf → null.
+	b, err := jsonKeyBytes(values)
 	if err != nil {
 		// Unreachable for scalar partition-key values; panic to surface the
 		// impossible rather than silently collide cache keys.
@@ -329,7 +330,8 @@ func serializePK(row Row, primaryKey []string) string {
 	for i, k := range primaryKey {
 		values[i] = row[k]
 	}
-	b, err := json.Marshal(values)
+	// jsonKeyBytes mirrors JSON.stringify (cap.ts:316): NaN/±Inf → null.
+	b, err := jsonKeyBytes(values)
 	if err != nil {
 		panic("Cap serializePK: json.Marshal: " + err.Error())
 	}

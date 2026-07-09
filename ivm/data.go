@@ -1,8 +1,10 @@
 package ivm
 
 import (
+	"encoding/json"
 	"fmt"
 	"iter"
+	"math"
 	"runtime/debug"
 	"strings"
 
@@ -12,6 +14,27 @@ import (
 // Value represents a column value. Mirrors zero-protocol/src/data.ts Value type.
 // We normalize undefined → nil (same as TS normalizeUndefined).
 type Value interface{}
+
+// jsonKeyBytes marshals state/cache key values the way JS JSON.stringify
+// does: non-finite float64s (NaN/±Inf) encode as null — JSON.stringify(NaN)
+// === 'null' — so a NaN partition/join value produces the SAME key as an
+// actual null, reproducing TS's key collision exactly (take.ts:710-725,
+// cap.ts:300-317, exists.ts:224-230 are all plain JSON.stringify). Bare
+// json.Marshal instead errors on the whole array for NaN/±Inf, which made
+// the old callers PANIC where TS succeeds — violating the Go-fails-iff-
+// TS-fails invariant. Truly non-JS values (channels, funcs) still return
+// an error; each caller panics with its own context (a plumbing bug, not a
+// data condition — pinned by json_marshal_panic_test.go).
+//
+// Mutates values in place (every caller builds a fresh slice).
+func jsonKeyBytes(values []Value) ([]byte, error) {
+	for i, v := range values {
+		if f, ok := v.(float64); ok && (math.IsNaN(f) || math.IsInf(f, 0)) {
+			values[i] = nil
+		}
+	}
+	return json.Marshal(values)
+}
 
 // smallFloatCacheMax bounds boxedSmallFloat below. 1024 covers the values that
 // dominate real numeric columns — booleans-as-int (0/1), enums, status codes,

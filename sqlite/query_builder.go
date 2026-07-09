@@ -489,6 +489,11 @@ func gatherStartConstraints(
 
 	// Inclusive (basis == "at"): add equality for order fields present in start.Row.
 	// Same partial-cursor rule: skip columns not specified in the cursor.
+	// Guard the degenerate cursor (Row lacks even the FIRST order column):
+	// appending "(" + join(nothing) + ")" would emit the literal "()", a SQL
+	// syntax error that panics every Fetch — the 'at' twin of the empty-
+	// orClauses guard below, and the same disposition: a cursor pinning no
+	// position imposes no constraint.
 	if start.Basis == "at" {
 		var andParts []string
 		for _, o := range order {
@@ -502,7 +507,9 @@ func gatherStartConstraints(
 			andParts = append(andParts, eqSQL)
 			params = append(params, value)
 		}
-		orClauses = append(orClauses, "("+strings.Join(andParts, " AND ")+")")
+		if len(andParts) > 0 {
+			orClauses = append(orClauses, "("+strings.Join(andParts, " AND ")+")")
+		}
 	}
 
 	// Defensive: if the cursor specified no usable order column (start.Row lacks

@@ -1520,7 +1520,9 @@ func (s *Source) fetchSerial(req ivm.FetchRequest, conn *connection) []ivm.Node 
 			// injected eagerly at the START of the stream.
 			add, remove := unorderedOverlayPlan(s.overlay.Change, req.Constraint, req.MultiConstraints)
 			if remove != nil {
-				out = removeByPK(out, remove, s.primaryKey)
+				// TS unordered convention: rowMatchesPK/valuesEqual
+				// (memory-source.ts:940-948) — a NULL PK never matches.
+				out = removeByPKUnordered(out, remove, s.primaryKey)
 			}
 			if add != nil && (conn.filterPredicate == nil || conn.filterPredicate(add)) {
 				out = append([]ivm.Node{{Row: add}}, out...)
@@ -1731,7 +1733,7 @@ func (s *Source) fetchDuringPushStream(req ivm.FetchRequest, conn *connection) i
 			if conn.filterPredicate != nil && !conn.filterPredicate(row) {
 				continue
 			}
-			if pendingRemove != nil && pkRowsEqual(row, pendingRemove, s.primaryKey) {
+			if pendingRemove != nil && overlayRemoveMatches(row, pendingRemove, s.primaryKey, unordered) {
 				pendingRemove = nil
 				continue
 			}

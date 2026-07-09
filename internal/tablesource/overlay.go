@@ -251,7 +251,12 @@ func unorderedOverlayPlan(
 }
 
 // pkRowsEqual reports whether two rows agree on every primary-key column,
-// using the same CompareValues convention as removeByPK.
+// using the same CompareValues convention as removeByPK — the ORDERED
+// overlay remove matcher. TS's ordered path matches the remove via the full
+// sort comparator (generateWithOverlayInner `cmp === 0`,
+// memory-source.ts:865-871), and compareValues treats null==null as EQUAL
+// for ordering, which CompareValues(nil,nil)==0 mirrors. Do NOT use this on
+// the unordered path — that is rowMatchesPK's valuesEqual convention.
 func pkRowsEqual(a, b ivm.Row, primaryKey []string) bool {
 	for _, pk := range primaryKey {
 		if ivm.CompareValues(a[pk], b[pk]) != 0 {
@@ -259,6 +264,36 @@ func pkRowsEqual(a, b ivm.Row, primaryKey []string) bool {
 		}
 	}
 	return true
+}
+
+// rowMatchesPK — direct port of TS rowMatchesPK (memory-source.ts:953-959),
+// the UNORDERED overlay remove matcher: per-PK-column valuesEqual, where
+// null is UNEQUAL to itself (data.ts:112-118). A remove overlay carrying a
+// NULL PK value can therefore never suppress a streamed row on the
+// unordered path — even a row whose PK is also NULL — while the ordered
+// path's comparator match (pkRowsEqual) WOULD suppress it. TS itself uses
+// these two different null conventions on the two paths; port each exactly.
+// (Unreachable with a Postgres upstream — PK columns are NOT NULL — but
+// SQLite permits NULL in non-INTEGER PRIMARY KEY columns.)
+func rowMatchesPK(a, b ivm.Row, primaryKey []string) bool {
+	for _, pk := range primaryKey {
+		if !ivm.ValuesEqual(a[pk], b[pk]) {
+			return false
+		}
+	}
+	return true
+}
+
+// overlayRemoveMatches selects the path-correct TS remove-overlay matcher:
+// unordered → rowMatchesPK/valuesEqual (generateWithOverlayInnerUnordered,
+// memory-source.ts:940-948); ordered → comparator equality
+// (generateWithOverlayInner, memory-source.ts:865-871), mirrored by
+// pkRowsEqual/CompareValues.
+func overlayRemoveMatches(row, remove ivm.Row, primaryKey []string, unordered bool) bool {
+	if unordered {
+		return rowMatchesPK(row, remove, primaryKey)
+	}
+	return pkRowsEqual(row, remove, primaryKey)
 }
 
 // constraintMatchesRow — TS uses valuesEqual (constraint.ts:21), which treats
@@ -301,6 +336,10 @@ func insertSorted(nodes []ivm.Node, node ivm.Node, comparator ivm.Comparator) []
 	return nodes
 }
 
+// removeByPK removes the first node matching row per the ORDERED
+// CompareValues convention (see pkRowsEqual). applyOverlay (ordered
+// materialized path) is its only production caller; the unordered
+// materialized path uses removeByPKUnordered.
 func removeByPK(nodes []ivm.Node, row ivm.Row, primaryKey []string) []ivm.Node {
 	for i, n := range nodes {
 		match := true
@@ -311,6 +350,18 @@ func removeByPK(nodes []ivm.Node, row ivm.Row, primaryKey []string) []ivm.Node {
 			}
 		}
 		if match {
+			return append(nodes[:i], nodes[i+1:]...)
+		}
+	}
+	return nodes
+}
+
+// removeByPKUnordered removes the first node matching row per TS's
+// UNORDERED convention (rowMatchesPK/valuesEqual — null never matches).
+// Twin of removeByPK, which keeps the ordered comparator convention.
+func removeByPKUnordered(nodes []ivm.Node, row ivm.Row, primaryKey []string) []ivm.Node {
+	for i, n := range nodes {
+		if rowMatchesPK(n.Row, row, primaryKey) {
 			return append(nodes[:i], nodes[i+1:]...)
 		}
 	}

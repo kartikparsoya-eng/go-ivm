@@ -7,7 +7,6 @@ package ivm
 // Take can count rows globally or by unique value of some partition key.
 
 import (
-	"encoding/json"
 	"fmt"
 	"iter"
 	"os"
@@ -690,7 +689,9 @@ func GetTakeStateKey(partitionKey PartitionKey, rowOrConstraint Row) string {
 			values = append(values, rowOrConstraint[key])
 		}
 	}
-	b, err := json.Marshal(values)
+	// jsonKeyBytes mirrors JSON.stringify (take.ts:724): NaN/±Inf encode as
+	// null (including TS's NaN↔null key collision) instead of erroring.
+	b, err := jsonKeyBytes(values)
 	if err != nil {
 		// Unreachable for scalar partition-key values; panic to surface the
 		// impossible rather than silently collide cache keys.

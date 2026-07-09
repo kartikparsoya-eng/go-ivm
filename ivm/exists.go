@@ -1,7 +1,6 @@
 package ivm
 
 import (
-	"encoding/json"
 	"fmt"
 	"iter"
 	"slices"
@@ -217,7 +216,7 @@ func (e *Exists) filterWithExists(node Node, exists bool) bool {
 
 // getCacheKey — builds a cache key from the node's join key values.
 func (e *Exists) getCacheKey(node Node, key CompoundKey) string {
-	values := make([]interface{}, len(key))
+	values := make([]Value, len(key))
 	for i, k := range key {
 		v := node.Row[k]
 		if v == nil {
@@ -226,7 +225,8 @@ func (e *Exists) getCacheKey(node Node, key CompoundKey) string {
 			values[i] = v
 		}
 	}
-	b, err := json.Marshal(values)
+	// jsonKeyBytes mirrors JSON.stringify (exists.ts:229): NaN/±Inf → null.
+	b, err := jsonKeyBytes(values)
 	if err != nil {
 		// Unreachable for scalar join-key values; panic to surface the
 		// impossible rather than silently collide cache keys.
