@@ -4,6 +4,7 @@ import (
 	"math"
 	"slices"
 	"strconv"
+	"sync/atomic"
 	"testing"
 )
 
@@ -29,6 +30,25 @@ func chunk2Fixture(t *testing.T) (*FlippedJoin, *recordingInput) {
 	return newFlipFixture(t, 5, parents, nil)
 }
 
+func assertChunkFetchPlan(t *testing.T, rec *recordingInput, initialLens []int, yieldedParents int) {
+	t.Helper()
+	wantFetches := len(initialLens) + yieldedParents
+	if len(rec.fetches) != wantFetches {
+		t.Fatalf("parent fetches = %d, want %d (%d initial chunk heads + %d chunk advances)",
+			len(rec.fetches), wantFetches, len(initialLens), yieldedParents)
+	}
+	for i, wantLen := range initialLens {
+		if got := len(rec.fetches[i].MultiConstraints[0]); got != wantLen {
+			t.Fatalf("initial chunk %d multi len = %d, want %d", i, got, wantLen)
+		}
+	}
+	for i := len(initialLens); i < len(rec.fetches); i++ {
+		if rec.fetches[i].Start == nil || rec.fetches[i].Start.Basis != BasisAfter {
+			t.Fatalf("reopen fetch %d Start = %+v, want BasisAfter", i, rec.fetches[i].Start)
+		}
+	}
+}
+
 func TestFlippedJoinChunkedMergesSortedChunks(t *testing.T) {
 	fj, rec := chunk2Fixture(t)
 
@@ -48,16 +68,7 @@ func TestFlippedJoinChunkedMergesSortedChunks(t *testing.T) {
 		}
 	}
 
-	// 3 parent fetches (chunks of 2, 2, 1), each carrying one
-	// multiConstraints entry capped at the chunk size.
-	if len(rec.fetches) != 3 {
-		t.Fatalf("parent fetches = %d, want 3", len(rec.fetches))
-	}
-	for i, wantLen := range []int{2, 2, 1} {
-		if got := len(rec.fetches[i].MultiConstraints[0]); got != wantLen {
-			t.Fatalf("chunk %d multi len = %d, want %d", i, got, wantLen)
-		}
-	}
+	assertChunkFetchPlan(t, rec, []int{2, 2, 1}, len(result))
 }
 
 func TestFlippedJoinChunkedDedupesSharedParentKeys(t *testing.T) {
@@ -84,13 +95,7 @@ func TestFlippedJoinChunkedDedupesSharedParentKeys(t *testing.T) {
 			t.Fatalf("parent %v children = %d, want 2", nd.Row["id"], c)
 		}
 	}
-	if len(rec.fetches) != 2 {
-		t.Fatalf("parent fetches = %d, want 2 (deduped 3 keys / chunk 2)", len(rec.fetches))
-	}
-	if len(rec.fetches[0].MultiConstraints[0]) != 2 || len(rec.fetches[1].MultiConstraints[0]) != 1 {
-		t.Fatalf("chunk sizes = %d,%d want 2,1",
-			len(rec.fetches[0].MultiConstraints[0]), len(rec.fetches[1].MultiConstraints[0]))
-	}
+	assertChunkFetchPlan(t, rec, []int{2, 1}, len(result))
 }
 
 func TestFlippedJoinChunkedReverse(t *testing.T) {
@@ -107,9 +112,7 @@ func TestFlippedJoinChunkedReverse(t *testing.T) {
 			t.Fatalf("parent %v wrong children %v", n.Row["id"], children)
 		}
 	}
-	if len(rec.fetches) != 3 {
-		t.Fatalf("parent fetches = %d, want 3", len(rec.fetches))
-	}
+	assertChunkFetchPlan(t, rec, []int{2, 2, 1}, len(result))
 	for i, f := range rec.fetches {
 		if !f.Reverse {
 			t.Fatalf("chunk %d did not carry Reverse", i)
@@ -126,13 +129,10 @@ func TestFlippedJoinChunkedStartAt(t *testing.T) {
 	if got, want := fetchedParentIDs(result), []string{"p3", "p4", "p5"}; !slices.Equal(got, want) {
 		t.Fatalf("start-at = %v, want %v", got, want)
 	}
-	// Each chunk's parent fetch carries the start parameter through.
-	if len(rec.fetches) != 3 {
-		t.Fatalf("parent fetches = %d, want 3", len(rec.fetches))
-	}
-	for i, f := range rec.fetches {
+	assertChunkFetchPlan(t, rec, []int{2, 2, 1}, len(result))
+	for i, f := range rec.fetches[:3] {
 		if f.Start == nil || f.Start.Row["id"] != "p3" || f.Start.Basis != "at" {
-			t.Fatalf("chunk %d start = %+v, want p3/at", i, f.Start)
+			t.Fatalf("initial chunk %d start = %+v, want p3/at", i, f.Start)
 		}
 	}
 }
@@ -169,9 +169,7 @@ func TestFlippedJoinChunkedConstraintOnNonJoinColumn(t *testing.T) {
 	if got, want := fetchedParentIDs(result), []string{"p1", "p3", "p4", "p5"}; !slices.Equal(got, want) {
 		t.Fatalf("constrained = %v, want %v", got, want)
 	}
-	if len(rec.fetches) != 3 {
-		t.Fatalf("parent fetches = %d, want 3", len(rec.fetches))
-	}
+	assertChunkFetchPlan(t, rec, []int{2, 2, 1}, len(result))
 	for i, f := range rec.fetches {
 		if f.Constraint == nil || (*f.Constraint)["active"] != true {
 			t.Fatalf("chunk %d lost req.Constraint: %+v", i, f.Constraint)
@@ -190,6 +188,41 @@ func TestFlippedJoinChunkedEarlyStop(t *testing.T) {
 	}
 	if !slices.Equal(got, []string{"p1"}) {
 		t.Fatalf("early stop got %v, want [p1]", got)
+	}
+}
+
+func TestFlippedJoinChunkedEarlyStopPullsOnlyChunkHeads(t *testing.T) {
+	t.Cleanup(SetMultiConstraintChunkSizeForTest(2))
+
+	parent := NewMemorySource("parent", map[string]string{"id": "string"}, []string{"id"})
+	child := NewMemorySource("child", map[string]string{"id": "string", "parentId": "string"}, []string{"id"})
+	for i := 1; i <= 5; i++ {
+		parent.BulkInsert([]Row{{"id": pID(i)}})
+		child.BulkInsert([]Row{{"id": cID(i), "parentId": pID(i)}})
+	}
+
+	parentCounter := &countingInput{
+		inner: parent.Connect(Ordering{{"id", "asc"}}, nil, nil),
+	}
+	fj := NewFlippedJoin(FlippedJoinArgs{
+		Parent:           parentCounter,
+		Child:            child.Connect(Ordering{{"id", "asc"}}, nil, nil),
+		ParentKey:        CompoundKey{"id"},
+		ChildKey:         CompoundKey{"parentId"},
+		RelationshipName: "children",
+		System:           "client",
+	})
+
+	var got []string
+	for n := range fj.Fetch(FetchRequest{}) {
+		got = append(got, n.Row["id"].(string))
+		break
+	}
+	if !slices.Equal(got, []string{"p1"}) {
+		t.Fatalf("early stop got %v, want [p1]", got)
+	}
+	if pulled := atomic.LoadInt32(&parentCounter.rowsReturned); pulled > 3 {
+		t.Fatalf("early stop pulled %d parent rows, want <= 3 chunk heads", pulled)
 	}
 }
 

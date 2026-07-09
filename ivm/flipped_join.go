@@ -1,6 +1,7 @@
 package ivm
 
 import (
+	"container/heap"
 	"encoding/json"
 	"iter"
 	"slices"
@@ -150,14 +151,10 @@ func SetMultiConstraintChunkSizeForTest(size int) func() {
 // multi entry, so it appears in exactly one chunk exactly once, and children
 // map back to it via the same canonical key.
 //
-// Go deviation from TS (deliberate): when the multi exceeds the chunk size,
-// TS opens ALL chunk cursors up front and lazily heap-merges
-// (mergeSortedStreams). Doing that here would need iter.Pull — N concurrent
-// leaf readers — which is exactly the reader-pool deadlock the pre-batched
-// Go code was rewritten to avoid (N readers > pool size K wedges the CG).
-// Instead chunks are fetched SEQUENTIALLY and eagerly (one reader at a
-// time), then merged; output order and content are identical. The common
-// case (≤ chunk-size unique keys, i.e. one chunk) stays fully lazy.
+// For multi sets larger than the chunk size, Go keeps TS's lazy heap merge
+// shape without holding one SQLite cursor per chunk: it fetches one head per
+// chunk, yields the smallest head, then reopens only that winning chunk with
+// Start:"after" the emitted row.
 func (fj *FlippedJoin) Fetch(req FetchRequest) iter.Seq[Node] {
 	// Translate constraints for the parent on parts of the join key to constraints for the child.
 	var childConstraint Constraint
@@ -270,10 +267,9 @@ func (fj *FlippedJoin) fetchBatched(req FetchRequest, childNodes []Node) iter.Se
 	}
 }
 
-// fetchChunkedSequential fetches computedMulti in chunkSize slices —
-// SEQUENTIALLY and eagerly, one leaf reader at a time (see Fetch for why Go
-// must not open all chunk cursors concurrently) — and merges the per-chunk
-// sorted results into one globally ordered sequence.
+// fetchChunkedSequential fetches one head row per multi-constraint chunk and
+// heap-merges those heads. Advancing a chunk reopens only that chunk after
+// its last emitted row, keeping at most one parent cursor active at a time.
 func (fj *FlippedJoin) fetchChunkedSequential(
 	parentReq FetchRequest,
 	incoming []MultiConstraint,
@@ -290,35 +286,85 @@ func (fj *FlippedJoin) fetchChunkedSequential(
 		return c
 	}
 	return func(yield func(Node) bool) {
-		var chunks [][]Node
+		var chunks []flippedJoinChunkState
+		heads := &flippedJoinChunkHeap{compare: compare}
+		heap.Init(heads)
+
 		for i := 0; i < len(computedMulti); i += chunkSize {
 			end := min(i+chunkSize, len(computedMulti))
-			creq := parentReq
-			creq.MultiConstraints = appendMulti(incoming, computedMulti[i:end])
-			chunks = append(chunks, slices.Collect(fj.parent.Fetch(creq)))
+			chunks = append(chunks, flippedJoinChunkState{
+				multi: computedMulti[i:end],
+			})
+			chunkIdx := len(chunks) - 1
+			if head, ok := fj.fetchChunkHead(parentReq, incoming, chunks[chunkIdx]); ok {
+				heap.Push(heads, flippedJoinChunkHead{chunk: chunkIdx, node: head})
+			}
 		}
-		// K-pointer merge of the (already sorted) chunk slices. K is small
-		// (unique keys / chunkSize) so a linear min scan per emit is fine.
-		heads := make([]int, len(chunks))
-		for {
-			best := -1
-			for c := range chunks {
-				if heads[c] >= len(chunks[c]) {
-					continue
-				}
-				if best == -1 || compare(chunks[c][heads[c]], chunks[best][heads[best]]) < 0 {
-					best = c
-				}
-			}
-			if best == -1 {
+
+		for heads.Len() > 0 {
+			best := heap.Pop(heads).(flippedJoinChunkHead)
+			if !yield(best.node) {
 				return
 			}
-			if !yield(chunks[best][heads[best]]) {
-				return
+			chunks[best.chunk].start = &Start{Row: best.node.Row, Basis: BasisAfter}
+			if head, ok := fj.fetchChunkHead(parentReq, incoming, chunks[best.chunk]); ok {
+				heap.Push(heads, flippedJoinChunkHead{chunk: best.chunk, node: head})
 			}
-			heads[best]++
 		}
 	}
+}
+
+type flippedJoinChunkState struct {
+	multi MultiConstraint
+	start *Start
+}
+
+func (fj *FlippedJoin) fetchChunkHead(
+	parentReq FetchRequest,
+	incoming []MultiConstraint,
+	chunk flippedJoinChunkState,
+) (Node, bool) {
+	creq := parentReq
+	creq.MultiConstraints = appendMulti(incoming, chunk.multi)
+	if chunk.start != nil {
+		creq.Start = chunk.start
+	}
+	for n := range fj.parent.Fetch(creq) {
+		return n, true
+	}
+	return Node{}, false
+}
+
+type flippedJoinChunkHead struct {
+	chunk int
+	node  Node
+}
+
+type flippedJoinChunkHeap struct {
+	items   []flippedJoinChunkHead
+	compare func(a, b Node) int
+}
+
+func (h flippedJoinChunkHeap) Len() int { return len(h.items) }
+func (h flippedJoinChunkHeap) Less(i, j int) bool {
+	c := h.compare(h.items[i].node, h.items[j].node)
+	if c == 0 {
+		return h.items[i].chunk < h.items[j].chunk
+	}
+	return c < 0
+}
+func (h flippedJoinChunkHeap) Swap(i, j int) {
+	h.items[i], h.items[j] = h.items[j], h.items[i]
+}
+func (h *flippedJoinChunkHeap) Push(x interface{}) {
+	h.items = append(h.items, x.(flippedJoinChunkHead))
+}
+func (h *flippedJoinChunkHeap) Pop() interface{} {
+	old := h.items
+	n := len(old)
+	x := old[n-1]
+	h.items = old[:n-1]
+	return x
 }
 
 // appendMulti returns incoming + mc as a fresh slice (never aliasing
