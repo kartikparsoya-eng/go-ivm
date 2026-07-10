@@ -56,6 +56,12 @@ type Snapshotter struct {
 	curr *Snapshot
 	prev *Snapshot
 
+	// destroyed is set by Destroy. Callers that can race teardown
+	// (e.g. a fire-and-forget reset re-read) check Destroyed() to bail
+	// early instead of reading a closed connection (L13, mirrors TS
+	// snapshotter.ts #destroyed).
+	destroyed bool
+
 	// beginStmt is the BEGIN variant that worked the first time
 	// ("BEGIN CONCURRENT" with rocicorp's wal2 patch, else plain "BEGIN").
 	// Cached so resetToHead doesn't retry CONCURRENT each cycle on builds
@@ -96,11 +102,24 @@ func (s *Snapshotter) Initialized() bool {
 	return s.curr != nil
 }
 
+// Destroyed reports whether Destroy has been called. Mirrors TS
+// snapshotter.ts get destroyed() (146-148). Callers that can race
+// teardown check this to distinguish "snapshot is gone" from "snapshot
+// is live but empty" (L13).
+func (s *Snapshotter) Destroyed() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.destroyed
+}
+
 // Current returns the current snapshot. Errors if not initialized.
 // Mirrors current() (133).
 func (s *Snapshotter) Current() (*Snapshot, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.destroyed {
+		return nil, fmt.Errorf("snapshotter: destroyed")
+	}
 	if s.curr == nil {
 		return nil, fmt.Errorf("snapshotter: not initialized")
 	}
@@ -131,6 +150,9 @@ func (s *Snapshotter) Advance(
 ) (*Diff, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.destroyed {
+		return nil, fmt.Errorf("snapshotter: destroyed")
+	}
 	if s.curr == nil {
 		return nil, fmt.Errorf("snapshotter: not initialized")
 	}
@@ -184,6 +206,9 @@ func (s *Snapshotter) Advance(
 func (s *Snapshotter) RefreshCurrentToHead() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.destroyed {
+		return fmt.Errorf("snapshotter: destroyed")
+	}
 	if s.curr == nil {
 		return fmt.Errorf("snapshotter: not initialized")
 	}
@@ -191,9 +216,11 @@ func (s *Snapshotter) RefreshCurrentToHead() error {
 }
 
 // Destroy closes both snapshot connections. Mirrors destroy() (202).
+// Sets destroyed so concurrent readers can bail early (L13).
 func (s *Snapshotter) Destroy() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.destroyed = true
 	if s.curr != nil {
 		s.curr.close()
 		s.curr = nil

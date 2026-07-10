@@ -719,6 +719,13 @@ func (s *Source) closeAllCachedStmtsLocked() {
 //
 // Subsequent calls (after OnAdvanceEnd rolled the tx back) just re-issue
 // the cached BEGIN variant + the warm-up SELECT.
+//
+// M4: When s.prevConn is nil, s.mu is RELEASED during the conn pool
+// acquisition (up to 30s) and re-acquired after. Without this, a pool
+// stall would block all Push/Fetch/Close on this Source — and since Push
+// runs under e.mu, the entire engine would freeze. After re-acquiring
+// s.mu, a double-check handles the race where another goroutine also
+// acquired a conn while s.mu was released.
 func (s *Source) ensurePrevTxLocked() error {
 	// Frame-coordinated: the Snapshotter owns the pinned frame on externalConn,
 	// already BEGIN-and-read. Nothing for this Source to acquire.
@@ -727,6 +734,9 @@ func (s *Source) ensurePrevTxLocked() error {
 	}
 	ctx := s.ctx
 	if s.prevConn == nil {
+		// Release s.mu during conn pool acquisition so a 30s pool stall
+		// doesn't block all Push/Fetch/Close on this Source.
+		s.mu.Unlock()
 		// Use a bounded timeout so pool exhaustion surfaces as a fast error
 		// instead of blocking indefinitely (which previously caused the TS-side
 		// 120s RPC timeout to fire with no diagnostic). 30s is long enough to
@@ -735,10 +745,17 @@ func (s *Source) ensurePrevTxLocked() error {
 		acquireCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 		conn, err := s.writableDB.Conn(acquireCtx)
 		cancel()
+		s.mu.Lock()
 		if err != nil {
 			return fmt.Errorf("ensurePrevTx %s: acquire conn (30s timeout): %w", s.tableName, err)
 		}
-		s.prevConn = conn
+		// Double-check: another goroutine may have acquired a conn
+		// while s.mu was released. If so, close the extra conn.
+		if s.prevConn != nil {
+			_ = conn.Close()
+		} else {
+			s.prevConn = conn
+		}
 	}
 	if s.prevTxStarted {
 		return nil
@@ -796,7 +813,7 @@ func (s *Source) OnAdvanceEnd() {
 	if s.prevConn == nil || !s.prevTxStarted {
 		return
 	}
-	ctx := context.Background()
+	ctx := s.ctx
 	if _, err := s.prevConn.ExecContext(ctx, "ROLLBACK"); err != nil {
 		// If ROLLBACK fails the conn is in an unknown state; close it
 		// so the next ensurePrevTx will reacquire a fresh one. Drop the
@@ -1080,11 +1097,16 @@ func (s *Source) genPushAndWrite(change ivm.SourceChange, conns []*connection) {
 	// enabled (see parallel_fanout.go), serially otherwise.
 	s.fanOut(change, epoch, conns)
 
-	// Re-acquire mu for writeChange + overlay clear.
-	s.mu.Lock()
-	err := s.writeChangeLocked(change)
-	s.overlay = nil
-	s.mu.Unlock()
+	// Re-acquire mu for writeChange + overlay clear. Use a closure with
+	// defer Unlock so the mutex is released even if writeChangeLocked
+	// panics — the outer defer's re-lock would deadlock otherwise.
+	err := func() error {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		err := s.writeChangeLocked(change)
+		s.overlay = nil
+		return err
+	}()
 	if err != nil {
 		// Stale prev tx is unrecoverable from inside Push; surface as a
 		// panic — it propagates out of the engine and the client group is

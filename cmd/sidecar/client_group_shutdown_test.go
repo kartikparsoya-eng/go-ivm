@@ -44,7 +44,7 @@ func TestTrySendReq_ReturnsFalseAfterShutdown(t *testing.T) {
 		t.Fatal("expected trySendReq to succeed before shutdown")
 	}
 
-	s.shutdownGroup(g, "test-cg", "test")
+	s.shutdownGroup(g, "test-cg", "test", true)
 
 	// Post-shutdown: trySendReq returns false promptly. Without the
 	// done-channel fix, this would either (a) panic on send-after-close,
@@ -86,7 +86,7 @@ func TestShutdownGroup_Idempotent(t *testing.T) {
 					t.Errorf("concurrent shutdownGroup panicked: %v", r)
 				}
 			}()
-			s.shutdownGroup(g, "test-cg", "test")
+			s.shutdownGroup(g, "test-cg", "test", true)
 		}()
 	}
 	wg.Wait()
@@ -117,7 +117,7 @@ func TestWorker_DrainsBufferedReqsOnShutdown(t *testing.T) {
 
 	// Shut down immediately. Worker may have processed 0-N requests
 	// already; the rest must be drained with an error.
-	s.shutdownGroup(g, "test-cg", "test")
+	s.shutdownGroup(g, "test-cg", "test", true)
 
 	// Every respCh must receive a response (either real or drained
 	// error) within a reasonable budget. Without the drain, the
@@ -158,7 +158,7 @@ func TestTrySendReq_NoMutexContention(t *testing.T) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		s.shutdownGroup(g, "test-cg", "test")
+		s.shutdownGroup(g, "test-cg", "test", true)
 	}()
 
 	// trySendReq should NOT be gated by g.mu (which shutdownGroup may

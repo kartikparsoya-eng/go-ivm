@@ -345,7 +345,9 @@ func rowIDSignatureUnit(table string, rowKey map[string]interface{}) (uint64, bo
 
 func isRowKeyScalar(v interface{}) bool {
 	switch v.(type) {
-	case nil, string, float64, bool, int64, int:
+	case nil, string, float64, float32, bool,
+		int64, int, int32, int8, int16,
+		uint8, uint16, uint32, uint64, uint:
 		return true
 	default:
 		return false

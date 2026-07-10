@@ -723,21 +723,34 @@ func (s *Server) handleAdvanceToHeadStream(req RPCRequest, streamW streamWriter)
 				cgID, aerr.Error())
 			return rpcError(req.ID, rpcCodeAdvanceAborted, aerr.Error())
 		}
-		if rs, ok := snapshotter.IsReset(streamErr); ok && !emittedPartial {
-			// Clean pre-stream reset: single Final frame carrying reset +
-			// version; the caller re-hydrates at version. It rides the row
-			// plane so the header and final share the production queue.
-			part := advanceToHeadStreamPartial{
-				ChunkIndex: 0,
-				Final:      true,
-				Version:    version,
-				Reset:      &resetWire{Reason: rs.Reason, Msg: rs.Msg},
+		if rs, ok := snapshotter.IsReset(streamErr); ok {
+			if !emittedPartial {
+				// Clean pre-stream reset: single Final frame carrying reset +
+				// version; the caller re-hydrates at version. It rides the row
+				// plane so the header and final share the production queue.
+				part := advanceToHeadStreamPartial{
+					ChunkIndex: 0,
+					Final:      true,
+					Version:    version,
+					Reset:      &resetWire{Reason: rs.Reason, Msg: rs.Msg},
+				}
+				if advanceRP == nil || !advanceRP.deliverFrame(part) {
+					return rpcError(req.ID, -32000,
+						"advanceToHeadStream: row-plane delivery dead before reset final")
+				}
+				return RPCResponse{JSONRPC: "2.0", Result: "done", ID: req.ID}
 			}
-			if advanceRP == nil || !advanceRP.deliverFrame(part) {
-				return rpcError(req.ID, -32000,
-					"advanceToHeadStream: row-plane delivery dead before reset final")
-			}
-			return RPCResponse{JSONRPC: "2.0", Result: "done", ID: req.ID}
+			// Mid-stream reset: partials already emitted, so we can't send
+			// a reset Final frame (the accumulator would reject a second
+			// final). Use rpcCodeScalarReset so TS classifies it as a
+			// reset (ResetPipelinesSignal) instead of 'unclassified' →
+			// CG teardown. The recovery (reset + re-hydrate) is identical
+			// regardless of the reset reason.
+			fmt.Fprintf(os.Stderr,
+				"[GO-IVM] advanceToHeadStream cg=%s mid-stream reset: %s: %s\n",
+				cgID, rs.Reason, rs.Msg)
+			return rpcError(req.ID, rpcCodeScalarReset,
+				"advanceToHeadStream reset: "+rs.Reason+": "+rs.Msg)
 		}
 		fmt.Fprintf(os.Stderr, "[GO-IVM] advanceToHeadStream ERROR cg=%s: %v\n", cgID, streamErr)
 		return rpcError(req.ID, -32000, "advanceToHeadStream: "+streamErr.Error())

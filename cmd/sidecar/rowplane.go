@@ -185,15 +185,14 @@ var (
 
 // deliverTimeoutDefault bounds how long one payload (or the stage) may wait
 // against a full TSFN queue before the stream is declared dead. It must sit
-// ABOVE both the longest observed recoverable JS-loop stall (43-46s
-// synchronous materializations — a 44s hydrate COMPLETED in the incident
-// soak) and the TS 120s RPC deadline (past which the client has abandoned
-// the RPC and usually already fired the pull-gate cancel, which unparks the
-// wait far earlier). Firing therefore means the loop stayed starved beyond
-// any plausible recovery — an incident ([GO-IVM][DELIVER-TIMEOUT]), not
-// load. Env-tunable via GO_IVM_DELIVER_TIMEOUT_SEC (read lazily — the env
-// sync from the embedder happens at goivm_start, after package init).
-const deliverTimeoutDefault = 150 * time.Second
+// ABOVE the longest observed recoverable JS-loop stall (43-46s synchronous
+// materializations — a 44s hydrate COMPLETED in the incident soak) but BELOW
+// the advance budget (advanceBudgetMs, default 60s) so a parked advance
+// producer can't hold a WAL pin past the budget. 55s gives a 9s buffer past
+// the 46s stall ceiling and 5s under the 60s budget. Env-tunable via
+// GO_IVM_DELIVER_TIMEOUT_SEC (read lazily — the env sync from the embedder
+// happens at goivm_start, after package init).
+const deliverTimeoutDefault = 55 * time.Second
 
 var deliverTimeoutOnce sync.Once
 var deliverTimeoutVal = deliverTimeoutDefault

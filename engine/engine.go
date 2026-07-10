@@ -850,6 +850,16 @@ func (e *Engine) buildBatchLocked(queries []QuerySpec) []*pipelineEntry {
 		}
 	}()
 	for _, q := range queries {
+		// Remove any existing pipeline for this query ID before building
+		// the new one. If a previous entry for the same ID is already in
+		// built (duplicate query ID in the batch), remove the STALE
+		// entry so parallel hydrate doesn't call Fetch on a destroyed
+		// pipeline → panic.
+		for i := len(built) - 1; i >= 0; i-- {
+			if built[i].queryID == q.QueryID {
+				built = append(built[:i], built[i+1:]...)
+			}
+		}
 		e.removeQueryLocked(q.QueryID)
 		built = append(built, e.buildAndRegisterLocked(q.QueryID, q.AST))
 	}

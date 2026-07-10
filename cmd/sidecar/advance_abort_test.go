@@ -184,7 +184,7 @@ func assertAbortTestAdvanceCompleted(t *testing.T, frames *[]advanceToHeadStream
 func TestAdvanceToHeadStream_CleanRetryableOnSnapshotterFailure(t *testing.T) {
 	srv, epoch, _ := abortTestSetup(t, 3)
 	group := srv.getGroup("cg1", false)
-	group.snap.Destroy() // force Advance → "snapshotter: not initialized"
+	group.snap.Destroy() // force Advance → "snapshotter: destroyed" (L13)
 
 	w, _ := collectAdvanceToHeadProdFrames(t, srv, 2)
 	resp := srv.handleStreamWithRecover(advanceToHeadStreamReq(t, epoch, nil, false), w, srv.handleAdvanceToHeadStream)
@@ -195,7 +195,7 @@ func TestAdvanceToHeadStream_CleanRetryableOnSnapshotterFailure(t *testing.T) {
 		t.Fatalf("code = %d, want %d (rpcCodeAdvanceCleanRetryable): %s",
 			resp.Error.Code, rpcCodeAdvanceCleanRetryable, resp.Error.Message)
 	}
-	if !strings.Contains(resp.Error.Message, "not initialized") {
+	if !strings.Contains(resp.Error.Message, "destroyed") {
 		t.Fatalf("message %q should carry the underlying cause", resp.Error.Message)
 	}
 }

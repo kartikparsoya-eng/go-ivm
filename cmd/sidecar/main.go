@@ -795,6 +795,12 @@ type ClientGroup struct {
 	// closeOnce guards close(done) so concurrent shutdownGroup / closeAll
 	// calls don't panic on double-close.
 	closeOnce sync.Once
+	// wg tracks the worker goroutine; shutdownGroup waits on it to
+	// guarantee the worker has fully exited (drained reqC, sent error
+	// responses) before teardown returns. Without this, a test calling
+	// removeGroup followed by assertions on a re-created group could
+	// race the still-draining worker (L5).
+	wg sync.WaitGroup
 	// initEpoch monotonically increments on every handleInit (atomic Add
 	// under mu). Mutating RPCs (addQuery* / advance* / destroy) carry the
 	// epoch they were issued under; mismatch → rejected with
@@ -1226,6 +1232,7 @@ func (s *Server) getGroup(id string, createIfMissing bool) *ClientGroup {
 	g.lastUsedNs.Store(time.Now().UnixNano())
 	s.groups[id] = g
 	// Start a worker goroutine that processes requests in order.
+	g.wg.Add(1)
 	go g.worker(s)
 	return g
 }
@@ -1452,7 +1459,7 @@ func (s *Server) reapIdleGroups(cutoff time.Time) int {
 		s.saveEpochLocked(c.id, current)
 		delete(s.groups, c.id)
 		s.mu.Unlock()
-		s.shutdownGroup(c.g, c.id, "reaper")
+		s.shutdownGroup(c.g, c.id, "reaper", true)
 		reaped++
 	}
 	return reaped
@@ -1463,6 +1470,7 @@ func (s *Server) reapIdleGroups(cutoff time.Time) int {
 // in reqC and responds to each with a "group destroyed" error so respCh
 // readers don't hang.
 func (g *ClientGroup) worker(s *Server) {
+	defer g.wg.Done()
 	for {
 		var req clientGroupReq
 		select {
@@ -1692,9 +1700,10 @@ func (s *Server) saveEpochLocked(id string, g *ClientGroup) {
 	}
 }
 
-// removeGroup destroys a client group and its engine. Closes reqC so the
-// worker goroutine exits cleanly; without this, every destroy leaked a
-// goroutine + the channel + the closed engine reference.
+// removeGroup destroys a client group and its engine. Signals the worker
+// to exit via close(done); the worker drains reqC and exits, and
+// shutdownGroup waits for it via wg.Wait. Without this, every destroy
+// leaked a goroutine + the channel + the closed engine reference.
 func (s *Server) removeGroup(id string) {
 	s.mu.Lock()
 	g := s.groups[id]
@@ -1704,7 +1713,11 @@ func (s *Server) removeGroup(id string) {
 	delete(s.groups, id)
 	s.mu.Unlock()
 	if g != nil {
-		s.shutdownGroup(g, id, "destroy-rpc")
+		// removeGroup is called from the worker's destroy handler (the
+		// worker IS the goroutine tracked by g.wg). Waiting for wg would
+		// self-deadlock. The worker exits on its own after this handler
+		// returns (it sees done closed on the next select iteration).
+		s.shutdownGroup(g, id, "destroy-rpc", false)
 	}
 }
 
@@ -1723,7 +1736,7 @@ func (s *Server) removeGroup(id string) {
 // as the exit signal and drains any remaining buffered requests with an
 // error response before returning. New senders past this point see done
 // closed and bail out without touching reqC.
-func (s *Server) shutdownGroup(g *ClientGroup, id, reason string) {
+func (s *Server) shutdownGroup(g *ClientGroup, id, reason string, waitWorker bool) {
 	t0 := time.Now()
 	g.closeOnce.Do(func() {
 		close(g.done)
@@ -1760,6 +1773,15 @@ func (s *Server) shutdownGroup(g *ClientGroup, id, reason string) {
 	}
 	snapDone := time.Now()
 	g.mu.Unlock()
+	// L5: wait for the worker goroutine to fully exit before returning.
+	// Skipped when called from the worker itself (destroy handler) to
+	// avoid self-deadlock — the worker exits on its own after the handler
+	// returns. The wait is bounded by the drain deadline (50ms) plus
+	// whatever time respCh readers take to receive the drain-error
+	// responses.
+	if waitWorker {
+		g.wg.Wait()
+	}
 	fmt.Fprintf(os.Stderr,
 		"[GO-IVM][TEARDOWN] cg=%s reason=%s total=%v gates=%v muWait=%v pool=%v(k=%d) eng=%v snap=%v\n",
 		id, reason, snapDone.Sub(t0),
@@ -1780,7 +1802,7 @@ func (s *Server) closeAll() {
 	s.groups = make(map[string]*ClientGroup)
 	s.mu.Unlock()
 	for id, g := range groups {
-		s.shutdownGroup(g, id, "close-all")
+		s.shutdownGroup(g, id, "close-all", true)
 	}
 	// Reader-shell cache last: the group teardowns above RETURN shells to
 	// it (pool.Close), so draining before them would strand those. Cached
