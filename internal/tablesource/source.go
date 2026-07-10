@@ -44,6 +44,7 @@ import (
 	"fmt"
 	"io"
 	"iter"
+	"os"
 	"slices"
 	"sort"
 	"strconv"
@@ -724,7 +725,7 @@ func (s *Source) ensurePrevTxLocked() error {
 	if s.externalConn != nil {
 		return nil
 	}
-	ctx := context.Background()
+	ctx := s.ctx
 	if s.prevConn == nil {
 		// Use a bounded timeout so pool exhaustion surfaces as a fast error
 		// instead of blocking indefinitely (which previously caused the TS-side
@@ -830,8 +831,11 @@ func (s *Source) OnAdvanceEnd() {
 		// Re-pin failed; leave prevTxStarted=false so the next ensurePrevTx
 		// retries. The next batch reads from a later frame (possibly
 		// including its own commits) — a missed re-pin degrades to the old
-		// lazy behavior for one batch rather than wedging.
-		_ = err
+		// lazy behavior for one batch rather than wedging. Log loudly so
+		// the error is visible instead of silently swallowed.
+		fmt.Fprintf(os.Stderr,
+			"[GO-IVM][TABLESOURCE] OnAdvanceEnd %s: ensurePrevTx re-pin failed: %v\n",
+			s.tableName, err)
 	}
 }
 
@@ -1585,7 +1589,7 @@ func (s *Source) fetchSerial(req ivm.FetchRequest, conn *connection) []ivm.Node 
 		req.Start,
 		req.MultiConstraints,
 	)
-	ctx := context.Background()
+	ctx := s.ctx
 	// Reuse a prepared statement for this (conn, SQL) instead of letting
 	// database/sql re-compile via sqlite3_prepare_v2 on every QueryContext
 	// (14.6% of cgo time in the live read-path profile). activeConn is a

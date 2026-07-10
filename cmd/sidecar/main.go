@@ -2221,8 +2221,16 @@ func (s *Server) handleAddQueriesStream(req RPCRequest, streamW streamWriter) RP
 	rp.setPullGate(gate)
 	defer s.streamGates.unregister(rid)
 	err := group.eng.AddQueriesStreamPull(specs, 1, func(r engine.QueryResult) bool {
-		if len(r.Changes) > 0 && !acquirePullCredit(gate, rp) {
-			return false
+		// Acquire one credit per row record that will be emitted, not one
+		// per QueryResult: a single fetched node flattens into parent plus
+		// relationship rows (streamNodes), so len(r.Changes) can exceed 1.
+		// The TS consumer decrements one credit per row entry it consumes,
+		// so acquiring only one credit per QueryResult lets Go run
+		// unboundedly ahead of the pullWindow on nested hydrates.
+		for range r.Changes {
+			if !acquirePullCredit(gate, rp) {
+				return false
+			}
 		}
 		if !rp.emitHydratePartial(r) {
 			return false

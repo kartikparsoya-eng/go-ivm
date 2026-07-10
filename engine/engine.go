@@ -1289,13 +1289,18 @@ func (e *Engine) addQueriesStreamChunked(
 	// Phase 3 (post, under e.mu again).
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if err := firstHydratePanic(built, hydratePanics); err != nil {
-		e.removeBuiltQueriesLocked(built)
-		return err
-	}
+	// Check cancellation BEFORE panics: a normal pull cancellation (consumer
+	// .return() / RPC timeout) causes downstream operators (Take, Cap) to
+	// panic on "unexpected early return" as the fetch range breaks. Those
+	// panics are a SIDE EFFECT of cancellation, not the root cause — reporting
+	// them as a hydrate panic misleads the caller. Cancellation takes priority.
 	if cancelled.Load() {
 		e.removeBuiltQueriesLocked(built)
 		return ErrStreamCancelled
+	}
+	if err := firstHydratePanic(built, hydratePanics); err != nil {
+		e.removeBuiltQueriesLocked(built)
+		return err
 	}
 
 	// HIGH-11: wire companion outputs after all hydrates complete. Skipped

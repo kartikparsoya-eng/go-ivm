@@ -66,6 +66,7 @@ jobs:
           go test -count=1 $(go list ./... | grep -v testharness)
 
   build:
+    needs: test-wal2
     runs-on: ubuntu-latest
     permissions:
       contents: read

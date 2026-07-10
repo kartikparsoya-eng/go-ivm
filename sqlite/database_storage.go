@@ -220,11 +220,16 @@ func (ds *DatabaseStorage) checkpoint() {
 func (ds *DatabaseStorage) Close() error {
 	ds.mu.Lock()
 	defer ds.mu.Unlock()
+	var commitErr error
 	if ds.tx != nil {
-		ds.tx.Commit()
+		commitErr = ds.tx.Commit()
 		ds.tx = nil
 	}
-	return ds.db.Close()
+	closeErr := ds.db.Close()
+	if commitErr != nil {
+		return fmt.Errorf("storage commit on close: %w", commitErr)
+	}
+	return closeErr
 }
 
 func (ds *DatabaseStorage) get(cgID string, opID int, key string) (json.RawMessage, bool) {
