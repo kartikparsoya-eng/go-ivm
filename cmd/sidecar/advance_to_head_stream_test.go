@@ -318,6 +318,13 @@ func TestAdvanceToHeadStream_RowMode(t *testing.T) {
 	mustExec(t, db, `INSERT OR REPLACE INTO "_zero.changeLog2" ("stateVersion","pos","table","rowKey","op") VALUES ('0000000002',0,'issue','{"id":"2"}','s')`)
 	mustExec(t, db, `INSERT OR REPLACE INTO "_zero.replicationState" (stateVersion, lock) VALUES ('0000000002', 1)`)
 
+	// Clear hydrate entries from the collector — we only inspect
+	// advance entries below. hydrateOneStreamOK uses reqID=2; without
+	// clearing, its groupDef (reqID=2) fails the reqID!=3 check.
+	col.mu.Lock()
+	col.entries = col.entries[:0]
+	col.mu.Unlock()
+
 	w, frames := collectAdvanceToHeadStreamFrames()
 	req := RPCRequest{Method: "advanceToHeadStream", ID: float64(3), Params: mustMarshal(t, advanceToHeadParams{
 		ClientGroupID: "cg1", InitEpoch: group.initEpoch.Load(), RowMode: true, PullMode: true, PullWindow: 1024,
