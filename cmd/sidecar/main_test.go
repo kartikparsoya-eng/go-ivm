@@ -1,69 +1,20 @@
 package main
 
 import (
-	"bufio"
 	"fmt"
-	"net"
-	"os"
 	"sync"
 	"testing"
+	"time"
 )
 
 // TestMultiGroupParallel verifies that multiple client groups can
-// init, addQuery, and advance concurrently without races or corruption.
+// init and destroy concurrently through the in-process ABI host without races
+// or corruption.
 func TestMultiGroupParallel(t *testing.T) {
-	socketPath := "/tmp/go-ivm-test-parallel.sock"
-	os.Remove(socketPath)
-
-	listener, err := net.Listen("unix", socketPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer listener.Close()
-	defer os.Remove(socketPath)
-
-	// Test uses MemorySource (the legacy default) — no replica path needed.
 	server := NewServer(makeReplicaPathOnly(t))
-	go func() {
-		for {
-			conn, err := listener.Accept()
-			if err != nil {
-				return
-			}
-			go handleConnection(conn, server)
-		}
-	}()
-
-	// Helper: send msgpack-RPC over length-prefix framing, get response.
-	sendRPC := func(conn net.Conn, reader *bufio.Reader, method string, params interface{}) RPCResponse {
-		paramData, err := mpMarshal(params)
-		if err != nil {
-			t.Fatalf("marshal params: %v", err)
-		}
-		req := RPCRequest{
-			JSONRPC: "2.0",
-			Method:  method,
-			Params:  paramData,
-			ID:      1,
-		}
-		reqData, err := mpMarshal(req)
-		if err != nil {
-			t.Fatalf("marshal req: %v", err)
-		}
-		if err := writeFrame(conn, reqData); err != nil {
-			t.Fatalf("write frame: %v", err)
-		}
-
-		respBytes, err := readFrame(reader)
-		if err != nil {
-			t.Fatalf("read frame: %v", err)
-		}
-		var resp RPCResponse
-		if err := mpUnmarshal(respBytes, &resp); err != nil {
-			t.Fatalf("unmarshal resp: %v", err)
-		}
-		return resp
-	}
+	router := newResponseRouter()
+	host := startABIHostWithServer(server, router.sink, nil)
+	defer host.Shutdown()
 
 	numGroups := 8
 	var wg sync.WaitGroup
@@ -74,23 +25,20 @@ func TestMultiGroupParallel(t *testing.T) {
 			defer wg.Done()
 
 			cgID := fmt.Sprintf("group-%d", groupIdx)
+			initID := float64(groupIdx*10 + 1)
+			destroyID := float64(groupIdx*10 + 2)
 
-			conn, err := net.Dial("unix", socketPath)
-			if err != nil {
-				t.Errorf("group %d: dial failed: %v", groupIdx, err)
-				return
-			}
-			defer conn.Close()
-			reader := bufio.NewReader(conn)
-
-			// Init with in-memory tables (no SQLite file needed)
 			initP := map[string]interface{}{
 				"clientGroupID": cgID,
 				"dbPath":        ":memory:",
 				"storagePath":   ":memory:",
 				"tables":        map[string]interface{}{},
 			}
-			resp := sendRPC(conn, reader, "init", initP)
+			if err := host.Send(encodeReq(t, "init", initID, initP)); err != nil {
+				t.Errorf("group %d init send: %v", groupIdx, err)
+				return
+			}
+			resp := router.wait(t, initID)
 			if resp.Error != nil {
 				t.Errorf("group %d init: %s", groupIdx, resp.Error.Message)
 				return
@@ -109,7 +57,11 @@ func TestMultiGroupParallel(t *testing.T) {
 				"clientGroupID": cgID,
 				"initEpoch":     epoch,
 			}
-			resp = sendRPC(conn, reader, "destroy", destroyP)
+			if err := host.Send(encodeReq(t, "destroy", destroyID, destroyP)); err != nil {
+				t.Errorf("group %d destroy send: %v", groupIdx, err)
+				return
+			}
+			resp = router.wait(t, destroyID)
 			if resp.Error != nil {
 				t.Errorf("group %d destroy: %s", groupIdx, resp.Error.Message)
 			}
@@ -117,4 +69,59 @@ func TestMultiGroupParallel(t *testing.T) {
 	}
 
 	wg.Wait()
+}
+
+type responseRouter struct {
+	mu    sync.Mutex
+	chans map[int]chan RPCResponse
+	errs  chan error
+}
+
+func newResponseRouter() *responseRouter {
+	return &responseRouter{
+		chans: make(map[int]chan RPCResponse),
+		errs:  make(chan error, 16),
+	}
+}
+
+func (r *responseRouter) channel(id int) chan RPCResponse {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	ch := r.chans[id]
+	if ch == nil {
+		ch = make(chan RPCResponse, 8)
+		r.chans[id] = ch
+	}
+	return ch
+}
+
+func (r *responseRouter) sink(kind int32, payload []byte) int32 {
+	if kind != abiKindFrame {
+		return deliverOK
+	}
+	var resp RPCResponse
+	if err := mpUnmarshal(payload, &resp); err != nil {
+		r.errs <- err
+		return deliverOK
+	}
+	id, ok := toFloat(resp.ID)
+	if !ok {
+		r.errs <- fmt.Errorf("non-numeric response ID %#v", resp.ID)
+		return deliverOK
+	}
+	r.channel(int(id)) <- resp
+	return deliverOK
+}
+
+func (r *responseRouter) wait(t *testing.T, id float64) RPCResponse {
+	t.Helper()
+	select {
+	case resp := <-r.channel(int(id)):
+		return resp
+	case err := <-r.errs:
+		t.Fatalf("decode response: %v", err)
+	case <-time.After(10 * time.Second):
+		t.Fatalf("timed out waiting for response id %v", id)
+	}
+	return RPCResponse{}
 }
