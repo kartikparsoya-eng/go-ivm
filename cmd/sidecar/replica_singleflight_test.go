@@ -54,6 +54,14 @@ func TestGetReplicaDB_ConcurrentCallersShareProbe(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping ~60s singleflight test under -short")
 	}
+	oldTimeout := replicaOpenTimeout
+	oldBackoff := replicaOpenInitialBackoff
+	replicaOpenTimeout = 25 * time.Millisecond
+	replicaOpenInitialBackoff = time.Millisecond
+	t.Cleanup(func() {
+		replicaOpenTimeout = oldTimeout
+		replicaOpenInitialBackoff = oldBackoff
+	})
 	// Use a non-existent path so the probe will fail. We override the
 	// open timeout indirectly: the test would take 60s with the real
 	// timeout, so this test is opportunistic — we abort early once we
@@ -121,6 +129,14 @@ func TestGetReplicaDB_NextCallerAfterFailureCanProbe(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping ~120s singleflight cleanup test under -short")
 	}
+	oldTimeout := replicaOpenTimeout
+	oldBackoff := replicaOpenInitialBackoff
+	replicaOpenTimeout = 25 * time.Millisecond
+	replicaOpenInitialBackoff = time.Millisecond
+	t.Cleanup(func() {
+		replicaOpenTimeout = oldTimeout
+		replicaOpenInitialBackoff = oldBackoff
+	})
 	s := &Server{
 		replicaPath: "/nonexistent/will/fail.db",
 	}

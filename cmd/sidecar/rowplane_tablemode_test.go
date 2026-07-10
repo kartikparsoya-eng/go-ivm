@@ -144,6 +144,8 @@ func TestABIHost_RowModeTableModeCoercion(t *testing.T) {
 		"clientGroupID": "cg-typed",
 		"initEpoch":     1,
 		"rowMode":       true,
+		"pullMode":      true,
+		"pullWindow":    1024,
 		"queries":       queries,
 	})
 

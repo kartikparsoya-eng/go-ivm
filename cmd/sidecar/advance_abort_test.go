@@ -59,12 +59,10 @@ func abortTestSetup(t *testing.T, nChanges int) (*Server, uint64, *sql.DB) {
 
 func advanceToHeadStreamReq(t *testing.T, epoch uint64, total *float64, suppress bool) RPCRequest {
 	t.Helper()
-	return RPCRequest{Method: "advanceToHeadStream", ID: 2, Params: mustMarshal(t, advanceToHeadParams{
-		ClientGroupID:        "cg1",
-		InitEpoch:            epoch,
-		TotalHydrationTimeMs: total,
-		SuppressAbort:        suppress,
-	})}
+	p := prodAdvanceParams("cg1", epoch)
+	p.TotalHydrationTimeMs = total
+	p.SuppressAbort = suppress
+	return RPCRequest{Method: "advanceToHeadStream", ID: 2, Params: mustMarshal(t, p)}
 }
 
 // TestAdvanceToHeadStream_EconomicAbort: a request-armed budget below the
@@ -78,7 +76,7 @@ func TestAdvanceToHeadStream_EconomicAbort(t *testing.T) {
 
 	srv, epoch, _ := abortTestSetup(t, 20)
 	total := 0.000001 // far below the leapfrog's cost → abort at the first check
-	w, frames := collectAdvanceToHeadStreamFrames()
+	w, frames := collectAdvanceToHeadProdFrames(t, srv, 2)
 	resp := srv.handleStreamWithRecover(advanceToHeadStreamReq(t, epoch, &total, false), w, srv.handleAdvanceToHeadStream)
 
 	if resp.Error == nil {
@@ -115,7 +113,7 @@ func TestAdvanceToHeadStream_SuppressAbort(t *testing.T) {
 		t.Skip("completing the apply requires BEGIN CONCURRENT (wal2/libsqlite3 build)")
 	}
 	total := 0.000001
-	w, frames := collectAdvanceToHeadStreamFrames()
+	w, frames := collectAdvanceToHeadProdFrames(t, srv, 2)
 	resp := srv.handleStreamWithRecover(advanceToHeadStreamReq(t, epoch, &total, true), w, srv.handleAdvanceToHeadStream)
 	if resp.Error != nil {
 		t.Fatalf("suppressAbort advance failed: %+v", resp.Error)
@@ -131,7 +129,7 @@ func TestAdvanceToHeadStream_GenerousBudgetNoAbort(t *testing.T) {
 		t.Skip("completing the apply requires BEGIN CONCURRENT (wal2/libsqlite3 build)")
 	}
 	total := 60_000.0
-	w, frames := collectAdvanceToHeadStreamFrames()
+	w, frames := collectAdvanceToHeadProdFrames(t, srv, 2)
 	resp := srv.handleStreamWithRecover(advanceToHeadStreamReq(t, epoch, &total, false), w, srv.handleAdvanceToHeadStream)
 	if resp.Error != nil {
 		t.Fatalf("generous-budget advance failed: %+v", resp.Error)
@@ -152,7 +150,7 @@ func TestAdvanceToHeadStream_AbortDisarmedWhenParamAbsent(t *testing.T) {
 	if !beginConcurrentSupported(t, db) {
 		t.Skip("completing the apply requires BEGIN CONCURRENT (wal2/libsqlite3 build)")
 	}
-	w, frames := collectAdvanceToHeadStreamFrames()
+	w, frames := collectAdvanceToHeadProdFrames(t, srv, 2)
 	resp := srv.handleStreamWithRecover(advanceToHeadStreamReq(t, epoch, nil, false), w, srv.handleAdvanceToHeadStream)
 	if resp.Error != nil {
 		t.Fatalf("param-absent advance failed: %+v", resp.Error)
@@ -188,7 +186,7 @@ func TestAdvanceToHeadStream_CleanRetryableOnSnapshotterFailure(t *testing.T) {
 	group := srv.getGroup("cg1", false)
 	group.snap.Destroy() // force Advance → "snapshotter: not initialized"
 
-	w, _ := collectAdvanceToHeadStreamFrames()
+	w, _ := collectAdvanceToHeadProdFrames(t, srv, 2)
 	resp := srv.handleStreamWithRecover(advanceToHeadStreamReq(t, epoch, nil, false), w, srv.handleAdvanceToHeadStream)
 	if resp.Error == nil {
 		t.Fatal("expected clean-retryable error, got success")
@@ -371,7 +369,7 @@ func TestAdvanceToHeadStream_NoAbortUnderSchedulerContention(t *testing.T) {
 	defer func() { close(stopSpin); spinners.Wait() }()
 
 	total := 1.0 // 1ms budget: the 50ms floor is the only guard left
-	w, frames := collectAdvanceToHeadStreamFrames()
+	w, frames := collectAdvanceToHeadProdFrames(t, srv, 2)
 	resp := srv.handleStreamWithRecover(advanceToHeadStreamReq(t, epoch, &total, false), w, srv.handleAdvanceToHeadStream)
 	if resp.Error != nil {
 		t.Fatalf("advance failed under scheduler contention (wall leaking into the processing budget?): %+v", resp.Error)

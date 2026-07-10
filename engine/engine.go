@@ -707,21 +707,6 @@ func (e *Engine) boundPipelineReaderPool() pipelineReaderPool {
 	return nil
 }
 
-// GetMemorySource returns the registered MemorySource for tableName, or nil
-// if either no source is registered for the table or the registered source is
-// not a MemorySource. Used by the sidecar's loadRows handler to append rows
-// to an existing source after init.
-func (e *Engine) GetMemorySource(tableName string) *ivm.MemorySource {
-	s, ok := e.sourcesView()[tableName]
-	if !ok {
-		return nil
-	}
-	if a, ok := s.(*memorySourceAdapter); ok {
-		return a.ms
-	}
-	return nil
-}
-
 // AddQuery builds a pipeline from an AST and registers it.
 // Returns initial hydration RowChanges (the current state as ADDs) and the
 // wall-time spent fetching + flattening (excludes pipeline build, which is

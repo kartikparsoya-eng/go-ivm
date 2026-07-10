@@ -33,12 +33,12 @@ type advanceToHeadParams struct {
 	InitEpoch     uint64 `json:"initEpoch"`
 	// RowMode opts the stream into the NAPI row plane: the engine's
 	// RowChanges cross the Go↔JS boundary as per-row flat records
-	// (kind 2/3 deliveries) instead of msgpack partial frames. Honored only
-	// when the in-process transport is active AND the request ID is numeric;
-	// otherwise silently degrades to the ordinary frame path.
+	// (kind 2/3 deliveries) instead of msgpack partial frames. This is
+	// mandatory for production advance streaming.
 	RowMode bool `json:"rowMode,omitempty"`
 	// PullMode opts row-mode advance into the ABI v3 credit gate. Row-bearing
 	// deliveries consume one credit; header/final/error frames ride free.
+	// This is mandatory with RowMode.
 	PullMode bool `json:"pullMode,omitempty"`
 	// PullWindow is the opening credit count for PullMode. 0 parks before the
 	// first row until the client grants explicit credit.
@@ -705,8 +705,10 @@ func (s *Server) handleAdvanceToHeadStream(req RPCRequest, streamW streamWriter)
 		NumChanges: numChanges,
 	}
 
+	var advanceRP *rowPlane
+
 	// finishStream maps the engine's returned error to the wire per the
-	// cursor-error split above. Shared by the rowMode and frame branches.
+	// cursor-error split above.
 	finishStream := func(streamErr error) RPCResponse {
 		if streamErr == nil {
 			return RPCResponse{JSONRPC: "2.0", Result: "done", ID: req.ID}
@@ -723,118 +725,82 @@ func (s *Server) handleAdvanceToHeadStream(req RPCRequest, streamW streamWriter)
 		}
 		if rs, ok := snapshotter.IsReset(streamErr); ok && !emittedPartial {
 			// Clean pre-stream reset: single Final frame carrying reset +
-			// version; the caller re-hydrates at version. streamW is safe
-			// in rowMode too — no records exist, so ordering is trivially
-			// preserved (see rowplane.go's emitAdvanceToHeadPartial note).
-			streamW(req.ID, advanceToHeadStreamPartial{
+			// version; the caller re-hydrates at version. It rides the row
+			// plane so the header and final share the production queue.
+			part := advanceToHeadStreamPartial{
 				ChunkIndex: 0,
 				Final:      true,
 				Version:    version,
 				Reset:      &resetWire{Reason: rs.Reason, Msg: rs.Msg},
-			})
+			}
+			if advanceRP == nil || !advanceRP.deliverFrame(part) {
+				return rpcError(req.ID, -32000,
+					"advanceToHeadStream: row-plane delivery dead before reset final")
+			}
 			return RPCResponse{JSONRPC: "2.0", Result: "done", ID: req.ID}
 		}
 		fmt.Fprintf(os.Stderr, "[GO-IVM] advanceToHeadStream ERROR cg=%s: %v\n", cgID, streamErr)
 		return rpcError(req.ID, -32000, "advanceToHeadStream: "+streamErr.Error())
 	}
 
-	// Row mode (NAPI transport only): per-row records via abiDeliver with
-	// chunkSize=1 so each RowChange crosses the boundary as the engine
-	// produces it — the deployed Go-primary trigger path gets
-	// row-by-row delivery. Fallback rows and
-	// the terminal Final (carrying Version/NumChanges/Timings) ship
-	// as kind-1 frames on the same ordered queue; "done" follows via the
-	// pipe (see rowplane.go's ordering invariant).
+	// Production stream contract: per-row records via the NAPI row plane with
+	// pull-mode credit gating. Fallback rows and the terminal Final (carrying
+	// Version/NumChanges/Timings) ship as kind-1 frames on the same ordered
+	// queue; "done" follows via the pipe (see rowplane.go's ordering invariant).
 	rp := newRowPlane(s, req.ID, p.RowMode, cgID, group.done)
-	if p.PullMode && rp == nil {
+	if !p.RowMode || !p.PullMode || rp == nil {
 		return rpcError(req.ID, -32000,
-			"advanceToHeadStream: pullMode requires row-mode NAPI transport")
+			"advanceToHeadStream: requires row-mode pull NAPI transport")
 	}
-	if rp != nil {
-		var gate *streamGate
-		if p.PullMode {
-			rid, _ := numericReqID(req.ID) // non-numeric already refused by newRowPlane
-			g := s.streamGates.register(rid, group, int64(p.PullWindow), func() {
-				group.lastUsedNs.Store(time.Now().UnixNano())
-			})
-			if g == nil {
-				return rpcError(req.ID, -32000,
-					"advanceToHeadStream: pull gate registration failed")
-			}
-			gate = g
-			rp.setPullGate(gate)
-			defer s.streamGates.unregister(rid)
-		}
-		if !rp.deliverFrame(headerPartial) {
-			return rpcError(req.ID, -32000,
-				"advanceToHeadStream: row-plane delivery dead before header")
-		}
-		streamErr := group.eng.AdvanceStreamChunkedSeqClocked(changesSeq, 1, abort.clock(), func(r engine.AdvanceStreamPartial) {
-			// Per-partial budget checkpoint: a panic here escapes
-			// AdvanceStreamChunkedSeq cleanly (engine stays reusable — see
-			// TestAdvanceStream_PanickingSink_NoDeadlockAndEngineReusable)
-			// and handleStreamWithRecover converts it to an RPC error.
-			checkAdvanceBudget(budgetDeadline, budgetOn, "apply", cgID)
-			// TS checkpoint 2 ("whenever a row is fetched during push"):
-			// rowMode emits per RowChange, so this is per-row granularity.
-			// The typed panic maps to rpcCodeAdvanceAborted with the exact
-			// message (panicErrorCode/panicErrorMessage).
-			if aerr := abort.check(); aerr != nil {
-				panic(aerr)
-			}
-			if gate != nil && len(r.Changes) > 0 && !acquirePullCredit(gate, rp) {
-				panic(fmt.Errorf("advanceToHeadStream cg=%s: stream cancelled while waiting for pull credit", cgID))
-			}
-			emittedPartial = true
-			if !rp.emitAdvanceToHeadPartial(r, version, numChanges) {
-				// Row-plane delivery dead (TSFN closed / group teardown /
-				// GO_IVM_DELIVER_TIMEOUT — the bounded successor of the G13
-				// blocking-deliver wedge). The engine's sink has no error
-				// return — panic into handleStreamWithRecover exactly like
-				// the economic abort; the -32000 classification tears the
-				// CG down on the TS side, which is right: the client is
-				// gone or its loop is starved beyond recovery, and state is
-				// half-advanced.
-				panic(fmt.Errorf("advanceToHeadStream cg=%s: row-plane delivery dead (stream cancelled or deliver timeout) — aborting advance", cgID))
-			}
-			if r.Final {
-				// rowMode: chunkSize=1, so ChunkIndex+1 is the per-row
-				// DELIVERY count, not a chunk count — record it as rows so the
-				// advance-chunks histogram isn't polluted (P2).
-				metrics.recordAdvanceRows(r.ChunkIndex + 1)
-			}
-		})
-		rebindCurr()
-		return finishStream(streamErr)
+	advanceRP = rp
+	rid, _ := numericReqID(req.ID) // non-numeric already refused by newRowPlane
+	gate := s.streamGates.register(rid, group, int64(p.PullWindow), func() {
+		group.lastUsedNs.Store(time.Now().UnixNano())
+	})
+	if gate == nil {
+		return rpcError(req.ID, -32000,
+			"advanceToHeadStream: pull gate registration failed")
 	}
-
-	streamW(req.ID, headerPartial)
-
-	sigAcc := NewRowSigAccumulator()
-	streamErr := group.eng.AdvanceStreamChunkedSeqClocked(changesSeq, 0, abort.clock(), func(r engine.AdvanceStreamPartial) {
+	rp.setPullGate(gate)
+	defer s.streamGates.unregister(rid)
+	if !rp.deliverFrame(headerPartial) {
+		return rpcError(req.ID, -32000,
+			"advanceToHeadStream: row-plane delivery dead before header")
+	}
+	streamErr := group.eng.AdvanceStreamChunkedSeqClocked(changesSeq, 1, abort.clock(), func(r engine.AdvanceStreamPartial) {
+		// Per-partial budget checkpoint: a panic here escapes
+		// AdvanceStreamChunkedSeq cleanly (engine stays reusable — see
+		// TestAdvanceStream_PanickingSink_NoDeadlockAndEngineReusable)
+		// and handleStreamWithRecover converts it to an RPC error.
 		checkAdvanceBudget(budgetDeadline, budgetOn, "apply", cgID)
+		// TS checkpoint 2 ("whenever a row is fetched during push"):
+		// rowMode emits per RowChange, so this is per-row granularity.
+		// The typed panic maps to rpcCodeAdvanceAborted with the exact
+		// message (panicErrorCode/panicErrorMessage).
 		if aerr := abort.check(); aerr != nil {
-			panic(aerr) // TS checkpoint 2 — see the rowMode branch
+			panic(aerr)
+		}
+		if len(r.Changes) > 0 && !acquirePullCredit(gate, rp) {
+			panic(fmt.Errorf("advanceToHeadStream cg=%s: stream cancelled while waiting for pull credit", cgID))
 		}
 		emittedPartial = true
-		sigAcc.accumulateChanges(r.Changes)
-		pc := toPositional(r.Changes)
-		part := advanceToHeadStreamPartial{
-			Dict:       pc.Dict,
-			Rows:       pc.Rows,
-			ChunkIndex: r.ChunkIndex,
-			Final:      r.Final,
-			Timings:    r.Timings,
+		if !rp.emitAdvanceToHeadPartial(r, version, numChanges) {
+			// Row-plane delivery dead (TSFN closed / group teardown /
+			// GO_IVM_DELIVER_TIMEOUT — the bounded successor of the G13
+			// blocking-deliver wedge). The engine's sink has no error
+			// return — panic into handleStreamWithRecover exactly like
+			// the economic abort; the -32000 classification tears the
+			// CG down on the TS side, which is right: the client is
+			// gone or its loop is starved beyond recovery, and state is
+			// half-advanced.
+			panic(fmt.Errorf("advanceToHeadStream cg=%s: row-plane delivery dead (stream cancelled or deliver timeout) — aborting advance", cgID))
 		}
 		if r.Final {
-			part.Version = version
-			part.NumChanges = numChanges
-			part.SigDeltas = sigAcc.allDeltasHex()
-			// One advanceToHeadStream call → one record on the terminal frame;
-			// Final's ChunkIndex+1 is the total chunk count for this call.
-			metrics.recordAdvanceChunks(r.ChunkIndex + 1)
+			// rowMode: chunkSize=1, so ChunkIndex+1 is the per-row
+			// DELIVERY count, not a chunk count — record it as rows so the
+			// advance-chunks histogram isn't polluted (P2).
+			metrics.recordAdvanceRows(r.ChunkIndex + 1)
 		}
-		streamW(req.ID, part)
 	})
 	rebindCurr()
 	return finishStream(streamErr)

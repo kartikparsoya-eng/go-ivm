@@ -306,11 +306,13 @@ func TestPullMode_CancelUnwindsAndRejects(t *testing.T) {
 		t.Fatalf("gate registry size = %d after cancel settle, want 0", srv.streamGates.size())
 	}
 
-	// Group healthy: an ordinary (non-pull) row-mode hydrate completes.
+	// Group healthy: a fresh production row/pull hydrate completes.
 	send(4, "addQueriesStream", map[string]interface{}{
 		"clientGroupID": "cg-pull",
 		"initEpoch":     1,
 		"rowMode":       true,
+		"pullMode":      true,
+		"pullWindow":    nRows,
 		"queries": []map[string]interface{}{
 			{"queryID": "q-after", "ast": map[string]interface{}{
 				"table":   "users",
@@ -425,7 +427,7 @@ func TestPullMode_WithoutRowModeErrors(t *testing.T) {
 	if got.Error.Code != -32000 {
 		t.Fatalf("error code = %d, want -32000 (%s)", got.Error.Code, got.Error.Message)
 	}
-	if !strings.Contains(got.Error.Message, "pullMode requires row-mode NAPI transport") {
+	if !strings.Contains(got.Error.Message, "requires row-mode pull NAPI transport") {
 		t.Fatalf("error = %q, want mandatory row-mode message", got.Error.Message)
 	}
 	if got := countKind(col, abiKindRow); got != 0 {

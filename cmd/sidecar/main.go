@@ -1021,6 +1021,11 @@ func NewServer(replicaPath string) *Server {
 	}
 }
 
+var (
+	replicaOpenTimeout        = 60 * time.Second
+	replicaOpenInitialBackoff = 500 * time.Millisecond
+)
+
 // getReplicaDB opens the SQLite replica on first call and caches the
 // *sql.DB. Subsequent calls return the cached pool. Internal retry of
 // up to 60s with progressive backoff handles the cold-start race where
@@ -1068,9 +1073,9 @@ func (s *Server) getReplicaDB() (*sql.DB, error) {
 	s.replicaErr = nil
 	s.replicaMu.Unlock()
 
-	const openTimeout = 60 * time.Second
+	openTimeout := replicaOpenTimeout
 	deadline := time.Now().Add(openTimeout)
-	backoff := 500 * time.Millisecond
+	backoff := replicaOpenInitialBackoff
 	var db *sql.DB
 	var writableDB *sql.DB
 	var lastErr error
@@ -2107,12 +2112,9 @@ type addQueriesParams struct {
 	InitEpoch uint64 `json:"initEpoch"`
 	// RowMode: see advanceParams.RowMode — same contract for hydrate.
 	RowMode bool `json:"rowMode,omitempty"`
-	// PullMode (ABI v3, DESIGN-duplex-streaming): opt this hydrate into
-	// credit-gated (pull) row delivery. Only honored when the row plane
-	// engages (in-process transport + RowMode + numeric reqID); otherwise
-	// silently degrades to today's push behavior — old-client/new-server
-	// and new-client/old-server pairs are both safe (unknown msgpack
-	// fields are ignored on decode).
+	// PullMode (ABI v3, DESIGN-duplex-streaming): hydrate streams must use
+	// credit-gated row delivery on the NAPI row plane. Older frame-mode
+	// compatibility is deliberately not part of the production contract.
 	PullMode bool `json:"pullMode,omitempty"`
 	// PullWindow is the OPENING credit for the pull gate (the client's
 	// window W). It rides the request — not a first goivm_stream_credit
@@ -2193,108 +2195,45 @@ func (s *Server) handleAddQueriesStream(req RPCRequest, streamW streamWriter) RP
 	if warmPool != nil {
 		defer s.tearDownWarmReaderPool(group, warmPool, warmCR)
 	}
-	// Row mode (NAPI transport only): per-row records via abiDeliver with
-	// chunkSize=1; each query's Final partial still ships as a kind-1 frame
-	// (per-query TimingMs + completion signal). onResult runs concurrently
-	// from hydrate lanes — rowPlane's mutex serializes the encoder.
+	// Production stream contract: per-row records via the NAPI row plane,
+	// credit-gated by pullMode. Each query's Final partial still ships as a
+	// kind-1 frame (per-query TimingMs + completion signal). onResult runs
+	// concurrently from hydrate lanes; rowPlane's mutex serializes delivery.
 	rp := newRowPlane(s, req.ID, p.RowMode, cgID, group.done)
-	if p.PullMode && rp == nil {
+	if !p.RowMode || !p.PullMode || rp == nil {
 		return rpcError(req.ID, -32000,
-			"addQueriesStream: pullMode requires row-mode NAPI transport")
+			"addQueriesStream: requires row-mode pull NAPI transport")
 	}
-	if rp != nil {
-		// Pull mode (ABI v3): register the per-RPC demand gate. Row-BEARING
-		// deliveries acquire one credit each; group defs, Final frames, and
-		// error frames ride free (D3 — gating them deadlocks: the client is
-		// waiting for exactly those to decide whether to grant). The gate's
-		// touch keeps the group reaper-proof while the client actively
-		// pulls. Failure to register the gate is a protocol error for
-		// pullMode rather than a fallback to ungated delivery.
-		if p.PullMode {
-			rid, _ := numericReqID(req.ID) // non-numeric already refused by newRowPlane
-			gate := s.streamGates.register(rid, group, int64(p.PullWindow), func() {
-				group.lastUsedNs.Store(time.Now().UnixNano())
-			})
-			if gate == nil {
-				return rpcError(req.ID, -32000,
-					"addQueriesStream: pull gate registration failed")
-			}
-			// The gate's cancel must also unpark a delivery stuck on a
-			// full TSFN queue (the cond broadcast only reaches gate
-			// waiters) — fold it into the plane's cancellation check.
-			rp.setPullGate(gate)
-			defer s.streamGates.unregister(rid)
-			err := group.eng.AddQueriesStreamPull(specs, 1, func(r engine.QueryResult) bool {
-				if len(r.Changes) > 0 && !acquirePullCredit(gate, rp) {
-					// Cancelled (client .return(), teardown, or idle
-					// timeout), or the pre-park stage flush failed: refuse
-					// — the engine breaks the fetch range and unwinds
-					// (D4). Nothing more is emitted for this RPC except
-					// the terminal error frame. acquirePullCredit flushes
-					// staged rows BEFORE parking on client demand — a
-					// park with a non-empty stage is the credit-park
-					// stalemate (see rowplane.go).
-					return false
-				}
-				if !rp.emitHydratePartial(r) {
-					// Stream dead mid-delivery (TSFN closed, client gone,
-					// or deliver timeout — the G13 wedge class, now a
-					// bounded refusal): same unwind as a gate cancel.
-					return false
-				}
-				if r.Final {
-					metrics.recordHydrateChunks(r.ChunkIndex + 1)
-				}
-				return true
-			})
-			if err != nil {
-				// ErrStreamCancelled lands here too: a plain -32000
-				// terminal error frame (I9 — client-initiated, never
-				// reset-classified; hydrateErrorResponse only special-
-				// cases DataError). The client already left; the frame
-				// is bookkeeping symmetry and rides the ungated path.
-				fmt.Fprintf(os.Stderr, "[GO-IVM] addQueriesStream(pullMode) ERROR cg=%s: %v\n", cgID, err)
-				return hydrateErrorResponse(req.ID, "addQueriesStream: ", err)
-			}
-			return RPCResponse{JSONRPC: "2.0", Result: "done", ID: req.ID}
-		}
-		err := group.eng.AddQueriesStreamChunked(specs, 1, func(r engine.QueryResult) bool {
-			if !rp.emitHydratePartial(r) {
-				return false // stream dead — same unwind as a consumer refusal
-			}
-			if r.Final {
-				metrics.recordHydrateChunks(r.ChunkIndex + 1)
-			}
-			return true
-		})
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "[GO-IVM] addQueriesStream(rowMode) ERROR cg=%s: %v\n", cgID, err)
-			return hydrateErrorResponse(req.ID, "addQueriesStream: ", err)
-		}
-		return RPCResponse{JSONRPC: "2.0", Result: "done", ID: req.ID}
+
+	// Pull mode (ABI v3): register the per-RPC demand gate. Row-bearing
+	// deliveries acquire one credit each; group defs, Final frames, and error
+	// frames ride free because gating them would deadlock the client.
+	rid, _ := numericReqID(req.ID) // non-numeric already refused by newRowPlane
+	gate := s.streamGates.register(rid, group, int64(p.PullWindow), func() {
+		group.lastUsedNs.Store(time.Now().UnixNano())
+	})
+	if gate == nil {
+		return rpcError(req.ID, -32000,
+			"addQueriesStream: pull gate registration failed")
 	}
-	sigAcc := NewRowSigAccumulator()
-	err := group.eng.AddQueriesStream(specs, func(r engine.QueryResult) {
-		sigAcc.accumulateChanges(r.Changes)
-		pc := toPositional(r.Changes)
-		part := addQueriesStreamPartial{
-			QueryID:    r.QueryID,
-			Dict:       pc.Dict,
-			Rows:       pc.Rows,
-			ChunkIndex: r.ChunkIndex,
-			Final:      r.Final,
-			TimingMs:   r.TimingMs,
+	// The gate's cancel must also unpark a delivery stuck on a full TSFN
+	// queue; fold it into the plane's cancellation check.
+	rp.setPullGate(gate)
+	defer s.streamGates.unregister(rid)
+	err := group.eng.AddQueriesStreamPull(specs, 1, func(r engine.QueryResult) bool {
+		if len(r.Changes) > 0 && !acquirePullCredit(gate, rp) {
+			return false
+		}
+		if !rp.emitHydratePartial(r) {
+			return false
 		}
 		if r.Final {
-			if sig, ok := sigAcc.deltaHex(r.QueryID); ok {
-				part.SigDelta = sig
-			}
 			metrics.recordHydrateChunks(r.ChunkIndex + 1)
 		}
-		streamW(req.ID, part)
+		return true
 	})
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "[GO-IVM] addQueriesStream ERROR cg=%s: %v\n", cgID, err)
+		fmt.Fprintf(os.Stderr, "[GO-IVM] addQueriesStream(pullMode) ERROR cg=%s: %v\n", cgID, err)
 		return hydrateErrorResponse(req.ID, "addQueriesStream: ", err)
 	}
 

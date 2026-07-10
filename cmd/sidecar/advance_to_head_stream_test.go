@@ -117,10 +117,9 @@ func TestAdvanceToHeadStream_SkipsNonSyncableTable(t *testing.T) {
 	mustExec(t, db, `INSERT OR REPLACE INTO "_zero.changeLog2" ("stateVersion","pos","table","rowKey","op") VALUES ('0000000002',0,'lmids','{"clientID":"client-a"}','s')`)
 	mustExec(t, db, `INSERT OR REPLACE INTO "_zero.replicationState" (stateVersion, lock) VALUES ('0000000002', 1)`)
 
-	w, frames := collectAdvanceToHeadStreamFrames()
-	req := RPCRequest{Method: "advanceToHeadStream", ID: 2, Params: mustMarshal(t, advanceToHeadParams{
-		ClientGroupID: "cg1", InitEpoch: group.initEpoch.Load(),
-	})}
+	w, frames := collectAdvanceToHeadProdFrames(t, srv, 2)
+	req := RPCRequest{Method: "advanceToHeadStream", ID: 2, Params: mustMarshal(t,
+		prodAdvanceParams("cg1", group.initEpoch.Load()))}
 	resp := srv.handleAdvanceToHeadStream(req, w)
 	if resp.Error != nil {
 		t.Fatalf("advanceToHeadStream error (non-syncable should be skipped, not errored): %+v", resp.Error)
@@ -165,10 +164,9 @@ func TestAdvanceToHeadStream_DriveTruncateEmitsResetFrame(t *testing.T) {
 	mustExec(t, db, `INSERT OR REPLACE INTO "_zero.changeLog2" ("stateVersion","pos","table","rowKey","op") VALUES ('0000000002',-1,'issue','0000000002','t')`)
 	mustExec(t, db, `INSERT OR REPLACE INTO "_zero.replicationState" (stateVersion, lock) VALUES ('0000000002', 1)`)
 
-	w, frames := collectAdvanceToHeadStreamFrames()
-	req := RPCRequest{Method: "advanceToHeadStream", ID: 2, Params: mustMarshal(t, advanceToHeadParams{
-		ClientGroupID: "cg1", InitEpoch: group.initEpoch.Load(),
-	})}
+	w, frames := collectAdvanceToHeadProdFrames(t, srv, 2)
+	req := RPCRequest{Method: "advanceToHeadStream", ID: 2, Params: mustMarshal(t,
+		prodAdvanceParams("cg1", group.initEpoch.Load()))}
 	resp := srv.handleAdvanceToHeadStream(req, w)
 	if resp.Error != nil {
 		t.Fatalf("advanceToHeadStream(truncate) error: %+v", resp.Error)
@@ -234,10 +232,9 @@ func TestAdvanceToHeadStream_DriveReassembles(t *testing.T) {
 	mustExec(t, db, `INSERT OR REPLACE INTO "_zero.changeLog2" ("stateVersion","pos","table","rowKey","op") VALUES ('0000000002',0,'issue','{"id":"2"}','s')`)
 	mustExec(t, db, `INSERT OR REPLACE INTO "_zero.replicationState" (stateVersion, lock) VALUES ('0000000002', 1)`)
 
-	w, frames := collectAdvanceToHeadStreamFrames()
-	req := RPCRequest{Method: "advanceToHeadStream", ID: 3, Params: mustMarshal(t, advanceToHeadParams{
-		ClientGroupID: "cg1", InitEpoch: group.initEpoch.Load(),
-	})}
+	w, frames := collectAdvanceToHeadProdFrames(t, srv, 3)
+	req := RPCRequest{Method: "advanceToHeadStream", ID: 3, Params: mustMarshal(t,
+		prodAdvanceParams("cg1", group.initEpoch.Load()))}
 	resp := srv.handleAdvanceToHeadStream(req, w)
 	if resp.Error != nil {
 		t.Fatalf("advanceToHeadStream(drive) error: %+v", resp.Error)
@@ -323,7 +320,7 @@ func TestAdvanceToHeadStream_RowMode(t *testing.T) {
 
 	w, frames := collectAdvanceToHeadStreamFrames()
 	req := RPCRequest{Method: "advanceToHeadStream", ID: float64(3), Params: mustMarshal(t, advanceToHeadParams{
-		ClientGroupID: "cg1", InitEpoch: group.initEpoch.Load(), RowMode: true,
+		ClientGroupID: "cg1", InitEpoch: group.initEpoch.Load(), RowMode: true, PullMode: true, PullWindow: 1024,
 	})}
 	resp := srv.handleAdvanceToHeadStream(req, w)
 	if resp.Error != nil {
@@ -409,9 +406,8 @@ func TestAdvanceToHeadStream_RowMode(t *testing.T) {
 }
 
 // Row-mode + reset (TRUNCATE): the diff aborts BEFORE the engine apply, so no
-// row records exist and the single Final reset frame legitimately rides
-// streamW (ordering trivially preserved — nothing else in flight for the id).
-// Runs everywhere (no engine write → no BEGIN CONCURRENT needed).
+// row records exist and the Header + Final reset frames ride the row plane's
+// NAPI queue. Runs everywhere (no engine write → no BEGIN CONCURRENT needed).
 func TestAdvanceToHeadStream_RowModeTruncateResetViaStreamW(t *testing.T) {
 	path, db := makeReplica(t)
 
@@ -433,7 +429,7 @@ func TestAdvanceToHeadStream_RowModeTruncateResetViaStreamW(t *testing.T) {
 
 	w, frames := collectAdvanceToHeadStreamFrames()
 	req := RPCRequest{Method: "advanceToHeadStream", ID: float64(2), Params: mustMarshal(t, advanceToHeadParams{
-		ClientGroupID: "cg1", InitEpoch: group.initEpoch.Load(), RowMode: true,
+		ClientGroupID: "cg1", InitEpoch: group.initEpoch.Load(), RowMode: true, PullMode: true, PullWindow: 1024,
 	})}
 	resp := srv.handleAdvanceToHeadStream(req, w)
 	if resp.Error != nil {
@@ -443,31 +439,42 @@ func TestAdvanceToHeadStream_RowModeTruncateResetViaStreamW(t *testing.T) {
 		t.Errorf("result = %v, want \"done\"", resp.Result)
 	}
 
-	if len(*frames) != 1 {
-		t.Fatalf("want reset streamW frame only, got %d", len(*frames))
+	if len(*frames) != 0 {
+		t.Fatalf("row-mode reset must not emit streamW frames, got %d: %+v", len(*frames), *frames)
 	}
-	f := (*frames)[0]
-	if !f.Final || f.Reset == nil || f.Reset.Reason != "truncation" || f.Version != "0000000002" {
-		t.Errorf("reset frame wrong: %+v", f)
-	}
-	// No records were produced (the abort precedes the engine apply).
+
+	// No row records were produced (the abort precedes the engine apply).
 	col.mu.Lock()
 	defer col.mu.Unlock()
-	if len(col.entries) == 0 {
-		t.Fatal("missing row-plane header frame")
-	}
-	headerResp := decodeResp(t, col.entries[0].payload)
-	header, ok := headerResp.Result.(map[string]interface{})
-	if !ok {
-		t.Fatalf("row-plane header result = %#v, want map", headerResp.Result)
-	}
-	if isHeader, _ := header["header"].(bool); !isHeader {
-		t.Fatalf("first row-plane frame must be Header, got %+v", header)
-	}
+	var headerSeen, resetSeen bool
 	for _, e := range col.entries {
 		if e.kind == abiKindRow || e.kind == abiKindGroupDef {
 			t.Fatalf("unexpected record delivery on the reset path: kind=%d", e.kind)
 		}
+		if e.kind != abiKindFrame {
+			continue
+		}
+		respF := decodeResp(t, e.payload)
+		if id, ok := toFloat(respF.ID); !ok || id != 2 {
+			continue
+		}
+		f, ok := advancePartialFromResult(respF.Result)
+		if !ok {
+			t.Fatalf("decode row-plane reset frame: %#v", respF.Result)
+		}
+		if f.Header {
+			headerSeen = true
+			continue
+		}
+		if f.Final {
+			resetSeen = true
+			if f.Reset == nil || f.Reset.Reason != "truncation" || f.Version != "0000000002" {
+				t.Errorf("reset frame wrong: %+v", f)
+			}
+		}
+	}
+	if !headerSeen || !resetSeen {
+		t.Fatalf("row-plane reset frames missing: header=%v reset=%v", headerSeen, resetSeen)
 	}
 }
 
@@ -494,7 +501,7 @@ func TestAdvanceToHeadStream_RowModeStaleEpochNoRecords(t *testing.T) {
 
 	w, frames := collectAdvanceToHeadStreamFrames()
 	req := RPCRequest{Method: "advanceToHeadStream", ID: float64(2), Params: mustMarshal(t, advanceToHeadParams{
-		ClientGroupID: "cg1", InitEpoch: group.initEpoch.Load() + 99, RowMode: true,
+		ClientGroupID: "cg1", InitEpoch: group.initEpoch.Load() + 99, RowMode: true, PullMode: true, PullWindow: 1024,
 	})}
 	resp := srv.handleAdvanceToHeadStream(req, w)
 	if resp.Error == nil {
@@ -528,6 +535,7 @@ func TestAdvanceToHeadStream_RowModeStaleEpochNoRecords(t *testing.T) {
 func TestPerfMetrics_AdvanceToHeadStreamCountsAsAdvance(t *testing.T) {
 	s := NewServer(makeReplicaPathOnly(t))
 	t.Cleanup(s.closeAll)
+	s.abiDeliver = newSinkCollector().sink
 	g := s.getGroup("cg-perf-a2h", true)
 
 	// metrics is package-global; tests in this package never run in
@@ -541,10 +549,7 @@ func TestPerfMetrics_AdvanceToHeadStreamCountsAsAdvance(t *testing.T) {
 		req: RPCRequest{
 			Method: "advanceToHeadStream",
 			ID:     float64(1),
-			Params: mustMarshal(t, advanceToHeadParams{
-				ClientGroupID: "cg-perf-a2h",
-				InitEpoch:     g.initEpoch.Load(),
-			}),
+			Params: mustMarshal(t, prodAdvanceParams("cg-perf-a2h", g.initEpoch.Load())),
 		},
 		respCh:  respCh,
 		streamW: func(_ interface{}, _ interface{}) {},
@@ -608,10 +613,9 @@ func TestAdvanceToHeadStream_OversizedDiffStreamsWithoutCap(t *testing.T) {
 	}
 	mustExec(t, db, `INSERT OR REPLACE INTO "_zero.replicationState" (stateVersion, lock) VALUES ('0000000002', 1)`)
 
-	w, frames := collectAdvanceToHeadStreamFrames()
-	req := RPCRequest{Method: "advanceToHeadStream", ID: 3, Params: mustMarshal(t, advanceToHeadParams{
-		ClientGroupID: "cg1", InitEpoch: group.initEpoch.Load(),
-	})}
+	w, frames := collectAdvanceToHeadProdFrames(t, srv, 3)
+	req := RPCRequest{Method: "advanceToHeadStream", ID: 3, Params: mustMarshal(t,
+		prodAdvanceParams("cg1", group.initEpoch.Load()))}
 	resp := srv.handleAdvanceToHeadStream(req, w)
 	if resp.Error != nil {
 		t.Fatalf("oversized diff errored despite lazy streaming (cap resurrected?): %+v", resp.Error)

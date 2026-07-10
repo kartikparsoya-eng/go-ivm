@@ -98,7 +98,10 @@ func oneQueryStreamParams(cgID, queryID string, ast builder.AST, initEpoch uint6
 			QueryID string      `json:"queryID"`
 			AST     builder.AST `json:"ast"`
 		}{{QueryID: queryID, AST: ast}},
-		InitEpoch: initEpoch,
+		InitEpoch:  initEpoch,
+		RowMode:    true,
+		PullMode:   true,
+		PullWindow: 1024,
 	}
 }
 
@@ -109,6 +112,12 @@ func oneQueryStreamParams(cgID, queryID string, ast builder.AST, initEpoch uint6
 // pool-sensitive tests keep their setup semantics.
 func hydrateOneStreamOK(t *testing.T, srv *Server, cgID, queryID string, ast builder.AST, initEpoch uint64) {
 	t.Helper()
+	origDeliver := srv.abiDeliver
+	if srv.abiDeliver == nil {
+		col := newSinkCollector()
+		srv.abiDeliver = col.sink
+		defer func() { srv.abiDeliver = origDeliver }()
+	}
 	req := RPCRequest{Method: "addQueriesStream", ID: 2,
 		Params: mustMarshal(t, oneQueryStreamParams(cgID, queryID, ast, initEpoch))}
 	if resp := srv.handleAddQueriesStream(req, func(interface{}, interface{}) {}); resp.Error != nil {

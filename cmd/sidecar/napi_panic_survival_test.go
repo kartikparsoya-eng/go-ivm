@@ -49,6 +49,8 @@ func TestABIHost_RowModeHandlerPanicSurvivesAndClassifies(t *testing.T) {
 		"clientGroupID": "cg-panic",
 		"initEpoch":     1,
 		"rowMode":       true,
+		"pullMode":      true,
+		"pullWindow":    1,
 		"queries": []map[string]interface{}{
 			{"queryID": "q-bad", "ast": map[string]interface{}{
 				"table":   "no_such_table",

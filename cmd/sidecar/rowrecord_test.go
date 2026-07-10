@@ -401,6 +401,8 @@ func TestABIHost_RowModeHydrateEndToEnd(t *testing.T) {
 		"clientGroupID": "cg-rows",
 		"initEpoch":     1,
 		"rowMode":       true,
+		"pullMode":      true,
+		"pullWindow":    1024,
 		"queries": []map[string]interface{}{
 			{"queryID": "q-all", "ast": map[string]interface{}{
 				"table":   "users",
@@ -544,6 +546,9 @@ func TestABIHost_RowModeAdvanceEndToEnd(t *testing.T) {
 	send(2, "addQueriesStream", map[string]interface{}{
 		"clientGroupID": "cg-adv",
 		"initEpoch":     1,
+		"rowMode":       true,
+		"pullMode":      true,
+		"pullWindow":    1024,
 		"queries": []map[string]interface{}{
 			{"queryID": "q-adv", "ast": map[string]interface{}{
 				"table":   "users",
@@ -587,6 +592,8 @@ func TestABIHost_RowModeAdvanceEndToEnd(t *testing.T) {
 		ClientGroupID: "cg-adv",
 		InitEpoch:     1,
 		RowMode:       true,
+		PullMode:      true,
+		PullWindow:    1024,
 	})
 
 	deadline := time.Now().Add(15 * time.Second)

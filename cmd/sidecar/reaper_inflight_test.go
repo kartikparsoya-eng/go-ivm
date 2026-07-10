@@ -111,6 +111,9 @@ func TestReaper_DoesNotReapGroupWithInFlightHandler(t *testing.T) {
 	if err := h.Send(encodeReq(t, "addQueriesStream", 2, map[string]interface{}{
 		"clientGroupID": cgID,
 		"initEpoch":     1,
+		"rowMode":       true,
+		"pullMode":      true,
+		"pullWindow":    1024,
 		"queries":       queries,
 	})); err != nil {
 		t.Fatalf("send addQueriesStream: %v", err)

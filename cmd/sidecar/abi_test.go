@@ -94,10 +94,8 @@ func TestABIHost_InitAdvanceRoundTrip(t *testing.T) {
 		t.Fatalf("init failed: %+v", initResp.Error)
 	}
 
-	if err := h.Send(encodeReq(t, "advanceToHeadStream", 2, advanceToHeadParams{
-		ClientGroupID: "cg-abi",
-		InitEpoch:     1,
-	})); err != nil {
+	if err := h.Send(encodeReq(t, "advanceToHeadStream", 2,
+		prodAdvanceParams("cg-abi", 1))); err != nil {
 		t.Fatalf("send advanceToHeadStream: %v", err)
 	}
 	// The replica is already at head, so the advance emits exactly: 1

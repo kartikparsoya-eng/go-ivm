@@ -148,10 +148,9 @@ func TestAdvanceToHeadStreamBudgetExceeded(t *testing.T) {
 		FROM (WITH RECURSIVE c(value) AS (SELECT 1 UNION ALL SELECT value+1 FROM c WHERE value < 30000) SELECT value FROM c)`)
 	mustExec(t, db, `INSERT OR REPLACE INTO "_zero.replicationState" (stateVersion, lock) VALUES ('0000000002', 1)`)
 
-	w, _ := collectAdvanceToHeadStreamFrames()
-	req := RPCRequest{Method: "advanceToHeadStream", ID: 2, Params: mustMarshal(t, advanceToHeadParams{
-		ClientGroupID: "cg1", InitEpoch: group.initEpoch.Load(),
-	})}
+	w, _ := collectAdvanceToHeadProdFrames(t, srv, 2)
+	req := RPCRequest{Method: "advanceToHeadStream", ID: 2, Params: mustMarshal(t,
+		prodAdvanceParams("cg1", group.initEpoch.Load()))}
 	resp := srv.handleStreamWithRecover(req, w, srv.handleAdvanceToHeadStream)
 	if resp.Error == nil {
 		t.Fatalf("expected budget-exceeded error, got result %+v", resp.Result)
