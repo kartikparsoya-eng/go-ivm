@@ -63,10 +63,11 @@ import (
 )
 
 // ParallelAdvance gates the per-query parallel fanout. Production default is
-// serial for TS-faithful cross-query emission order; operators can opt into the
-// previous concurrent fanout with GO_IVM_PARALLEL_ADVANCE=true while the
-// deterministic reduce layer is still a separate design.
-var ParallelAdvance = os.Getenv("GO_IVM_PARALLEL_ADVANCE") == "true"
+// ON — controlled by GO_IVM_ADVANCE_PARALLELISM (workers, default 4). Set
+// GO_IVM_ADVANCE_PARALLELISM=1 for serial fanout (TS-faithful cross-query
+// emission order). GO_IVM_PARALLEL_ADVANCE=false explicitly disables the
+// parallel path regardless of worker count.
+var ParallelAdvance = os.Getenv("GO_IVM_PARALLEL_ADVANCE") != "false"
 
 // ParallelAdvanceWorkers bounds how many query groups push concurrently per
 // source-change. GO_IVM_ADVANCE_PARALLELISM is the advance-specific knob;
@@ -159,6 +160,7 @@ func (s *Source) fanOut(change ivm.SourceChange, epoch int, conns []*connection)
 	workers := ParallelAdvanceWorkers
 	if !ParallelAdvance || workers < 2 || len(groups) < 2 {
 		// Serial path — behaviorally identical to the pre-parallel loop.
+		// workers < 2 covers GO_IVM_ADVANCE_PARALLELISM=1 (explicit serial).
 		for _, g := range groups {
 			pushGroup(g)
 		}

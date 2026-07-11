@@ -106,8 +106,8 @@ func newServerFromEnv() (*Server, error) {
 	// default-path deployment prints NONE of these. Each gates an alternate
 	// implementation kept as a rollback/experiment — code that is off the
 	// TS-faithfulness review surface until deliberately engaged.
-	if tablesource.ParallelAdvance {
-		nonDefault("GO_IVM_PARALLEL_ADVANCE=true (concurrent advance fanout)")
+	if !tablesource.ParallelAdvance {
+		nonDefault("GO_IVM_PARALLEL_ADVANCE=false (serial advance fanout)")
 	}
 	return server, nil
 }
