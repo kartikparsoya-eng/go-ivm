@@ -74,12 +74,22 @@ const LAUNCH_ARGS = [
 // them cuts decoded-image memory + network without touching JS/sync/websocket.
 const BLOCK_TYPES = new Set(['image', 'font', 'media']);
 
+// Reseeded rust-test (2026-06-30): sandbox@xyne.ai participates in chan-3..10;
+// richest by conversation count = chan-5(5), chan-2(5)*, chan-4(2), chan-3(2).
+// (*chan-2 not participated by sandbox; using the participated+populated set.)
 const CHANNELS = [
-  'cmpmblj2z002c10zqxpdasvfd', // test
-  'cmpmjimyo00a110zqzd2u18dp', // gpro
-  'cmpmjrgn900bc10zqzcsdjxs8', // notbisvw
-  'cmp2cqlq900f7iphvij992i5e', // personal
+  'chan-5', // 5 conversations
+  'chan-4', // 2 conversations
+  'chan-3', // 2 conversations
 ];
+// A real conversation per channel — the chat editor only mounts when the route
+// carries a conversation (/chat/dir/{channel}/{conversation}); a bare channel
+// renders the conversation LIST (no composer → writes fail "no-editor").
+const CONV = {
+  'chan-5': 'conv-1-1',
+  'chan-4': 'conv-4-1',
+  'chan-3': 'conv-3-1',
+};
 const WORKSPACE = 'cmp2cccas0015yifcnrkufm63';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -138,7 +148,7 @@ async function runCG(browser, cgIndex) {
     // DOM-based polling (not a Playwright locator) — robust under contention.
     let ready = false;
     for (let attempt = 0; attempt < 3 && !ready; attempt++) {
-      await page.goto(`http://rust-test.localhost/${ws}/chat/dir/${channel}`);
+      await page.goto(`http://rust-test.localhost/${ws}/chat/dir/${channel}/${CONV[channel] ?? ''}`);
       try { await page.waitForLoadState('networkidle', {timeout: 20000}); } catch {}
       for (let i = 0; i < 60; i++) { // up to 30s
         ready = await page.evaluate(() => !!document.querySelector('[contenteditable="true"][aria-label="Message input"]'));
@@ -214,7 +224,7 @@ async function runCG(browser, cgIndex) {
       if (cyc % ROTATE_EVERY === 0) {
         curIdx = (curIdx + 1) % CHANNELS.length;
         try {
-          await page.goto(`http://rust-test.localhost/${ws}/chat/dir/${CHANNELS[curIdx]}`);
+          await page.goto(`http://rust-test.localhost/${ws}/chat/dir/${CHANNELS[curIdx]}/${CONV[CHANNELS[curIdx]] ?? ''}`);
           try { await page.waitForLoadState('networkidle', {timeout: 8000}); } catch {}
           await ensureEditor();
           switches++;
