@@ -9,10 +9,10 @@ import (
 	"github.com/kartikparsoya-eng/go-ivm/ivm"
 )
 
-// C1 regression: a panic inside a hydrate goroutine (here a nil-PK row, which
-// trips streamer.pkValue) must be converted to a returned error, NOT propagate
-// out of the goroutine and abort the whole sidecar process. The test reaching
-// its assertions at all proves the process did not crash.
+// Regression test: a panic inside a hydrate goroutine (here a nil-PK row,
+// which trips streamer.pkValue) must be converted to a returned error, not
+// propagate out of the goroutine and abort the whole process. The test
+// reaching its assertions at all proves the process did not crash.
 
 func newPanicSeedEngine(t *testing.T) *Engine {
 	t.Helper()

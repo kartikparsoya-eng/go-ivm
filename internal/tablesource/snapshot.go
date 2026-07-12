@@ -179,7 +179,7 @@ func OpenAtSnapshot(ctx context.Context, db *sql.DB, snap *Snapshot) (*sql.Tx, *
 //
 // mu serializes against OpenAtSnapshot: a Free racing with an in-flight
 // sqlite3_snapshot_open would otherwise release the C handle while
-// snapshot_open is still dereferencing it. Pre-fix the freed/handle/tx/conn
+// snapshot_open is still dereferencing it. Prior to this fix, the freed/handle/tx/conn
 // fields were touched without any synchronization — Go's race detector
 // flagged this under sustained concurrent rotateSnapshot + fetchForConn.
 func (s *Snapshot) Free() {

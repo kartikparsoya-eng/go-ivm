@@ -1,16 +1,11 @@
 package main
 
-// Reaper in-flight guard (scale-review A4).
+// Reaper in-flight guard tests.
 //
-// lastUsedNs is stamped when the worker DEQUEUES a request; nothing
-// refreshed it while the handler ran. A handler outliving the idle window
-// (a long hydrate stalled by transport backpressure) therefore made a LIVE
-// group reap-eligible: the reaper deleted it from s.groups mid-handler and
-// the next RPC for the same cgID created a SECOND group+engine over the
-// same storage — split-brain. The fix: ClientGroup.inFlight is true from
-// dequeue through respCh delivery; the reaper skips in-flight groups (scan
-// AND double-check), and the worker stamps lastUsedNs fresh at completion
-// so a just-finished group is never "idle since dequeue".
+// ClientGroup.inFlight is true from dequeue through respCh delivery; the
+// reaper skips in-flight groups (scan and double-check), and the worker
+// stamps lastUsedNs fresh at completion so a just-finished group is never
+// considered idle.
 
 import (
 	"fmt"
@@ -23,17 +18,12 @@ import (
 	"github.com/kartikparsoya-eng/go-ivm/sqlite"
 )
 
-// TestReaper_DoesNotReapGroupWithInFlightHandler drives a REAL parked
+// TestReaper_DoesNotReapGroupWithInFlightHandler drives a real parked
 // handler through the ABI host: a gated sink stalls the delivery chain
 // (sink → pump reader → pipe → flusher → flushCh), so an addQueriesStream
 // with more partial frames than the chain absorbs parks the worker
-// mid-handler — exactly the "long hydrate under backpressure" shape. The
-// reaper must then refuse to reap the group even though lastUsedNs is
-// ancient. Pre-fix this test fails: reapIdleGroups deletes the group while
-// its handler is still streaming.
-//
-// Uses only pre-fix identifiers so it compiles (and demonstrably fails)
-// against the pre-fix tree.
+// mid-handler — the "long hydrate under backpressure" shape. The reaper
+// must refuse to reap the group even though lastUsedNs is ancient.
 func TestReaper_DoesNotReapGroupWithInFlightHandler(t *testing.T) {
 	var (
 		gateMu sync.Mutex
@@ -137,13 +127,13 @@ func TestReaper_DoesNotReapGroupWithInFlightHandler(t *testing.T) {
 	const ancient = int64(1) // ~epoch: older than any cutoff
 	g.lastUsedNs.Store(ancient)
 
-	// Reap with "everything older than now" — the ONLY thing that may save
-	// this group is the in-flight guard. Pre-fix: reaps it mid-handler.
+	// Reap with "everything older than now" — the only thing that may save
+	// this group is the in-flight guard.
 	if n := h.server.reapIdleGroups(time.Now()); n != 0 {
-		t.Fatalf("reaper collected %d group(s) while a handler was in flight (A4 split-brain)", n)
+		t.Fatalf("reaper collected %d group(s) while a handler was in flight", n)
 	}
 	if h.server.getGroup(cgID, false) == nil {
-		t.Fatal("group vanished from s.groups while its handler was mid-stream (A4)")
+		t.Fatal("group vanished from s.groups while its handler was mid-stream")
 	}
 
 	// Open the gate; the stream must complete cleanly (no error frame).

@@ -1,22 +1,20 @@
 package engine
 
-// Tests for the pull-streaming engine changes (DESIGN-duplex-streaming §6
-// steps 2-3):
+// Tests for the pull-streaming engine changes:
 //
-//   D4 — bool-returning onResult: a false return cancels the stream, breaks
-//        the producer's fetch range (iter.Seq defers unwind → cursor close /
-//        reader release), and AddQueriesStream*(Chunked|Pull) returns
-//        ErrStreamCancelled. Verified against BOTH source kinds: MemorySource
-//        (production of results stops promptly) and tablesource (the source's
-//        conn+tx survive a mid-cursor abandon: a later hydrate re-reads
-//        cleanly and Close() releases everything without error).
-//   D5 — e.mu is released for the drain phase, so unrelated engine work
-//        (advances on other tables) proceeds while a pull producer parks.
-//   D6 — AddQueriesStreamPull runs each query on its own goroutine (no lane
-//        pool) and produces byte-identical results to the lane-pool path.
+//   - bool-returning onResult: a false return cancels the stream, breaks
+//     the producer's fetch range (iter.Seq defers unwind → cursor close /
+//     reader release), and AddQueriesStream*(Chunked|Pull) returns
+//     ErrStreamCancelled. Verified against both source kinds: MemorySource
+//     (production of results stops promptly) and tablesource (the source's
+//     conn+tx survive a mid-cursor abandon: a later hydrate re-reads cleanly
+//     and Close() releases everything without error).
+//   - e.mu is released for the drain phase, so unrelated engine work
+//     (advances on other tables) proceeds while a pull producer parks.
+//   - AddQueriesStreamPull runs each query on its own goroutine (no lane
+//     pool) and produces byte-identical results to the lane-pool path.
 //
-// All run with -race; the cancel tests assert no goroutine leaks via
-// goleak (I7).
+// All run with -race; the cancel tests assert no goroutine leaks via goleak.
 
 import (
 	"errors"
@@ -33,8 +31,8 @@ import (
 // verifyNoStreamLeaks asserts no goroutine from the streaming machinery
 // survives the test. database/sql internals (connectionOpener, Tx.awaitDone)
 // are ignored: they belong to the engine storage / tablesource pool / prev-tx
-// lifetimes, which the shared helpers close in t.Cleanup — AFTER this check
-// runs. The leak signal that matters for I7 is a stuck hydrate producer or
+// lifetimes, which the shared helpers close in t.Cleanup — after this check
+// runs. The leak signal that matters is a stuck hydrate producer or
 // operator-fetch frame, whose stacks are not filtered.
 func verifyNoStreamLeaks(t *testing.T) {
 	goleak.VerifyNone(t,
@@ -44,12 +42,11 @@ func verifyNoStreamLeaks(t *testing.T) {
 	)
 }
 
-// TestStreamCancel_StopsProductionAndReturnsErr pins D4 on a MemorySource:
-// onResult refuses after 3 chunks (chunkSize=1 ⇒ 3 rows) of a 500-row
-// result; the producer must stop at the refusal (exactly 4 calls: 3
-// accepted + the refused one) and the call must return ErrStreamCancelled.
-// Fails pre-D4: onResult had no abort signal, so all 500 rows + the Final
-// frame were produced and the call returned nil.
+// TestStreamCancel_StopsProductionAndReturnsErr verifies stream
+// cancellation on a MemorySource: onResult refuses after 3 chunks
+// (chunkSize=1 ⇒ 3 rows) of a 500-row result; the producer must stop at the
+// refusal (exactly 4 calls: 3 accepted + the refused one) and the call must
+// return ErrStreamCancelled.
 func TestStreamCancel_StopsProductionAndReturnsErr(t *testing.T) {
 	defer verifyNoStreamLeaks(t)
 	eng, _ := newStreamingTestEngine(t, 500)
@@ -71,13 +68,13 @@ func TestStreamCancel_StopsProductionAndReturnsErr(t *testing.T) {
 	}
 }
 
-// TestStreamCancel_TableSourceReleasesReader pins I7 on the production
-// source path: cancelling mid-scan abandons an open SQLite cursor on the
-// source's prev-tx conn. Breaking the range must unwind the operator chain
-// (cursor Close) so that (a) a follow-up hydrate on the same source
-// re-reads the full table — impossible if the conn were wedged mid-rows —
-// and (b) Engine.Close can ROLLBACK the prev tx and return the conn
-// without error. Fails pre-D4 (no way to cancel at all).
+// TestStreamCancel_TableSourceReleasesReader verifies cancellation on
+// the production source path: cancelling mid-scan abandons an open SQLite
+// cursor on the source's prev-tx conn. Breaking the range must unwind the
+// operator chain (cursor Close) so that (a) a follow-up hydrate on the same
+// source re-reads the full table — impossible if the conn were wedged
+// mid-rows — and (b) Engine.Close can ROLLBACK the prev tx and return the
+// conn without error.
 func TestStreamCancel_TableSourceReleasesReader(t *testing.T) {
 	defer verifyNoStreamLeaks(t)
 	eng := newTicketsTableEngine(t, 200)
@@ -135,7 +132,7 @@ func TestStreamCancel_PullBatchAllLanesStop(t *testing.T) {
 	}
 }
 
-// TestStreamPull_MatchesNonPullOutput pins D6: the per-query-goroutine
+// TestStreamPull_MatchesNonPullOutput verifies that the per-query-goroutine
 // path (pull) emits exactly the same per-query chunk sequence as the
 // lane-pool path — same rows, same order, same Final/ChunkIndex contract.
 func TestStreamPull_MatchesNonPullOutput(t *testing.T) {
@@ -208,17 +205,13 @@ func TestStreamPull_MatchesNonPullOutput(t *testing.T) {
 	}
 }
 
-// TestAdvanceRunsDuringParkedPullDrain pins the D5 payoff at the engine
-// level: with a pull hydrate parked in its drain phase (e.mu released), a
-// concurrent AdvanceStream on the SAME engine completes instead of
-// deadlocking behind the parked producer. The advance targets a DIFFERENT
-// table ("orders") than the parked fetch ("users") — mutating a table a
-// suspended cursor is iterating stays the caller's (group.mu-level)
-// responsibility; what the ENGINE must no longer do is serialize unrelated
-// work behind a parked drain. Deadlocks (times out) pre-D5. (In production
-// the sidecar's group.mu serializes same-group advance vs hydrate —
-// TS-faithful; engines are per-group, so this models the engine-internal
-// freeze hazard only.)
+// TestAdvanceRunsDuringParkedPullDrain verifies that with a pull hydrate
+// parked in its drain phase (e.mu released), a concurrent AdvanceStream on
+// the same engine completes instead of deadlocking behind the parked
+// producer. The advance targets a different table ("orders") than the
+// parked fetch ("users") — mutating a table a suspended cursor is iterating
+// stays the caller's (group.mu-level) responsibility; what the engine must
+// no longer do is serialize unrelated work behind a parked drain.
 func TestAdvanceRunsDuringParkedPullDrain(t *testing.T) {
 	defer verifyNoStreamLeaks(t)
 	eng, _ := newStreamingTestEngine(t, 100)

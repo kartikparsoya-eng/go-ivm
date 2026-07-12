@@ -59,13 +59,13 @@ var ErrEngineClosed = errors.New("engine is closed")
 // aborted the stream: the pull gate was cancelled (client .return()/.throw(),
 // group teardown, or the pull idle timeout) and onResult returned false, so
 // the producer broke its fetch range and unwound (cursor closed, pool reader
-// released). DESIGN-duplex-streaming D4.
+// released).
 //
-// I9 (reset-classification pin): this error is CLIENT-INITIATED and must
-// never join the reset ladder — a storm of tab-closes must not become a
-// reset storm. The sidecar maps it to a plain -32000 terminal error frame
-// for bookkeeping symmetry (the client already left); it must not map to
-// rpcCodeDataError or any reset-triggering class.
+// This error is CLIENT-INITIATED and must never join the reset ladder —
+// a storm of tab-closes must not become a reset storm. The sidecar maps
+// it to a plain -32000 terminal error frame for bookkeeping symmetry
+// (the client already left); it must not map to rpcCodeDataError or any
+// reset-triggering class.
 var ErrStreamCancelled = errors.New("hydrate stream cancelled by consumer")
 
 // Source is the interface that engine sources must implement.
@@ -160,7 +160,7 @@ type pipelineEntry struct {
 	// and all companion sub-pipelines. Held so removeQueryLocked can call
 	// delegate.cgs.Destroy() to DELETE this query's operator-storage rows
 	// (keyed by cgID == queryID). Without this the rows leaked — Destroy was
-	// never invoked anywhere (HIGH-4). cgs is nil for queries with no
+	// never invoked anywhere. cgs is nil for queries with no
 	// storage-using operator (e.g. no Take).
 	delegate *engineDelegate
 }
@@ -319,7 +319,7 @@ func NewEngine(cfg EngineConfig) (*Engine, error) {
 		// to avoid goroutine-spawn overhead dominating tiny per-connection work,
 		// but dashboard-style workloads typically have 2-3 queries per source
 		// per cg, so sources never crossed the threshold and parallel push was
-		// effectively dead code. At 2 connections, fan-out still wins on
+		// unused in practice. At 2 connections, fan-out still wins on
 		// branchy operator trees (joins, filter chains); on trivial trees the
 		// overhead is bounded by len(activeConns) * goroutine-spawn (~1µs).
 		threshold = 2
@@ -529,8 +529,8 @@ func (e *Engine) RegisterMemorySource(ms *ivm.MemorySource) {
 }
 
 // connBinder is implemented by sources that can redirect their prev-tx
-// reads/writes to an externally-pinned connection — tablesource.Source, for
-// P2 frame-coordination. MemorySource adapters don't implement it.
+// reads/writes to an externally-pinned connection — tablesource.Source uses
+// this to bind to the Snapshotter's pinned connection during advance. MemorySource adapters don't implement it.
 type connBinder interface {
 	BindConn(*sql.Conn)
 	UnbindConn()
@@ -595,8 +595,10 @@ type pipelineReaderPool interface {
 // Queueing here is NORMAL: under Option B each pipeline holds exactly one
 // reader acquired while holding nothing, so a batch wider than the pool's K
 // waits its turn exactly like TS's queries queue behind the view-syncer's
-// single conn (K=1). And the wait can LEGITIMATELY be long (F2,
-// parallelism audit 2026-07-10): the production pull path runs with
+// single conn (K=1). And the wait can legitimately be long
+//
+//	the production pull path runs with
+//
 // timeoutMs=0 — a consumer-driven RPC lifetime (go-ivm-client.ts
 // addQueriesStreamPull), NOT the 120s bound this deadline was originally
 // justified against — so a wide batch (say 50 queries on K=8) with heavy
@@ -643,7 +645,7 @@ func acquirePipelineReader(rp pipelineReaderPool, queryID string, cancelled *ato
 		if cancelled != nil && cancelled.Load() {
 			return nil, false
 		}
-		// Progress-based deadline (F2): any reader release anywhere in the
+		// Progress-based deadline: any reader release anywhere in the
 		// pool proves the machine is moving — this waiter is queued behind
 		// legitimate work, not wedged. Only a frozen counter lets the
 		// deadline expire.
@@ -737,7 +739,7 @@ func (e *Engine) AddQuery(queryID string, ast builder.AST) ([]RowChange, float64
 	hydration := hydrateEntry(entry, e.minRowVersions)
 	timingMs := float64(time.Since(start).Microseconds()) / 1000.0
 
-	// HIGH-11: wire companion outputs after hydrate.
+	// Wire companion outputs after hydrate.
 	e.wireCompanionOutputsLocked(entry)
 
 	return hydration, timingMs, nil
@@ -812,7 +814,7 @@ func (e *Engine) buildAndRegisterLocked(queryID string, ast builder.AST) *pipeli
 		schema:  schema,
 	})
 
-	// HIGH-11: companion outputs are wired AFTER hydrate (see
+	// Companion outputs are wired AFTER hydrate (see
 	// wireCompanionOutputsLocked), matching TS which wires the main pipeline
 	// before hydrate but companions after (pipeline-driver.ts:1615-1747). They
 	// only emit on advance (source.Push), never during the hydrate Fetch, so
@@ -938,7 +940,7 @@ func (e *Engine) AddQueries(queries []QuerySpec) ([]QueryResult, error) {
 	results := make([]QueryResult, len(built))
 	mrv := e.minRowVersions
 	rp := e.boundPipelineReaderPool()
-	// C1: a panic inside a hydrate goroutine (e.g. pkValue on a nil-PK row)
+	// a panic inside a hydrate goroutine (e.g. pkValue on a nil-PK row)
 	// cannot be caught by the RPC handler's recover — panics don't cross
 	// goroutine boundaries, so an uncaught one aborts the WHOLE multi-CG
 	// process. Capture per-lane and surface as an error (mirrors the
@@ -999,7 +1001,7 @@ func (e *Engine) AddQueries(queries []QuerySpec) ([]QueryResult, error) {
 		return nil, err
 	}
 
-	// HIGH-11: wire companion outputs after all hydrates complete.
+	// Wire companion outputs after all hydrates complete.
 	for _, entry := range built {
 		e.wireCompanionOutputsLocked(entry)
 	}
@@ -1018,10 +1020,10 @@ func (e *Engine) AddQueries(queries []QuerySpec) ([]QueryResult, error) {
 // its writeMu).
 //
 // Returns after all goroutines have finished. Engine.mu is held for the
-// BUILD and POST phases only; the drain runs outside it (D5,
-// DESIGN-duplex-streaming). "Source state stays read-only across the
-// hydration window" is the CALLER's per-group serialization invariant
-// (worker FIFO + group.mu in the sidecar — TS's per-CG model).
+// BUILD and POST phases only; the drain runs outside it.
+// "Source state stays read-only across the hydration window" is the CALLER's
+// per-group serialization invariant (worker FIFO + group.mu in the sidecar —
+// TS's per-CG model).
 func (e *Engine) AddQueriesStream(
 	queries []QuerySpec,
 	onResult func(QueryResult),
@@ -1036,7 +1038,7 @@ func (e *Engine) AddQueriesStream(
 // the (lazy) fetch produces it, instead of being re-batched into
 // hydrateChunkSize frames. chunkSize<=0 falls back to hydrateChunkSize.
 //
-// onResult returns whether the consumer wants MORE results (D4): false
+// onResult returns whether the consumer wants MORE results: false
 // means "consumer gone — stop producing". The producer breaks its fetch
 // range, which unwinds the operator chain via the iter.Seq defers (cursor
 // close, pool-reader release — the Go dual of TS generator .return()), and
@@ -1054,7 +1056,7 @@ func (e *Engine) AddQueriesStreamChunked(
 }
 
 // AddQueriesStreamPull is AddQueriesStreamChunked for pull-mode (ABI v3)
-// hydrates. Two differences (DESIGN-duplex-streaming D5/D6):
+// hydrates. Two differences from the push variant:
 //
 //   - Each query drains on its OWN goroutine instead of the shared
 //     hydrate-lane pool. A pull producer parks on client demand (the
@@ -1084,7 +1086,7 @@ func (e *Engine) addQueriesStreamChunked(
 	pull bool,
 	onResult func(QueryResult) bool,
 ) error {
-	// D5 lock structure (DESIGN-duplex-streaming): build under e.mu, drain
+	// Lock structure: build under e.mu, drain
 	// OUTSIDE e.mu, post-wiring under e.mu again. The drain phase only
 	// READS source state; every source-mutating entry point is serialized
 	// against this call at the sidecar level (per-CG worker FIFO +
@@ -1109,7 +1111,7 @@ func (e *Engine) addQueriesStreamChunked(
 	// wiring happens here too — see buildAndRegisterLocked. The closure's
 	// deferred unlock covers build-phase PANICS (unknown table → DataError
 	// panic, addqueries_build_unwind_test.go): the panic must escape to
-	// the caller with e.mu released, exactly as the pre-D5 whole-function
+	// the caller with e.mu released, exactly as the original whole-function
 	// defer provided.
 	var built []*pipelineEntry
 	var mrv map[string]string
@@ -1138,7 +1140,7 @@ func (e *Engine) addQueriesStreamChunked(
 	// slices.Collect materialization. Go-side peak memory is bounded by the
 	// current chunk (hydrateChunkSize RowChanges), not the full result set.
 	//
-	// C1: capture per-lane panics (see AddQueries) so a nil-PK panic in one
+	// capture per-lane panics (see AddQueries) so a nil-PK panic in one
 	// query's hydrate becomes a returned error instead of a process abort.
 	// The query may have already emitted partial (Final=false) frames; the
 	// handler turns the returned error into an rpcError, which rejects the
@@ -1185,7 +1187,7 @@ func (e *Engine) addQueriesStreamChunked(
 				cancelled.Store(true)
 				return false
 			}
-			// T1-5: reuse the backing array (see the matching note in
+			// reuse the backing array (see the matching note in
 			// AdvanceStream's flush). onResult encodes Changes
 			// synchronously via the sidecar's streamW before returning, so
 			// the array is free to reuse. Revert to `chunk = nil` if any
@@ -1208,7 +1210,7 @@ func (e *Engine) addQueriesStreamChunked(
 					// Returning breaks the range mid-iteration: iter.Seq
 					// yield sees false, every operator frame's defers run,
 					// the SQLite cursor closes, the pool reader returns to
-					// the warm pool (D4 — the .return() dual).
+					// the warm pool (the .return() dual).
 					return
 				}
 			}
@@ -1252,7 +1254,7 @@ func (e *Engine) addQueriesStreamChunked(
 
 	var wg sync.WaitGroup
 	if pull {
-		// D6: one goroutine per query — a parked pull producer must not
+		// One goroutine per query — a parked pull producer must not
 		// occupy a shared lane (see AddQueriesStreamPull).
 		for i, entry := range built {
 			wg.Add(1)
@@ -1313,7 +1315,7 @@ func (e *Engine) addQueriesStreamChunked(
 		return err
 	}
 
-	// HIGH-11: wire companion outputs after all hydrates complete. Skipped
+	// Wire companion outputs after all hydrates complete. Skipped
 	// if the engine closed mid-drain (Close contract says callers prevent
 	// that, but the check is cheap and the wiring would touch destroyed
 	// pipelines).
@@ -1327,7 +1329,7 @@ func (e *Engine) addQueriesStreamChunked(
 
 // firstHydratePanic converts the first non-nil per-goroutine hydrate panic into
 // an error so the RPC handler can return an error frame instead of letting the
-// panic abort the whole sidecar process (C1). Any value is wrapped
+// panic abort the whole sidecar process. Any value is wrapped
 // with its query ID for diagnosis.
 func firstHydratePanic(built []*pipelineEntry, panics []any) error {
 	for i, p := range panics {
@@ -1384,14 +1386,13 @@ type QueryResult struct {
 // view-syncer's cursor page size). The per-facet vars below remain as
 // fine-grained overrides for A/B work; deployments should set only this.
 //
-// TRANSPORT-AGNOSTIC (REVIEW-napi-transport O2): this default is engine-
-// level, so it applies to the SOCKET transport too, not just napi. A
-// socket deployment on this binary emits ~100× more (smaller) frames per
-// large hydrate/advance than the old 10000 default — each frame pays a
+// This default is engine-level, so it applies regardless of transport.
+// A socket deployment on this binary emits ~100× more (smaller) frames per
+// large hydrate/advance than the 10000 default — each frame pays a
 // length-prefix + write() syscall + TS-side decode dispatch. This is
 // intended (streaming-by-default is a deliberate product decision) and is
 // the exact config the streaming-tablesrc image variant already ships and
-// soaked over a socket. A socket deployment that wants the old
+// soaked over a socket. A socket deployment that wants the previous
 // coarse-frame behavior sets GO_IVM_CHUNK_SIZE=10000 (or the per-facet
 // GO_IVM_HYDRATE_CHUNK_SIZE / GO_IVM_ADVANCE_CHUNK_SIZE).
 var defaultChunkSize = envChunkSize("GO_IVM_CHUNK_SIZE", 100)
@@ -1487,7 +1488,7 @@ func (e *Engine) removeQueryLocked(queryID string) {
 	for _, ce := range entry.companions {
 		ce.pipeline.Input.Destroy()
 	}
-	// HIGH-4: DELETE this query's operator-storage rows (Take windows, etc.).
+	// DELETE this query's operator-storage rows (Take windows, etc.).
 	// CreateClientGroupStorage DELETEs on construction but Destroy was never
 	// called, so rows accumulated per distinct queryID over the engine's
 	// lifetime. cgs is nil when no storage-using operator was built.
@@ -1513,7 +1514,7 @@ func (e *Engine) removeBuiltQueriesLocked(built []*pipelineEntry) {
 // driftCheckLocked in prod; the MemorySource genPush asserts in the engine
 // test fixture) and every downstream operator assert PANIC with a plain
 // error — the direct twin of TS's assert-throws. The panic re-raises out of
-// this method after the streamer is drained (HIGH-10) and signalAdvanceEnd
+// this method after the streamer is drained and signalAdvanceEnd
 // has rotated the sources; the sidecar handler converts it to an RPC error
 // and TS tears the client group down.
 func (e *Engine) Advance(changes []SnapshotChange) *AdvanceResult {
@@ -1534,7 +1535,7 @@ func (e *Engine) Advance(changes []SnapshotChange) *AdvanceResult {
 	func() {
 		defer func() {
 			if r := recover(); r != nil {
-				// HIGH-10: drain the streamer before re-raising, matching
+				// Drain the streamer before re-raising, matching
 				// AdvanceStream's recover. Otherwise this aborted advance's
 				// accumulated entries survive and the NEXT successful
 				// Advance's first streamer.Stream() surfaces them as if
@@ -1650,7 +1651,7 @@ func (e *Engine) AdvanceStreamChunked(
 }
 
 // AdvanceStreamChunkedSeq is AdvanceStreamChunked over a LAZY change
-// sequence (DESIGN-duplex-streaming D9): the snapshotter's changelog
+// sequence: the snapshotter's changelog
 // cursor feeds the push loop one SnapshotChange at a time, so peak memory
 // is O(chunk) instead of O(diff) — the GO_IVM_MAX_DIFF_CHANGES cap and its
 // reset failure mode are unnecessary for callers of this variant. This is
@@ -1766,7 +1767,7 @@ func (e *Engine) advanceStreamChunkedSeq(
 	// final frame only.
 	// `rows` is consumed synchronously — the sidecar's streamW → mpMarshal
 	// encodes it into a separate byte buffer before onResult returns, so
-	// callers may reuse the backing array after (T1-5 invariant).
+	// callers may reuse the backing array after onResult returns.
 	emitLocked := func(rows []RowChange, final bool) {
 		var t []TableTiming
 		if final {
@@ -1784,7 +1785,7 @@ func (e *Engine) advanceStreamChunkedSeq(
 	// flushPendingLocked ships the buffered sub-threshold residual of EARLIER
 	// pushes as its own partial frame. Callers MUST hold flushMu.
 	//
-	// Cross-push wire order (scale-review C1): the chunkSink flushes full
+	// Cross-push wire order: the chunkSink flushes full
 	// chunks of the CURRENT push's fan-out directly to the wire mid-flatten.
 	// If a previous push's residual were still sitting in `pending`, the newer
 	// rows would overtake it on the wire — remove(X) (push N, buffered) +
@@ -1824,7 +1825,7 @@ func (e *Engine) advanceStreamChunkedSeq(
 		flushPendingLocked()
 	}
 
-	// Operator-level streaming (DESIGN-streaming-advance §Win-2): a single
+	// Operator-level streaming: a single
 	// source-change's fan-out flushes full chunks DURING the flatten via the
 	// streamer's chunkSink, so peak buffer is bounded to one chunk instead of the
 	// whole delta (a 50k-child ADD ships as N frames, not one 50k frame — matching
@@ -1835,21 +1836,18 @@ func (e *Engine) advanceStreamChunkedSeq(
 	e.streamer.SetChunkSink(func(chunk []RowChange) {
 		flushMu.Lock()
 		defer flushMu.Unlock() // deferred: onResult may panic (see flush)
-		// C1: ship earlier pushes' buffered residual BEFORE this mid-flatten
+		// Ship earlier pushes' buffered residual BEFORE this mid-flatten
 		// chunk so the wire never carries newer rows ahead of older ones.
 		flushPendingLocked()
 		emitLocked(chunk, false)
 	}, chunkSize, softChunkBytes)
 	defer e.streamer.SetChunkSink(nil, 0, 0)
 
-	// Panic capture: pre-fix this re-raised inline (panic(r)
-	// in the deferred recover), skipping the terminal flush(true) below
-	// and leaving the TS-side accumulator throwing
-	// "finished without a final chunk". That cascaded to C5's protocol-
-	// violation path which treats the wire as corrupted. By capturing
-	// the panic and re-raising AFTER flush(true), TS always sees a
-	// clean terminal frame — empty changes signal "advance abandoned"
-	// rather than wire protocol corruption.
+	// Panic capture: re-raise the panic AFTER the terminal flush so TS
+	// always sees a clean terminal frame. Without this, a panic skips the
+	// terminal flush and TS sees "finished without a final chunk", which
+	// cascades to the protocol-violation path. With capture, empty changes
+	// signal "advance abandoned" rather than wire protocol corruption.
 	var capturedPanic any
 	var seqErr error
 	func() {
@@ -1874,7 +1872,7 @@ func (e *Engine) advanceStreamChunkedSeq(
 		// Sources snapshot hoisted above (shared with the clock plumbing).
 		for change, cerr := range changes {
 			if cerr != nil {
-				// Lazy cursor failed mid-diff (D9): stop consuming; the
+				// Lazy cursor failed mid-diff: stop consuming; the
 				// error settles the whole stream (see AdvanceStreamChunkedSeq).
 				seqErr = cerr
 				return
@@ -1925,7 +1923,7 @@ func (e *Engine) advanceStreamChunkedSeq(
 	// recover()-guarded func so it fires on the panic path too.
 	e.signalAdvanceEnd()
 
-	// D9: a lazy-cursor failure settles the stream as an ERROR — no
+	// A lazy-cursor failure settles the stream as an ERROR — no
 	// terminal Final frame (the caller's rpcError is the terminal; a clean
 	// Final here would let a consumer mistake a half-applied diff for a
 	// complete advance).
@@ -2014,7 +2012,7 @@ type pipelineOutput struct {
 }
 
 func (po *pipelineOutput) Push(change ivm.Change, pusher ivm.InputBase) {
-	// Flatten-in-push (DESIGN-streaming-advance.md): Accumulate flattens the
+	// Flatten-in-push: Accumulate flattens the
 	// change tree to RowChanges NOW, while Output.Push is on the stack and the
 	// mutation overlay + join in-progress child state are still live (§3). No
 	// eager materializeChange deep-copy — streamNodesInto walks the lazy

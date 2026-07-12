@@ -1,6 +1,6 @@
 package tablesource
 
-// Parallel advance fanout (DESIGN-streaming-advance follow-up, 2026-07-02).
+// Parallel advance fanout.
 //
 // genPushAndWrite fans one source-level change out to every subscribed
 // connection. Serially that is the LAST single-threaded stage of the advance
@@ -30,7 +30,7 @@ package tablesource
 //     conn.lastPushedEpoch is written only by the connection's own group
 //     goroutine and read only from fetches on that same goroutine.
 //   - the engine's Streamer: Accumulate is mutex-guarded and documents the
-//     cross-query ordering contract (D8) — order across concurrently
+//     cross-query ordering contract — order across concurrently
 //     pushing pipelines follows lock acquisition and is non-deterministic;
 //     rows WITHIN one query keep their push order. Downstream consumers
 //     are per-query (TS routes RowChanges by queryID; the CVR merge keys

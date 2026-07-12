@@ -1,10 +1,9 @@
 package tablesource
 
 // Open: read-side SQLite connection pool for the Go IVM TableSource leaf.
-// Mirrors the design-doc constraints — WAL is asserted (NOT switched on by
-// us — the TS replicator owns the file), query_only protects against
-// accidental writes from this process, and the pool is sized for true
-// per-goroutine reader parallelism.
+// WAL is asserted (NOT switched on by us — the TS replicator owns the file),
+// query_only protects against accidental writes from this process, and the
+// pool is sized for true per-goroutine reader parallelism.
 //
 // We deliberately do NOT use mode=ro. WAL mode requires the reader process
 // to write to the -shm and -wal sidecar files; mode=ro forbids that and
@@ -82,7 +81,7 @@ var readPoolDSNs sync.Map // *sql.DB → string (DSN)
 // rawOpenReaderConn opens ONE raw driver connection configured identically
 // to db's pooled connections (same DSN → same pragmas + lower() hook), but
 // OUTSIDE database/sql. Raw conns are the substrate of the Option B reader
-// pool. (F3 correction, 2026-07-10: the original motivation — "database/sql
+// pool. the original motivation — "database/sql
 // serializes a *sql.Conn behind one live Rows" — was empirically overstated:
 // conn-prepared statements interleave live cursors on one *sql.Conn just
 // fine. The real pillars are the stmt busy-checkout cache, the driver-level
@@ -144,7 +143,7 @@ func probeRealTextDigits() (int, error) {
 }
 
 // sqlLowerCaserPool amortizes cases.Lower(language.Und) construction (napi
-// review M5 twin): the lower() override runs PER VALUE PER ROW during every
+// TS twin): the lower() override runs PER VALUE PER ROW during every
 // ILIKE scan, and a cases.Caser is stateful (not concurrency-safe), so the
 // previous per-call construction paid the language lookup + transformer
 // build on every row.
@@ -169,7 +168,7 @@ func sqlUnicodeLower(s string) string {
 // ("argument must be BLOB or TEXT") — so the query_builder ILIKE shape
 // `lower(col) LIKE lower(?)` errored mid-scan on the first NULL in any
 // nullable column, and Source.Fetch panicked on rows.Err() → a
-// deterministic hydrate-failure loop (napi hostile review C1).
+// deterministic hydrate-failure loop.
 //
 // Per-type contract (matches ext/icu icuCaseFunc16 + sqlite3_value_text):
 //   - NULL → NULL (ICU returns without setting a result). mattn delivers
@@ -242,7 +241,7 @@ type OpenOptions struct {
 	// MaxOpenConns caps the pool. 0 → defaultMaxOpenConns.
 	MaxOpenConns int
 	// MaxIdleConns caps idle conns kept ready. 0 → MaxOpenConns (keep-warm:
-	// 2026-07-07 latency forensics — an idle cap ≪ open cap made every
+	// An idle cap much smaller than the open cap makes every
 	// pool-demand burst churn fresh SQLite opens against the replica
 	// (wal-index mmap + cold page cache), a uniform tax on the warm
 	// hydrate/advance path: 70s cumulative read-pool wait per 10s window
@@ -265,7 +264,7 @@ type OpenOptions struct {
 	// ConnMaxIdle is how long an idle pooled conn survives before the
 	// pool cleaner closes it (releasing its fd + page cache — see
 	// defaultConnMaxIdle). 0 → defaultConnMaxIdle; negative → no idle
-	// deadline (pre-2026-07 behavior, conns park forever).
+	// deadline (conns park forever when negative).
 	ConnMaxIdle time.Duration
 }
 

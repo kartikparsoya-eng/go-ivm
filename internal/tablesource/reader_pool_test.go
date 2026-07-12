@@ -220,8 +220,7 @@ func TestReaderPool_PinsAllToVersion(t *testing.T) {
 
 // TestReaderPool_ConvergesToHead_IgnoresStaleTarget: the pool converges to the
 // replica's actual head regardless of the (now-ignored) wantVersion parameter.
-// The old code rejected a stale target; the converge-upward strategy simply
-// pins all readers at whatever head they land on.
+// The converge-upward strategy pins all readers at whatever head they land on.
 func TestReaderPool_ConvergesToHead_IgnoresStaleTarget(t *testing.T) {
 	path := seedReplicaWithStateVersion(t, "v42")
 	db, err := Open(path, OpenOptions{})

@@ -1,18 +1,17 @@
 package tablesource
 
-// Consolidated regression tests for the napi-review mediums + user's-audit
-// items that land in this package:
+// Consolidated regression tests for the tablesource package:
 //
-//   M3  — filter literals typed by LITERAL JS-type (convertFilter no longer
-//         stamps the column's schema type onto literal sides).
-//   M4  — poolReader's prepared-stmt cache is bounded (IN-length variance).
-//   M9b — compound multiConstraints exercised through Source.Fetch itself
-//         (previously only the generated SQL was executed, never the
-//         Source.Fetch plumbing that binds and scans it).
-//   a4  — FromSQLiteType string/number branches follow TS's fromSQLiteType
-//         exactly (no numeric-string parsing; ints in string columns become
-//         JS numbers) — covered in sqlite's coercion tests via the exported
-//         function; the convertFilter side is here.
+//   - filter literals typed by literal JS-type (convertFilter no longer
+//     stamps the column's schema type onto literal sides).
+//   - poolReader's prepared-stmt cache is bounded (IN-length variance).
+//   - compound multiConstraints exercised through Source.Fetch itself
+//     (previously only the generated SQL was executed, never the
+//     Source.Fetch plumbing that binds and scans it).
+//   - FromSQLiteType string/number branches follow the reference
+//     implementation exactly (no numeric-string parsing; ints in string
+//     columns become numbers) — covered in sqlite's coercion tests via
+//     the exported function; the convertFilter side is here.
 
 import (
 	"context"
@@ -29,13 +28,10 @@ import (
 	"github.com/kartikparsoya-eng/go-ivm/sqlite"
 )
 
-// TestConvertFilterLiteralTypedByLiteral (M3): a string literal filtered
-// against a json column must reach SQLite as the BARE string, exactly as TS
-// binds it (query-builder.ts valuePositionToSQL → toSQLiteType(v,
-// getJsType(v))). Pre-fix, convertSimpleCondition stamped ColType="json"
-// from the column schema and the sqlite layer marshaled the literal to its
-// JSON encoding ('"Payment Failures"') — silently comparing different
-// values than TS for the identical AST.
+// TestConvertFilterLiteralTypedByLiteral verifies that a string literal
+// filtered against a json column reaches SQLite as the bare string, not
+// JSON-encoded. The literal's type is determined by its own JS type, not
+// the column's schema type.
 func TestConvertFilterLiteralTypedByLiteral(t *testing.T) {
 	src, db := newJSONSource(t)
 	defer db.Close()
@@ -62,14 +58,12 @@ func TestConvertFilterLiteralTypedByLiteral(t *testing.T) {
 	}
 }
 
-// TestPoolReaderStmtCacheBounded (M4): IN-clause shapes vary by list length
-// (`IN (?,?)` vs `IN (?,?,?)`), so a batched flipped-join hydrate mints one
-// distinct SQL text per length — each pinning a compiled sqlite3_stmt on
-// the C heap for the reader's whole life. Pre-fix the map was unbounded;
-// post-fix it holds ≤ stmtCachePerConnCap entries and evicts the coldest
-// quarter, with hot shapes surviving. Exercised through the Option B
-// checkout/return cycle (checkout removes from the map; RETURN is the
-// insert — and thus the eviction trigger).
+// TestPoolReaderStmtCacheBounded verifies that the prepared-stmt cache
+// for a poolReader is bounded. IN-clause shapes vary by list length, so a
+// batched flipped-join hydrate mints one distinct SQL text per length —
+// each pinning a compiled sqlite3_stmt on the C heap for the reader's
+// life. The cache holds at most stmtCachePerConnCap entries and evicts
+// the coldest quarter, with hot shapes surviving.
 func TestPoolReaderStmtCacheBounded(t *testing.T) {
 	path := newWALFixture(t)
 	db, err := Open(path, OpenOptions{})
@@ -113,7 +107,7 @@ func TestPoolReaderStmtCacheBounded(t *testing.T) {
 	}
 
 	if got := len(r.stmts); got > stmtCachePerConnCap {
-		t.Fatalf("poolReader stmt cache grew to %d entries; cap is %d (unbounded pre-M4)",
+		t.Fatalf("poolReader stmt cache grew to %d entries; cap is %d",
 			got, stmtCachePerConnCap)
 	}
 	if _, ok := r.stmts[hot]; !ok {
@@ -138,10 +132,10 @@ func TestPoolReaderStmtCacheBounded(t *testing.T) {
 	r.returnStmt(hot, st, true)
 }
 
-// TestSourceFetchCompoundMultiConstraints (M9b): the compound
-// `(a,b) IN (VALUES …)` form was only ever executed as raw SQL in tests;
-// this drives it through Source.Fetch itself — Connect → Fetch with
-// MultiConstraints — proving the binding, scan, and ordering plumbing.
+// TestSourceFetchCompoundMultiConstraints drives the compound
+// `(a,b) IN (VALUES …)` form through Source.Fetch itself — Connect →
+// Fetch with MultiConstraints — proving the binding, scan, and ordering
+// plumbing.
 func TestSourceFetchCompoundMultiConstraints(t *testing.T) {
 	path := newWALFixture(t)
 	seed, err := sql.Open("sqlite3", "file:"+path)

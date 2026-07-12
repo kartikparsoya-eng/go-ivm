@@ -357,10 +357,10 @@ func valuePositionToSQL(vp ValuePos) (string, []interface{}) {
 	case "column":
 		return quoteIdent(vp.Name), nil
 	case "literal":
-		// M3 (napi review): TS types filter literals by the LITERAL's OWN JS
+		// TS types filter literals by the LITERAL's OWN JS
 		// type — valuePositionToSQL → toSQLiteType(v, getJsType(v))
 		// (zqlite/query-builder.ts:257,265) — NOT by the column's schema
-		// type. The old ColType plumbing coerced by COLUMN type, so e.g. a
+		// type. Coercing by COLUMN type made e.g. a
 		// string literal compared against a json column was bound as its
 		// JSON encoding ('"x"' instead of x), and a string literal against a
 		// boolean column ('true') was bound as 1 — both silently matching
@@ -747,7 +747,7 @@ func FromSQLiteType(v interface{}, colType string) ivm.Value {
 		// 'null'-typed column comes back a JS NUMBER, not a bigint. The Go
 		// port must therefore CONVERT int64/uint64 to float64 after the
 		// bounds check — the previous passthrough (return raw int64) was a
-		// porting divergence (full-scale review 2026-07-03): within Go it
+		// porting divergence: within Go it
 		// left int64 vs float64 mixing in comparators/equality for the same
 		// logical value, and it diverged from what TS's engine holds.
 		switch val := v.(type) {

@@ -470,7 +470,7 @@ func canonicalValue(v Value) string {
 			// keyed -0.0 must find a parent fetched back as +0.0 (SQLite
 			// stores integral REALs int-serial, normalizing -0.0 to 0);
 			// FormatFloat's "d-0" split the keys and silently dropped the
-			// parent row (napi hostile review M2).
+			// parent row.
 			return "d0"
 		}
 		return "d" + strconv.FormatFloat(t, 'g', -1, 64)

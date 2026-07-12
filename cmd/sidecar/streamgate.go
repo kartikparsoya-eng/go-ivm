@@ -1,6 +1,6 @@
 package main
 
-// streamgate.go — the pull-hydration demand gate (ABI v3, DESIGN-duplex-streaming §4.2/§4.3/§4.7).
+// streamgate.go — the pull-hydration demand gate (ABI v3).
 //
 // One streamGate per pull-mode addQueriesStream RPC. The rowPlane's onResult
 // path acquires ONE credit before each row-BEARING delivery (kind-3 records
@@ -46,7 +46,7 @@ type streamGate struct {
 	// lastGrant is the creation/last-grant instant; the idle sweeper
 	// auto-cancels a gate whose producers have been parked with no grant
 	// for longer than the pull idle timeout (bounds the WAL-frame pin and
-	// the group.mu hold — D7). Guarded by mu.
+	// the group.mu hold). Guarded by mu.
 	lastGrant time.Time
 	// waiters counts producers currently parked in acquire. The sweeper
 	// only fires on gates that actually have someone parked: a stream
@@ -141,7 +141,7 @@ func (g *streamGate) isCancelled() bool {
 }
 
 // idleParked reports whether at least one producer has been parked with no
-// grant for longer than idle. Used by the sweeper (D7): parked-past-timeout
+// grant for longer than idle. Used by the sweeper: parked-past-timeout
 // gates are auto-cancelled — same unwind as a client cancel; the client
 // sees a terminal error frame and re-hydrates.
 func (g *streamGate) idleParked(now time.Time, idle time.Duration) bool {
@@ -269,7 +269,7 @@ func (r *streamGateRegistry) cancelAll() {
 }
 
 // sweepIdle auto-cancels every gate whose producers have been parked with
-// no grant for longer than idle (D7). Returns the number cancelled.
+// no grant for longer than idle. Returns the number cancelled.
 func (r *streamGateRegistry) sweepIdle(now time.Time, idle time.Duration) int {
 	r.mu.Lock()
 	var toCancel []*streamGate

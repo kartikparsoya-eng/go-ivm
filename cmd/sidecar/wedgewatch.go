@@ -1,38 +1,25 @@
 package main
 
-// wedgewatch.go — the CG-worker wedge watchdog (2026-07-09, G13 forensics).
+// wedgewatch.go — the CG-worker wedge watchdog.
 //
-// Born from a two-build ART incident (7fd5a895 → 7fbeed43) that log
-// archaeology could BOUND but not NAME: per-CG init/hydrate cycles starving
-// at exactly the TS 120s RPC deadline in ~122s lockstep, with every
-// candidate blocking site individually refuted by absence-of-log evidence —
-// the idle sweeper never fired (producers not parked in gate.acquire ≥60s),
-// destroys dequeued in µs off the same FIFO the init starved in (worker
-// free), TEARDOWN muWait=41ns (group.mu free), zero ERROR/PANIC/SLOW lines
-// for the wedged RPCs. The surviving model — the handler returns
-// SUCCESSFULLY at T≈120-140s, invisibly — could not be confirmed because
-// nothing logs a successful return (the [SLOW] breadcrumb was gated on a
-// non-empty traceparent) and nothing observes a handler mid-flight.
-//
-// The watchdog closes both holes from inside the process:
+// Detects and diagnoses per-CG init/hydrate cycles that stall past the TS
+// 120s RPC deadline. The watchdog scans every CG worker's in-flight
+// request periodically and reports handlers running past a configurable
+// threshold, emitting three log lines:
 //
 //   [GO-IVM][WEDGE]        — every scan tick while a handler runs past the
 //                            threshold: cg, method, elapsed, queued depth,
 //                            FIFO queue-wait, reqID. Correlates directly
 //                            against the TS 120s deadline.
-//   [GO-IVM][WEDGE-STACKS] — ONCE per incident: a full all-goroutine dump
+//   [GO-IVM][WEDGE-STACKS] — ONCE per wedge: a full all-goroutine dump
 //                            (the exact `pprof/goroutine?debug=2` capture,
 //                            minus the operator) between BEGIN/END sentinels
-//                            so the ART gate can extract it mechanically.
+//                            so tooling can extract it mechanically.
 //   [GO-IVM][WEDGE-CLEAR]  — emitted by the worker when a past-threshold
 //                            handler finally returns: the release timestamp
 //                            + total elapsed, which is what discriminates
 //                            "wedged forever" from "silently un-stuck at
-//                            ~120s" (the two models the incident left open).
-//
-// The ART gate (tools/log_gate.py) hard-blocks on [GO-IVM][WEDGE], so the
-// first soak on a build carrying this file surfaces wedge incidents — with
-// stacks — in the gate verdict with zero operator effort.
+//                            ~120s".
 //
 // Threshold: GO_IVM_WEDGE_WATCHDOG_SEC (default 90s) — deliberately BELOW
 // the TS 120s RPC deadline so the stack dump lands while the client is
@@ -42,7 +29,7 @@ package main
 // Cost when nothing is wedged: one atomic load per group per tick
 // (tick = threshold/4, clamped [250ms, 10s]) — nil curReq short-circuits.
 // The all-goroutine dump stops the world briefly; it fires at most once per
-// incident on a worker that is, by definition, already failing its client.
+// wedge on a worker that is, by definition, already failing its client.
 
 import (
 	"context"
@@ -118,7 +105,7 @@ func (s *Server) runWedgeWatchdog(ctx context.Context) {
 
 // scanWedgedGroups is one watchdog pass: reports every group whose worker
 // has been inside one handler for longer than s.wedgeThreshold, and dumps
-// all goroutine stacks ONCE per incident (g.wedgeDumped latches; the worker
+// all goroutine stacks ONCE per wedge (g.wedgeDumped latches; the worker
 // re-arms it when the handler completes). Returns the number of wedged
 // groups found (tests).
 func (s *Server) scanWedgedGroups(now time.Time) int {
@@ -151,11 +138,9 @@ func (s *Server) scanWedgedGroups(now time.Time) int {
 	return wedged
 }
 
-// dumpAllStacks prints every goroutine's stack between sentinel lines the
-// ART gate can extract mechanically. Equivalent to hitting
-// /debug/pprof/goroutine?debug=2 at the moment the wedge is detected —
-// which is exactly the capture the 7fbeed43 incident needed and no one was
-// around to take.
+// dumpAllStacks prints every goroutine's stack between sentinel lines so
+// the output can be extracted mechanically. Equivalent to hitting
+// /debug/pprof/goroutine?debug=2 at the moment the wedge is detected.
 func dumpAllStacks(info *activeReq, elapsed time.Duration) {
 	// runtime.Stack(all=true) truncates when the buffer is too small —
 	// grow geometrically until it fits (a saturated worker can carry a few

@@ -5,7 +5,7 @@ package main
 // ordinary test toolchain; the cgo //export shims live in napi_lib.go
 // (build tag `napilib`) and are deliberately paper-thin over this.
 //
-// Design (frame pump): the socket transport's ONLY jobs are (a) carrying
+// Design (frame pump): the in-process transport's ONLY jobs are (a) carrying
 // length-prefixed msgpack frames in each direction and (b) exerting
 // backpressure. Everything else — request dispatch, per-group FIFO, streaming
 // partials, the single-flusher ordering guarantee — lives in handleConnection
@@ -20,13 +20,13 @@ package main
 // Backpressure is preserved end-to-end: a slow JS consumer blocks the sink
 // call → blocks the pump reader → blocks handleConnection's flusher →
 // fills flushCh/outC → blocks the request reader (same chain as a slow
-// socket; see handleConnection's flusher comment).
+// transport; see handleConnection's flusher comment).
 //
-// Send-side queue: Node's socket.write never blocks the JS thread (userspace
+// Send-side queue: the embedding's send call never blocks the JS thread
 // buffering), so goivm_send must not either. sendQ is an unbounded
 // mutex+cond queue drained by one writer goroutine; memory is bounded in
 // practice by the TS client's own in-flight slot discipline (maxInFlight),
-// exactly as with the socket.
+// exactly as with a socket transport.
 
 import (
 	"bufio"
@@ -49,10 +49,8 @@ import (
 // transport. Returns an error instead of os.Exit-ing — inside a host
 // process, exiting would take the embedder down.
 //
-// Hard-wired prod path (removal sweep): the replica-backed table source is
-// the ONLY leaf source and drive-mode advanceToHeadStream is the ONLY
-// advance — the GO_IVM_SOURCE_MODE / GO_IVM_ADVANCE_TO_HEAD /
-// GO_IVM_ADVANCE_DRIVE gates are gone, so a replica path is required.
+// The replica-backed table source is the ONLY leaf source and drive-mode
+// advanceToHeadStream is the ONLY advance path — a replica path is required.
 func newServerFromEnv() (*Server, error) {
 	if err := sqlite.SelfCheckCoercion(); err != nil {
 		return nil, fmt.Errorf("coercion self-check: %w", err)
@@ -95,17 +93,16 @@ func newServerFromEnv() (*Server, error) {
 		}
 	}
 	// Warm-hydrate reader pool: production default ON — co-read-only (never
-	// converges the pool to head), so it cannot desync live pipelines;
-	// validated in the rust-test soak (pin-rate 100%, serial fallback 0).
+	// converges the pool to head), so it cannot desync live pipelines.
 	// GO_IVM_WARM_HYDRATE_POOL=false disables.
 	server.warmHydratePoolEnabled = os.Getenv("GO_IVM_WARM_HYDRATE_POOL") != "false"
 	fmt.Fprintf(os.Stderr,
 		"[GO-IVM] hydrate config: readers=%d(floor) lanes=%d (drive advance, streaming hydrate, appID=%q)\n",
 		server.hydrateReaders, server.hydrateLanes, server.appID)
-	// Startup-time non-default engine-knob markers (see PROD-PATH.md): a
-	// default-path deployment prints NONE of these. Each gates an alternate
-	// implementation kept as a rollback/experiment — code that is off the
-	// TS-faithfulness review surface until deliberately engaged.
+	// Startup-time non-default engine-knob markers: a default-path
+	// deployment prints NONE of these. Each gates an alternate implementation
+	// kept as a rollback/experiment — code that is off the default path until
+	// deliberately engaged.
 	if !tablesource.ParallelAdvance {
 		nonDefault("GO_IVM_PARALLEL_ADVANCE=false (serial advance fanout)")
 	}
@@ -126,7 +123,7 @@ func envFirstPositiveInt(def int, names ...string) int {
 // abiHost owns one in-process "connection": the net.Pipe pair, the send
 // queue + writer goroutine, and the pump reader that forwards response
 // frames to the registered sink. One host per embedding (the addon creates
-// exactly one), mirroring the one-socket-per-worker deployment shape.
+// exactly one), mirroring the one-connection-per-worker deployment shape.
 type abiHost struct {
 	server *Server
 
@@ -142,9 +139,7 @@ type abiHost struct {
 	// of the call); deliverFull means NOTHING was enqueued and the caller
 	// owns the retry (rowplane.go retryDeliver for the row plane;
 	// deliverPumpFrame for the pump); deliverClosed means the transport is
-	// dead. Pre-v4 this callback BLOCKED on a full queue — an uncancellable
-	// park inside cgo that composed with rp.mu + wg.Wait + the inFlight
-	// worker into the G13 permanent CG wedge.
+	// dead.
 	deliver func(kind int32, payload []byte) int32
 
 	mu     sync.Mutex
@@ -152,7 +147,7 @@ type abiHost struct {
 	sendQ  [][]byte
 	closed bool
 	// shuttingDown marks a DELIBERATE Shutdown() so the death watcher can
-	// distinguish it from an unexpected pipe/handler death (A3): only the
+	// distinguish it from an unexpected pipe/handler death: only the
 	// latter delivers a kind-4 host-death record. Guarded by mu.
 	shuttingDown bool
 	// deathCause records the FIRST pump-exit error (read or write side) as
@@ -162,9 +157,9 @@ type abiHost struct {
 	wg         sync.WaitGroup
 
 	// reaperCancel stops the idle-group reaper goroutine on Shutdown. The
-	// socket transport runs this reaper from main(); the in-process host
-	// must run its own or abandoned CGs never get collected (napi-only
-	// leak — the whole reason abi.go reuses Server but not main()).
+	// reaper is normally started by main(); the in-process host
+	// must run its own or abandoned CGs never get collected
+	// (the same reason abi.go reuses Server but not main()).
 	reaperCancel context.CancelFunc
 
 	// hcWg tracks the handleConnection goroutine so Shutdown can JOIN it.
@@ -173,18 +168,18 @@ type abiHost struct {
 	// running — harmless in production (process exit reclaims; the pump
 	// reader that touches the TSFN has already exited via <-h.done) but a
 	// brief goroutine escape that tests observing "host fully torn down"
-	// could race against (full-scale review 2026-07-03).
+	// could race against.
 	hcWg sync.WaitGroup
 
 	// pprofServer is the in-process pprof endpoint (nil unless
-	// GO_IVM_PPROF_ADDR is set). Same O1 rationale as the reaper: pprof and
+	// GO_IVM_PPROF_ADDR is set). Same rationale as the reaper: pprof and
 	// the PERF reporter lived only in main(), leaving napi mode blind.
 	pprofServer *http.Server
 
 	// otelShutdown flushes + tears down the OTLP trace exporter (otel.go).
 	// nil when tracing is off or the host was built without env wiring
-	// (startABIHostWithServer test path). Same O1 parity rationale as
-	// pprof/PERF: otelInit used to live only in the socket main().
+	// (startABIHostWithServer test path). Same parity rationale as
+	// pprof/PERF: otelInit used to live only in the socket main() and the
 	otelShutdown func(context.Context) error
 }
 
@@ -240,13 +235,13 @@ func startABIHostWithServer(server *Server, deliver func(kind int32, payload []b
 	// before handleConnection starts; never mutated after.
 	server.abiDeliver = deliver
 
-	// Idle-group reaper: the socket transport starts this from main(); the
+	// Idle-group reaper: normally started by main(); the
 	// in-process host must start its own (same Server, same leak otherwise).
 	// Cancelled on Shutdown.
 	reaperCtx, reaperCancel := context.WithCancel(context.Background())
 	h.reaperCancel = reaperCancel
 	go server.runReaper(reaperCtx)
-	// Pull idle sweeper (ABI v3, D7): auto-cancels pull gates parked past
+	// Pull idle sweeper (ABI v3): auto-cancels pull gates parked past
 	// GO_IVM_PULL_IDLE_TIMEOUT_SEC. Same lifecycle as the reaper.
 	go server.runPullIdleSweeper(reaperCtx)
 	// Wedge watchdog (wedgewatch.go): reports + stack-dumps any CG worker
@@ -254,7 +249,7 @@ func startABIHostWithServer(server *Server, deliver func(kind int32, payload []b
 	// lifecycle as the reaper.
 	go server.runWedgeWatchdog(reaperCtx)
 
-	// Observability parity with the socket path (REVIEW-napi-transport O1):
+	// Observability parity with the socket path:
 	// the 10s [GO-IVM][PERF] reporter (what every soak greps) + the pprof
 	// endpoint. Both were main()-only; the host never runs main(). pprof is
 	// per-worker-port-derived (napi workers are separate processes).
@@ -263,7 +258,7 @@ func startABIHostWithServer(server *Server, deliver func(kind int32, payload []b
 
 	// The production connection handler, verbatim. When either pipe end
 	// closes, its read loop errors out and it tears down exactly as it
-	// would on a socket disconnect. Tracked by hcWg so Shutdown can join
+	// would on a transport disconnect. Tracked by hcWg so Shutdown can join
 	// its deferred cleanup (which completes only after closeAll unblocks
 	// the workers' respCh sends — hence the wait is AFTER closeAll).
 	h.hcWg.Add(1)
@@ -274,7 +269,7 @@ func startABIHostWithServer(server *Server, deliver func(kind int32, payload []b
 
 	// Send-queue writer: drains sendQ → clientEnd. net.Pipe writes are
 	// synchronous (block until handleConnection's reader consumes), which
-	// is exactly the request-side backpressure the socket had via the
+	// is exactly the request-side backpressure a socket had via the
 	// kernel buffer + outC chain — but it must block THIS goroutine, not
 	// the JS thread, hence the queue.
 	h.wg.Add(1)
@@ -326,7 +321,7 @@ func startABIHostWithServer(server *Server, deliver func(kind int32, payload []b
 
 	go func() {
 		h.wg.Wait()
-		// Death watcher (A3, scale review): an UNEXPECTED pump death —
+		// Death watcher: an UNEXPECTED pump death —
 		// handleConnection exit (bad frame, internal error) or pipe
 		// teardown, anything but a deliberate Shutdown — was previously
 		// silent: every pending RPC hung to its full timeout and JS had no
@@ -410,10 +405,10 @@ func (h *abiHost) isClosed() bool {
 
 // Send enqueues one request frame (payload WITHOUT length prefix; the writer
 // adds it). TAKES OWNERSHIP of payload — the caller must not reuse or mutate
-// the slice after the call (REVIEW-napi-transport perf #2: goivm_send already
-// hands us a fresh C.GoBytes copy, so an internal make+copy here was a second
-// redundant allocation per request frame; every caller passes a freshly
-// built, never-retained slice — verified).
+// the slice after the call (goivm_send already hands us a fresh
+// C.GoBytes copy, so an internal make+copy here would be a second redundant
+// allocation per request frame; every caller passes a freshly built,
+// never-retained slice).
 func (h *abiHost) Send(payload []byte) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()

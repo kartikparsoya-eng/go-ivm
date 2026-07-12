@@ -1,13 +1,9 @@
 package main
 
-// Regression tests for the row plane's ALL-OR-NOTHING partial contract
-// (REVIEW-napi-transport B2). Before the fix, emitChanges delivered
-// encodable rows as records IMMEDIATELY while unencodable ones waited for
-// the trailing fallback frame — reordering changes WITHIN a partial: [add X
-// (fallback), remove X (record)] arrived at the client as remove-then-add →
-// net phantom row → drift. (The unencodable trigger in these tests is a
-// heterogeneous row — a column outside the group's canonical order; the
-// original remove-first trigger now encodes via replacement defs.)
+// Regression tests for the row plane's all-or-nothing partial contract.
+// emitChanges must deliver all rows in a partial as a single unit — either
+// all as records (fast path) or all in a fallback frame — never mix the two,
+// which would reorder changes within a partial and cause drift.
 //
 // Drives rowPlane directly with a sinkCollector (no engine, no addon):
 // the contract under test is purely the record/frame routing.
@@ -60,13 +56,10 @@ func countKinds(col *sinkCollector) (defs, rows, frames int) {
 	return
 }
 
-// TestRowPlane_MixedPartialAllOrNothing is the B2 repro: a partial holding
+// TestRowPlane_MixedPartialAllOrNothing verifies that a partial holding
 // one unencodable add (foreign column outside the group's canonical order)
-// and one encodable remove must ship ENTIRELY as one frame, in original
-// change order, with ZERO records. (This originally used a remove-first
-// group as the unencodable trigger; the user's-audit fix made those encode
-// via replacement defs, so the trigger is now a heterogeneous row — the
-// remaining unencodable shape.)
+// and one encodable remove ships entirely as one frame, in original change
+// order, with zero records.
 func TestRowPlane_MixedPartialAllOrNothing(t *testing.T) {
 	col := newSinkCollector()
 	rp := rowPlaneForTest(t, col, 5)
@@ -80,11 +73,9 @@ func TestRowPlane_MixedPartialAllOrNothing(t *testing.T) {
 		t.Fatalf("after partial1: defs=%d rows=%d frames=%d, want 1/1/0", defs, rows, frames)
 	}
 
-	// Partial 2: [add X (UNencodable — carries a column outside the
-	// canonical order), remove X (encodable)]. Pre-fix: remove left as a
-	// record BEFORE the add's fallback frame → client applied
-	// remove-then-add → phantom X. Post-fix: zero new records; ONE frame
-	// carrying both changes in original order.
+	// Partial 2: [add X (unencodable — carries a column outside the
+	// canonical order), remove X (encodable)]. Must produce zero new
+	// records; one frame carrying both changes in original order.
 	heteroAdd := rcAdd("q1", "x")
 	heteroAdd.Row = ivm.Row{"id": "x", "zz": float64(9)} // zz ∉ {id,n}
 	rp.emitAdvanceToHeadPartial(engine.AdvanceStreamPartial{

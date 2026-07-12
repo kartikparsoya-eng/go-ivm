@@ -1,15 +1,15 @@
 package engine
 
-// TS↔Go lifecycle + parallelization correctness on the PROD source path
-// (internal/tablesource, not MemorySource). The TS view-syncer churns query
+// Lifecycle + parallelization correctness on the production source path
+// (internal/tablesource, not MemorySource). The view-syncer churns query
 // lifecycle constantly — TTL expiry removes queries, auth maintenance
 // retransforms them, clients re-issue them — all interleaved with advances.
 // Every RPC below maps 1:1 onto that churn: addQueriesStream / removeQuery /
-// advance(Stream). These pin that the Go engine's state stays correct across
-// the churn: removed queries emit nothing, writeChange-applied advances are
-// visible to a later re-hydrate, re-added queries re-wire their outputs, and
-// the whole lifecycle is race-clean under concurrent callers (e.mu is the
-// contract; run with -race).
+// advance(Stream). These tests pin that the engine's state stays correct
+// across the churn: removed queries emit nothing, writeChange-applied
+// advances are visible to a later re-hydrate, re-added queries re-wire their
+// outputs, and the whole lifecycle is race-clean under concurrent callers
+// (e.mu is the contract; run with -race).
 
 import (
 	"database/sql"
@@ -394,19 +394,18 @@ func TestTableSourceParallel_StreamingHydrateLanes(t *testing.T) {
 }
 
 // Concurrent lifecycle callers: one goroutine advancing, one churning
-// remove/re-add of the same query — the TS view-syncer's advance loop racing
-// TTL-expiry/re-issue traffic. Since D5 (DESIGN-duplex-streaming) the engine
-// no longer holds e.mu across the hydrate DRAIN, so per-engine serialization
-// of hydrate vs source-mutating calls is the CALLER's contract — in
-// production the sidecar's per-CG worker FIFO + group.mu (held across every
-// advance/hydrate/removeQuery RPC), which is exactly TS's per-CG
-// serialization. `groupMu` below models that caller lock; without it this
-// test would violate the documented contract, not exercise a supported
-// interleaving. What stays pinned: no drift, no state leak — each advance
-// batch is rolled back at OnAdvanceEnd (no replicator behind it), so
-// whatever the interleaving, a final fresh hydrate must see exactly the
-// seeded replica; more rows would mean prev-tx state leaked across a batch
-// boundary under churn.
+// remove/re-add of the same query — modeling the view-syncer's advance
+// loop racing TTL-expiry/re-issue traffic. The engine no longer holds e.mu
+// across the hydrate drain, so per-engine serialization of hydrate vs
+// source-mutating calls is the caller's contract — in production the
+// sidecar's per-CG worker FIFO + group.mu (held across every
+// advance/hydrate/removeQuery RPC). `groupMu` below models that caller lock;
+// without it this test would violate the documented contract, not exercise
+// a supported interleaving. What stays pinned: no drift, no state leak —
+// each advance batch is rolled back at OnAdvanceEnd (no replicator behind
+// it), so whatever the interleaving, a final fresh hydrate must see exactly
+// the seeded replica; more rows would mean prev-tx state leaked across a
+// batch boundary under churn.
 func TestTableSourceLifecycle_ConcurrentAdvanceAndQueryChurn(t *testing.T) {
 	const (
 		seed     = 5

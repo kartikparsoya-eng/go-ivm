@@ -126,7 +126,7 @@ func newRowRecordEncoder(reqID float64) *rowRecordEncoder {
 // numericReqID converts a decoded RPC id to f64. Returns false for
 // non-numeric ids (string ids are legal JSON-RPC; row mode requires numeric
 // — the caller falls back to frame mode for such requests) AND for integer
-// ids whose f64 conversion is not exact (|id| > 2^53, scale review): a
+// ids whose f64 conversion is not exact (|id| > 2^53): a
 // silently-rounded reqID can COLLIDE with a different RPC's reqID, routing
 // this stream's row records into that RPC's pending decode — cross-RPC
 // record bleed. The production TS client's ids are small counters, so the
@@ -191,7 +191,7 @@ func (e *rowRecordEncoder) putF64(v float64) {
 // identifier exceeds the u16 length space — FAIL LOUD (the caller pins the
 // group to the frame plane) instead of silently truncating: a truncated
 // def would mismatch every subsequent record's column order, delivering
-// wrong values under wrong keys at the client (REVIEW-napi-transport
+// wrong values under wrong keys at the client
 // pass-2 minor).
 func (e *rowRecordEncoder) putShortStr(s string) bool {
 	if len(s) > math.MaxUint16 {
@@ -207,13 +207,13 @@ func (e *rowRecordEncoder) putShortStr(s string) bool {
 // nil if the group was already known. The returned slice aliases e.buf and
 // must be consumed (copied by abiDeliver's sink) before the next encode.
 //
-// Remove-first groups (user's-audit item): removes carry no Row, so a group
+// Remove-first groups (item): removes carry no Row, so a group
 // whose FIRST change is a remove interns with PK-only columns (ncols=0) and
 // needsCols=true — sufficient for every remove record. When the first
 // add/edit arrives, the def cannot be amended (immutable JS-side), so a
 // REPLACEMENT group is minted — fresh id, full columns — and swapped into
 // the map. Old records keep referencing the old (still-registered) def;
-// everything later rides the new one. Pre-fix, the remove-first group froze
+// everything later rides the new one. The remove-first group froze
 // cols=nil forever and every subsequent add/edit for that (queryID,table)
 // fell back to the msgpack frame plane for the rest of the RPC — an entire
 // advance losing per-row delivery because a delete happened to come first.
@@ -354,7 +354,7 @@ func (e *rowRecordEncoder) encodeRow(g *rowGroup, c *engine.RowChange) ([]byte, 
 	if found != len(c.Row) {
 		return nil, false
 	}
-	// R1 (REVIEW-napi-transport): kind-3 records carry u32 value lengths (up
+	//  kind-3 records carry u32 value lengths (up
 	// to 4GB) with NO cap of their own — unlike frames, which capFrameBytes
 	// guards. A single fat JSON/blob value would malloc+memcpy an unbounded
 	// buffer into the addon. Above the frame cap, fall back to the msgpack

@@ -131,8 +131,7 @@ func TestTableSourceNestedExists_ThreeLevels(t *testing.T) {
 //   - Delete participant from chan-A → NOT EXISTS flips false→true →
 //     Add(chan-A) must be emitted.
 //
-// Without the snapshotDisabled overlay fix (gap #1) this would fail the
-// same way the EXISTS-advance test did.
+// Without the snapshotDisabled overlay fix this would fail the same way\n// the EXISTS-advance test did.
 func TestTableSourceNotExistsCompoundKey_AdvanceEmitsTransition(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "replica.sqlite")
 	w, _ := sql.Open("sqlite3", path)

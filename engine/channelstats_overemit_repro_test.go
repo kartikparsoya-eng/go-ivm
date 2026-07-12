@@ -1,28 +1,20 @@
 package engine
 
-// Reproduces the H18 over-emission found by the shadow-tablesrc soak on 2026-06-02:
+// Tests that a nested flipped-EXISTS query does not over-emit rows from
+// the inner correlated subquery.
 //
-//   Query:  channelStats(channelId=X) with WHERE
-//             flipped-EXISTS(channels WHERE id=channelId AND
-//                     (visibility='PUBLIC' OR
-//                      flipped-EXISTS(channel_participants WHERE channelId=channels.id AND userId=Y)))
-//   TS produced 2 RowChanges (channel_stats + channels)
-//   Go produced 3 RowChanges (channel_stats + channels + EXTRA channel_participants)
+// Query shape: channelStats(channelId=X) with WHERE containing
+// flipped-EXISTS(channels WHERE id=channelId AND
+//   (visibility='PUBLIC' OR
+//    flipped-EXISTS(channel_participants WHERE channelId=channels.id AND userId=Y)))
 //
-// Both EXISTS clauses are flipped (whereExists(..., {flip: true}) in the
-// production query layer), which routes TS through applyFilterWithFlips:
-// the inner OR becomes UnionFanOut/UnionFanIn with branch-order-aware
-// merge-with-dedup. First-occurrence wins, so the visibility=PUBLIC branch's
+// When both EXISTS clauses are flipped, the OR branches are merged via
+// UnionFanOut/UnionFanIn with branch-order-aware dedup. The PUBLIC branch's
 // channels node (no inner relationship) shadows the FlippedJoin branch's
 // channels node (with the channel_participants relationship attached). The
-// merged channels node has no inner relationship, so the streamer never
-// recurses into participants.
-//
-// Go's builder previously skipped flipped CSQs entirely (passthrough at
-// applyCorrelatedSubqueryCondition) so the inner OR didn't go through Union
-// at all and the participant row leaked to the wire. This test pins that
-// behavior; it should pass once the FlippedJoin path is wired through
-// applyFilterWithFlips.
+// merged node carries no inner relationship, so the streamer should not
+// recurse into participants. Expected output: 2 RowChanges
+// (channel_stats + channels), not 3.
 
 import (
 	"testing"
@@ -176,9 +168,7 @@ func TestChannelStats_DoesNotOverEmitNestedExistsRow(t *testing.T) {
 		counts[c.Table]++
 	}
 
-	// TS emits 2: channel_stats + channels.
-	// Go's current behavior (pre-fix) emits 3 with the extra channel_participants.
-	// The fix should make Go match TS exactly.
+	// Expected: 2 changes (channel_stats + channels), not 3.
 	if counts["channel_stats"] != 1 {
 		t.Errorf("channel_stats: want 1 change, got %d (test bug?)", counts["channel_stats"])
 	}
@@ -186,6 +176,6 @@ func TestChannelStats_DoesNotOverEmitNestedExistsRow(t *testing.T) {
 		t.Errorf("channels: want 1 change, got %d", counts["channels"])
 	}
 	if counts["channel_participants"] != 0 {
-		t.Errorf("channel_participants: want 0 changes (filter-only inner CSQ should be suppressed), got %d — H18 over-emission", counts["channel_participants"])
+		t.Errorf("channel_participants: want 0 changes (filter-only inner CSQ should be suppressed), got %d", counts["channel_participants"])
 	}
 }

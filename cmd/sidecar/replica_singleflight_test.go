@@ -1,17 +1,11 @@
 package main
 
-// Regression coverage for the C13 getReplicaDB singleflight refactor.
+// Regression coverage for the getReplicaDB singleflight refactor.
 //
-// Pre-fix getReplicaDB held replicaMu across the entire 60-second retry
-// loop. N concurrent first-init calls serialized behind the first; each
-// failed attempt forced the next waiter to redo a fresh 60s loop from
-// scratch. Under chronic replica-unreachable conditions this multiplied
-// init latency by N and saturated the mutex.
-//
-// The fix uses a probe-channel singleflight: exactly one goroutine
-// performs the slow open; others wait on `replicaProbe` (closed when
-// the probe completes) and then read the shared result. The mutex is
-// only held for tiny critical sections.
+// getReplicaDB uses a probe-channel singleflight: exactly one goroutine
+// performs the slow open; others wait on `replicaProbe` (closed when the
+// probe completes) and then read the shared result. The mutex is only
+// held for tiny critical sections.
 
 import (
 	"sync"
@@ -37,19 +31,10 @@ func TestGetReplicaDB_NoCacheMissBlock(t *testing.T) {
 	}
 }
 
-// TestGetReplicaDB_ConcurrentCallersShareProbe is the core C13 contract:
-// N concurrent callers do NOT each restart the 60s retry loop. The first
-// caller probes; the rest wait on the probe channel. With a bad path
-// that consistently fails, ALL N should observe the same single ~60s
-// delay (well, we shorten by using an invalid path; the loop exits
-// after its deadline regardless).
-//
-// We can't easily set a custom timeout without exposing internals, so
-// we focus on the structural assertion: the second caller observes the
-// SAME failure as the first within a small grace window, not a fresh
-// retry loop. We measure that the second caller doesn't start its own
-// probe by checking that BOTH callers finish within a tight window of
-// each other.
+// TestGetReplicaDB_ConcurrentCallersShareProbe verifies that N concurrent
+// callers share the same probe: the first caller probes, the rest wait on
+// the probe channel. All N should finish within a small window of each
+// other, not each restart the retry loop independently.
 func TestGetReplicaDB_ConcurrentCallersShareProbe(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping ~60s singleflight test under -short")
@@ -99,8 +84,7 @@ func TestGetReplicaDB_ConcurrentCallersShareProbe(t *testing.T) {
 	wg.Wait()
 
 	// All N should finish within a small window of each other (the
-	// time it takes the probe channel to broadcast). Pre-fix, each
-	// caller would serialize and the gap would be ~60s × (N-1).
+	// time it takes the probe channel to broadcast).
 	var minT, maxT time.Time
 	for _, ts := range finished {
 		if minT.IsZero() || ts.Before(minT) {

@@ -25,15 +25,11 @@ func newNullableFixture(t *testing.T) string {
 	return path
 }
 
-// TestLowerNullILIKEShape pins C1 from the napi-path hostile review: the
-// lower() override was registered as func(string) string, and mattn's
-// callbackArgString rejects SQLITE_NULL ("argument must be BLOB or TEXT").
-// Every `nullable_col ILIKE ?` hydrate runs the query_builder shape
-// `lower(col) LIKE lower(?) ESCAPE '\'`; the moment the scan reached a NULL
-// row the statement errored mid-scan, which panics at all three
-// Source.Fetch paths (source.go rows.Err() checks) → hydrate-failure loop.
-// TS's ICU lower() (ext/icu icuCaseFunc16) passes NULL through: NULL LIKE
-// pattern is NULL → row simply doesn't match.
+// TestLowerNullILIKEShape verifies that the lower() override handles NULL
+// values without error. The lower() override must pass NULL through (NULL
+// LIKE pattern is NULL → row doesn't match), matching SQLite's built-in
+// lower() behavior. The query shape `lower(col) LIKE lower(?) ESCAPE '\'`
+// must scan over NULL rows without erroring.
 func TestLowerNullILIKEShape(t *testing.T) {
 	pool, err := Open(newNullableFixture(t), OpenOptions{})
 	if err != nil {
@@ -56,10 +52,9 @@ func TestLowerNullILIKEShape(t *testing.T) {
 		}
 		ids = append(ids, id)
 	}
-	// Pre-fix: rows.Err() = "argument must be BLOB or TEXT" once the scan
-	// hits the NULL row — the exact error Source.Fetch panics on.
+	// rows.Err() must be nil — the scan must handle NULL rows without error.
 	if err := rows.Err(); err != nil {
-		t.Fatalf("ILIKE scan over NULL row errored (C1 regression): %v", err)
+		t.Fatalf("ILIKE scan over NULL row errored: %v", err)
 	}
 	if len(ids) != 1 || ids[0] != 1 {
 		t.Fatalf("ILIKE matches = %v; want [1]", ids)

@@ -1,17 +1,14 @@
 package sqlite
 
-// D3: FromSQLiteType json-parse-failure + int-precision tests.
+// FromSQLiteType json-parse-failure + int-precision tests.
 //
-// The json type path previously returned the raw string on JSON.parse
-// failure (silent passthrough), while TS throws UnsupportedValueError
-// (table-source.ts:637-640). This divergence meant Go would ship a
-// string to the client where TS ships an error — desyncing the
-// init-vs-advance value shape. The fix panics on parse failure to
-// match TS; the engine's recover surfaces it as an RPC error.
+// The json type path panics on JSON.parse failure instead of silently
+// returning the raw string; the engine's recover surfaces it as an RPC
+// error.
 //
-// Also covers the HIGH-9 bounds check for the number type (int >2^53
-// panics) and confirms the string type preserves full int64 precision
-// via decimal string conversion (no float64 coercion).
+// Also covers the int-precision bounds check for the number type
+// (int >2^53 panics) and confirms the string type converts integers to
+// float64 (no precision-preserving decimal string conversion).
 
 import (
 	"encoding/json"
@@ -50,8 +47,7 @@ func TestFromSQLiteType_JSONValidParse(t *testing.T) {
 
 // TestFromSQLiteType_JSONInvalidPanics verifies that invalid JSON in
 // a json-typed column panics instead of silently returning the raw
-// string. TS throws UnsupportedValueError (table-source.ts:637-640);
-// Go must match by panicking (the engine's recover surfaces it).
+// string.
 func TestFromSQLiteType_JSONInvalidPanics(t *testing.T) {
 	invalidInputs := []struct {
 		name string
@@ -86,10 +82,9 @@ func TestFromSQLiteType_JSONInvalidBytesPanics(t *testing.T) {
 	FromSQLiteType([]byte(`{"broken`), "json")
 }
 
-// TestFromSQLiteType_NumberHigh9Int64Panics verifies the HIGH-9 guard:
-// int64 values beyond ±2^53-1 panic because they cannot round-trip
-// through float64 without precision loss. TS throws
-// UnsupportedValueError (table-source.ts:623-627); Go panics to match.
+// TestFromSQLiteType_NumberHigh9Int64Panics verifies the int-precision
+// guard: int64 values beyond ±2^53-1 panic because they cannot round-trip
+// through float64 without precision loss.
 func TestFromSQLiteType_NumberHigh9Int64Panics(t *testing.T) {
 	cases := []struct {
 		name string
@@ -146,15 +141,10 @@ func TestFromSQLiteType_NumberHigh9AtBoundarySucceeds(t *testing.T) {
 	}
 }
 
-// TestFromSQLiteType_StringMirrorsTS (user's-audit coercion item): TS folds
-// 'string' into the SAME branch as 'number'|'null' (table-source.ts
-// fromSQLiteType) — bigint → bounds-check → Number(v), everything else
-// returned AS-IS. So an INTEGER stored in a string column surfaces in TS's
-// engine as a JS NUMBER, and one beyond ±(2^53−1) THROWS
-// UnsupportedValueError. The old Go behavior (strconv.FormatInt to a
-// decimal string, "preserving" precision) was itself the divergence: it
-// handed Go a string where TS holds a number, splitting comparators and
-// canonical keys between the engines.
+// TestFromSQLiteType_StringMirrorsTS verifies that the 'string' type
+// folds integers into float64 (like JS Number), with values beyond
+// ±(2^53-1) panicking. An INTEGER stored in a string column surfaces as
+// a float64, matching the reference implementation.
 func TestFromSQLiteType_StringMirrorsTS(t *testing.T) {
 	// In-range int64 → float64, like TS's Number(bigint).
 	if got := FromSQLiteType(int64(42), "string"); got != float64(42) {
@@ -173,11 +163,9 @@ func TestFromSQLiteType_StringMirrorsTS(t *testing.T) {
 	FromSQLiteType(int64(1)<<60, "string")
 }
 
-// TestFromSQLiteType_NumberStringNotParsed (user's-audit item — the
-// numeric-string coercion on the advance path): TS's 'number' branch never
-// parses strings; the old Go ParseFloat (a modernc legacy, dead on the
-// mattn hydrate path) fired via NormalizeRow on the ADVANCE path, turning a
-// numeric-looking string into float64 where TS keeps the string.
+// TestFromSQLiteType_NumberStringNotParsed verifies that the 'number'
+// type never parses strings — a numeric-looking string is returned
+// unchanged.
 func TestFromSQLiteType_NumberStringNotParsed(t *testing.T) {
 	if got := FromSQLiteType("123.45", "number"); got != "123.45" {
 		t.Fatalf("FromSQLiteType(%q, number) = %#v; TS returns the string unchanged", "123.45", got)
@@ -187,8 +175,8 @@ func TestFromSQLiteType_NumberStringNotParsed(t *testing.T) {
 	}
 }
 
-// TestFromSQLiteType_NullHigh9Panics verifies the HIGH-9 guard on the
-// null type (which TS folds with number/string per table-source.ts:619).
+// TestFromSQLiteType_NullHigh9Panics verifies the int-precision guard
+// on the null type.
 func TestFromSQLiteType_NullHigh9Panics(t *testing.T) {
 	defer func() {
 		if r := recover(); r == nil {
@@ -199,19 +187,9 @@ func TestFromSQLiteType_NullHigh9Panics(t *testing.T) {
 }
 
 // TestToSQLiteType_JSONRoundTrip verifies that ToSQLiteType always
-// produces valid JSON for json-typed columns, matching TS's
-// JSON.stringify behavior (query-builder.ts:192). The Go side
-// previously had a string passthrough (query_builder.go:383-384)
-// that returned Go strings as-is without JSON-quoting, causing
-// FromSQLiteType to panic on the next read:
-//
-//	SQLite: "Payment Failures" (valid JSON string)
-//	FromSQLiteType → "Payment Failures" (Go string, quotes stripped)
-//	ToSQLiteType (bug) → "Payment Failures" (no quotes — NOT valid JSON)
-//	FromSQLiteType → panic: invalid character 'P'
-//
-// After the fix, ToSQLiteType always json.Marshal's, producing
-// "\"Payment Failures\"" which round-trips correctly.
+// produces valid JSON for json-typed columns. The Go side must always
+// json.Marshal its output so that FromSQLiteType can re-read it without
+// panicking.
 func TestToSQLiteType_JSONRoundTrip(t *testing.T) {
 	panicValues := []string{
 		"Payment Failures",
@@ -270,9 +248,8 @@ func TestToSQLiteType_JSONNonStringValues(t *testing.T) {
 		{"array", []interface{}{float64(1), float64(2)}, `[1,2]`},
 		{"number", float64(42), `42`},
 		{"bool", true, `true`},
-		// JSON.stringify(null) === 'null' (query-builder.ts:287) — TS stores the
-		// TEXT 'null' for a null json value, never SQL NULL. This case used to pin
-		// the buggy nil→nil short-circuit.
+		// JSON.stringify(null) === 'null' — the stored form is the TEXT
+		// 'null' for a null json value, never SQL NULL.
 		{"null", nil, `null`},
 	}
 	for _, c := range cases {
@@ -291,14 +268,12 @@ func TestToSQLiteType_JSONNonStringValues(t *testing.T) {
 
 // TestToSQLiteType_JSONMarshalFailureMatchesTS verifies the json-column
 // marshal-failure path. json.Marshal rejects NaN/±Inf, but JS JSON.stringify
-// (query-builder.ts:192) encodes them as the literal "null" rather than
-// throwing. Go must match: return "null" (valid JSON that round-trips to nil),
-// NOT the old fmt.Sprintf("%v", v) fallback which wrote bare "NaN"/"+Inf" that
-// FromSQLiteType then panicked on — the same corruption class as the original
-// string-passthrough bug. Panicking here would be wrong too: it would be the
-// first place Go fails where TS succeeds, violating the Go-fails-iff-TS-fails
-// invariant. (Unreachable for real json-column values, which come from
-// json.Unmarshal and never hold non-finite floats, but kept symmetric.)
+// encodes them as the literal "null" rather than throwing. Go must match:
+// return "null" (valid JSON that round-trips to nil), not a bare string
+// fallback that FromSQLiteType would panic on. Panicking here would be wrong
+// too: it would be the first place Go fails where the reference succeeds.
+// (Unreachable for real json-column values, which come from json.Unmarshal
+// and never hold non-finite floats, but kept symmetric.)
 func TestToSQLiteType_JSONMarshalFailureMatchesTS(t *testing.T) {
 	for _, v := range []interface{}{math.NaN(), math.Inf(1), math.Inf(-1)} {
 		t.Run(fmt.Sprintf("%v", v), func(t *testing.T) {
@@ -315,15 +290,10 @@ func TestToSQLiteType_JSONMarshalFailureMatchesTS(t *testing.T) {
 }
 
 // TestJSONWriteReadRoundTrip_AllShapes is the cross-boundary fidelity guard for
-// the SQLite write↔read boundary: for EVERY json value shape, the value must
+// the SQLite write↔read boundary: for every json value shape, the value must
 // survive ToSQLiteType (write) → FromSQLiteType (read) byte-for-byte unchanged.
-// The original string-passthrough bug was ONE shape (a scalar string) silently
-// diverging; this asserts the whole shape space round-trips, so a future change
-// to either half that breaks any shape fails loudly here. Mirrors TS, where
-// toSQLiteType (JSON.stringify, query-builder.ts:192) and fromSQLiteType
-// (JSON.parse, table-source.ts:633) are exact inverses. The stored form must
-// ALWAYS be JSON text (a Go string) — never a bare passthrough value, which is
-// exactly the invariant the bug violated.
+// The stored form must always be JSON text (a Go string) — never a bare
+// passthrough value.
 func TestJSONWriteReadRoundTrip_AllShapes(t *testing.T) {
 	shapes := []struct {
 		name string
@@ -353,10 +323,8 @@ func TestJSONWriteReadRoundTrip_AllShapes(t *testing.T) {
 			}
 		})
 	}
-	// nil does NOT short-circuit: TS's json arm JSON.stringify's null into the
-	// TEXT 'null' (query-builder.ts:287), so the stored form is "null", which
-	// round-trips back to nil via JSON.parse. Pinned in detail by
-	// TestToSQLiteType_NullJSONStoresJSONNullText.
+	// nil does NOT short-circuit: the stored form is the TEXT 'null', which
+	// round-trips back to nil via JSON.parse.
 	if got := ToSQLiteType(nil, "json"); got != "null" {
 		t.Fatalf("ToSQLiteType(nil, json) = %#v, want the TEXT \"null\"", got)
 	}
@@ -395,12 +363,10 @@ func deepEqual(a, b interface{}) bool {
 	}
 }
 
-// TestFromSQLiteType_NullTypeConvertsIntsToFloat64 pins the TS-parity fix
-// from the full-scale porting review (2026-07-03): TS's fromSQLiteType folds
-// 'number'|'string'|'null' into ONE branch that converts bigint → Number, so
-// an INTEGER-stored value in a 'null'-typed column must come back float64 —
-// NOT the raw int64 the previous passthrough returned (which left int64 vs
-// float64 mixing inside Go comparators for the same logical value).
+// TestFromSQLiteType_NullTypeConvertsIntsToFloat64 verifies that the
+// 'null' type folds integers into float64, matching the reference
+// implementation's fromSQLiteType behavior. An INTEGER-stored value in a
+// 'null'-typed column must come back as float64, not the raw int64.
 func TestFromSQLiteType_NullTypeConvertsIntsToFloat64(t *testing.T) {
 	if got := FromSQLiteType(int64(42), "null"); got != float64(42) {
 		t.Fatalf("FromSQLiteType(int64(42), null) = %T(%v), want float64(42)", got, got)

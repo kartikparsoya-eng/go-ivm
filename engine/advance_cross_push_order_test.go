@@ -9,27 +9,24 @@ import (
 )
 
 // TestAdvanceStreamChunked_CrossPushWireOrder is the regression test for
-// scale-review C1: cross-push row-order inversion in advanceStreamChunked.
+// cross-push row-order inversion in advanceStreamChunked.
 //
 // Mechanism under test: push N's sub-threshold output sits buffered in
 // `pending` (not flushed — below chunkSize); push N+1's fan-out crosses the
 // chunk threshold mid-flatten, and the streamer's chunkSink flushes those
-// full chunks DIRECTLY to the wire. Pre-fix that bypassed `pending`, so push
-// N+1's rows arrived on the wire BEFORE push N's — chunkIndex stayed
-// monotonic, so nothing downstream could detect the inversion.
+// full chunks directly to the wire. If the chunkSink bypassed `pending`,
+// push N+1's rows would arrive on the wire before push N's — chunkIndex
+// stays monotonic, so nothing downstream could detect the inversion.
 //
-// The scenario drives the user-visible corruption on ONE row:
+// The scenario drives the user-visible corruption on one row:
 //
 //	change 1: ADD posts row "p-new" under u1   → 1 RowChange → pending
 //	change 2: REMOVE u1 (500+ child fan-out)   → chunkSink frames
 //
-// "p-new" sorts FIRST among u1's children ('-' < '0'), so remove(p-new) rides
+// "p-new" sorts first among u1's children ('-' < '0'), so remove(p-new) rides
 // the very first mid-flatten chunk while add(p-new) is still buffered.
-// Pre-fix wire order: remove(p-new) … add(p-new) — a client applying that
-// keeps p-new alive under a parent that no longer exists (phantom row); the
-// mirror case (remove buffered, add chunk-flushed) permanently deletes a live
-// row. Post-fix, the chunkSink drains `pending` before emitting any chunk, so
-// add(p-new) precedes remove(p-new).
+// Correct wire order: add(p-new) precedes remove(p-new); the chunkSink drains
+// `pending` before emitting any chunk.
 func TestAdvanceStreamChunked_CrossPushWireOrder(t *testing.T) {
 	const childCount = 500
 	const chunkSize = 50
@@ -114,7 +111,7 @@ func TestAdvanceStreamChunked_CrossPushWireOrder(t *testing.T) {
 	if addIdx == -1 || removeIdx == -1 {
 		t.Fatalf("p-new missing from wire: addIdx=%d removeIdx=%d", addIdx, removeIdx)
 	}
-	// THE C1 assertion: push order == wire order. add(p-new) came from push 1,
+	// Push order must equal wire order. add(p-new) came from push 1,
 	// remove(p-new) from push 2; a client applying remove-then-add resurrects
 	// a row whose parent was just removed (or, mirrored, loses a live row).
 	if addIdx >= removeIdx {

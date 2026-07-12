@@ -1,11 +1,11 @@
 package main
 
-// D2: destroy epoch guard tests.
+// Destroy epoch guard tests.
 //
-// handleDestroy checks initEpoch like every other mutating RPC.
-// A stale destroy from a torn-down view-syncer whose RPC raced past a
-// fresh init for the same cgID must be rejected with rpcCodeStaleInitEpoch
-// instead of tearing down the live successor's engine.
+// handleDestroy checks initEpoch like every other mutating RPC. A stale
+// destroy from a torn-down view-syncer whose RPC raced past a fresh init
+// for the same cgID must be rejected with rpcCodeStaleInitEpoch instead
+// of tearing down the live successor's engine.
 
 import (
 	"testing"
@@ -139,19 +139,12 @@ func TestDestroy_DefaultClientGroupID(t *testing.T) {
 	}
 }
 
-// TestInitEpoch_SurvivesDestroyReinit is the scale-review C3 regression test.
-//
-// Pre-fix, removeGroup deleted the ClientGroup and the next handleInit for
-// the same cgID created a FRESH one whose epoch restarted at 0 → first init
-// of generation 2 handed out epoch 1 == generation 1's epoch 1. A late
-// mutating RPC from the torn-down generation-1 instance then PASSED
-// checkInitEpoch and mutated generation 2's freshly-hydrated engine — the
-// exact cross-instance corruption the epoch guard's own doc comment claims
-// to prevent.
-//
-// Post-fix, Server.lastEpochs (the graveyard) survives removeGroup and
-// seeds the re-created group, so gen-2 epochs are strictly greater than
-// anything gen 1 handed out and the stale RPC is rejected.
+// TestInitEpoch_SurvivesDestroyReinit verifies that epochs never restart
+// across destroy→re-init cycles. Server.lastEpochs (the graveyard)
+// survives removeGroup and seeds the re-created group, so gen-2 epochs
+// are strictly greater than anything gen 1 handed out. A late mutating
+// RPC from the torn-down generation-1 instance must be rejected, not
+// applied to generation 2's engine.
 func TestInitEpoch_SurvivesDestroyReinit(t *testing.T) {
 	srv, cgID, epochGen1 := initTestServer(t)
 
@@ -178,7 +171,7 @@ func TestInitEpoch_SurvivesDestroyReinit(t *testing.T) {
 	}
 	epochGen2 := g2.initEpoch.Load()
 
-	// THE C3 invariant: epochs never restart across generations.
+	// Epochs must never restart across generations.
 	if epochGen2 <= epochGen1 {
 		t.Fatalf("epoch restarted across destroy→re-init: gen1=%d gen2=%d — "+
 			"a late RPC from the torn-down instance would pass checkInitEpoch",
@@ -197,7 +190,7 @@ func TestInitEpoch_SurvivesDestroyReinit(t *testing.T) {
 		}),
 	})
 	if rq.Error == nil {
-		t.Fatal("stale-epoch removeQuery from the torn-down generation was ACCEPTED — " +
+		t.Fatal("stale-epoch removeQuery from the torn-down generation was accepted — " +
 			"the old instance mutated the new engine")
 	}
 	if rq.Error.Code != rpcCodeStaleInitEpoch {

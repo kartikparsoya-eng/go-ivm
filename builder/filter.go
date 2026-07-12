@@ -77,7 +77,7 @@ func simpleConditionPredicate(cond *Condition) Predicate {
 	// run at predicate BUILD. An invalid pattern (trailing escape) must
 	// fail the query at build inside addQuery's recover — exactly where TS
 	// throws — NOT per-row at match time, where a panic lands mid-advance
-	// and tears down the whole CG (napi hostile review H1).
+	// and tears down the whole CG.
 	switch cond.Op {
 	case "LIKE", "NOT LIKE", "ILIKE", "NOT ILIKE":
 		if p, ok := eagerLikePredicate(cond); ok {
@@ -132,7 +132,7 @@ func eagerLikePredicate(cond *Condition) (Predicate, bool) {
 			panic(ivm.NewDataError("LIKE pattern must not end with escape character"))
 		}
 		if ci {
-			// M6: the regex literals were JS-canonicalized at compile; the
+			// The regex literals were JS-canonicalized at compile; the
 			// input must go through the same mapping (see jsCanonicalize).
 			match = func(s string) bool { return re.MatchString(jsCanonicalize(s)) }
 		} else {
@@ -156,8 +156,8 @@ func eagerLikePredicate(cond *Condition) (Predicate, bool) {
 // assertLikeString mirrors TS getLikePredicate's `assertString(lhs)`
 // (like.ts:10): a non-null, non-string LHS — reachable only via JSON-column
 // values, since zql's type system rejects LIKE on non-string columns — THROWS
-// in TS rather than being coerced. The old `fmt.Sprintf("%v", lv)` coercion
-// silently matched where TS errors (napi hostile review M7). DataError →
+// in TS rather than being coerced. A `fmt.Sprintf("%v", lv)` coercion
+// silently matched where TS errors. DataError →
 // recovered per-query/per-push → RPC_CODE_DATA_ERROR → the TS side's
 // 'data-error' bucket (teardown, never reset) — the same terminal outcome as
 // TS's thrown assertion.
@@ -324,11 +324,11 @@ func numericToFloat64(v ivm.Value) (float64, bool) {
 // the same cross-type numeric coercion valuesIdentical uses for =/!=, then
 // falls back to ivm.CompareValues for same-type (string/bool) ordering.
 //
-// Operators MED-8: HIGH-2 taught =/!= to coerce a numeric column compared
+// The =/!= operators coerce a numeric column compared
 // against a numeric-string literal (e.g. `count > '5'`) so Go matches the TS
 // path, which evaluates filters through SQLite's implicit cast. The ordered
-// operators were left calling ivm.CompareValues directly, which PANICS on the
-// float-vs-numeric-string pair — an asymmetric divergence (=/!= returned a
+// operators call ivm.CompareValues directly, which PANICS on the
+// float-vs-numeric-string pair — an asymmetric divergence (=/!= returns a
 // clean bool, </> crashed). This restores symmetry.
 func compareForOrder(a, b ivm.Value) int {
 	if c, ok := numericCmpCoerced(a, b); ok {
@@ -427,7 +427,7 @@ func matchLike(s, pattern string, caseInsensitive bool) bool {
 		panic(ivm.NewDataError("LIKE pattern must not end with escape character"))
 	}
 	if caseInsensitive {
-		// M6: canonicalize the input through the same JS non-'u' 'i'-flag
+		// Canonicalize the input through the same JS non-'u' 'i'-flag
 		// mapping the compiled literals went through (see jsCanonicalize).
 		return re.MatchString(jsCanonicalize(s))
 	}
@@ -435,10 +435,10 @@ func matchLike(s, pattern string, caseInsensitive bool) bool {
 }
 
 // lowerCaserPool amortizes cases.Lower(language.Und) construction (napi
-// hostile review M5): a cases.Caser is stateful — NOT safe for concurrent
+// A cases.Caser is stateful — NOT safe for concurrent
 // use — so the previous code built a fresh one PER unicodeLower CALL, i.e.
 // per row on the ILIKE fast path (~220ms per 441k-row hydrate in caser
-// construction alone, ×2 before H1 hoisted the RHS lowercase to build time).
+// construction alone).
 // Pool them: the transform machinery is reused across rows, and the pool
 // keeps the per-row path allocation-free under steady state.
 var lowerCaserPool = sync.Pool{
@@ -468,8 +468,8 @@ func unicodeLower(s string) string {
 // on exactly the orbits that last rule splits: ſ (U+017F LATIN SMALL LETTER
 // LONG S) folds with s/S under RE2 but stays distinct in JS (its uppercase
 // 'S' is ASCII while ſ is not → no fold), and KELVIN SIGN (U+212A) folds
-// with k/K under RE2 but not in JS (it uppercases to itself, ≠ 'K') — napi
-// hostile review M6.
+// with k/K under RE2 but not in JS (it uppercases to itself, ≠ 'K') —
+// matching JS Canonicalize.
 //
 // Go's unicode.ToUpper is the SIMPLE (single-rune) mapping; JS toUpperCase
 // is the full mapping, with multi-char results rejected by Canonicalize.
@@ -557,7 +557,7 @@ func compileLikePattern(source string, caseInsensitive bool) *regexp.Regexp {
 	// 'fooa\nbar' LIKE 'foo_') while wildcards still refused to cross
 	// newlines (false negatives, 'a\nb' NOT LIKE 'a%b').
 	// Case-insensitivity is NOT RE2's (?i): that is Unicode simple folding,
-	// which over-matches JS's non-'u' 'i' flag on ſ / KELVIN SIGN (M6).
+	// which over-matches JS's non-'u' 'i' flag on ſ / KELVIN SIGN.
 	// Instead every literal rune is JS-canonicalized here, and the INPUT is
 	// canonicalized at match time (jsCanonicalize) — reproducing exactly how
 	// a JS 'i'-flag regex compares (Canonicalize both sides, then exact).
@@ -599,10 +599,10 @@ func compileLikePattern(source string, caseInsensitive bool) *regexp.Regexp {
 
 // valueIn checks if left is contained in right (which should be a slice).
 //
-// Types MED-8: `x IN (a, b)` is sugar for `x = a OR x = b`, so each element
+// `x IN (a, b)` is sugar for `x = a OR x = b`, so each element
 // test must use the SAME equality as the `=` operator — valuesIdentical, which
 // applies the cross-type numeric↔numeric-string coercion the TS path gets from
-// SQLite (HIGH-2). The old code used ivm.ValuesEqual (strict, no coercion) for
+// SQLite. Using ivm.ValuesEqual (strict, no coercion) for
 // []interface{}/[]float64 and a fragile fmt.Sprintf string compare for
 // []string, so `count IN ('5')` with count=5 returned false while `count = '5'`
 // returned true — an asymmetric divergence from TS. Routing every element

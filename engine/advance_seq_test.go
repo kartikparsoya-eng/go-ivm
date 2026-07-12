@@ -1,14 +1,13 @@
 package engine
 
-// D9 (DESIGN-duplex-streaming) engine tests: AdvanceStreamChunkedSeq feeds
-// the push loop from a LAZY change sequence.
+// Engine tests for AdvanceStreamChunkedSeq, which feeds the push loop
+// from a lazy change sequence.
 //
 //   - parity: a seq-fed advance emits exactly the frames a slice-fed one does
 //   - laziness: changes are pulled interleaved with emission (never
-//     materialized up front) — the memory property that replaces the
-//     GO_IVM_MAX_DIFF_CHANGES cap
+//     materialized up front)
 //   - cursor error: a mid-seq error settles the stream as an ERROR — the
-//     loop stops, NO terminal Final frame is emitted (a half-applied diff
+//     loop stops, no terminal Final frame is emitted (a half-applied diff
 //     must never look complete), and the engine stays reusable
 
 import (
@@ -88,11 +87,11 @@ func TestAdvanceStreamSeq_MatchesSliceOutput(t *testing.T) {
 	}
 }
 
-// TestAdvanceStreamSeq_LazyConsumption pins the D9 memory property: the seq
-// is pulled INTERLEAVED with emission. At chunkSize=1 every applied change
-// flushes before the next is pulled, so when partial N arrives, at most
-// N+1 changes have been read — nothing materializes the diff up front.
-// Fails if the seq is collected into a slice before the push loop.
+// TestAdvanceStreamSeq_LazyConsumption verifies the memory property: the
+// seq is pulled interleaved with emission. At chunkSize=1 every applied
+// change flushes before the next is pulled, so when partial N arrives, at
+// most N+1 changes have been read — nothing materializes the diff up
+// front.
 func TestAdvanceStreamSeq_LazyConsumption(t *testing.T) {
 	const n = 50
 	eng := seqAdvanceEngine(t)
@@ -125,8 +124,8 @@ func TestAdvanceStreamSeq_LazyConsumption(t *testing.T) {
 	}
 }
 
-// TestAdvanceStreamSeq_CursorErrorNoFinal pins the D9 error contract: a
-// mid-seq cursor error stops the loop, returns the error, and emits NO
+// TestAdvanceStreamSeq_CursorErrorNoFinal verifies the error contract: a
+// mid-seq cursor error stops the loop, returns the error, and emits no
 // terminal Final frame — the caller's rpcError is the stream terminal, so
 // a half-applied diff can never settle as a clean advance. The engine
 // remains reusable afterwards.

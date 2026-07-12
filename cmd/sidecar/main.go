@@ -188,7 +188,7 @@ func numericToFloat64(rv reflect.Value) (float64, bool) {
 // 1 byte is the smallest msgpack value (fixmap0 / nil / etc.); a real
 // RPCRequest object always serializes to ~15+ bytes, but we use 1 to avoid
 // false-rejects if the protocol ever adds a minimal pong-style frame.
-// Pre-fix readFrame accepted len=0 and io.ReadFull happily returned a
+// Prior to the guard below, readFrame accepted len=0 and io.ReadFull happily returned a
 // zero-length data slice; unmarshal would then throw and tight-loop
 // against a stream of 4-byte-zero prefixes (DoS amplifier with cheap
 // upstream cost). Reject early so the connection closes deterministically.
@@ -277,7 +277,7 @@ type perfMetrics struct {
 	// "chunk count" is really a ROW count. Tracked separately so the
 	// advance-chunks histogram stays comparable across transports — socket
 	// (frames of ~100) vs napi rowMode (rows) — which an A/B rollout dashboard
-	// would otherwise read apples-vs-oranges (REVIEW-napi-transport P2).
+	// would otherwise read apples-vs-oranges.
 	advanceRowCounts []int
 
 	// Cold-start reader-pool bind outcomes (last 10s window). Lets us
@@ -309,7 +309,7 @@ type perfMetrics struct {
 	// hard bound or frame delivery; abi.go deliverPumpFrame). Under ABI v5
 	// staging, ordinary congestion stages records instead of parking, so
 	// this counts genuine waits only. napiDeliverTimeouts counts parks
-	// that hit GO_IVM_DELIVER_TIMEOUT — incident-class, paired with the
+	// that hit GO_IVM_DELIVER_TIMEOUT, paired with the
 	// [GO-IVM][DELIVER-TIMEOUT] marker. napiStagedRecords counts records
 	// that found the queue full and staged (the congestion volume);
 	// napiBatchFlushes counts kind-5 batch items shipped — staged/batches
@@ -357,7 +357,7 @@ func (m *perfMetrics) recordAdvanceChunks(n int) {
 
 // recordAdvanceRows logs the per-row delivery count for ONE rowMode advance
 // call (chunkSize=1). Separate from recordAdvanceChunks because a "chunk" is
-// a row in that mode; see advanceRowCounts (REVIEW-napi-transport P2).
+// a row in that mode; see advanceRowCounts.
 func (m *perfMetrics) recordAdvanceRows(n int) {
 	m.mu.Lock()
 	m.advanceRowCounts = append(m.advanceRowCounts, n)
@@ -366,7 +366,7 @@ func (m *perfMetrics) recordAdvanceRows(n int) {
 
 // startPprofServer opens the pprof + block/mutex profiling endpoint when
 // GO_IVM_PPROF_ADDR is set (nil when unset — off by default). Started by the
-// in-process NAPI host (REVIEW-napi-transport O1). pprof pinned the EXISTS
+// in-process NAPI host . pprof pinned the EXISTS
 // N+1, the pin race, and the GC ceiling on this project, so it must exist
 // in-process.
 //
@@ -402,7 +402,7 @@ func startPprofServer() *http.Server {
 
 // runPerfReporter runs the 10-second [GO-IVM][PERF] window reporter plus the
 // replica-pool-pressure watch until ctx is cancelled. Started by the NAPI
-// host (REVIEW-napi-transport O1 — the PERF line is what every soak greps).
+// host — the PERF line is what every soak greps.
 // Blocking; run in a goroutine.
 func (s *Server) runPerfReporter(ctx context.Context) {
 	ticker := time.NewTicker(10 * time.Second)
@@ -437,10 +437,10 @@ func (s *Server) runPerfReporter(ctx context.Context) {
 					ws.WaitCount-lastWriteWait, ws.InUse, ws.MaxOpenConnections,
 					ws.WaitDuration.Round(time.Millisecond))
 			} else if rs.MaxOpenConnections > 0 && rs.InUse >= rs.MaxOpenConnections {
-				// Saturation without NEW waits is the deadlock signature the
-				// 2026-07-06 incident hid: blocked acquirers bump WaitCount
-				// exactly once, so a wedged-full pool goes silent under the
-				// growth-only gate above. Log it every window until it clears.
+				// Saturation without NEW waits is the deadlock signature of a
+				// wedged-full pool: blocked acquirers bump WaitCount exactly
+				// once, so it goes silent under the growth-only gate above.
+				// Log it every window until it clears.
 				fmt.Fprintf(os.Stderr,
 					"[GO-IVM] replica read pool SATURATED: in-use %d/%d for a full 10s window "+
 						"(writable in-use %d/%d) — acquires are queueing; sustained saturation "+
@@ -553,7 +553,7 @@ func (m *perfMetrics) reportAndReset() {
 	hydChunkP50, hydChunkP95, hydChunkMax := chunkStats(hydChunks)
 	advChunkP50, advChunkP95, advChunkMax := chunkStats(advChunks)
 	// Row-mode advance rows reported as a DISTINCT segment (not folded into
-	// advance chunks) so socket-vs-napi comparisons stay honest (P2).
+	// advance chunks) so socket-vs-napi comparisons stay honest.
 	advRowP50, advRowP95, advRowMax := chunkStats(advRows)
 
 	fmt.Fprintf(os.Stderr,
@@ -612,7 +612,7 @@ func (m *perfMetrics) reportAndReset() {
 	// producing — no park); batches = kind-5 items shipped (staged/batches
 	// ≈ coalescing factor); stalls = genuine PARKS (stage hard bound /
 	// frame delivery / pump), event-woken by the drain signal; timeouts =
-	// parks that outlived GO_IVM_DELIVER_TIMEOUT (incident — see
+	// parks that outlived GO_IVM_DELIVER_TIMEOUT (see
 	// [GO-IVM][DELIVER-TIMEOUT]). Sustained staging tracks JS-event-loop
 	// busyness; sustained STALLS mean even batches can't ship.
 	if deliverStalls > 0 || deliverTimeouts > 0 || stagedRecords > 0 || batchFlushes > 0 {
@@ -622,8 +622,8 @@ func (m *perfMetrics) reportAndReset() {
 	}
 }
 
-// updatePeak performs an atomic max — fixes parallelism review HIGH-2.
-// The old Load+Store pattern was racy: two goroutines could both observe
+// updatePeak performs an atomic max.
+// The prior Load+Store pattern was racy: two goroutines could both observe
 // peak=10, then one stores 15, the other stores 12 — peak ends at 12.
 // With CompareAndSwap we retry until our value either wins or is obsolete.
 func updatePeak(peak *atomic.Int64, n int64) {
@@ -660,8 +660,7 @@ func chunkStats(c []int) (p50, p95, max int) {
 }
 
 // Version handshake — bumped when wire format or RPC semantics change so
-// the TS client can refuse to talk to an incompatible sidecar
-// (REVIEW-final MED-CROSS-5).
+// the TS client can refuse to talk to an incompatible sidecar.
 const (
 	sidecarVersion     = "0.7.0"
 	sidecarProtocolRev = 12 // bumped: advanceToHeadStream header frame.
@@ -711,7 +710,7 @@ func envPositiveInt(name string, def int) int {
 // connMaxIdleFromEnv resolves GO_IVM_CONN_MAX_IDLE_SEC into the tablesource
 // pool's idle-conn deadline. Unset → 0 (package default, 90s). A value of 0
 // or a negative sentinel disables the deadline (conns park until closed) —
-// use only for A/B against the pre-fix behavior. Invalid → default.
+// use only for A/B against the baseline behavior. Invalid → default.
 func connMaxIdleFromEnv() time.Duration {
 	v := os.Getenv("GO_IVM_CONN_MAX_IDLE_SEC")
 	if v == "" {
@@ -751,7 +750,7 @@ type RPCRequest struct {
 	Method  string             `json:"method"`
 	Params  msgpack.RawMessage `json:"params"`
 	ID      interface{}        `json:"id"`
-	// W3C traceparent forwarded by the TS client (REVIEW-final MED-CROSS-4).
+	// W3C traceparent forwarded by the TS client.
 	// Logged for slow handlers; full Go-side OTel SDK integration is a
 	// separate feature.
 	Traceparent string `json:"traceparent,omitempty"`
@@ -799,7 +798,7 @@ type ClientGroup struct {
 	// guarantee the worker has fully exited (drained reqC, sent error
 	// responses) before teardown returns. Without this, a test calling
 	// removeGroup followed by assertions on a re-created group could
-	// race the still-draining worker (L5).
+	// race the still-draining worker.
 	wg sync.WaitGroup
 	// initEpoch monotonically increments on every handleInit (atomic Add
 	// under mu). Mutating RPCs (addQuery* / advance* / destroy) carry the
@@ -816,12 +815,12 @@ type ClientGroup struct {
 	initEpoch atomic.Uint64
 	// lastUsedNs is set on every request arrival; the idle reaper compares
 	// against `now - groupIdleTimeout` to garbage-collect abandoned groups
-	// (REVIEW-final HIGH-CROSS-2 / HIGH-CROSS-3). Accessed via atomic so the
+	// Accessed via atomic so the
 	// reaper doesn't need mu.
 	lastUsedNs atomic.Int64
 	// inFlight is true while the worker is executing a handler (dequeue
 	// through respCh delivery). The reaper must never reap a group whose
-	// worker is mid-handler (scale-review A4): lastUsedNs is stamped at
+	// worker is mid-handler: lastUsedNs is stamped at
 	// DEQUEUE, so a handler outliving the idle window (long hydrate under
 	// backpressure) made a LIVE group reap-eligible — it was deleted from
 	// s.groups while its handler streamed, and the next RPC for the same
@@ -838,18 +837,18 @@ type ClientGroup struct {
 	// (wedgewatch.go) reads it lock-free to detect handlers running past
 	// GO_IVM_WEDGE_WATCHDOG_SEC. Written only by the worker goroutine.
 	curReq atomic.Pointer[activeReq]
-	// wedgeDumped latches the once-per-incident all-goroutine stack dump
+	// wedgeDumped latches the once-per-wedge all-goroutine stack dump
 	// (set by the watchdog on first detection, re-armed by the worker when
 	// the handler completes) so a wedge produces exactly one dump, however
 	// many scan ticks it spans.
 	wedgeDumped atomic.Bool
 
 	// sendMu closes the orphaned-respCh race between trySendReq and the
-	// worker's post-done drain (full-scale review 2026-07-03). trySendReq
+	// worker's post-done drain. trySendReq
 	// holds RLock across its done pre-check AND the reqC send; the exiting
 	// worker takes Lock ONCE (a barrier) after its drain grace expires —
 	// waiting out any sender still mid-send — then does a final
-	// non-blocking sweep of reqC. Pre-fix, a sender preempted >50ms between
+	// non-blocking sweep of reqC. A sender preempted >50ms between
 	// the pre-check and the select commit could land a request in reqC
 	// AFTER the worker exited: its respCh never got a reader, the
 	// connection's writer goroutine blocked forever, and handleConnection's
@@ -873,7 +872,7 @@ type ClientGroup struct {
 	// GO_IVM_HYDRATE_READERS>1). Built+bound in buildSnapshotterLocked at curr's
 	// stateVersion; torn down at the first advance (tearDownReaderPool), on
 	// shutdownGroup / re-init, and by the reaper once readerPoolBoundAt is
-	// older than coldPoolTTL (scale review: an advance-less CG kept alive by
+	// older than coldPoolTTL: an advance-less CG kept alive by
 	// non-advance RPCs pinned the init-time WAL frame indefinitely — on a
 	// busy replica wal2 cannot checkpoint past the pinned frame, so the WAL
 	// grows without bound). Nil when the feature is off or the pool couldn't
@@ -924,7 +923,7 @@ type streamWriter func(reqID interface{}, partial interface{})
 type Server struct {
 	mu     sync.RWMutex
 	groups map[string]*ClientGroup // clientGroupID → ClientGroup
-	// lastEpochs is the initEpoch GRAVEYARD (scale-review C3): the highest
+	// lastEpochs is the initEpoch graveyard — the highest
 	// epoch each cgID ever reached, surviving group destruction. A destroyed
 	// cgID's re-init seeds the fresh ClientGroup from here, so the new
 	// generation's first epoch is strictly greater than anything the old
@@ -961,7 +960,7 @@ type Server struct {
 	// the actual open is deferred until the first init RPC — by that time
 	// the TS replicator has finished writing the SQLite header.
 	//
-	// Singleflight design (C13): pre-fix this used a single mutex held
+	// Singleflight design : this used a single mutex held
 	// across the entire 60-second retry loop. N concurrent first-init
 	// callers serialized behind the first; each failed open's deadline
 	// expiration forced the next waiter to redo a fresh 60s loop from
@@ -1226,7 +1225,7 @@ func (s *Server) getGroup(id string, createIfMissing bool) *ClientGroup {
 		reqC: make(chan clientGroupReq, 64),
 		done: make(chan struct{}),
 	}
-	// C3: seed the epoch from the graveyard so a re-created cgID continues
+	// seed the epoch from the graveyard so a re-created cgID continues
 	// its predecessor's count instead of restarting at 0 (see lastEpochs).
 	g.initEpoch.Store(s.lastEpochs[id])
 	g.lastUsedNs.Store(time.Now().UnixNano())
@@ -1266,7 +1265,7 @@ func reaperIdleTimeout() time.Duration {
 }
 
 // coldPoolTTL is how long a cold-start reader pool may stay bound before the
-// reaper tears it down (scale review). The pool exists to parallelize the
+// reaper tears it down. The pool exists to parallelize the
 // cold-start hydrate burst and is normally dropped at the FIRST advance —
 // but a CG that hydrates and then never advances (client keeps it alive
 // with non-advance RPCs, or advances simply stop being driven) kept K
@@ -1286,7 +1285,7 @@ func coldPoolTTL() time.Duration {
 
 // pullIdleTimeout bounds how long a pull-hydrate producer may stay parked
 // at zero credit with no grants before its gate is auto-cancelled (ABI v3,
-// DESIGN-duplex-streaming D7). This is the pull lane's analogue of
+// This is the pull lane's analogue of
 // GO_IVM_ADVANCE_BUDGET_MS: it bounds the WAL-frame pin (a parked hydrate
 // holds its read snapshot) and the group.mu hold (same-CG advances queue
 // behind a parked hydrate — TS-faithful, but TS never parks on a vanished
@@ -1303,7 +1302,7 @@ func pullIdleTimeout() time.Duration {
 }
 
 // runPullIdleSweeper cancels pull gates whose producers have been parked
-// past pullIdleTimeout (D7). Started by BOTH transports next to runReaper.
+// past pullIdleTimeout. Started by both transports next to runReaper.
 // The sweep is O(registered gates) over a leaf-locked registry — it never
 // touches s.mu or group.mu, so it can never wedge behind a slow handler.
 // Covers the crashed-client-no-cancel case together with shutdownGroup's
@@ -1431,7 +1430,7 @@ func (s *Server) reapIdleGroups(cutoff time.Time) int {
 	}, 0, len(s.groups))
 	for id, g := range s.groups {
 		if g.inFlight.Load() {
-			continue // A4: worker mid-handler — alive by definition
+			continue // worker mid-handler — alive by definition
 		}
 		if g.lastUsedNs.Load() < cutoffNs {
 			candidates = append(candidates, struct {
@@ -1520,7 +1519,7 @@ func (g *ClientGroup) worker(s *Server) {
 			}
 		}
 		g.lastUsedNs.Store(time.Now().UnixNano())
-		g.inFlight.Store(true) // A4: reap-proof while the handler runs
+		g.inFlight.Store(true) // reap-proof while the handler runs
 		var start time.Time
 		method := req.req.Method
 		dequeued := time.Now()
@@ -1535,8 +1534,9 @@ func (g *ClientGroup) worker(s *Server) {
 			qWait = dequeued.Sub(req.enqueuedAt)
 		}
 		// Wedge-watchdog stamp (wedgewatch.go): makes this handler's
-		// execution OBSERVABLE while in flight — the 7fbeed43 incident was
-		// undiagnosable precisely because a running handler was invisible
+		// execution OBSERVABLE while in flight. A running handler was
+		// previously invisible — nothing logged until it returned, and a
+		// successful return logged nothing at all.
 		// (nothing logs until it returns, and a successful return logged
 		// nothing at all).
 		g.curReq.Store(&activeReq{
@@ -1578,7 +1578,7 @@ func (g *ClientGroup) worker(s *Server) {
 		if req.streamW != nil && method == "addQueriesStream" {
 			// Streaming variant: per-query partial frames go through streamW;
 			// the terminal "done" RPCResponse still flows through respCh.
-			// C1: the stream handlers run OUTSIDE handleRequest's recover, and
+			// the stream handlers run OUTSIDE handleRequest's recover, and
 			// the engine deliberately re-raises panics on this (worker)
 			// goroutine — so without this recover such a panic aborts
 			// the whole multi-CG process. Convert it to an error response (the
@@ -1604,7 +1604,7 @@ func (g *ClientGroup) worker(s *Server) {
 		}
 
 		// Slow-handler log doubles as a fallback breadcrumb when OTel is off.
-		// UNCONDITIONAL on traceparent (7fbeed43 forensics): the old
+		// UNCONDITIONAL on traceparent (forensics): the old
 		// `Traceparent != ""` gate made a slow-but-successful hydrate
 		// invisible when the request arrived without one — the exact
 		// blindspot that left a ~140s silent return indistinguishable from a
@@ -1622,13 +1622,13 @@ func (g *ClientGroup) worker(s *Server) {
 		// RETURNED — the release-side timestamp that discriminates "wedged
 		// forever" from "silently un-stuck at ~120s" (see wedgewatch.go).
 		// Fires for EVERY method (an init/destroy that took 90s matters as
-		// much as a hydrate), incident-rate by construction.
+		// much as a hydrate).
 		if elapsed := time.Since(dequeued); elapsed > s.wedgeThreshold {
 			fmt.Fprintf(wedgeLogW, "[GO-IVM][WEDGE-CLEAR] cg=%s method=%s elapsed=%v err=%v\n",
 				cg, method, elapsed.Round(time.Millisecond), resp.Error != nil)
 		}
 		g.curReq.Store(nil)
-		g.wedgeDumped.Store(false) // re-arm the once-per-incident dump latch
+		g.wedgeDumped.Store(false) // re-arm the once-per-wedge dump latch
 		// Completion stamp BEFORE clearing inFlight (see the field comment):
 		// without it, a handler that ran longer than the idle window left
 		// lastUsedNs at its DEQUEUE time — instantly reap-eligible the
@@ -1691,7 +1691,7 @@ func (g *ClientGroup) trySendReq(req clientGroupReq) bool {
 	}
 }
 
-// saveEpochLocked persists a group's initEpoch to the graveyard (C3) so a
+// saveEpochLocked persists a group's initEpoch to the graveyard  so a
 // future re-creation of the same cgID cannot restart the epoch count.
 // MUST hold s.mu (write). Monotonic: never lowers an existing entry.
 func (s *Server) saveEpochLocked(id string, g *ClientGroup) {
@@ -1741,7 +1741,7 @@ func (s *Server) shutdownGroup(g *ClientGroup, id, reason string, waitWorker boo
 	g.closeOnce.Do(func() {
 		close(g.done)
 	})
-	// Pull gates FIRST (ABI v3, D6): a pull-hydrate producer parked at zero
+	// Pull gates FIRST: a pull-hydrate producer parked at zero
 	// credit holds group.mu via its RPC handler — taking g.mu below would
 	// wait on the client's think-time (or forever, for a vanished client).
 	// Cancelling the group's gates unparks those producers; they unwind
@@ -1773,7 +1773,7 @@ func (s *Server) shutdownGroup(g *ClientGroup, id, reason string, waitWorker boo
 	}
 	snapDone := time.Now()
 	g.mu.Unlock()
-	// L5: wait for the worker goroutine to fully exit before returning.
+	// wait for the worker goroutine to fully exit before returning.
 	// Skipped when called from the worker itself (destroy handler) to
 	// avoid self-deadlock — the worker exits on its own after the handler
 	// returns. The wait is bounded by the drain deadline (50ms) plus
@@ -1883,7 +1883,7 @@ func hydrateErrorResponse(reqID interface{}, prefix string, err error) RPCRespon
 	return rpcError(reqID, -32000, prefix+err.Error())
 }
 
-// handleStreamWithRecover runs a streaming handler with a panic recover (C1).
+// handleStreamWithRecover runs a streaming handler with a panic recover.
 // The streaming handlers dispatch directly from the worker goroutine, bypassing
 // handleRequest's recover; the engine also re-raises panics onto
 // this goroutine. Without this, such a panic would abort the whole process.
@@ -2079,7 +2079,7 @@ func (s *Server) handleInit(req RPCRequest) RPCResponse {
 	// max(tsVersion, THIS) so hydrated rows written after TS's own (earlier)
 	// snapshot pin are never received under an unbumped CVR version —
 	// the cvr.ts:778 "Expected CVR version to have been bumped" teardown
-	// (gen-6). Fail loudly if the just-built snapshotter can't report it:
+	// . Fail loudly if the just-built snapshotter can't report it:
 	// silently omitting the field would resurrect that bug for this CG.
 	cur := snapState.current
 
@@ -2134,7 +2134,7 @@ type addQueriesParams struct {
 	InitEpoch uint64 `json:"initEpoch"`
 	// RowMode: see advanceParams.RowMode — same contract for hydrate.
 	RowMode bool `json:"rowMode,omitempty"`
-	// PullMode (ABI v3, DESIGN-duplex-streaming): hydrate streams must use
+	// PullMode: hydrate streams must use
 	// credit-gated row delivery on the NAPI row plane. Older frame-mode
 	// compatibility is deliberately not part of the production contract.
 	PullMode bool `json:"pullMode,omitempty"`
@@ -2394,7 +2394,7 @@ func handleConnection(conn net.Conn, server *Server) {
 	// "done") enqueue encoded frames here. This structurally guarantees FIFO
 	// ordering — partials enqueued by lanes before wg.Wait precede the "done"
 	// frame enqueued after — and replaces writeFrameLocked+writeMu+writerSem.
-	// See DESIGN-streaming-hydrate.md §3g.
+	// See the streaming-hydrate design notes.
 	//
 	// Backpressure: the flusher's bounded channel (cap 256) blocks the
 	// enqueuing goroutine when the socket is slow. That goroutine is one of
@@ -2534,7 +2534,7 @@ func handleConnection(conn net.Conn, server *Server) {
 
 // tuneRuntime relaxes the garbage collector for this allocation-heavy server.
 // Each hydrate of a ~1k-row query allocates ~8.6k objects (the per-row Row map
-// dominates — see PERF-REVIEW.md). At the Go default GOGC=100 the GC saturates
+// dominates. At the Go default GOGC=100 the GC saturates
 // under concurrent multi-CG load and becomes the ceiling on multi-core scaling:
 // the cross-CG parallel speedup measured 2.6x at 16 CGs on a 14-core box at
 // GOGC=100, but 4.9x at GOGC=800 (TableSourceMulti benchmarks) — the cores and
@@ -2552,7 +2552,7 @@ func handleConnection(conn net.Conn, server *Server) {
 // parseByteSize parses a byte count with an optional binary suffix
 // (B, KiB, MiB, GiB, TiB) — the same shapes the Go runtime's own GOMEMLIMIT
 // accepts, because operators habitually write "4GiB" for GO_IVM_GOMEMLIMIT
-// too (pre-fix that parsed as an error and silently disabled every memory
+// too (that parsed as an error and silently disabled every memory
 // fallback; see tuneRuntime).
 func parseByteSize(s string) (int64, bool) {
 	mult := int64(1)
@@ -2577,7 +2577,7 @@ func parseByteSize(s string) (int64, bool) {
 }
 
 func tuneRuntime() {
-	// Crash forensics (REVIEW-napi-transport C1): a Go runtime FATAL (not a
+	// Crash forensics : a Go runtime FATAL (not a
 	// recovered panic — concurrent map write, stack overflow, etc.) prints its
 	// goroutine dump then kills the process. In napi mode that process is the
 	// syncer WORKER, and a K8s restart makes the trace easy to miss — so

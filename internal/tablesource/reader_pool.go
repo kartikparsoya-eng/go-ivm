@@ -41,7 +41,7 @@ const maxConvergeAttempts = 10
 // History: this deadline was introduced when pool builds acquired K conns
 // from the SHARED database/sql read pool one at a time while holding the
 // ones already acquired — hold-and-wait across concurrent builders under
-// read-pool exhaustion was a permanent deadlock (2026-07-06 ART incident).
+// read-pool exhaustion was a permanent deadlock.
 // Option B's raw driver opens don't queue on any pool, so the build-time
 // hold-and-wait class is structurally gone; the deadline is kept because a
 // BEGIN/converge read can still stall on WAL-lock contention, and a bounded
@@ -54,7 +54,7 @@ var PoolAcquireTimeout = 5 * time.Second
 // AcquireForPipeline is the normal admission behavior when a batch is wider
 // than K (TS's model is K=1 — every query queues behind the single conn).
 // The engine's tripwire firing therefore means something is genuinely stuck
-// (a parked producer never released, a leaked reader) — a BUG, not load:
+// (a parked producer never released, a leaked reader) — a bug, not load:
 // the engine PANICS loudly. Never a silent fallback — mid-flight acquires no
 // longer exist, so there is nothing to fall back to.
 
@@ -64,15 +64,17 @@ var PoolAcquireTimeout = 5 * time.Second
 // AcquireForPipeline, and every fetch of that pipeline — nested child
 // fetches included — runs on this single conn with INTERLEAVED cursors:
 // SQLite natively supports many live statements on one connection inside one
-// read tx (TS's better-sqlite3 nested iterate() model). NOTE (F3,
-// parallelism audit 2026-07-10): database/sql's serialization was
+// read tx (TS's better-sqlite3 nested iterate() model). NOTE
+//
+//	database/sql's serialization was
+//
 // empirically OVERSTATED as the raw-conn motivation — conn-prepared
 // statements (conn.PrepareContext → stmt.QueryContext) DO interleave live
 // cursors on one *sql.Conn (verified against mattn). The raw-conn design
 // stands on its real pillars: stmt busy-checkout control for same-SQL
 // nesting (checkoutStmt — database/sql's stmt layer cannot express it),
 // pool-accounting bypass (builds invisible to MaxOpenConns — the
-// 2026-07-06 builder-starves-probe class), driver-level scan (no
+// builder-starves-probe class), driver-level scan (no
 // database/sql convert layer), and shell reuse across pool generations
 // (reader_cache.go).
 //
@@ -80,7 +82,7 @@ var PoolAcquireTimeout = 5 * time.Second
 // is synchronous), so reader state needs no locking. mattn's own internal
 // mutexes cover its C-level bookkeeping.
 //
-// The stmt cache is BOUNDED (napi review M4): IN-clause SQL shapes vary by
+// The stmt cache is BOUNDED: IN-clause SQL shapes vary by
 // list LENGTH — `IN (?,?)` vs `IN (?,?,?)` are distinct texts — so a batched
 // flipped-join hydrate with varying key-set sizes mints unbounded distinct
 // shapes, each pinning a compiled sqlite3_stmt on the C heap (invisible to
@@ -257,8 +259,8 @@ type ReaderPool struct {
 	// Read lock-free by every leaf fetch (readerFor) on the hydrate path.
 	bound sync.Map // string → *poolReader
 	// releases counts every reader RETURN to the pool — the pool-wide
-	// PROGRESS signal the engine's admission tripwire keys on (F2,
-	// parallelism audit 2026-07-10): a waiter resets its deadline whenever
+	// PROGRESS signal the engine's admission tripwire keys on
+	//  a waiter resets its deadline whenever
 	// this moves, so only a pool with ZERO movement for the whole tripwire
 	// window (a genuine wedge — leaked reader, never-released parked
 	// producer) trips; a busy-but-moving admission queue never false-fires.
@@ -495,7 +497,7 @@ func (p *ReaderPool) Size() int { return len(p.all) }
 // when one is enabled for p.db: the read tx is ROLLED BACK first (a cached
 // shell pins NO WAL frame and satisfies the coread arm's TXN_NONE
 // precondition), the conn + prepared-stmt cache survive for the next pool
-// generation. Without a cache — or on the BUG path — readers close outright.
+// generation. Without a cache, readers close outright.
 // Safe to call on a partially-built pool (NewReaderPool's error path closes
 // readers directly, never through here).
 //

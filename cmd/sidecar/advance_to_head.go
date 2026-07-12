@@ -1,6 +1,6 @@
 package main
 
-// advanceToHeadStream: the Go-derived-diff advance (design §4, P2 drive).
+// advanceToHeadStream: the Go-derived-diff advance.
 //
 // Instead of TS computing the snapshot Diff and shipping a SnapshotChange[]
 // over the wire, the Go sidecar derives its OWN diff from the replica's
@@ -23,7 +23,7 @@ import (
 )
 
 // errSeqConsumerStopped aborts diff.Each when the engine stops consuming
-// the lazy change seq (D9): the engine broke its range (panic unwind /
+// the lazy change seq: the engine broke its range (panic unwind /
 // budget abort), so the cursor must stop reading — it is NOT a cursor
 // failure and is swallowed by the seq adapter.
 var errSeqConsumerStopped = errors.New("advance seq consumer stopped")
@@ -155,19 +155,19 @@ func (s *Server) buildSnapshotterState(p *initParams) (*initSnapshotterState, er
 	}, nil
 }
 
-// poolSerialLogW is the sink for the [GO-IVM][POOL-SERIAL] incident marker
+// poolSerialLogW is the sink for the [GO-IVM][POOL-SERIAL] serial-hydrate marker
 // (test-swappable, like wedgeLogW; production is always os.Stderr).
 var poolSerialLogW io.Writer = os.Stderr
 
-// logPoolSerial emits the incident-class serial-hydrate marker: a pool
+// logPoolSerial emits the serial-hydrate marker: a pool
 // build FAILED and the hydrate is running single-conn. With the reader-shell
 // cache (reader_cache.go) making builds nearly free, the 7addd28 build-slot
 // gate — whose skip-to-serial was the last ROUTINE serial path — is deleted;
 // what remains serial is failure-only (coread capture error, frame
-// mismatch, build error), which deserves the same greppable incident status
+// mismatch, build error), which deserves the same greppable marker status
 // as [GO-IVM][WEDGE]: any nonzero count in a soak is a bug to chase, never
 // "the design working". Deliberate configuration serial (feature off, K≤1)
-// stays silent — it is not an incident.
+// stays silent.
 func logPoolSerial(cgID, path, reason string, err error) {
 	fmt.Fprintf(poolSerialLogW, "[GO-IVM][POOL-SERIAL] cg=%s path=%s reason=%s err=%v\n",
 		cgID, path, reason, err)
@@ -277,7 +277,7 @@ func (s *Server) buildWarmReaderPoolLocked(group *ClientGroup, cgID string) (*ta
 	// production default. The gate must stay wired even though the default
 	// is ON: 0df0f63 dropped this check when streaming went default-on, and
 	// the 2026-07-02 flag consolidation then documented the env knob while
-	// it was consumed nowhere — a dead kill switch (REVIEW-napi-transport
+	// it was consumed nowhere — a dead kill switch
 	// B1; TestBuildWarmReaderPool_Guards/feature_off pins it now).
 	// k<=1 is unreachable with the default lanes but kept as a defensive
 	// floor.
@@ -298,7 +298,7 @@ func (s *Server) buildWarmReaderPoolLocked(group *ClientGroup, cgID string) (*ta
 	// ANY bound pool suffices for any batch — a pipeline needs exactly ONE
 	// reader regardless of join depth (nested fetches interleave cursors on
 	// it), and a batch wider than the pool queues at admission while holding
-	// nothing. The old K ≥ P × Cmax(new) resize dance (scale-review C2 —
+	// nothing. The previous K ≥ P × Cmax(new) resize dance —
 	// rebuildColdReaderPoolLocked) dissolved with the per-fetch acquires it
 	// existed to keep deadlock-free.
 	if group.readerPool != nil {
@@ -583,7 +583,7 @@ func (s *Server) handleAdvanceToHeadStream(req RPCRequest, streamW streamWriter)
 		return resp
 	}
 
-	// Advance-time budget (user's-audit item): one deadline covers derive +
+	// Advance-time budget (item): one deadline covers derive +
 	// Collect + engine apply + emit — the whole window during which the diff
 	// pins prev's WAL frame. Checked between phases and per streamed partial
 	// (checkAdvanceBudget panics; handleStreamWithRecover → rpcError → the
@@ -632,7 +632,7 @@ func (s *Server) handleAdvanceToHeadStream(req RPCRequest, streamW streamWriter)
 	rebindCurr := func() {
 		group.eng.BindTableSourcesToConn(diff.Curr().Conn())
 	}
-	// P1 (REVIEW-napi-transport): rebind on EVERY exit including a panic
+	// Rebind on EVERY exit including a panic
 	// unwind — the engine re-raises panics after its terminal
 	// flush, which would otherwise skip the success-path rebindCurr() and
 	// strand the sources on diff.Prev() (one-frame-behind staleness).
@@ -640,13 +640,12 @@ func (s *Server) handleAdvanceToHeadStream(req RPCRequest, streamW streamWriter)
 	// rebind-before-Final-frame ordering.
 	defer rebindCurr()
 
-	// D9 (DESIGN-duplex-streaming): the changelog cursor feeds the engine
-	// LAZILY — no diff.Collect materialization, no GO_IVM_MAX_DIFF_CHANGES
-	// cap (and no cap-induced reset). Peak memory is O(chunk); the a3 time
-	// budget (checked per emitted partial) is the bound. diff.Each runs
-	// INSIDE the engine's range on this goroutine: one changelog entry is
-	// read, pushed, flattened, and emitted before the next is read — TS's
-	// lazy-cursor #advance shape.
+	// The changelog cursor feeds the engine LAZILY — no diff.Collect
+	// materialization, no GO_IVM_MAX_DIFF_CHANGES cap (and no cap-induced
+	// reset). Peak memory is O(chunk); the time budget (checked per emitted
+	// partial) is the bound. diff.Each runs INSIDE the engine's range on this
+	// goroutine: one changelog entry is read, pushed, flattened, and emitted
+	// before the next is read — TS's lazy-cursor #advance shape.
 	//
 	// Cursor errors surface IN-BAND through the seq's error slot. The
 	// engine stops, skips its terminal Final flush, and returns the error
@@ -811,7 +810,7 @@ func (s *Server) handleAdvanceToHeadStream(req RPCRequest, streamW streamWriter)
 		if r.Final {
 			// rowMode: chunkSize=1, so ChunkIndex+1 is the per-row
 			// DELIVERY count, not a chunk count — record it as rows so the
-			// advance-chunks histogram isn't polluted (P2).
+			// advance-chunks histogram isn't polluted.
 			metrics.recordAdvanceRows(r.ChunkIndex + 1)
 		}
 	})

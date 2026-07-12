@@ -25,7 +25,7 @@ type Source interface {
 	// NormalizeRow coerces row values to the column types this source
 	// expects. Used by the builder to normalize literal cursor rows
 	// (ast.Start.Row) so they compare correctly against normalized source
-	// rows during Skip — REVIEW-final HIGH-1 (Skip cursor not normalized).
+	// rows during Skip.
 	NormalizeRow(row ivm.Row)
 }
 
@@ -154,7 +154,7 @@ func buildPipelineInternal(ast AST, delegate Delegate, p *Pipeline, partitionKey
 	if ast.Start != nil {
 		// Normalize the cursor row against the source's column schema so
 		// CompareValues sees matching types between the cursor and stored
-		// rows (REVIEW-final HIGH-1 / porting HIGH-1). Without this, an
+		// rows. Without this, an
 		// msgpack-decoded int cursor compared against a float64 source row
 		// would mismatch.
 		startRow := make(ivm.Row, len(ast.Start.Row))

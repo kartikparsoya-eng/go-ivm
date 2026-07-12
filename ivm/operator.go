@@ -132,7 +132,7 @@ type InputBase interface {
 // Fetch returns iter.Seq[Node] (TS Stream<Node | 'yield'> → Go iter.Seq[Node],
 // dropping 'yield'). The seq is lazy: the cursor/reader is held for the
 // lifetime of the seq, released on exhaustion or early stop (yield returns
-// false). See DESIGN-streaming-hydrate.md §3e.
+// false).
 type Input interface {
 	InputBase
 	SetOutput(output Output)

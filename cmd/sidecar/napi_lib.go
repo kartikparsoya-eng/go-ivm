@@ -92,7 +92,7 @@ import (
 //	    client must fatal the worker on receipt, so a v1 addon that would
 //	    silently warn-and-drop it must not pair with a v2 library).
 //	v3: added goivm_stream_credit / goivm_stream_cancel (pull-hydration
-//	    demand gate, DESIGN-duplex-streaming). Pull is a per-request
+//	    demand gate). Pull is a per-request
 //	    opt-in (params.pullMode) so a v3 addon on a v3 library with pull
 //	    disabled behaves exactly like v2; the version gates the SYMBOLS —
 //	    a v3 addon dlsym-ing the credit exports must never pair with a
@@ -215,7 +215,7 @@ func goivm_send(data unsafe.Pointer, length C.int32_t) C.int32_t {
 	}
 	// C.GoBytes copies C→Go, so the caller's C buffer is free after return.
 	// The resulting slice is fresh and unshared, so h.Send takes ownership of
-	// it directly (no second copy — REVIEW-napi-transport perf #2).
+	// it directly (no second copy — perf #2).
 	payload := C.GoBytes(data, C.int(length))
 	if err := h.Send(payload); err != nil {
 		return 3
@@ -238,7 +238,7 @@ func goivm_shutdown() {
 }
 
 // goivm_stream_credit grants n credits to the pull gate of the in-flight
-// pullMode RPC identified by reqID (ABI v3, DESIGN-duplex-streaming D8).
+// pullMode RPC identified by reqID (ABI v3).
 //
 // Called DIRECTLY on the JS thread (dlsym'd, no TSFN round-trip): the JS
 // iterator grants at its low-water mark as the app consumes rows. Safe
@@ -262,7 +262,7 @@ func goivm_stream_credit(reqID C.double, n C.int32_t) {
 
 // goivm_stream_cancel cancels the pull gate of the in-flight pullMode RPC
 // identified by reqID — the JS iterator's .return()/.throw() crossing the
-// boundary (ABI v3, D4). The parked producer unparks, the engine breaks
+// boundary (ABI v3). The parked producer unparks, the engine breaks
 // its fetch range (operator chain unwinds, cursor closes, pool reader
 // returns), and the RPC settles with a terminal error frame. Same direct-
 // call constraints as goivm_stream_credit; idempotent; unknown reqID is a

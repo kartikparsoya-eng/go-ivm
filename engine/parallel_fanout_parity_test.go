@@ -1,24 +1,22 @@
 package engine
 
 // End-to-end parity test for the parallel advance fanout
-// (tablesource.ParallelAdvance / GO_IVM_PARALLEL_ADVANCE): the SAME advance
-// batch, run through the full engine + operator stack with FIVE queries
+// (tablesource.ParallelAdvance / GO_IVM_PARALLEL_ADVANCE): the same advance
+// batch, run through the full engine + operator stack with five queries
 // subscribed to the same tables, must produce identical per-query RowChange
 // sequences with the fanout serial and parallel.
 //
 // Per-query comparison (not whole-slice DeepEqual) is deliberate: the
-// streamer's documented ordering contract (D8) makes cross-query interleave
-// non-deterministic under concurrent pushes, while rows WITHIN a query keep
-// their push order — which is exactly what downstream consumers rely on (TS
-// routes by queryID). This test pins that contract through the real stack:
-// plain-filter queries, an unfiltered query, and two compound-EXISTS shapes
-// whose push processing does nested lazy fetches (Join parent fetch +
-// Exists re-check) against the shared prev-tx conn from CONCURRENT group
-// goroutines — the checkout stmt cache + interleaved-cursor path under real
-// parallelism. Run with -race in CI.
+// streamer's ordering contract makes cross-query interleave non-deterministic
+// under concurrent pushes, while rows within a query keep their push order —
+// which is exactly what downstream consumers rely on (routing by queryID).
+// This test pins that contract through the real stack: plain-filter queries,
+// an unfiltered query, and two compound-EXISTS shapes whose push processing
+// does nested lazy fetches (Join parent fetch + Exists re-check) against the
+// shared prev-tx conn from concurrent group goroutines — the checkout stmt
+// cache + interleaved-cursor path under real parallelism. Run with -race.
 //
-// Fresh engine + replica per run (same constraint as
-// lazy_advance_parity_test.go: the mattn test build has no BEGIN
+// Fresh engine + replica per run (the mattn test build has no BEGIN
 // CONCURRENT, so multi-advance chains on one engine can't be made
 // self-consistent; one seeded fixture per run sidesteps it).
 

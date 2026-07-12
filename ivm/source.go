@@ -30,7 +30,7 @@ type SourceChange struct {
 // push asserts. TS throws an Error here and the view-syncer tears the client
 // group down; the Go panic gets the identical disposition (propagates out of
 // the engine → RPC error → 'unclassified' → rethrow → teardown). The message
-// format is the old *DriftError.Error() text, kept byte-identical so log
+// format matches the *DriftError.Error() text, kept byte-identical so log
 // greps survive the type change. Shared by MemorySource (test fixture),
 // tablesource.Source (prod leaf), Take's stale-bound asserts, join key-change
 // asserts, and operator-storage failures.
@@ -609,8 +609,7 @@ func (ms *MemorySource) NormalizeRow(row Row) {
 // Takes connsMu write-lock to keep this safe against any future caller path
 // that runs concurrently with a push or Fetch. Today the sidecar serializes
 // all source-touching RPCs via group.mu, so this is belt-and-braces — but
-// it documents the invariant and survives future API surface changes
-// (REVIEW-final LOW-PORT-1).
+// it documents the invariant and survives future API surface changes.
 func (ms *MemorySource) BulkInsert(rows []Row) {
 	ms.connsMu.Lock()
 	defer ms.connsMu.Unlock()

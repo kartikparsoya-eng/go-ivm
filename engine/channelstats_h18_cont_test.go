@@ -1,14 +1,12 @@
 package engine
 
-// H18-cont regression test: TS's cost-model planner annotates the inner
-// EXISTS(participants) CSQ with flip:true at materialization time, so the
-// AST Go actually receives in production has Flip:true on that CSQ (after
-// the zero-cache pipeline-driver patch that plans the AST before
-// dispatching to Go). With the FlippedJoin path wired up, Go's pipeline
-// builds UnionFanOut → [Filter(visibility=PUBLIC), FlippedJoin(participants)]
-// → UnionFanIn. The merge-with-dedup picks the simpler filter branch's
-// node, so the channels node carries no inner-CSQ relationship and the
-// streamer doesn't emit channel_participants. Expected: 2 changes.
+// Regression test for the flipped-EXISTS over-emission with a production
+// AST shape. The inner EXISTS(participants) CSQ has Flip:true, so Go's
+// pipeline builds UnionFanOut → [Filter(visibility=PUBLIC),
+// FlippedJoin(participants)] → UnionFanIn. The merge-with-dedup picks the
+// simpler filter branch's node, so the channels node carries no inner-CSQ
+// relationship and the streamer does not emit channel_participants.
+// Expected: 2 changes.
 
 import (
 	"testing"
@@ -179,9 +177,7 @@ func TestChannelStats_H18cont_NoFlipProductionShape(t *testing.T) {
 		counts[c.Table]++
 	}
 
-	// TS produces 2 for this case (channel_stats + channels).
-	// Production: Go also produces 3 (extra channel_participants).
-	// Goal: this test reproduces the over-emit so we can iterate on the fix.
+	// Expected: 2 changes (channel_stats + channels).
 	if counts["channel_stats"] != 1 {
 		t.Errorf("channel_stats: want 1, got %d", counts["channel_stats"])
 	}
@@ -189,6 +185,6 @@ func TestChannelStats_H18cont_NoFlipProductionShape(t *testing.T) {
 		t.Errorf("channels: want 1, got %d", counts["channels"])
 	}
 	if counts["channel_participants"] != 0 {
-		t.Errorf("channel_participants: want 0 (TS suppresses inner CSQ row when OR's PUBLIC branch matches), got %d — over-emit reproduced", counts["channel_participants"])
+		t.Errorf("channel_participants: want 0 (inner CSQ row suppressed when OR's PUBLIC branch matches), got %d", counts["channel_participants"])
 	}
 }

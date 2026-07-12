@@ -243,11 +243,10 @@ func TestFilterPredicate(t *testing.T) {
 	}
 }
 
-// TestCrossTypeOrderedComparison covers operators MED-8: a numeric column
-// compared against a numeric-string literal (or vice versa) must coerce and
-// order numerically — mirroring the TS path that runs the filter through
-// SQLite's implicit cast — instead of panicking in ivm.CompareValues. Pairs
-// with the =/!= coercion HIGH-2 already shipped via valuesIdentical.
+// TestCrossTypeOrderedComparison covers cross-type ordering: a numeric
+// column compared against a numeric-string literal (or vice versa) must
+// coerce and order numerically, mirroring SQLite's implicit cast, instead
+// of panicking in ivm.CompareValues.
 func TestCrossTypeOrderedComparison(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -289,9 +288,9 @@ func TestCrossTypeOrderedComparison(t *testing.T) {
 	}
 }
 
-// TestInCoercion covers types MED-8: IN/NOT IN must coerce numeric↔
-// numeric-string per element, exactly like =/!= (valuesIdentical), so
-// `count IN ('5')` agrees with `count = '5'`.
+// TestInCoercion covers IN/NOT IN coercion: IN/NOT IN must coerce
+// numeric↔numeric-string per element, exactly like =/!=
+// (valuesIdentical), so `count IN ('5')` agrees with `count = '5'`.
 func TestInCoercion(t *testing.T) {
 	tests := []struct {
 		name   string

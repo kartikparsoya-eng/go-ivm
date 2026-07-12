@@ -153,17 +153,12 @@ func assertWarmNoop(t *testing.T, srv *Server, group *ClientGroup) {
 	}
 }
 
-// TestBuildWarmReaderPool_BoundColdPoolReusedForAnyBatch replaces the
-// scale-review C2 resize test (TestBuildWarmReaderPool_UndersizedColdPoolNotReused).
-// C2's premise — a still-bound cold pool sized K < P × Cmax(new batch) lets
-// hydrate lanes hold parent readers while blocked acquiring child readers —
-// DISSOLVED with Option B: a pipeline needs exactly ONE reader regardless of
-// join depth (nested fetches interleave cursors on it), acquired while
-// holding nothing, so "undersized" no longer exists; a batch wider than K
-// queues at admission. The invariant flips accordingly: a second
-// addQueriesStream arriving pre-first-advance must REUSE the still-bound
-// cold pool untouched — no rebuild, no teardown, same frame — for ANY
-// batch shape.
+// TestBuildWarmReaderPool_BoundColdPoolReusedForAnyBatch verifies that a
+// second addQueriesStream arriving pre-first-advance reuses the still-bound
+// cold pool untouched — no rebuild, no teardown, same frame — for any batch
+// shape. A pipeline needs exactly one reader regardless of join depth
+// (nested fetches interleave cursors on it), acquired while holding nothing;
+// a batch wider than K queues at admission.
 func TestBuildWarmReaderPool_BoundColdPoolReusedForAnyBatch(t *testing.T) {
 	srv, group := warmTestServer(t)
 	if group.readerPool == nil {

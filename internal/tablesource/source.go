@@ -1,11 +1,7 @@
 // Package tablesource is the read-only TableSource port from TS: the
 // SQLite-backed leaf Source reading the zero-cache replica directly,
-// constructed per (cg, table) in cmd/sidecar. It is the ONLY leaf source
-// (the loadRows-fed MemorySource mode was removed in the RPC-surface
-// removal sweep; ivm.MemorySource itself survives as an engine-test
-// fixture).
-//
-// See DESIGN-tablesource-port.md for the original phased plan.
+// constructed per (cg, table) in cmd/sidecar. It is the ONLY leaf source;
+// ivm.MemorySource survives as an engine-test fixture.
 package tablesource
 
 // Source: TableSource leaf implementing engine.Source against the TS
@@ -88,7 +84,7 @@ type Source struct {
 	// once at New() so the Push hot path doesn't re-derive them per
 	// change. Mirrors TS's `#getStatementsFor` cache (table-source.ts:136).
 	columnOrder    []string // stable iteration order for INSERT VALUES (...)
-	nonPKCols      []string // cols not in the primary key, for UPDATE SET ...
+	nonPKCols      []string // cols not in the primary key, for UPDATE SET clause
 	insertSQL      string
 	deleteSQL      string
 	updateSQL      string // "" if all columns are part of the primary key
@@ -142,7 +138,7 @@ type Source struct {
 
 	// externalConn, when non-nil, redirects ALL prev-tx reads/writes to a
 	// connection owned by something else (the Snapshotter's `prev` Snapshot —
-	// P2 frame-coordination). While bound, ensurePrevTx/OnAdvanceEnd are
+	// frame coordination). While bound, ensurePrevTx/OnAdvanceEnd are
 	// no-ops: the Snapshotter owns the pinned BEGIN CONCURRENT frame the diff
 	// was derived against, so applying that diff's changes here lands them in
 	// the SAME frame (no independent re-pin = no frame-timing drift). Set/
@@ -172,7 +168,7 @@ type Source struct {
 	// stays valid across advances (a prepare_v2 stmt is frame-independent and
 	// SQLite auto-recompiles it on the rare replica-schema change).
 	//
-	// The INNER per-SQL map is the unbounded axis (scale review): conn
+	// The INNER per-SQL map is the unbounded axis: conn
 	// teardown — the only full invalidation — never happens mid-life for
 	// exactly those long-lived conns, and nothing maps a removed query back
 	// to its SQL shapes, so a long-lived CG with query churn accumulated one
@@ -268,8 +264,8 @@ type presenceKey struct {
 
 // probedTables caches SUCCESSFUL presence probes per (read pool, table) so
 // CG init only touches the read pool for the first init of each table.
-// See the probe block in NewWithContext for the full rationale (2026-07-07
-// soak incident). Negative results are never stored.
+// See the probe block in NewWithContext for the full rationale.
+// Negative results are never stored.
 var probedTables sync.Map // presenceKey → struct{}
 
 // New constructs a Source for tableName.
@@ -309,13 +305,13 @@ func ValidateWithContext(parent context.Context, db *sql.DB, tableName string, c
 	// table doesn't exist, costs nothing if it does. Bounded: this probe
 	// acquires a read-pool conn, and under pool exhaustion an unbounded
 	// acquire wedged handleInit for the full 120s TS RPC timeout and then
-	// leaked the goroutine forever (2026-07-06 ART incident — the probe
-	// sat behind deadlocked pool builders; see PoolAcquireTimeout). The
+	// leaked the goroutine forever — the probe
+	// sat behind deadlocked pool builders (see PoolAcquireTimeout). The
 	// deadline is on the PROBE only — the Source's stored lifetime ctx
 	// below stays bound to parent, not to this timeout.
 	//
-	// CACHED per (pool, table) — 2026-07-07 soak incident: this probe was
-	// the only HARD-FAIL read-pool acquisition on the CG-init path, and it
+	// CACHED per (pool, table): this probe is the only hard-fail
+	// read-pool acquisition on the CG-init path, and it
 	// ran once per Source per CG init. Under sustained CG churn the warm-
 	// hydrate reader pools (K=8 conns each, held for the full hydrate —
 	// observed up to 10s) legitimately saturate the read pool (128/128 for
@@ -354,7 +350,7 @@ func ValidateWithContext(parent context.Context, db *sql.DB, tableName string, c
 			// Classify on DeadlineExceeded SPECIFICALLY: cancelProbe() has
 			// already run, so probeCtx.Err() is never nil here — the old
 			// `probeCtx.Err() != nil` check made the "table not found"
-			// branch dead code and reported genuinely missing tables as
+			// branch was unreachable and reported genuinely missing tables as
 			// pool exhaustion. Err() sticks at DeadlineExceeded once the
 			// deadline fires (a later cancel() does not overwrite it), so
 			// this cleanly separates "queued too long on the pool" from
@@ -485,7 +481,7 @@ func (s *Source) Close() error {
 // BindConn binds this Source's prev-tx reads/writes to an externally-owned,
 // already-pinned connection (the Snapshotter's `prev` Snapshot conn). While
 // bound, the Source does NOT manage its own prev tx — the snapshotter owns the
-// frame. P2 frame-coordination: the engine applies a Snapshotter-derived diff
+// frame. Frame coordination: the engine applies a Snapshotter-derived diff
 // into the very frame it was derived against, eliminating the residual drift
 // that an independently-re-pinned per-Source tx caused.
 func (s *Source) BindConn(conn *sql.Conn) {
@@ -564,7 +560,7 @@ func (s *Source) checkoutSelectLocked(conn *sql.Conn, query string) (*sql.Stmt, 
 // overlay guard blocks the rollback path); the close is defensive.
 //
 // Inserting past stmtCachePerConnCap evicts the least-recently-returned
-// quarter of the bucket (scale review: without a bound, one C-heap
+// quarter of the bucket (without a bound, one C-heap
 // sqlite3_stmt per distinct SQL shape accrued for the CG's whole life —
 // conn teardown, the only invalidation, never fires for the long-lived
 // prevConn/externalConn).
@@ -720,7 +716,7 @@ func (s *Source) closeAllCachedStmtsLocked() {
 // Subsequent calls (after OnAdvanceEnd rolled the tx back) just re-issue
 // the cached BEGIN variant + the warm-up SELECT.
 //
-// M4: When s.prevConn is nil, s.mu is RELEASED during the conn pool
+// When s.prevConn is nil, s.mu is RELEASED during the conn pool
 // acquisition (up to 30s) and re-acquired after. Without this, a pool
 // stall would block all Push/Fetch/Close on this Source — and since Push
 // runs under e.mu, the entire engine would freeze. After re-acquiring
@@ -875,8 +871,8 @@ func (s *Source) PrimaryKey() []string { return s.primaryKey }
 // with fromSQLiteType. So by the time a json value reaches this Go wire-normalize
 // path it is ALREADY parsed: a json scalar string like "Payment Failures" arrives
 // as a bare Go string, not as JSON text. Re-running FromSQLiteType's strict parse
-// on it would panic (W1). Passing it through unchanged is both panic-free and
-// behavior-identical to the old code for every other json shape (objects, arrays,
+// on it would panic. Passing it through unchanged is both panic-free and
+// behavior-identical to the current code for every other json shape (objects, arrays,
 // numbers, bools, null already hit FromSQLiteType's json default: return v). The
 // strict parse stays where it belongs — the SQLite-read boundary in scanRows.
 func (s *Source) NormalizeRow(row ivm.Row) {
@@ -1030,7 +1026,7 @@ func (s *Source) genPushAndWrite(change ivm.SourceChange, conns []*connection) {
 	// Second resolution for the split-edit legs (the Remove leg's
 	// writeChangeLocked updates batchState before the Add leg arrives);
 	// idempotent for changes already resolved in Push. This replaces the
-	// old BUG 1/1b/1c existsLocked probes — batchState is authoritative for
+	// legacy existsLocked probes — batchState is authoritative for
 	// any PK touched this batch, so no SQL probe is needed for the rewrite
 	// decision (untouched PKs pass through to driftCheckLocked unchanged).
 	var skip bool
@@ -1050,7 +1046,7 @@ func (s *Source) genPushAndWrite(change ivm.SourceChange, conns []*connection) {
 	d, derr := s.driftCheckLocked(change)
 	if derr != nil {
 		// A REAL DB error from the exists probe (I/O, SQLITE_BUSY, closed
-		// conn) is NOT drift — treating it as "absent" (the pre-fix
+		// conn) is NOT drift — treating it as "absent" (the prior
 		// behavior) fabricated missing-row drift for every Remove/Edit
 		// under I/O pressure. Panic with the plain error, matching TS where
 		// better-sqlite3 THROWS from the exists closure
@@ -1166,9 +1162,9 @@ func (s *Source) driftCheckLocked(change ivm.SourceChange) (driftErr error, prob
 //
 // A REAL statement failure (I/O error, SQLITE_BUSY, closed conn — anything
 // but ErrNoRows) returns a non-nil error and MUST NOT be read as "row
-// absent" (scale review): at the drift check that fabricated missing-row
-// DriftErrors for every Remove/Edit under I/O pressure (drift storm →
-// reset loop), and at the BUG-1b/1c conversions it silently turned Edits
+// absent": at the drift check that fabricated missing-row DriftErrors
+// for every Remove/Edit under I/O pressure (drift storm → reset loop),
+// and at the Edit-to-Add conversion it silently turned Edits
 // into Adds against live state. TS's exists closure THROWS on statement
 // error; callers here panic AFTER releasing s.mu.
 //
@@ -1763,7 +1759,7 @@ func (s *Source) fetchSerial(req ivm.FetchRequest, conn *connection) []ivm.Node 
 // a clean terminal frame.
 func (s *Source) fetchDuringPushStream(req ivm.FetchRequest, conn *connection) iter.Seq[ivm.Node] {
 	return func(yield func(ivm.Node) bool) {
-		// Locked setup, PANIC-SAFE (REVIEW-napi-transport F7): the splice
+		// Locked setup, PANIC-SAFE : the splice
 		// plan runs user-value-sensitive code inside the lock —
 		// overlaySplicePlan invokes the effective comparator against
 		// req.Start (CompareValues panics with a DataError on non-scalar /
@@ -2139,7 +2135,7 @@ func (s *Source) UnbindReaderPool() {
 // LITERAL's own JS-type (query_builder.go jsValueType — mirrors TS
 // query-builder.ts getJsType); the old column-schema ColType stamping made a
 // string literal on a json column bind as its JSON encoding, diverging from
-// TS (napi review M3).
+// TS.
 func (s *Source) convertFilter(cond *builder.Condition) *sqlite.Condition {
 	if cond == nil {
 		return nil

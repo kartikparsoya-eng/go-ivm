@@ -50,7 +50,7 @@ type Snapshotter struct {
 
 	// mu serializes Init/Advance/Destroy against any in-flight Diff
 	// iteration. TS relies on the single-threaded JS event loop; Go must
-	// serialize advance vs. iteration explicitly (design §8 risk 5).
+	// serialize advance vs. iteration explicitly.
 	mu sync.Mutex
 
 	curr *Snapshot
@@ -192,7 +192,7 @@ func (s *Snapshotter) Advance(
 }
 
 // RefreshCurrentToHead re-pins the current snapshot at the latest replica head
-// on its existing connection. P2 drive mode calls this immediately before the
+// on its existing connection. Drive mode calls this immediately before the
 // FIRST hydrate: Init() pins curr at handleInit time, but the replicator may
 // have advanced by the time the initial addQueries arrives, so without this the
 // hydrate reads a frame slightly behind the one TS hydrates at (observed as rare
@@ -297,7 +297,7 @@ type Snapshot struct {
 func (s *Snapshot) Version() string { return s.version }
 
 // Conn returns the connection holding this snapshot's pinned BEGIN CONCURRENT
-// frame. P2 frame-coordination binds the engine's tablesource leaves to this
+// frame. Frame coordination binds the engine's tablesource leaves to this
 // conn so a Snapshotter-derived diff is applied into the exact frame it was
 // derived against. The caller must not close it (the Snapshotter owns it).
 func (s *Snapshot) Conn() *sql.Conn { return s.conn }
@@ -321,7 +321,7 @@ func (s *Snapshot) resetToHead(beginStmt string) error {
 	return nil
 }
 
-// close rolls back the open tx and releases the connection. Idempotent-ish:
+// close rolls back the open tx and releases the connection. Idempotent:
 // safe to call once per Snapshot.
 func (s *Snapshot) close() {
 	if s.conn == nil {

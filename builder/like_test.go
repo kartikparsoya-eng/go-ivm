@@ -7,17 +7,14 @@ import (
 	"github.com/kartikparsoya-eng/go-ivm/ivm"
 )
 
-// TestMatchLike pins matchLike to TS's in-memory matcher contract
-// (zql/src/builder/like.ts @ v1.7.0), which zero 1.7.0 made authoritative on
-// BOTH paths (the SQL side now runs case_sensitive_like=ON with ESCAPE '\'
-// and lower()ed ILIKE operands):
+// TestMatchLike pins matchLike to the in-memory matcher contract:
 //   - backslash escapes the next character (Postgres default)
 //   - wildcards are DOTALL (cross newlines) and ^/$ anchor the whole string
 //   - LIKE is case-sensitive; ILIKE lowercases with full Unicode mapping
-//   - a trailing backslash is invalid (TS throws; Go panics a DataError)
+//   - a trailing backslash is invalid (panics a DataError)
 //
-// Also keeps the HIGH-8 cases the old byte-by-byte matcher got wrong
-// (multi-byte UTF-8 under `_`).
+// Also covers multi-byte UTF-8 cases where `_` must match one code point,
+// not one byte.
 func TestMatchLike(t *testing.T) {
 	cases := []struct {
 		name            string
@@ -77,11 +74,10 @@ func TestMatchLike(t *testing.T) {
 	}
 }
 
-// TestMatchLikeUpstreamCases ports the ENTIRE upstream corpus from
-// packages/zql/src/builder/like-test-cases.ts 1:1 (napi review M9: nine of
-// these blocks had no Go counterpart). Every input/expectation pair is
-// upstream's — verified there against SQLite — so this is the strongest
-// like.ts-parity pin we can hold without executing TS.
+// TestMatchLikeUpstreamCases ports the entire upstream corpus from
+// the reference test cases 1:1. Every input/expectation pair is verified
+// against SQLite upstream, so this is the strongest parity pin without
+// executing the reference implementation.
 func TestMatchLikeUpstreamCases(t *testing.T) {
 	type block struct {
 		pattern string
@@ -148,11 +144,11 @@ func TestMatchLikeUpstreamCases(t *testing.T) {
 	}
 }
 
-// TestMatchLikeJSCanonicalizeFold pins M6: like.ts uses a NON-'u' 'i'-flag
-// RegExp, whose ECMA-262 Canonicalize never folds a non-ASCII character into
-// an ASCII one and never folds KELVIN SIGN into k. RE2's (?i) — the pre-fix
-// implementation — applies Unicode simple case folding, which conflates all
-// of these and silently over-matched TS.
+// TestMatchLikeJSCanonicalizeFold verifies that the ILIKE case-folding
+// matches ECMA-262 Canonicalize semantics: it never folds a non-ASCII
+// character into an ASCII one and never folds KELVIN SIGN into k. RE2's
+// (?i) applies Unicode simple case folding, which conflates these and
+// would over-match.
 func TestMatchLikeJSCanonicalizeFold(t *testing.T) {
 	cases := []struct {
 		name       string
@@ -182,11 +178,9 @@ func TestMatchLikeJSCanonicalizeFold(t *testing.T) {
 	}
 }
 
-// TestLikeNonStringLHSPanics pins M7: TS's getLikePredicate asserts the LHS
-// is a string (like.ts:10 assertString) — reachable via JSON-column values —
-// and THROWS. Go previously coerced via fmt.Sprintf("%v"), silently matching
-// (`5 LIKE '5'` was true) where TS errors. Both the eager (literal-RHS) and
-// lazy (evalOp) paths must panic a DataError.
+// TestLikeNonStringLHSPanics verifies that a non-string LIKE LHS
+// panics a DataError, matching the reference implementation's assertString
+// guard. Both the eager (literal-RHS) and lazy (evalOp) paths must panic.
 func TestLikeNonStringLHSPanics(t *testing.T) {
 	mustPanic := func(t *testing.T, f func()) {
 		t.Helper()
@@ -237,15 +231,10 @@ func TestMatchLikeTrailingEscapePanics(t *testing.T) {
 	matchLike(`x\`, `x\`, false)
 }
 
-// TestBuildPredicateTrailingEscapeFailsAtBuild pins H1 from the napi-path
-// hostile review: TS compiles the LIKE pattern at predicate BUILD
-// (filter.ts:79 createPredicateImpl → like.ts patternToRegExp) and throws
-// "LIKE pattern must not end with escape character" there — surfacing as a
-// clean per-query error from addQuery. Pre-fix, Go deferred compilation to
-// the first matchLike call, so a bad pattern installed a LIVE pipeline that
-// panicked per-row mid-advance — tearing down the whole CG, and the
-// orphaned pipeline re-panicked on every subsequent push. BuildPredicate
-// must panic a DataError WITHOUT the predicate ever being invoked.
+// TestBuildPredicateTrailingEscapeFailsAtBuild verifies that a LIKE
+// pattern ending with a trailing escape character panics a DataError at
+// predicate build time, not at match time. BuildPredicate must panic
+// without the predicate ever being invoked.
 func TestBuildPredicateTrailingEscapeFailsAtBuild(t *testing.T) {
 	for _, op := range []string{"LIKE", "NOT LIKE", "ILIKE", "NOT ILIKE"} {
 		t.Run(op, func(t *testing.T) {

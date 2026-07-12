@@ -8,14 +8,11 @@ import (
 	"github.com/kartikparsoya-eng/go-ivm/ivm"
 )
 
-// Pins the follow-TS source-drift disposition: when a source's pre-push
-// validation detects an Edit/Remove against a missing row (or a duplicate
-// Add), the plain-error panic propagates OUT of engine.Advance /
-// engine.AdvanceStream — TS's twin asserts throw and the view-syncer tears
-// the client group down. The engine drains its streamer before re-raising
-// (HIGH-10) and signalAdvanceEnd still rotates the sources, so a follow-up
-// advance on the same engine is clean (relevant for the moment between the
-// panic and the CG teardown completing).
+// Tests the source-drift disposition: when a source's pre-push validation
+// detects an Edit/Remove against a missing row (or a duplicate Add), the
+// panic propagates out of engine.Advance / engine.AdvanceStream. The engine
+// drains its streamer before re-raising, and signalAdvanceEnd still rotates
+// the sources, so a follow-up advance on the same engine is clean.
 
 func setupSimpleEngine(t *testing.T) (*Engine, *ivm.MemorySource) {
 	t.Helper()

@@ -1,25 +1,24 @@
 package main
 
-// E2E pull-mode (ABI v3) tests over the full in-process stack: abi host →
+// E2E pull-mode tests over the full in-process stack: abi host →
 // handleConnection → handleAddQueriesStream(pullMode) → demand gate → row
-// plane → sink. Everything runs WITHOUT the addon: grants/cancels call the
+// plane → sink. Everything runs without the addon: grants/cancels call the
 // same registry methods the goivm_stream_credit/goivm_stream_cancel exports
-// are paper-thin shims over (napi_lib.go), so the whole pull discipline is
+// are thin shims over (napi_lib.go), so the whole pull discipline is
 // -race-testable with the ordinary toolchain.
 //
-// Pins (DESIGN-duplex-streaming §6 validation gates):
-//   - I6 lockstep at W=1: ZERO row-bearing deliveries before the first
+// Pins:
+//   - Lockstep at W=1: zero row-bearing deliveries before the first
 //     grant; rows delivered == credits granted at every checkpoint
 //     (produced ≤ consumed + 1 with the gate sitting before enqueue).
-//   - Final/error/done frames ride FREE (never gated): the terminal
+//   - Final/error/done frames ride free (never gated): the terminal
 //     error frame of a cancelled stream arrives while credit is zero.
-//   - Cancel → the RPC settles with a -32000 error frame (I9: plain
-//     -32000, never the -32102 data-error class), the gate is
-//     unregistered, and the group remains fully usable.
-//   - D7 idle sweep cancels a parked stream (same unwind as cancel).
+//   - Cancel → the RPC settles with a plain -32000 error frame, the gate
+//     is unregistered, and the group remains fully usable.
+//   - Idle sweep cancels a parked stream (same unwind as cancel).
 //   - Teardown-cancels-gates: host Shutdown completes while a pull
-//     producer is parked (pre-hook this deadlocks on group.mu).
-//   - pullMode without rowMode is rejected: the production pull contract is
+//     producer is parked.
+//   - pullMode without rowMode is rejected: the pull contract is
 //     mandatory once requested, never silently downgraded to ungated frames.
 
 import (
@@ -33,8 +32,7 @@ import (
 
 // startPullHost boots a table-mode host over a replica whose `users` table
 // is seeded with nRows and returns the server, collector, host, and a send
-// helper. (Port of the old memory-mode fixture: init used to carry schema +
-// loadRows the rows; the replica file is now authoritative.)
+// helper.
 func startPullHost(t *testing.T, nRows int) (*Server, *sinkCollector, *abiHost, func(id float64, method string, params interface{})) {
 	t.Helper()
 	path := makeUsersReplica(t, nRows)
@@ -169,11 +167,11 @@ func frameFor(col *sinkCollector, t *testing.T, id float64, pred func(RPCRespons
 	return RPCResponse{}, false
 }
 
-// TestPullMode_OpeningWindowViaRequest pins the race-free opening window
-// (I6 at W>1): pullWindow rides the REQUEST, so exactly W rows flow with no
+// TestPullMode_OpeningWindowViaRequest verifies the race-free opening
+// window: pullWindow rides the request, so exactly W rows flow with no
 // grant call ever made — produced ≤ consumed + W — and top-ups extend the
-// window from there. This is the production shape (the JS client always
-// sends pullWindow ≥ 1; grant calls are top-ups only).
+// window from there. This is the production shape (the client always sends
+// pullWindow ≥ 1; grant calls are top-ups only).
 func TestPullMode_OpeningWindowViaRequest(t *testing.T) {
 	const nRows = 30
 	srv, col, _, send := startPullHost(t, nRows)
@@ -197,9 +195,9 @@ func TestPullMode_OpeningWindowViaRequest(t *testing.T) {
 	waitRows(t, col, nRows, 5*time.Second)
 }
 
-// TestPullMode_LockstepDemandGate is the I6 lockstep pin at W=1: no
-// row-bearing delivery may cross the boundary until the client grants, and
-// deliveries track grants exactly.
+// TestPullMode_LockstepDemandGate verifies the lockstep contract at W=1:
+// no row-bearing delivery may cross the boundary until the client grants,
+// and deliveries track grants exactly.
 func TestPullMode_LockstepDemandGate(t *testing.T) {
 	const nRows = 30
 	srv, col, _, send := startPullHost(t, nRows)
@@ -259,10 +257,10 @@ func TestPullMode_LockstepDemandGate(t *testing.T) {
 	}
 }
 
-// TestPullMode_CancelUnwindsAndRejects: mid-stream cancel produces a plain
-// -32000 terminal error frame WHILE credit is zero (error frames ride
-// free), stops all row production, unregisters the gate, and leaves the
-// group fully usable for the next hydrate.
+// TestPullMode_CancelUnwindsAndRejects verifies that mid-stream cancel
+// produces a plain -32000 terminal error frame while credit is zero
+// (error frames ride free), stops all row production, unregisters the
+// gate, and leaves the group fully usable for the next hydrate.
 func TestPullMode_CancelUnwindsAndRejects(t *testing.T) {
 	const nRows = 30
 	srv, col, _, send := startPullHost(t, nRows)
@@ -276,9 +274,8 @@ func TestPullMode_CancelUnwindsAndRejects(t *testing.T) {
 	// Cancel with zero credit outstanding — the producer is parked.
 	srv.streamGates.cancel(3)
 
-	// Terminal error frame arrives ungated; I9: plain -32000, and the
-	// message names the consumer-cancel (never the -32102 DataError
-	// class, which would teach the TS client to tear the CG down).
+	// Terminal error frame arrives ungated; plain -32000, and the
+	// message names the consumer-cancel (never the data-error class).
 	deadline := time.Now().Add(5 * time.Second)
 	var errResp RPCResponse
 	for {
@@ -293,7 +290,7 @@ func TestPullMode_CancelUnwindsAndRejects(t *testing.T) {
 		time.Sleep(2 * time.Millisecond)
 	}
 	if errResp.Error.Code != -32000 {
-		t.Fatalf("cancel error code = %d, want -32000 (I9: never reset/data classes)", errResp.Error.Code)
+		t.Fatalf("cancel error code = %d, want -32000 (never reset/data classes)", errResp.Error.Code)
 	}
 	if !strings.Contains(errResp.Error.Message, "cancelled by consumer") {
 		t.Fatalf("cancel error message %q does not name the consumer cancel", errResp.Error.Message)
@@ -338,9 +335,9 @@ func TestPullMode_CancelUnwindsAndRejects(t *testing.T) {
 	}
 }
 
-// TestPullMode_IdleSweepCancelsParked pins D7: a stream parked past the
-// idle window with no grants is auto-cancelled by the sweeper — the exact
-// client-cancel unwind, terminal error frame included.
+// TestPullMode_IdleSweepCancelsParked verifies that a stream parked past
+// the idle window with no grants is auto-cancelled by the sweeper — the
+// same unwind as a client cancel, terminal error frame included.
 func TestPullMode_IdleSweepCancelsParked(t *testing.T) {
 	srv, col, _, send := startPullHost(t, 10)
 
@@ -371,9 +368,9 @@ func TestPullMode_IdleSweepCancelsParked(t *testing.T) {
 	}
 }
 
-// TestPullMode_ShutdownUnparksProducer pins the teardown broadcast: host
-// Shutdown (→ closeAll → shutdownGroup) must cancel the group's gates
-// BEFORE taking group.mu, or teardown deadlocks behind the parked
+// TestPullMode_ShutdownUnparksProducer verifies the teardown broadcast:
+// host Shutdown (→ closeAll → shutdownGroup) must cancel the group's gates
+// before taking group.mu, or teardown deadlocks behind the parked
 // producer's RPC handler.
 func TestPullMode_ShutdownUnparksProducer(t *testing.T) {
 	srv, _, h, send := startPullHost(t, 10)
@@ -395,10 +392,10 @@ func TestPullMode_ShutdownUnparksProducer(t *testing.T) {
 	}
 }
 
-// TestPullMode_WithoutRowModeErrors: pullMode without the row plane
-// (rowMode=false) is a protocol error. The JS prod path requires NAPI row
-// records and pull credit; silently downgrading here reintroduces the eager
-// buffered path this contract removes.
+// TestPullMode_WithoutRowModeErrors verifies that pullMode without the
+// row plane (rowMode=false) is a protocol error. The production path
+// requires row records and pull credit; silently downgrading would
+// reintroduce the eager buffered path this contract removes.
 func TestPullMode_WithoutRowModeErrors(t *testing.T) {
 	const nRows = 10
 	srv, col, _, send := startPullHost(t, nRows)

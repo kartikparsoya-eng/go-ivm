@@ -1,28 +1,19 @@
 package engine
 
-// Profiling harness for the flatten-in-push change (DESIGN-streaming-advance.md,
-// "Win 1"). These benchmarks isolate the exact cost the change targets: the
-// per-advance materialize deep-copy of a relationship subtree.
+// Profiling harness for the flatten-in-push change. These benchmarks
+// isolate the per-advance materialize deep-copy cost of a relationship
+// subtree.
 //
-// Shape: a "popular parent" — ONE users row (u1) with childCount posts rows all
-// correlated to u1. The query is `users` with a top-level Related → posts, so
-// the pipeline output for u1 is a single Add/Remove Change whose Node carries a
-// relationship closure yielding childCount child Nodes. That subtree is what the
-// legacy pipelineOutput.Push materialized eagerly (materializeChange →
-// materializeNode, deep-copying every child) and what the new path flattens
-// straight to RowChanges during push.
+// Shape: a "popular parent" — one users row (u1) with childCount posts rows
+// all correlated to u1. The query is `users` with a top-level Related → posts,
+// so the pipeline output for u1 is a single Add/Remove Change whose Node
+// carries a relationship closure yielding childCount child Nodes. That
+// subtree is what the eager materialize path deep-copied, and what the
+// flatten-in-push path converts straight to RowChanges during push.
 //
 // Run:
 //
 //	go test ./engine/ -run '^$' -bench 'AdvanceFanout' -benchmem
-//
-// Compare NEW (flatten-in-push, working tree) vs OLD (materialize) by stashing:
-//
-//	go test ./engine/ -run '^$' -bench 'AdvanceFanout' -benchmem  > /tmp/new.txt
-//	git stash                                                     # restore materialize
-//	go test ./engine/ -run '^$' -bench 'AdvanceFanout' -benchmem  > /tmp/old.txt
-//	git stash pop
-//	# eyeball, or: benchstat /tmp/old.txt /tmp/new.txt
 
 import (
 	"fmt"
@@ -110,12 +101,10 @@ func BenchmarkAdvanceFanout_100(b *testing.B)  { benchAdvanceFanout(b, 100) }
 func BenchmarkAdvanceFanout_1000(b *testing.B) { benchAdvanceFanout(b, 1000) }
 func BenchmarkAdvanceFanout_5000(b *testing.B) { benchAdvanceFanout(b, 5000) }
 
-// TestAdvanceFanout_RowCount documents how many RowChanges a SINGLE
-// source-change (one popular-parent ADD) fans out to. This is the Win-2 gate
-// input from DESIGN-streaming-advance §7: a single source-change's output is
-// NOT split (engine.go — "we don't split an individual source-change's
-// RowChange list"), so this count is the un-splittable unit that Win 1 still
-// buffers whole. Compare against advanceChunkSize (default 10000).
+// TestAdvanceFanout_RowCount documents how many RowChanges a single
+// source-change (one popular-parent ADD) fans out to. A single
+// source-change's output is not split, so this count is the un-splittable
+// unit buffered whole. Compare against advanceChunkSize (default 10000).
 func TestAdvanceFanout_RowCount(t *testing.T) {
 	for _, childCount := range []int{100, 1000, 5000} {
 		eng := newFanoutEngine(t, childCount)

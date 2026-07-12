@@ -14,10 +14,8 @@ import (
 // pkValue reads a primary-key column from a row, panicking if it is missing
 // or nil. Primary keys are NOT NULL by definition, so a nil PK means a
 // corrupted replica or a join mis-constructing the node — TS fails loud here
-// via must() (pipeline-driver.ts:2959). Go previously wrote nil silently,
-// shipping a {pk: nil} rowKey the CVR records but no future advance matches →
-// permanent client-view soft-leak (HIGH-6). Panicking matches TS's
-// fail-fast contract; engine.Advance's recover surfaces it for re-init.
+// via must() (pipeline-driver.ts:2959). Panicking matches TS's fail-fast
+// contract; engine.Advance's recover surfaces it for re-init.
 func pkValue(row ivm.Row, pk, table string) interface{} {
 	v, ok := row[pk]
 	if !ok || v == nil {
@@ -47,14 +45,14 @@ type RowChange struct {
 // Streamer accumulates IVM changes and flattens them to RowChanges.
 // Thread-safe: Accumulate may be called concurrently from parallel pipelines.
 //
-// Flatten-in-push (DESIGN-streaming-advance.md): Accumulate flattens each
-// change tree to RowChanges SYNCHRONOUSLY, while the caller's Output.Push is
-// still on the stack and the mutation overlay + join in-progress state are
-// live (§3). This deletes the eager materializeChange deep-copy and the
-// Nodes-then-RowChanges double-hold, matching TS's #streamNodes generator
-// (pipeline-driver.ts:2818-2866) which flattens inside the push loop.
+// Flatten-in-push: Accumulate flattens each change tree to RowChanges
+// SYNCHRONOUSLY, while the caller's Output.Push is still on the stack and
+// the mutation overlay + join in-progress state are live. This deletes the
+// eager materializeChange deep-copy and the Nodes-then-RowChanges double-
+// hold, matching TS's #streamNodes generator (pipeline-driver.ts:2818-2866)
+// which flattens inside the push loop.
 //
-// Ordering contract (D8):
+// Ordering contract:
 //   - Changes within a single Accumulate call preserve their input slice
 //     order in the Stream() output.
 //   - Order ACROSS Accumulate calls follows the order Accumulate acquired
@@ -115,7 +113,7 @@ func (s *Streamer) SetChunkSink(sink func([]RowChange), rowLimit, byteLimit int)
 }
 
 // Accumulate flattens IVM changes to RowChanges immediately — while the
-// overlay and join push-scoped state are still live (DESIGN-streaming-advance
+// overlay and join push-scoped state are still live
 // §3). Called by each pipeline's output handler during push; the flatten
 // runs on the caller's goroutine, parallelizing across push pipelines.
 func (s *Streamer) Accumulate(queryID string, schema *ivm.SourceSchema, changes []ivm.Change) {
@@ -223,10 +221,10 @@ func streamChangesInto(emit func(RowChange), queryID string, schema *ivm.SourceS
 			// must(schema.relationships[child.relationshipName])
 			// (pipeline-driver.ts:2798-2802) — a CHILD change naming a
 			// relationship its schema doesn't know is a pipeline-construction
-			// bug, and TS THROWS → CG teardown. The old `if childSchema != nil`
+			// bug, and TS THROWS → CG teardown. The previous `if childSchema != nil`
 			// guard silently DROPPED the descendant change instead: silent data
 			// loss where TS fails loud, and inconsistent with streamNodesInto's
-			// identical-class panic below. (streamer audit F2.)
+			// identical-class panic below.
 			if change.Child == nil {
 				// TS would TypeError reading child.relationshipName of undefined.
 				panic(fmt.Sprintf(
@@ -246,7 +244,7 @@ func streamChangesInto(emit func(RowChange), queryID string, schema *ivm.SourceS
 
 // streamNodes produces RowChanges for a node and its relationships.
 //
-// Thin wrapper over streamNodesInto (T1-3): pre-sizes a single accumulator and
+// Thin wrapper over streamNodesInto : pre-sizes a single accumulator and
 // lets the whole relationship subtree append into it. The previous version
 // allocated a fresh []RowChange at every recursion level and re-appended it
 // into the parent's slice — O(N log N) allocator work for an O(N) result.

@@ -1,6 +1,6 @@
 package main
 
-// OTLP/HTTP trace exporter (REVIEW-final MED-CROSS-4). One server span per
+// OTLP/HTTP trace exporter. One server span per
 // RPC handler, parented via the TS-forwarded `traceparent`. Tracing is a
 // no-op when no OTEL_EXPORTER_OTLP_ENDPOINT is set so callers can call
 // startHandlerSpan unconditionally without paying for spans nobody collects.

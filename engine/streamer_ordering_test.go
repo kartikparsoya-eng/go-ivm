@@ -7,10 +7,8 @@ import (
 	"github.com/kartikparsoya-eng/go-ivm/ivm"
 )
 
-// TestStreamer_PreservesIntraCallOrder is D8 contract part 1:
-// changes within a single Accumulate call appear in Stream() in their
-// input slice order. This is the basis for downstream-sorting comparators
-// (TS shadow-compare) being able to assume per-call order.
+// TestStreamer_PreservesIntraCallOrder verifies that changes within a
+// single Accumulate call appear in Stream() in their input slice order.
 func TestStreamer_PreservesIntraCallOrder(t *testing.T) {
 	s := NewStreamer()
 	schema := &ivm.SourceSchema{
@@ -38,11 +36,11 @@ func TestStreamer_PreservesIntraCallOrder(t *testing.T) {
 	}
 }
 
-// TestStreamer_AccumulateConcurrentNoLoss is D8 contract part 2:
-// under N concurrent Accumulate goroutines, Stream() emits exactly the
-// union of inputs (no dropped or duplicated changes). Cross-queryID order
-// in the output is intentionally not asserted — callers requiring
-// determinism must sort downstream.
+// TestStreamer_AccumulateConcurrentNoLoss verifies that under N concurrent
+// Accumulate goroutines, Stream() emits exactly the union of inputs (no
+// dropped or duplicated changes). Cross-queryID order in the output is
+// intentionally not asserted — callers requiring determinism must sort
+// downstream.
 func TestStreamer_AccumulateConcurrentNoLoss(t *testing.T) {
 	s := NewStreamer()
 	schema := &ivm.SourceSchema{
@@ -87,10 +85,10 @@ func TestStreamer_AccumulateConcurrentNoLoss(t *testing.T) {
 	}
 }
 
-// TestStreamer_StreamResetsBuffer is D8 contract part 3: after Stream()
-// returns, the internal buffer is cleared. The next Accumulate starts
-// against a fresh slice — a one-time large advance doesn't permanently
-// retain memory (the comment in streamer.go calls this out).
+// TestStreamer_StreamResetsBuffer verifies that after Stream() returns,
+// the internal buffer is cleared. The next Accumulate starts against a
+// fresh slice — a one-time large advance doesn't permanently retain
+// memory.
 func TestStreamer_StreamResetsBuffer(t *testing.T) {
 	s := NewStreamer()
 	schema := &ivm.SourceSchema{

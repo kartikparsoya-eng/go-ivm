@@ -21,8 +21,7 @@ package main
 //     is safe because it is enqueued only after the handler returns, i.e.
 //     after every abiDeliver above (TSFN FIFO puts it last).
 //
-// Fallback contract (ALL-OR-NOTHING per partial — REVIEW-napi-transport
-// B2): if ANY change in a partial can't be row-encoded (non-homogeneous
+// Fallback contract (ALL-OR-NOTHING per partial): if ANY change in a partial can't be row-encoded (non-homogeneous
 // column set — see encodeRow), the ENTIRE partial ships inside one
 // positional msgpack partial and ZERO of its rows go out as records. Mixing
 // planes within a partial would reorder its changes — encodable rows left
@@ -30,39 +29,27 @@ package main
 // so [add X (fallback), remove X (record)] arrived at the client as
 // remove-then-add: net phantom row → drift. chunkSize=1 partials mostly
 // dodge this, and remove-first groups regained the record path via
-// groupFor's replacement-def minting (user's-audit fix), but the
+// groupFor's replacement-def minting, but the
 // residual-drain path still produces multi-change partials, so the
 // interleave stays reachable. Correct over fast; the TS row-mode
 // accumulator accepts both planes.
 //
-// LOCK DISCIPLINE (2026-07-09, the G13 wedge fix — root-caused from the
-// wedge watchdog's self-captured stacks): rp.mu may NEVER be held across a
-// deliver that waits. The addon's TSFN queue is bounded (default 8192) and
-// the pre-v4 deliver used napi_tsfn_blocking — "backpressure like a slow
-// socket" — but a Node event loop starved for minutes parked the deliver in
-// an UNCANCELLABLE cgo call while it held rp.mu: every sibling producer of
-// the RPC piled onto the mutex with gate waiters==0 (invisible to the pull
-// idle sweeper), wg.Wait (engine.go, phase-2 drain) never returned, the CG
-// worker stayed inFlight forever (reap-proof by design, A4), and every
-// retry for the cgID starved behind it in ~122s lockstep with the TS 120s
-// RPC deadline. A blocked cgo call cannot be interrupted from outside, so
-// the ONLY viable cancellation point is a Go-side retry around a
-// NONBLOCKING enqueue (ABI v4). Additionally (F1, parallelism audit
-// 2026-07-10): every rp.mu section is DEFER-unlocked and every
+// LOCK DISCIPLINE: rp.mu may NEVER be held across a deliver that waits.
+// The addon's TSFN queue is bounded (default 8192) and an earlier blocking
+// deliver could park the producer in an uncancellable cgo call while it
+// held rp.mu: every sibling producer of the RPC piled onto the mutex with
+// gate waiters==0 (invisible to the pull idle sweeper), wg.Wait (engine.go,
+// phase-2 drain) never returned, and the CG worker stayed inFlight forever
+// (reap-proof by design), starving every retry for the cgID behind it. A
+// blocked cgo call cannot be interrupted from outside, so the only viable
+// cancellation point is a Go-side retry around a nonblocking enqueue.
+// Additionally, every rp.mu section is DEFER-unlocked and every
 // unlock-for-park window DEFER-relocks — a panic anywhere in the encoder
-// path (groupFor, encodeRow) previously escaped with rp.mu held forever,
-// wedging every sibling producer on the MUTEX (not in a park): no
-// deliver-timeout applied, no gate cancel reaches a mutex wait — the exact
-// convoy shape v4 killed, reintroduced through the panic door.
+// path (groupFor, encodeRow) would otherwise escape with rp.mu held forever,
+// wedging every sibling producer on the mutex (not in a park): no
+// deliver-timeout applied, no gate cancel reaches a mutex wait.
 //
-// STAGING + EVENT-DRIVEN WAKEUP (2026-07-10, the v4 latency-tax fix — the
-// PASS soak's telemetry showed 19,242 queue-full parks in 20 min with NO
-// pathological JS stalls: the two taxes were (1) the poll — v4's escalating
-// 100µs→5ms sleep meant every park ate up to 5ms of dead air after the
-// queue had already drained, ≈40-95s of injected idle concentrated in busy
-// windows; (2) row-granular queue slots — one row per TSFN entry let any
-// ordinary 100-300ms JS busy slice look like congestion at 8192 slots).
-// The boundary is now demand-shaped:
+// STAGING + EVENT-DRIVEN WAKEUP: the deliver boundary is demand-shaped:
 //
 //   - Queue has room → single-record items, exactly the zero-copy fast
 //     path (first-row latency untouched; the production steady state pays
@@ -90,17 +77,17 @@ package main
 // the client-granted window — demand remains the clock. Advance stays
 // push: the stage hard bound + park is the backpressure, now event-woken.
 //
-// WAL-pin note (parallelism audit): an ADVANCE producer parked here holds
-// its prev-tx WAL pin for up to the deliver timeout (150s), which exceeds
-// the 60s advance-budget promise — budget checks are pre-emit only. The
-// park is cancellable (group teardown) and the deadline bounds it; folding
-// the park into the budget clock is future work if soaks show it matters.
+// WAL-pin note: an ADVANCE producer parked here holds its prev-tx WAL pin
+// for up to the deliver timeout (55s), which exceeds the 60s advance-budget
+// promise — budget checks are pre-emit only. The park is cancellable (group
+// teardown) and the deadline bounds it; folding the park into the budget
+// clock is future work if soaks show it matters.
 //
 // emit* return false when the stream is DEAD — the delivery was refused
 // (TSFN closing), cancelled (client gone / group teardown), or timed out
 // (GO_IVM_DELIVER_TIMEOUT — the JS loop stayed starved past any plausible
 // recovery). Hydrate callers feed that into the engine's existing
-// consumer-refusal unwind (onResult false → D4); the advance caller panics
+// consumer-refusal unwind (onResult returns false); the advance caller panics
 // into handleStreamWithRecover (the engine's sink has no error return —
 // same pattern as the economic abort).
 
@@ -185,13 +172,13 @@ var (
 
 // deliverTimeoutDefault bounds how long one payload (or the stage) may wait
 // against a full TSFN queue before the stream is declared dead. It must sit
-// ABOVE the longest observed recoverable JS-loop stall (43-46s synchronous
-// materializations — a 44s hydrate COMPLETED in the incident soak) but BELOW
-// the advance budget (advanceBudgetMs, default 60s) so a parked advance
-// producer can't hold a WAL pin past the budget. 55s gives a 9s buffer past
-// the 46s stall ceiling and 5s under the 60s budget. Env-tunable via
-// GO_IVM_DELIVER_TIMEOUT_SEC (read lazily — the env sync from the embedder
-// happens at goivm_start, after package init).
+// above the longest expected recoverable JS-loop stall (43-46s synchronous
+// materializations have been observed) but below the advance budget
+// (advanceBudgetMs, default 60s) so a parked advance producer can't hold a
+// WAL pin past the budget. 55s gives a 9s buffer past the 46s stall ceiling
+// and 5s under the 60s budget. Env-tunable via GO_IVM_DELIVER_TIMEOUT_SEC
+// (read lazily — the env sync from the embedder happens at goivm_start,
+// after package init).
 const deliverTimeoutDefault = 55 * time.Second
 
 var deliverTimeoutOnce sync.Once
@@ -209,7 +196,7 @@ func deliverTimeoutDur() time.Duration {
 	return deliverTimeoutVal
 }
 
-// deliverLogW is the sink for the [GO-IVM][DELIVER-TIMEOUT] incident marker
+// deliverLogW is the sink for the [GO-IVM][DELIVER-TIMEOUT] marker
 // (test-swappable, like wedgeLogW; production is always os.Stderr).
 var deliverLogW io.Writer = os.Stderr
 
@@ -304,7 +291,7 @@ func (rp *rowPlane) setPullGate(gate *streamGate) {
 	}
 }
 
-// noteDeliverTimeout emits the incident marker and bumps the counter.
+// noteDeliverTimeout emits the marker and bumps the counter.
 func (rp *rowPlane) noteDeliverTimeout(kind int32, payloadLen int) {
 	metrics.napiDeliverTimeouts.Add(1)
 	fmt.Fprintf(deliverLogW,
@@ -314,7 +301,7 @@ func (rp *rowPlane) noteDeliverTimeout(kind int32, payloadLen int) {
 
 // parkSlice waits for a drain signal (event — instant) or one cancellation
 // tick. ch MUST have been grabbed via tsfnDrain.waitCh() BEFORE the failed
-// delivery attempt (the lost-wakeup rule). Holding rp.mu here is FORBIDDEN.
+// delivery attempt (the lost-wakeup rule). Holding rp.mu here would deadlock.
 func parkSlice(ch <-chan struct{}, t *time.Timer) {
 	if !t.Stop() {
 		select {
@@ -331,7 +318,7 @@ func parkSlice(ch <-chan struct{}, t *time.Timer) {
 
 // retryDeliver parks one OWNED payload against a full TSFN queue: an
 // event-driven wait on the drain broadcast, checking cancellation each
-// tick. Holding rp.mu here is FORBIDDEN — this is the wait the lock
+// tick. Holding rp.mu here would deadlock — this is the wait the lock
 // discipline exists to keep lock-free. Returns false when the stream is
 // dead (closed / cancelled / deadline).
 func (rp *rowPlane) retryDeliver(kind int32, payload []byte) bool {
@@ -389,7 +376,7 @@ func (rp *rowPlane) tryFlushStageLocked() bool {
 }
 
 // flushStageLocked flushes the ENTIRE current stage, parking (with rp.mu
-// RELEASED — the F1 defer discipline makes the window panic-safe) until a
+// RELEASED — the defer discipline makes the window panic-safe) until a
 // drain signal frees queue space. Because the attempt always runs under
 // rp.mu against the whole stage, no flush ever ships a partial batch:
 // siblings appending during the park simply grow the batch the next
@@ -405,7 +392,7 @@ func (rp *rowPlane) flushStageLocked() bool {
 	defer t.Stop()
 	for {
 		// Re-check after every park (multi-parker wake, review LOW
-		// 2026-07-10): flushes are whole-stage atomic under mu, so a sibling
+		//: flushes are whole-stage atomic under mu, so a sibling
 		// parker that re-acquired FIRST may have shipped the entire stage —
 		// this parker's work is done. Without the re-check it delivered the
 		// now-empty stage as a zero-record kind-5: a wasted TSFN slot during
@@ -437,7 +424,7 @@ func (rp *rowPlane) flushStageLocked() bool {
 			return false
 		}
 		// Park with rp.mu RELEASED; the defer re-lock keeps the caller's
-		// defer-unlock balanced even if the park path ever panics (F1).
+		// defer-unlock balanced even if the park path ever panics.
 		func() {
 			rp.mu.Unlock()
 			defer rp.mu.Lock()
@@ -476,7 +463,7 @@ func (rp *rowPlane) sendOrStageLocked(kind int32, payload []byte) bool {
 }
 
 // emitChangesGuarded is the ONLY entry to emitChangesLocked: it owns the
-// panic-safe rp.mu section (F1, parallelism audit 2026-07-10). The v4
+// panic-safe rp.mu section. The v4
 // rewrite had replaced the pre-v4 `defer rp.mu.Unlock()` with bare
 // Lock/Unlock pairs in the emit* callers — a panic anywhere in the encoder
 // path escaped with rp.mu held FOREVER: every sibling producer then
@@ -501,7 +488,7 @@ func (rp *rowPlane) flushStage() bool {
 // the stream is dead (gate cancelled, or the flush was cancelled/timed
 // out/closed).
 //
-// The rule (credit-park stalemate, 2026-07-10 — found auditing the v5
+// The rule (credit-park stalemate — found auditing the v5
 // staging design): staged rows are granted-but-undelivered, INVISIBLE to
 // the client. Its top-up policy grants only when outstanding
 // (granted − consumed) falls to the low-water mark — and it can never
@@ -561,7 +548,7 @@ func (rp *rowPlane) emitChangesLocked(changes []engine.RowChange) (fallback []en
 	if len(changes) == 0 {
 		return nil, true
 	}
-	// Fast path — the PRODUCTION case (REVIEW-napi-transport perf #1). rowMode
+	// Fast path — the PRODUCTION case . rowMode
 	// forces chunkSize=1, so every partial carries exactly one change and the
 	// all-or-nothing buffering below has nothing to protect. deliver copies
 	// synchronously ON SUCCESS and staging copies on FULL, so the record may
@@ -591,7 +578,7 @@ func (rp *rowPlane) emitChangesLocked(changes []engine.RowChange) (fallback []en
 	// Phase 1 encodes every row into a COPY (encodeRow's return aliases the
 	// encoder's scratch buffer, so buffered records must not share it) so a
 	// later unencodable change can abort the WHOLE partial with zero records
-	// already delivered (the F2 all-or-nothing rule).
+	// already delivered (the all-or-nothing rule).
 	recs := make([][]byte, 0, len(changes))
 	for i := range changes {
 		c := &changes[i]
