@@ -13,7 +13,7 @@ import (
 
 // maxSafeInteger is JS Number.MAX_SAFE_INTEGER (2^53 - 1). int64/uint64 values
 // beyond ±this cannot round-trip through float64 without precision loss, which
-// is how TS's number model (all numbers are float64) bounds integers (HIGH-9).
+// is how TS's number model (all numbers are float64) bounds integers.
 const maxSafeInteger = int64(1)<<53 - 1
 
 // boxFloat64 shares a single immutable box for common numeric column values to
@@ -593,7 +593,7 @@ func FromSQLiteType(v interface{}, colType string) ivm.Value {
 	if v == nil {
 		return nil
 	}
-	// A time.Time here is a PLUMBING BUG, never a data condition. TS's
+	// A time.Time here is a plumbing issue, never a data condition. TS's
 	// better-sqlite3 has no decltype conversion — it ships raw cells — and
 	// every Go-side row SELECT strips the declared type with the unary-+
 	// wrap (`+"col" AS "col"` — BuildSelectQuery and the snapshotter's
@@ -645,7 +645,7 @@ func FromSQLiteType(v interface{}, colType string) ivm.Value {
 	case "number":
 		switch val := v.(type) {
 		case int64:
-			// HIGH-9: int64 above JS Number.MAX_SAFE_INTEGER (±2^53-1) cannot
+			// Int64 above JS Number.MAX_SAFE_INTEGER (±2^53-1) cannot
 			// round-trip through float64 — silent precision loss aliases PKs to
 			// adjacent integers and makes joins match wrong rows. TS throws
 			// UnsupportedValueError on the same input; panic to match (the

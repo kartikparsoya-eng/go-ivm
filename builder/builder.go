@@ -614,7 +614,7 @@ func wrapInFilter(input ivm.Input, cond *Condition, p *Pipeline) ivm.Input {
 // through UnionFanOut/UnionFanIn so per-branch outputs are merged with
 // first-occurrence-wins dedup — matching TS's branch-order semantics so a
 // branch with no nested relationship beats one with the same row plus an
-// added inner relationship (the H18 case).
+// added inner relationship.
 //
 // Port of TS applyFilterWithFlips
 // (mono/packages/zql/src/builder/builder.ts:386).

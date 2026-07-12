@@ -90,12 +90,12 @@ type Connection struct {
 // Concurrency model:
 //   - `connections` is guarded by `connsMu` (RWMutex). Push paths take RLock
 //     to snapshot the slice; Connect/Disconnect take Lock for mutation. This
-//     hardens MEDIUM-1 from the parallelism review: the invariant that
+//     hardens the invariant that
 //     Connect/Disconnect only run under Engine.mu was load-bearing but
 //     fragile.
 //   - `overlay` is an atomic.Pointer so cross-goroutine reads during parallel
-//     fan-out have a documented happens-before edge (MEDIUM-5 from the
-//     parallelism review). Push paths Store; Fetch paths Load.
+//     fan-out have a documented happens-before edge. The
+//     Push paths Store; Fetch paths Load.
 type MemorySource struct {
 	tableName         string
 	columns           map[string]string
@@ -113,7 +113,7 @@ type MemorySource struct {
 	nextConnectGroup  string
 	// converter, if set, replaces the default partial-coverage NormalizeRow
 	// behavior with a per-column conversion (e.g. sqlite.FromSQLiteType).
-	// REVIEW-ts-integration CRITICAL-3 / REVIEW-porting MEDIUM-2.
+	// Replaces the default partial-coverage NormalizeRow behavior.
 	converter ValueConverter
 	// batchState tracks, per PK written in the current advance batch, the row
 	// the source data now holds for that PK (nil = removed/absent). Last
@@ -326,7 +326,7 @@ func (ms *MemorySource) genPushAndWriteWithSplitEdit(change SourceChange) {
 //   - Remove, PK removed in-batch       → skip            (TS no-op filter, snapshotter.ts:540-544)
 //   - Remove, PK written in-batch       → Remove(cur)     (TS: prev.getRow → cur)
 //
-// The first, third, and fourth cases are the original BUG 1b/1c/1 rewrites;
+// The first, third, and fourth cases are the original rewrites;
 // the Edit→Edit and Remove→Remove(cur) substitutions close the remaining
 // gap where a PK EDITED earlier in the batch passed its stale pre-batch
 // value through (silently divergent OldRow/Row — observable through filter
@@ -536,7 +536,7 @@ func (ms *MemorySource) Columns() map[string]string { return ms.columns }
 // applied to EVERY column — matching what TableSource.NormalizeRow does via
 // FromSQLiteType. Without a converter we fall back to the legacy partial
 // coverage (number / boolean only), which is enough for tests but misses
-// json / string / blob — see REVIEW-ts-integration CRITICAL-3.
+// json / string / blob.
 func (ms *MemorySource) NormalizeRow(row Row) {
 	if row == nil {
 		return

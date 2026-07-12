@@ -434,7 +434,7 @@ func (t *Take) pushEditChange(change Change) {
 				// newCmp<0, size>1) there must be a row before the bound. If we
 				// reach here something is wrong with bound tracking — panic loudly
 				// rather than silently fall back, so divergence surfaces.
-				// (Porting review HIGH-3.)
+				//
 				panic("Take.pushEditChange: beforeBoundNode must be found when oldCmp==0, newCmp<0, size>1")
 			}
 			t.setTakeState(takeStateKey, takeState.Size, beforeBoundNode.Row, maxBound)

@@ -41,7 +41,7 @@ package tablesource
 // replaced with ONE fresh open — see provisionReader.
 //
 // Admission: only ReaderPool.Close's HEALTHY path caches (all readers
-// free). Build-failure unwinds and the borrowed-readers BUG path close
+// free). Build-failure unwinds and the borrowed-readers failure path close
 // outright — a shell is cached only when provably idle.
 
 import (

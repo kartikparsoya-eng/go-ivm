@@ -78,9 +78,9 @@ func RunTestCase(tc TestCase) (*HarnessResult, error) {
 			columns[colName] = colDef.Type
 		}
 		// Inject FromSQLiteType so the harness's MemorySource normalizes
-		// every column type the same way production does (REVIEW-final
-		// MED-PORT-1). Without this, tests masked json/string/blob bugs
-		// because the legacy NormalizeRow only covered number/boolean.
+		// every column type the same way production does
+		// (Without this, tests masked json/string/blob bugs
+		// because the legacy NormalizeRow only covered number/boolean).
 		sources[tableName] = ivm.NewMemorySourceWithConverter(
 			tableName, columns, schema.PrimaryKey,
 			func(v interface{}, colType string) ivm.Value {

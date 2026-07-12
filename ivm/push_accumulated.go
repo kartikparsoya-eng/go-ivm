@@ -108,7 +108,7 @@ func PushAccumulatedChanges(
 			output.Push(addEmptyRelationships(removeChange), pusher)
 			return
 		}
-		// Porting review MEDIUM-4: TS uses must(addChange ?? removeChange),
+		// TS uses must(addChange ?? removeChange),
 		// which throws if neither is present. Go was silently falling through
 		// to a zero-value removeChange. Panic to surface the invariant
 		// violation rather than emit a malformed empty Change.
@@ -147,7 +147,7 @@ func PushAccumulatedChanges(
 			output.Push(addEmptyRelationships(removeChange), pusher)
 			return
 		}
-		// Same MEDIUM-4 invariant for the CHILD branch.
+		// Same invariant for the CHILD branch.
 		panic("PushAccumulated CHILD: expected hasChild||hasAdd||hasRemove, got none")
 	}
 
