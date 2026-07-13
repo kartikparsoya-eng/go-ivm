@@ -3,7 +3,6 @@ package ivm
 import (
 	"iter"
 	"slices"
-	"strings"
 	"testing"
 )
 
@@ -27,17 +26,20 @@ func (s *stubParentAlways) Fetch(req FetchRequest) iter.Seq[Node] {
 	}
 }
 
-// TestFlippedJoinChunkedNonAdvancingCursorPanics verifies the defense-in-depth
-// guard: if fetchChunkHead returns the same row that was just advanced past,
-// fetchChunkedSequential panics instead of looping forever. Before the guard,
-// a non-advancing cursor (caused by the NULL-cursor SQL bug) would re-yield
-// the same head eternally, burning a core at 100% CPU with no backstop able
-// to interrupt it.
-func TestFlippedJoinChunkedNonAdvancingCursorPanics(t *testing.T) {
+// TestFlippedJoinChunkedNonAdvancingParentTerminates pins the structural
+// wedge fix: the chunk-buffered merge fetches each chunk exactly once, so a
+// parent whose results ignore the Start cursor (what the NULL-cursor SQL
+// degeneracy produced — WHERE collapsed to TRUE) CANNOT loop: there is no
+// keyset re-fetch to not-advance. The old shape re-fetched the winning
+// chunk per yielded row and looped forever on such a parent (the 6-21+
+// minute live advance wedge); a same-row panic guard then converted the
+// loop to a teardown. Both the loop and the guard are gone — this test
+// pins termination + the one-fetch-per-chunk contract against the exact
+// adversarial parent that used to wedge.
+func TestFlippedJoinChunkedNonAdvancingParentTerminates(t *testing.T) {
 	// chunkSize=1 with 2 distinct parent keys (p1, p2) → 2 chunks → enters
-	// the chunked path. The stub always returns p1, so after yielding
-	// chunk 0's head (p1), the re-fetch with Start={p1, after} returns
-	// p1 again → the same-row guard fires.
+	// the chunked path. The stub returns p1 for every fetch regardless of
+	// constraints or Start.
 	t.Cleanup(SetMultiConstraintChunkSizeForTest(1))
 
 	stub := &stubParentAlways{
@@ -69,24 +71,22 @@ func TestFlippedJoinChunkedNonAdvancingCursorPanics(t *testing.T) {
 		System:           "client",
 	})
 
-	// The fetch should panic on the non-advancing cursor.
-	defer func() {
-		r := recover()
-		if r == nil {
-			t.Fatal("expected panic from non-advancing cursor guard, got none")
+	// The fetch must TERMINATE (the old shape looped forever here) with
+	// exactly one parent fetch per chunk. Output: each chunk's buffer is
+	// the single p1 row the stub returns; both pass the parent-key filter
+	// (p1 is a known key), so p1 is yielded once per chunk.
+	got := slices.Collect(fj.Fetch(FetchRequest{}))
+	if len(got) != 2 {
+		t.Fatalf("got %d nodes, want 2 (one buffered p1 per chunk)", len(got))
+	}
+	for _, n := range got {
+		if n.Row["id"] != "p1" {
+			t.Fatalf("unexpected row %v", n.Row)
 		}
-		msg, ok := r.(string)
-		if !ok {
-			t.Fatalf("expected string panic, got %T: %v", r, r)
-		}
-		// Verify the panic message mentions non-advancing cursor.
-		if !strings.Contains(msg, "non-advancing cursor") {
-			t.Fatalf("panic message should mention 'non-advancing cursor', got: %q", msg)
-		}
-	}()
-
-	_ = slices.Collect(fj.Fetch(FetchRequest{}))
-	t.Fatal("should have panicked before reaching here")
+	}
+	if stub.fetches != 2 {
+		t.Fatalf("parent fetched %d times, want exactly 2 (one per chunk, never per row)", stub.fetches)
+	}
 }
 
 // TestFlippedJoinChunkedNullSortColumnTerminates verifies that a chunked

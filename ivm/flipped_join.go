@@ -3,7 +3,6 @@ package ivm
 import (
 	"container/heap"
 	"encoding/json"
-	"fmt"
 	"iter"
 	"slices"
 	"sort"
@@ -152,10 +151,12 @@ func SetMultiConstraintChunkSizeForTest(size int) func() {
 // multi entry, so it appears in exactly one chunk exactly once, and children
 // map back to it via the same canonical key.
 //
-// For multi sets larger than the chunk size, Go keeps TS's lazy heap merge
-// shape without holding one SQLite cursor per chunk: it fetches one head per
-// chunk, yields the smallest head, then reopens only that winning chunk with
-// Start:"after" the emitted row.
+// For multi sets larger than the chunk size, Go fetches each chunk fully
+// (one bounded-IN query per chunk — the eager leaf pays that scan for ANY
+// query shape), buffers it, and heap-merges the buffers — TS's
+// one-query-per-chunk cost with buffered rows standing in for TS's open
+// streaming cursors. See fetchChunkedSequential for why the previous
+// per-head keyset-reopen shape was quadratic and wedge-prone.
 func (fj *FlippedJoin) Fetch(req FetchRequest) iter.Seq[Node] {
 	// Translate constraints for the parent on parts of the join key to constraints for the child.
 	var childConstraint Constraint
@@ -268,9 +269,28 @@ func (fj *FlippedJoin) fetchBatched(req FetchRequest, childNodes []Node) iter.Se
 	}
 }
 
-// fetchChunkedSequential fetches one head row per multi-constraint chunk and
-// heap-merges those heads. Advancing a chunk reopens only that chunk after
-// its last emitted row, keeping at most one parent cursor active at a time.
+// fetchChunkedSequential fetches each multi-constraint chunk ONCE (one
+// bounded-IN query per chunk), buffers it, and heap-merges the buffered
+// chunks into one ordered stream.
+//
+// COST MODEL (2026-07-13 wedge root cause): the previous shape fetched one
+// HEAD row per chunk and re-opened the winning chunk with a keyset cursor
+// (Start after the emitted row) for every yielded row. That looked lazy but
+// wasn't: the production leaf fetch (tablesource fetchSerial) eagerly
+// drains the ENTIRE result of every query, so each per-head reopen paid a
+// full remaining-chunk scan to keep one row — O(rows) SQL round-trips and
+// O(rows²/chunks) row decodes per fetch. Through a chained FlippedJoin
+// (whose outer Fetch collects the inner's whole output to build its
+// IN-list) a single child-change push re-fetch ran for 6-21+ minutes with
+// no abort checkpoint reachable — the live advance wedge. TS never pays
+// this: its #fetchChunked holds one open streaming cursor per chunk and
+// merges (one query per chunk, rows stream). Buffering whole chunks is the
+// same O(chunks) query count with the rows RETAINED instead of re-fetched —
+// strictly cheaper than the old shape on every axis (the old prime already
+// drained every chunk fully and threw the rows away). The delta vs TS is
+// memory (buffered rows vs open cursors), which the eager leaf makes the
+// native Go shape; the keyset resume machinery — and with it the whole
+// non-advancing-cursor wedge class — is gone from this path.
 func (fj *FlippedJoin) fetchChunkedSequential(
 	parentReq FetchRequest,
 	incoming []MultiConstraint,
@@ -287,19 +307,21 @@ func (fj *FlippedJoin) fetchChunkedSequential(
 		return c
 	}
 	return func(yield func(Node) bool) {
-		var chunks []flippedJoinChunkState
+		var chunks []flippedJoinBufferedChunk
 		heads := &flippedJoinChunkHeap{compare: compare}
 		heap.Init(heads)
 
 		for i := 0; i < len(computedMulti); i += chunkSize {
 			end := min(i+chunkSize, len(computedMulti))
-			chunks = append(chunks, flippedJoinChunkState{
-				multi: computedMulti[i:end],
-			})
-			chunkIdx := len(chunks) - 1
-			if head, ok := fj.fetchChunkHead(parentReq, incoming, chunks[chunkIdx]); ok {
-				heap.Push(heads, flippedJoinChunkHead{chunk: chunkIdx, node: head})
+			creq := parentReq
+			creq.MultiConstraints = appendMulti(incoming, computedMulti[i:end])
+			buf := slices.Collect(fj.parent.Fetch(creq))
+			if len(buf) == 0 {
+				continue
 			}
+			chunkIdx := len(chunks)
+			chunks = append(chunks, flippedJoinBufferedChunk{buf: buf, next: 1})
+			heap.Push(heads, flippedJoinChunkHead{chunk: chunkIdx, node: buf[0]})
 		}
 
 		for heads.Len() > 0 {
@@ -307,40 +329,23 @@ func (fj *FlippedJoin) fetchChunkedSequential(
 			if !yield(best.node) {
 				return
 			}
-			chunks[best.chunk].start = &Start{Row: best.node.Row, Basis: BasisAfter}
-			if head, ok := fj.fetchChunkHead(parentReq, incoming, chunks[best.chunk]); ok {
-				if compareRows(head.Row, best.node.Row) == 0 {
-					panic(fmt.Sprintf(
-						"FlippedJoin.fetchChunkedSequential: non-advancing cursor - "+
-							"chunk head did not advance past the previous row (table=%s). "+
-							"This indicates a keyset SQL bug; resetting to prevent infinite loop.",
-						fj.schema.TableName))
-				}
-				heap.Push(heads, flippedJoinChunkHead{chunk: best.chunk, node: head})
+			c := &chunks[best.chunk]
+			if c.next < len(c.buf) {
+				heap.Push(heads, flippedJoinChunkHead{chunk: best.chunk, node: c.buf[c.next]})
+				c.next++
+			} else {
+				c.buf = nil // drained — release the rows to GC mid-merge
 			}
 		}
 	}
 }
 
-type flippedJoinChunkState struct {
-	multi MultiConstraint
-	start *Start
-}
-
-func (fj *FlippedJoin) fetchChunkHead(
-	parentReq FetchRequest,
-	incoming []MultiConstraint,
-	chunk flippedJoinChunkState,
-) (Node, bool) {
-	creq := parentReq
-	creq.MultiConstraints = appendMulti(incoming, chunk.multi)
-	if chunk.start != nil {
-		creq.Start = chunk.start
-	}
-	for n := range fj.parent.Fetch(creq) {
-		return n, true
-	}
-	return Node{}, false
+// flippedJoinBufferedChunk is one fetched-and-buffered multi-constraint
+// chunk: `buf` holds the chunk's rows in parent order, `next` is the index
+// of the first row not yet offered to the merge heap.
+type flippedJoinBufferedChunk struct {
+	buf  []Node
+	next int
 }
 
 type flippedJoinChunkHead struct {

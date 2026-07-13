@@ -30,21 +30,20 @@ func chunk2Fixture(t *testing.T) (*FlippedJoin, *recordingInput) {
 	return newFlipFixture(t, 5, parents, nil)
 }
 
-func assertChunkFetchPlan(t *testing.T, rec *recordingInput, initialLens []int, yieldedParents int) {
+// assertChunkFetchPlan pins the chunk-BUFFERED fetch plan (2026-07-13 wedge
+// root-cause fix): exactly ONE parent fetch per chunk, each carrying that
+// chunk's multi-constraint slice — no per-yield keyset reopens (the old
+// BasisAfter re-fetches were the O(rows) query amplification behind the
+// advance wedge).
+func assertChunkFetchPlan(t *testing.T, rec *recordingInput, chunkLens []int) {
 	t.Helper()
-	wantFetches := len(initialLens) + yieldedParents
-	if len(rec.fetches) != wantFetches {
-		t.Fatalf("parent fetches = %d, want %d (%d initial chunk heads + %d chunk advances)",
-			len(rec.fetches), wantFetches, len(initialLens), yieldedParents)
+	if len(rec.fetches) != len(chunkLens) {
+		t.Fatalf("parent fetches = %d, want exactly %d (one per chunk, no reopens)",
+			len(rec.fetches), len(chunkLens))
 	}
-	for i, wantLen := range initialLens {
+	for i, wantLen := range chunkLens {
 		if got := len(rec.fetches[i].MultiConstraints[0]); got != wantLen {
-			t.Fatalf("initial chunk %d multi len = %d, want %d", i, got, wantLen)
-		}
-	}
-	for i := len(initialLens); i < len(rec.fetches); i++ {
-		if rec.fetches[i].Start == nil || rec.fetches[i].Start.Basis != BasisAfter {
-			t.Fatalf("reopen fetch %d Start = %+v, want BasisAfter", i, rec.fetches[i].Start)
+			t.Fatalf("chunk %d multi len = %d, want %d", i, got, wantLen)
 		}
 	}
 }
@@ -68,7 +67,7 @@ func TestFlippedJoinChunkedMergesSortedChunks(t *testing.T) {
 		}
 	}
 
-	assertChunkFetchPlan(t, rec, []int{2, 2, 1}, len(result))
+	assertChunkFetchPlan(t, rec, []int{2, 2, 1})
 }
 
 func TestFlippedJoinChunkedDedupesSharedParentKeys(t *testing.T) {
@@ -95,7 +94,7 @@ func TestFlippedJoinChunkedDedupesSharedParentKeys(t *testing.T) {
 			t.Fatalf("parent %v children = %d, want 2", nd.Row["id"], c)
 		}
 	}
-	assertChunkFetchPlan(t, rec, []int{2, 1}, len(result))
+	assertChunkFetchPlan(t, rec, []int{2, 1})
 }
 
 func TestFlippedJoinChunkedReverse(t *testing.T) {
@@ -112,7 +111,7 @@ func TestFlippedJoinChunkedReverse(t *testing.T) {
 			t.Fatalf("parent %v wrong children %v", n.Row["id"], children)
 		}
 	}
-	assertChunkFetchPlan(t, rec, []int{2, 2, 1}, len(result))
+	assertChunkFetchPlan(t, rec, []int{2, 2, 1})
 	for i, f := range rec.fetches {
 		if !f.Reverse {
 			t.Fatalf("chunk %d did not carry Reverse", i)
@@ -129,7 +128,7 @@ func TestFlippedJoinChunkedStartAt(t *testing.T) {
 	if got, want := fetchedParentIDs(result), []string{"p3", "p4", "p5"}; !slices.Equal(got, want) {
 		t.Fatalf("start-at = %v, want %v", got, want)
 	}
-	assertChunkFetchPlan(t, rec, []int{2, 2, 1}, len(result))
+	assertChunkFetchPlan(t, rec, []int{2, 2, 1})
 	for i, f := range rec.fetches[:3] {
 		if f.Start == nil || f.Start.Row["id"] != "p3" || f.Start.Basis != "at" {
 			t.Fatalf("initial chunk %d start = %+v, want p3/at", i, f.Start)
@@ -169,7 +168,7 @@ func TestFlippedJoinChunkedConstraintOnNonJoinColumn(t *testing.T) {
 	if got, want := fetchedParentIDs(result), []string{"p1", "p3", "p4", "p5"}; !slices.Equal(got, want) {
 		t.Fatalf("constrained = %v, want %v", got, want)
 	}
-	assertChunkFetchPlan(t, rec, []int{2, 2, 1}, len(result))
+	assertChunkFetchPlan(t, rec, []int{2, 2, 1})
 	for i, f := range rec.fetches {
 		if f.Constraint == nil || (*f.Constraint)["active"] != true {
 			t.Fatalf("chunk %d lost req.Constraint: %+v", i, f.Constraint)
@@ -191,7 +190,15 @@ func TestFlippedJoinChunkedEarlyStop(t *testing.T) {
 	}
 }
 
-func TestFlippedJoinChunkedEarlyStopPullsOnlyChunkHeads(t *testing.T) {
+// Early termination contract of the chunk-BUFFERED merge (2026-07-13 wedge
+// root-cause fix): every chunk is fetched exactly ONCE — one bounded-IN
+// query per chunk, full chunk buffered — regardless of how few rows the
+// consumer takes. The old per-head keyset-reopen shape re-issued a query
+// per yielded row (and the eager leaf drained the whole remaining chunk
+// each time — the O(rows²/chunks) advance wedge). The pins that matter:
+// fetch CALLS == chunk count (never per-row), rows pulled == total rows
+// (buffered once, never re-fetched).
+func TestFlippedJoinChunkedEarlyStopOneQueryPerChunk(t *testing.T) {
 	t.Cleanup(SetMultiConstraintChunkSizeForTest(2))
 
 	parent := NewMemorySource("parent", map[string]string{"id": "string"}, []string{"id"})
@@ -221,8 +228,14 @@ func TestFlippedJoinChunkedEarlyStopPullsOnlyChunkHeads(t *testing.T) {
 	if !slices.Equal(got, []string{"p1"}) {
 		t.Fatalf("early stop got %v, want [p1]", got)
 	}
-	if pulled := atomic.LoadInt32(&parentCounter.rowsReturned); pulled > 3 {
-		t.Fatalf("early stop pulled %d parent rows, want <= 3 chunk heads", pulled)
+	// 5 parents at chunkSize 2 → 3 chunks → exactly 3 parent fetches.
+	if calls := atomic.LoadInt32(&parentCounter.fetchCount); calls != 3 {
+		t.Fatalf("early stop issued %d parent fetches, want exactly 3 (one per chunk)", calls)
+	}
+	// Whole chunks are buffered up front — all 5 rows pulled ONCE, and
+	// critically never more than once (no per-row re-fetch amplification).
+	if pulled := atomic.LoadInt32(&parentCounter.rowsReturned); pulled != 5 {
+		t.Fatalf("pulled %d parent rows, want exactly 5 (each row fetched once)", pulled)
 	}
 }
 
