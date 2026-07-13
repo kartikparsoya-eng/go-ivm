@@ -590,6 +590,18 @@ func (s *Server) handleAdvanceToHeadStream(req RPCRequest, streamW streamWriter)
 	// TS classifier's reset bucket).
 	budgetDeadline, budgetOn := advanceDeadline()
 
+	// Wall-clock budget context: when the advance budget is enabled, create
+	// a context with the same deadline and thread it through to the sources'
+	// SQL queries. The go-sqlite3 driver calls sqlite3_interrupt() when this
+	// context fires, unblocking a query stuck on WAL contention that the
+	// per-entry/per-partial Go-side budget checks can't reach (they only
+	// run between cgo calls, not inside one).
+	var advCtx context.Context
+	if budgetOn {
+		var cancel context.CancelFunc
+		advCtx, cancel = context.WithDeadline(context.Background(), budgetDeadline)
+		defer cancel()
+	}
 	// TS economic abort (advance_abort.go): armed only when the request
 	// carries totalHydrationTimeMs — the production drive path. This only
 	// captures the formula params; the processing clock arms AFTER the
@@ -785,7 +797,7 @@ func (s *Server) handleAdvanceToHeadStream(req RPCRequest, streamW streamWriter)
 		return rpcError(req.ID, -32000,
 			"advanceToHeadStream: row-plane delivery dead before header")
 	}
-	streamErr := group.eng.AdvanceStreamChunkedSeqClocked(changesSeq, 1, abort.clock(), func(r engine.AdvanceStreamPartial) {
+	streamErr := group.eng.AdvanceStreamChunkedSeqClocked(changesSeq, 1, abort.clock(), advCtx, func(r engine.AdvanceStreamPartial) {
 		// Per-partial budget checkpoint: a panic here escapes
 		// AdvanceStreamChunkedSeq cleanly (engine stays reusable — see
 		// TestAdvanceStream_PanickingSink_NoDeadlockAndEngineReusable)

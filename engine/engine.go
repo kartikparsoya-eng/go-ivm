@@ -6,6 +6,7 @@ package engine
 // pushes don't race with concurrent fetches.
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -1675,7 +1676,7 @@ func (e *Engine) AdvanceStreamChunkedSeq(
 	if chunkSize <= 0 {
 		chunkSize = advanceChunkSize
 	}
-	return e.advanceStreamChunkedSeq(changes, chunkSize, nil, onResult)
+	return e.advanceStreamChunkedSeq(changes, chunkSize, nil, nil, onResult)
 }
 
 // advanceClockCarrier is implemented by sources whose push fan-out runs on
@@ -1686,6 +1687,7 @@ func (e *Engine) AdvanceStreamChunkedSeq(
 // fixture, not on the production path) deliberately does not implement it.
 type advanceClockCarrier interface {
 	SetAdvanceClock(*procclock.Accumulator)
+	SetAdvanceCtx(context.Context)
 }
 
 // AdvanceStreamChunkedSeqClocked is AdvanceStreamChunkedSeq with a
@@ -1695,12 +1697,13 @@ func (e *Engine) AdvanceStreamChunkedSeqClocked(
 	changes iter.Seq2[SnapshotChange, error],
 	chunkSize int,
 	clk *procclock.Accumulator,
+	advCtx context.Context,
 	onResult func(AdvanceStreamPartial),
 ) error {
 	if chunkSize <= 0 {
 		chunkSize = advanceChunkSize
 	}
-	return e.advanceStreamChunkedSeq(changes, chunkSize, clk, onResult)
+	return e.advanceStreamChunkedSeq(changes, chunkSize, clk, advCtx, onResult)
 }
 
 func (e *Engine) advanceStreamChunked(
@@ -1714,13 +1717,14 @@ func (e *Engine) advanceStreamChunked(
 				return
 			}
 		}
-	}, chunkSize, nil, onResult)
+	}, chunkSize, nil, nil, onResult)
 }
 
 func (e *Engine) advanceStreamChunkedSeq(
 	changes iter.Seq2[SnapshotChange, error],
 	chunkSize int,
 	clk *procclock.Accumulator,
+	advCtx context.Context,
 	onResult func(AdvanceStreamPartial),
 ) error {
 	e.mu.Lock()
@@ -1749,6 +1753,24 @@ func (e *Engine) advanceStreamChunkedSeq(
 			for _, src := range sources {
 				if c, ok := src.(advanceClockCarrier); ok {
 					c.SetAdvanceClock(nil)
+				}
+			}
+		}()
+	}
+	// Install the advance's wall-clock budget context on sources so
+	// advance-path SQL queries can be interrupted by the budget deadline
+	// (sqlite3_interrupt via go-sqlite3 context cancellation). Cleared on
+	// ALL exits via defer (same lifecycle as the clock above).
+	if advCtx != nil {
+		for _, src := range sources {
+			if c, ok := src.(advanceClockCarrier); ok {
+				c.SetAdvanceCtx(advCtx)
+			}
+		}
+		defer func() {
+			for _, src := range sources {
+				if c, ok := src.(advanceClockCarrier); ok {
+					c.SetAdvanceCtx(nil)
 				}
 			}
 		}()

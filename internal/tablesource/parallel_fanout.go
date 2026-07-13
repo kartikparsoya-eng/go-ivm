@@ -54,6 +54,7 @@ package tablesource
 // The single-group / knob-off path falls back to the exact serial loop.
 
 import (
+	"context"
 	"os"
 	"strconv"
 	"sync"
@@ -109,6 +110,31 @@ func (s *Source) SetNextConnectGroup(group string) {
 // sidecar registered itself).
 func (s *Source) SetAdvanceClock(clk *procclock.Accumulator) {
 	s.advanceClock.Store(clk)
+}
+
+// SetAdvanceCtx installs (nil: clears) the advance's wall-clock budget
+// context. When set, SQL queries on the advance path use this context
+// instead of s.ctx (the CG lifetime context) so that a query blocking on
+// WAL contention is interrupted by the budget deadline — the go-sqlite3
+// driver calls sqlite3_interrupt() when ctx.Done() fires. Cleared on
+// advance completion (via defer, same as the clock).
+func (s *Source) SetAdvanceCtx(ctx context.Context) {
+	if ctx == nil {
+		s.advanceCtx.Store(nil)
+	} else {
+		s.advanceCtx.Store(&ctx)
+	}
+}
+
+// advanceQueryCtx returns the advance budget context if installed,
+// otherwise s.ctx. Used by advance-path SQL queries (fetchSerial,
+// fetchDuringPushStream) so the budget deadline can interrupt a
+// blocked query.
+func (s *Source) advanceQueryCtx() context.Context {
+	if ctx := s.advanceCtx.Load(); ctx != nil {
+		return *ctx
+	}
+	return s.ctx
 }
 
 // fanOut pushes one source-level change through every connection, in

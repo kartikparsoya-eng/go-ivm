@@ -119,6 +119,15 @@ type Source struct {
 	// atomic.Pointer lets fanOut read it without s.mu).
 	advanceClock atomic.Pointer[procclock.Accumulator]
 
+	// advanceCtx, when non-nil, is a context with the advance's wall-clock
+	// budget deadline. SQL queries on the advance path (fetchSerial,
+	// fetchDuringPushStream) use this instead of s.ctx so that a query
+	// blocking on WAL contention is interrupted by the budget deadline via
+	// sqlite3_interrupt (the go-sqlite3 driver honors context cancellation).
+	// Installed/cleared by the engine alongside advanceClock. nil during
+	// hydrate (falls back to s.ctx, the CG lifetime context).
+	advanceCtx atomic.Pointer[context.Context]
+
 	// Prev-tx state.
 	//
 	// prevConn is the *sql.Conn dedicated to this Source's prev snapshot.
@@ -1607,7 +1616,7 @@ func (s *Source) fetchSerial(req ivm.FetchRequest, conn *connection) []ivm.Node 
 		req.Start,
 		req.MultiConstraints,
 	)
-	ctx := s.ctx
+	ctx := s.advanceQueryCtx()
 	// Reuse a prepared statement for this (conn, SQL) instead of letting
 	// database/sql re-compile via sqlite3_prepare_v2 on every QueryContext
 	// (14.6% of cgo time in the live read-path profile). activeConn is a
@@ -1850,7 +1859,7 @@ func (s *Source) fetchDuringPushStream(req ivm.FetchRequest, conn *connection) i
 		}
 
 		defer s.returnSelectStmt(dbConn, qSQL, stmt)
-		rows, err := stmt.QueryContext(s.ctx, qParams...)
+		rows, err := stmt.QueryContext(s.advanceQueryCtx(), qParams...)
 		if err != nil {
 			panic(fmt.Sprintf("tablesource.Source.Fetch %s: query: %v\nSQL: %s",
 				s.tableName, err, qSQL))
