@@ -137,6 +137,32 @@ func (s *Source) advanceQueryCtx() context.Context {
 	return s.ctx
 }
 
+// SetAdvanceAbortCheck installs (nil: clears) the advance's per-fetch abort
+// checkpoint — the Go port of TS's per-row-fetch abort
+// (#shouldAdvanceYieldMaybeAbortAdvance fires on every row fetched during
+// push processing). The closure panics a typed abort error when the
+// advance's economic/wall budget is exceeded; fetch call sites invoke it via
+// checkAdvanceAbort. Installed/cleared by the engine around each clocked
+// advance, same lifecycle as the clock and budget ctx. Safe to call from
+// parallel fanout goroutines (the sidecar's abort.check is
+// concurrency-safe; a panic is recovered per-goroutine and re-raised on the
+// coordinator, landing in the same typed-recover path as sink-site aborts).
+func (s *Source) SetAdvanceAbortCheck(check func()) {
+	if check == nil {
+		s.advanceAbortCheck.Store(nil)
+	} else {
+		s.advanceAbortCheck.Store(&check)
+	}
+}
+
+// checkAdvanceAbort runs the installed per-fetch abort checkpoint, if any.
+// No-op outside a clocked advance (hydrate, tests).
+func (s *Source) checkAdvanceAbort() {
+	if check := s.advanceAbortCheck.Load(); check != nil {
+		(*check)()
+	}
+}
+
 // fanOut pushes one source-level change through every connection, in
 // parallel across pipeline groups when enabled. Push output rides the
 // engine's Streamer (the terminal sink) — Output.Push is void, so there is

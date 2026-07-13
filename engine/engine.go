@@ -1676,7 +1676,7 @@ func (e *Engine) AdvanceStreamChunkedSeq(
 	if chunkSize <= 0 {
 		chunkSize = advanceChunkSize
 	}
-	return e.advanceStreamChunkedSeq(changes, chunkSize, nil, nil, onResult)
+	return e.advanceStreamChunkedSeq(changes, chunkSize, nil, nil, nil, onResult)
 }
 
 // advanceClockCarrier is implemented by sources whose push fan-out runs on
@@ -1688,22 +1688,33 @@ func (e *Engine) AdvanceStreamChunkedSeq(
 type advanceClockCarrier interface {
 	SetAdvanceClock(*procclock.Accumulator)
 	SetAdvanceCtx(context.Context)
+	SetAdvanceAbortCheck(func())
 }
 
 // AdvanceStreamChunkedSeqClocked is AdvanceStreamChunkedSeq with a
 // processing-clock accumulator threaded down to the sources' parallel
 // push-fanout workers. nil clk ≡ AdvanceStreamChunkedSeq (zero cost).
+//
+// abortCheck, when non-nil, is invoked by the sources from INSIDE their
+// advance-path fetch loops (per fetch call + every scanned-row batch) and
+// panics a typed abort when the advance's economic/wall budget is exceeded.
+// This is the Go port of TS's per-row-fetch abort checkpoint
+// (#shouldAdvanceYieldMaybeAbortAdvance runs on every row fetched during
+// push processing): without it, a push re-fetch that emits nothing — e.g. a
+// chained-FlippedJoin drain — never crosses the per-change or per-partial
+// check sites and can outrun every backstop (the 2026-07-13 advance wedge).
 func (e *Engine) AdvanceStreamChunkedSeqClocked(
 	changes iter.Seq2[SnapshotChange, error],
 	chunkSize int,
 	clk *procclock.Accumulator,
 	advCtx context.Context,
+	abortCheck func(),
 	onResult func(AdvanceStreamPartial),
 ) error {
 	if chunkSize <= 0 {
 		chunkSize = advanceChunkSize
 	}
-	return e.advanceStreamChunkedSeq(changes, chunkSize, clk, advCtx, onResult)
+	return e.advanceStreamChunkedSeq(changes, chunkSize, clk, advCtx, abortCheck, onResult)
 }
 
 func (e *Engine) advanceStreamChunked(
@@ -1717,7 +1728,7 @@ func (e *Engine) advanceStreamChunked(
 				return
 			}
 		}
-	}, chunkSize, nil, nil, onResult)
+	}, chunkSize, nil, nil, nil, onResult)
 }
 
 func (e *Engine) advanceStreamChunkedSeq(
@@ -1725,6 +1736,7 @@ func (e *Engine) advanceStreamChunkedSeq(
 	chunkSize int,
 	clk *procclock.Accumulator,
 	advCtx context.Context,
+	abortCheck func(),
 	onResult func(AdvanceStreamPartial),
 ) error {
 	e.mu.Lock()
@@ -1771,6 +1783,26 @@ func (e *Engine) advanceStreamChunkedSeq(
 			for _, src := range sources {
 				if c, ok := src.(advanceClockCarrier); ok {
 					c.SetAdvanceCtx(nil)
+				}
+			}
+		}()
+	}
+	// Install the per-fetch abort checkpoint on sources so advance-path
+	// fetch loops themselves can abort (TS's per-row-fetch check — see
+	// AdvanceStreamChunkedSeqClocked). Cleared on ALL exits via defer
+	// (same lifecycle as the clock and ctx above). Safe vs hydrate: the
+	// sidecar's per-CG worker serializes advance and hydrate RPCs, so an
+	// installed check is only ever observed by this advance's own fetches.
+	if abortCheck != nil {
+		for _, src := range sources {
+			if c, ok := src.(advanceClockCarrier); ok {
+				c.SetAdvanceAbortCheck(abortCheck)
+			}
+		}
+		defer func() {
+			for _, src := range sources {
+				if c, ok := src.(advanceClockCarrier); ok {
+					c.SetAdvanceAbortCheck(nil)
 				}
 			}
 		}()

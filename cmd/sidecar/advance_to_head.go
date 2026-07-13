@@ -609,6 +609,25 @@ func (s *Server) handleAdvanceToHeadStream(req RPCRequest, streamW streamWriter)
 	// exists, view-syncer.ts:2544, and measures processing laps, not wall).
 	abort := newAdvanceAbort(p.TotalHydrationTimeMs, p.SuppressAbort)
 
+	// Per-fetch abort checkpoint, threaded to the sources' advance-path
+	// fetch loops (engine → SetAdvanceAbortCheck). TS runs its abort check
+	// on EVERY row fetched during push processing; without this a push
+	// re-fetch that emits nothing (e.g. a chained-FlippedJoin drain) never
+	// crosses the per-change or per-partial check sites and outruns both
+	// budgets — the 2026-07-13 advance wedge. Both panics are TYPED
+	// (advanceAbortedError → rpcCodeAdvanceAborted → TS's
+	// 'advancement-timeout' reset), never a plain string (which would
+	// classify 'unclassified' → CG teardown).
+	var fetchAbortCheck func()
+	if abort.armed || budgetOn {
+		fetchAbortCheck = func() {
+			if aerr := abort.check(); aerr != nil {
+				panic(aerr)
+			}
+			checkAdvanceBudget(budgetDeadline, budgetOn, "fetch", cgID)
+		}
+	}
+
 	// First advance ends the cold-start hydrate window; drop the reader pool
 	// before curr rotates off its pinned frame.
 	s.tearDownReaderPool(group)
@@ -797,7 +816,7 @@ func (s *Server) handleAdvanceToHeadStream(req RPCRequest, streamW streamWriter)
 		return rpcError(req.ID, -32000,
 			"advanceToHeadStream: row-plane delivery dead before header")
 	}
-	streamErr := group.eng.AdvanceStreamChunkedSeqClocked(changesSeq, 1, abort.clock(), advCtx, func(r engine.AdvanceStreamPartial) {
+	streamErr := group.eng.AdvanceStreamChunkedSeqClocked(changesSeq, 1, abort.clock(), advCtx, fetchAbortCheck, func(r engine.AdvanceStreamPartial) {
 		// Per-partial budget checkpoint: a panic here escapes
 		// AdvanceStreamChunkedSeq cleanly (engine stays reusable — see
 		// TestAdvanceStream_PanickingSink_NoDeadlockAndEngineReusable)

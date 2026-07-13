@@ -128,6 +128,15 @@ type Source struct {
 	// hydrate (falls back to s.ctx, the CG lifetime context).
 	advanceCtx atomic.Pointer[context.Context]
 
+	// advanceAbortCheck, when non-nil, is the advance's per-fetch abort
+	// checkpoint (TS parity: #shouldAdvanceYieldMaybeAbortAdvance runs on
+	// every row fetched during push processing). Called at the top of every
+	// advance-path fetch and every scanned-row batch; panics a typed abort
+	// (recognized by the sidecar's recover → rpcCodeAdvanceAborted → TS
+	// reset) when the economic or wall budget is exceeded. Installed/cleared
+	// by the engine alongside advanceClock/advanceCtx; nil during hydrate.
+	advanceAbortCheck atomic.Pointer[func()]
+
 	// Prev-tx state.
 	//
 	// prevConn is the *sql.Conn dedicated to this Source's prev snapshot.
@@ -1592,6 +1601,11 @@ func (s *Source) fetchForConn(req ivm.FetchRequest, conn *connection) []ivm.Node
 // cursor is ever held across a consumer yield, so this fetch can never
 // participate in a hold-and-wait cycle.
 func (s *Source) fetchSerial(req ivm.FetchRequest, conn *connection) []ivm.Node {
+	// Per-fetch abort checkpoint (TS parity — see SetAdvanceAbortCheck).
+	// Checked BEFORE taking s.mu: an advance whose budget is already blown
+	// must not queue another query. No-op outside a clocked advance.
+	s.checkAdvanceAbort()
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -1768,6 +1782,11 @@ func (s *Source) fetchSerial(req ivm.FetchRequest, conn *connection) []ivm.Node 
 // a clean terminal frame.
 func (s *Source) fetchDuringPushStream(req ivm.FetchRequest, conn *connection) iter.Seq[ivm.Node] {
 	return func(yield func(ivm.Node) bool) {
+		// Per-fetch abort checkpoint (TS parity — see SetAdvanceAbortCheck).
+		// The eager branch below re-checks via fetchForConn → fetchSerial;
+		// this covers the streaming branch's query. No-op outside a clocked
+		// advance.
+		s.checkAdvanceAbort()
 		// Locked setup, PANIC-SAFE : the splice
 		// plan runs user-value-sensitive code inside the lock —
 		// overlaySplicePlan invokes the effective comparator against
@@ -1887,7 +1906,13 @@ func (s *Source) fetchDuringPushStream(req ivm.FetchRequest, conn *connection) i
 				return
 			}
 		}
+		scanned := 0
 		for rows.Next() {
+			// Per-fetch abort checkpoint every scanned-row batch — same
+			// amortization as scanRows.
+			if scanned++; scanned&1023 == 0 {
+				s.checkAdvanceAbort()
+			}
 			if err := rows.Scan(ptrs...); err != nil {
 				panic(fmt.Sprintf("tablesource.Source.Fetch %s: scan: %v",
 					s.tableName, err))
@@ -1967,7 +1992,14 @@ func (s *Source) scanRows(
 	for i := range raw {
 		ptrs[i] = &raw[i]
 	}
+	scanned := 0
 	for rows.Next() {
+		// Per-fetch abort checkpoint every scanned-row batch: bounds how
+		// far a single huge result scan can outrun the advance budget
+		// (TS checks on every fetched row; 1024 amortizes the clock read).
+		if scanned++; scanned&1023 == 0 {
+			s.checkAdvanceAbort()
+		}
 		if err := rows.Scan(ptrs...); err != nil {
 			panic(fmt.Sprintf("tablesource.Source.Fetch %s: scan: %v",
 				s.tableName, err))
