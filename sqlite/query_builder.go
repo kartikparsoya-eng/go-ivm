@@ -456,6 +456,25 @@ func gatherStartConstraints(
 						op = "<"
 					}
 				}
+				// NULL cursor value short-circuit: when the cursor's value for
+				// an Optional (nullable) column is nil (SQL NULL), the
+				// nullableAwareRangeComparison form "(? IS NULL OR col > ?)"
+				// collapses to TRUE (NULL IS NULL → TRUE), making the keyset
+				// exclude nothing — including the cursor row itself. This
+				// causes an infinite loop in FlippedJoin's chunked fetch
+				// (fetchChunkedSequential re-fetches the same head forever).
+				// SQLite sorts NULL first in ascending order, so:
+				//   - "strictly after NULL" (>) = all non-NULL rows → col IS NOT NULL
+				//   - "strictly before NULL" (<) = no rows (NULL is the minimum) → FALSE
+				// Neither form needs a placeholder.
+				if constraintValue == nil {
+					if op == ">" {
+						andParts = append(andParts, quoteIdent(iField)+" IS NOT NULL")
+					} else {
+						andParts = append(andParts, "FALSE")
+					}
+					goto nextOrClause
+				}
 				rangeSQL := nullableAwareRangeComparison(iField, op, colSchema)
 				andParts = append(andParts, rangeSQL)
 				params = append(params, constraintValue)
@@ -479,6 +498,7 @@ func gatherStartConstraints(
 				params = append(params, value)
 			}
 		}
+	nextOrClause:
 		orClauses = append(orClauses, "("+strings.Join(andParts, " AND ")+")")
 	}
 

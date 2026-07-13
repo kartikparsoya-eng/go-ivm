@@ -3,6 +3,7 @@ package ivm
 import (
 	"container/heap"
 	"encoding/json"
+	"fmt"
 	"iter"
 	"slices"
 	"sort"
@@ -308,6 +309,13 @@ func (fj *FlippedJoin) fetchChunkedSequential(
 			}
 			chunks[best.chunk].start = &Start{Row: best.node.Row, Basis: BasisAfter}
 			if head, ok := fj.fetchChunkHead(parentReq, incoming, chunks[best.chunk]); ok {
+				if compareRows(head.Row, best.node.Row) == 0 {
+					panic(fmt.Sprintf(
+						"FlippedJoin.fetchChunkedSequential: non-advancing cursor - "+
+							"chunk head did not advance past the previous row (table=%s). "+
+							"This indicates a keyset SQL bug; resetting to prevent infinite loop.",
+						fj.schema.TableName))
+				}
 				heap.Push(heads, flippedJoinChunkHead{chunk: best.chunk, node: head})
 			}
 		}

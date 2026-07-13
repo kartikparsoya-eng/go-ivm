@@ -33,21 +33,25 @@ func TestBuildSelectQuery_EmptyStartCursorDoesNotEmitParenParen(t *testing.T) {
 	}
 }
 
-// User's-audit item "present-but-null cursor over-include", RESOLVED AS
-// TS-MIRRORED (no behavior change): a cursor value that is PRESENT but NULL
-// on an OPTIONAL order column generates the nullable-aware form
-// "(? IS NULL OR col > ?)" — with a NULL bind, "? IS NULL" is TRUE, so the
-// clause admits EVERY row including ones whose col IS NULL. The push-path
-// comparator (ivm.CompareWithPartialBound: nil sorts first) admits only
-// non-null rows for the same bound — an internal hydrate-vs-push
-// over-include. Verified against TS before touching anything: TS emits the
-// IDENTICAL SQL shape (zqlite/query-builder.ts nullableAwareRangeComparison
-// binds the null cursor value into the same "(value IS NULL OR …)" form)
-// while ITS push comparator (zql skip.ts #comparator, nulls-first) has the
-// same asymmetry. Under the faithful-to-TS rule the divergence must be
-// PRESERVED, not fixed — this test pins the SQL shape so a future
-// "correction" here can't silently split Go from TS under shadow-compare.
-func TestBuildSelectQuery_PresentNullCursorMirrorsTS(t *testing.T) {
+// A cursor value that is PRESENT but NULL on an OPTIONAL order column
+// previously generated "(? IS NULL OR col > ?)" with a NULL bind, which
+// collapsed to TRUE (NULL IS NULL → TRUE) — admitting every row including
+// the cursor row itself. This caused an infinite loop in FlippedJoin's
+// chunked fetch (fetchChunkedSequential re-fetched the same head forever).
+// The fix short-circuits: "strictly after NULL" (> in ascending) emits
+// "col IS NOT NULL" (SQLite sorts NULL first, so everything after NULL =
+// all non-NULL rows). This intentionally diverges from TS, which has the
+// same latent bug. The divergence is safe: the push-path comparator
+// (CompareWithPartialBound, nil sorts first) already treats "after NULL"
+// as "all non-NULL" — the SQL now matches that semantics instead of
+// contradicting it.
+//
+// Divergence from TS: at a NULL-valued cursor boundary on an Optional
+// sort column, TS over-includes (its identical SQL shape collapses to
+// TRUE) while Go now returns the SQL-correct set (col IS NOT NULL).
+// Shadow-compare / G8 oracle triage should classify this as
+// go=correct, ts=over-include, not a Go bug.
+func TestBuildSelectQuery_PresentNullCursorDivergesFromTS(t *testing.T) {
 	cols := map[string]ColumnSchema{
 		"score": {Type: "number", Optional: true},
 		"id":    {Type: "string"},
@@ -57,19 +61,13 @@ func TestBuildSelectQuery_PresentNullCursorMirrorsTS(t *testing.T) {
 
 	q := BuildSelectQuery("t", cols, nil, nil, order, false, start, nil)
 
-	// TS shape: the optional ">" form with the cursor value bound twice.
-	if !strings.Contains(q.SQL, `(? IS NULL OR "score" > ?)`) {
-		t.Fatalf("optional-column cursor form missing from %q (TS emits it verbatim)", q.SQL)
+	// Fixed: NULL cursor on optional ">" column emits "col IS NOT NULL"
+	// instead of the old "(? IS NULL OR col > ?)" which collapsed to TRUE.
+	if !strings.Contains(q.SQL, `"score" IS NOT NULL`) {
+		t.Fatalf("expected IS NOT NULL for NULL cursor on optional >, got %q", q.SQL)
 	}
-	// The null cursor value must actually be BOUND (twice for the ">" form),
-	// exactly as TS binds `value` into both placeholders.
-	nils := 0
-	for _, p := range q.Params {
-		if p == nil {
-			nils++
-		}
-	}
-	if nils < 2 {
-		t.Fatalf("params %v: want the null cursor value bound into both placeholders", q.Params)
+	// The old broken form "(? IS NULL OR score > ?)" must NOT appear.
+	if strings.Contains(q.SQL, `? IS NULL OR "score" > ?`) {
+		t.Fatalf("old broken nullable-aware form still present in %q", q.SQL)
 	}
 }
