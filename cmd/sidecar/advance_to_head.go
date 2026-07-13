@@ -667,6 +667,12 @@ func (s *Server) handleAdvanceToHeadStream(req RPCRequest, streamW streamWriter)
 			if aerr := abort.check(); aerr != nil {
 				return aerr
 			}
+			// Wall-clock budget check per changelog entry: a pathologically
+			// large diff (e.g. the mutation matrix's 220 mutations → thousands
+			// of changelog entries) can spend minutes in GetRow/GetRows SQL
+			// queries without ever reaching the between-phases or per-partial
+			// checks. This ensures the 60s budget fires inside the loop.
+			checkAdvanceBudget(budgetDeadline, budgetOn, "collect", cgID)
 			if !yield(engine.SnapshotChange{
 				Table:      c.Table,
 				PrevValues: c.PrevValues,
