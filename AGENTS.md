@@ -95,6 +95,8 @@ pnpm --filter zero-cache run check-types
 | `GO_IVM_DELIVER_TIMEOUT_SEC` | 55 | Row-plane park deadline (M5 fix: was 150s) |
 | `GO_IVM_WEDGE_WATCHDOG_SEC` | 90 | CG handler wedge detection threshold |
 | `GO_IVM_CHUNK_SOFT_BYTES` | 8388608 | Soft byte budget per streamed partial frame |
+| `GO_IVM_REAPER_IDLE_SEC` | 900 (15 min) | Idle CG reaping timeout |
+| `GO_IVM_REAPER_INTERVAL_SEC` | 300 (5 min) | Reaper scan interval |
 
 ### TS side (set in zero-config.ts / Dockerfile.go-ivm)
 

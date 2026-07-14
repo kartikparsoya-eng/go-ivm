@@ -1237,9 +1237,10 @@ func (s *Server) getGroup(id string, createIfMissing bool) *ClientGroup {
 }
 
 // groupIdleTimeout — groups untouched for this long are eligible for
-// reaping. Picked to be longer than typical client churn (>30 min) but
-// short enough to bound memory after a wave of disconnects.
-const groupIdleTimeout = 30 * time.Minute
+// reaping. Covers typical client churn (network blips, tab switches,
+// mobile backgrounding) while bounding idle memory (~10-20MB per CG in
+// conns + page cache). Tunable via GO_IVM_REAPER_IDLE_SEC.
+const groupIdleTimeout = 15 * time.Minute
 
 // reaperInterval is how often runReaper scans for idle groups. Env-tunable
 // (GO_IVM_REAPER_INTERVAL_SEC) so the memory-leak soak can force fast
