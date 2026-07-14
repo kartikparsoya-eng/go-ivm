@@ -40,13 +40,7 @@ func newFixture(t *testing.T) *fixture {
 	}
 	t.Cleanup(func() { _ = db.Close() })
 
-	// Register the DSN so the snapshotter's raw driver conn (which bypasses
-	// database/sql) can open with the same DSN. The goivm driver must also
-	// be registered — rawOpenSnapshotConn does this, but RegisterDSN must
-	// be called for DBs opened outside tablesource.Open/OpenWritable.
-	// Note: with the Raw() approach, the raw conn is extracted from the
-	// *sql.Conn, so no DSN registration is needed for the snapshotter itself.
-	// But the goivm driver must still be registered for other raw conn paths.
+	// The goivm driver must be registered for the Unicode lower() hook.
 	if _, err := tablesource.RegisterGoivmDriver(); err != nil {
 		t.Fatalf("register goivm driver: %v", err)
 	}

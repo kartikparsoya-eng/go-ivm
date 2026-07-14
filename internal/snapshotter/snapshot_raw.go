@@ -3,14 +3,12 @@ package snapshotter
 import (
 	"context"
 	"database/sql"
-	"database/sql/driver"
-	"fmt"
 	"io"
 )
 
-// snapshotStmt is a cached prepared statement on the snapshot's raw conn.
+// snapshotStmt is a cached prepared statement on the snapshot's *sql.Conn.
 type snapshotStmt struct {
-	st driver.Stmt
+	st *sql.Stmt
 }
 
 // stmtCacheCap bounds the per-snapshot prepared-statement cache. Each
@@ -20,75 +18,19 @@ type snapshotStmt struct {
 // upper bound is ~160 entries.
 const stmtCacheCap = 512
 
-// initRawConn extracts the underlying driver.Conn from the *sql.Conn via
-// Raw(). This gives us direct access to the mattn driver's conn (bypassing
-// database/sql.withLock) WITHOUT opening a second connection — critical
-// because a second BEGIN CONCURRENT on a separate conn would create a
-// second WAL2 snapshot, blocking the write-worker's commits under load
-// (SQLITE_BUSY_SNAPSHOT).
-func (s *Snapshot) initRawConn() error {
-	return s.conn.Raw(func(raw any) error {
-		dc, ok := raw.(driver.Conn)
-		if !ok {
-			return fmt.Errorf("snapshotter: underlying conn is not a driver.Conn (got %T)", raw)
-		}
-		s.rawConn = dc
-		return nil
-	})
-}
-
-// rawExec runs a no-result statement (BEGIN/ROLLBACK) on the raw conn.
-func (s *Snapshot) rawExec(ctx context.Context, query string) error {
-	ec, ok := s.rawConn.(driver.ExecerContext)
-	if !ok {
-		return fmt.Errorf("snapshotter: raw conn does not implement ExecerContext")
-	}
-	_, err := ec.ExecContext(ctx, query, nil)
-	return err
-}
-
-// rawStateVersion reads the replication state version on the raw conn.
-func (s *Snapshot) rawStateVersion(ctx context.Context) (string, error) {
-	qc, ok := s.rawConn.(driver.QueryerContext)
-	if !ok {
-		return "", fmt.Errorf("snapshotter: raw conn does not implement QueryerContext")
-	}
-	rows, err := qc.QueryContext(ctx, `SELECT stateVersion FROM "_zero.replicationState"`, nil)
-	if err != nil {
-		return "", err
-	}
-	defer rows.Close()
-	dest := make([]driver.Value, 1)
-	if err := rows.Next(dest); err != nil {
-		return "", fmt.Errorf("snapshotter: stateVersion row: %w", err)
-	}
-	switch v := dest[0].(type) {
-	case string:
-		return v, nil
-	case []byte:
-		return string(v), nil
-	default:
-		return "", fmt.Errorf("snapshotter: stateVersion has unexpected type %T", dest[0])
-	}
-}
-
 // getStmt returns a prepared statement from the cache, preparing a fresh
 // one on first use. The advance path is serialized (e.mu + group.mu), so
 // only one goroutine accesses the cache at a time — no locking needed.
 // Cursors are fully consumed before the next query (no nesting), so a
 // simple get-or-prepare without checkout/remove is safe.
-func (s *Snapshot) getStmt(ctx context.Context, query string) (driver.Stmt, error) {
+func (s *Snapshot) getStmt(ctx context.Context, query string) (*sql.Stmt, error) {
 	if s.stmts == nil {
 		s.stmts = make(map[string]*snapshotStmt, 64)
 	}
 	if e, ok := s.stmts[query]; ok {
 		return e.st, nil
 	}
-	pc, ok := s.rawConn.(driver.ConnPrepareContext)
-	if !ok {
-		return nil, fmt.Errorf("snapshotter: raw conn does not implement ConnPrepareContext")
-	}
-	st, err := pc.PrepareContext(ctx, query)
+	st, err := s.conn.PrepareContext(ctx, query)
 	if err != nil {
 		return nil, err
 	}
@@ -127,87 +69,91 @@ func (s *Snapshot) finalizeStmts() {
 	}
 }
 
-// rawQueryRow executes a query returning a single row via the raw conn's
-// stmt cache. Returns (rowMap, found, error). A nil rowMap with found=false
-// means no matching row (io.EOF from the driver).
-func (s *Snapshot) rawQueryRow(ctx context.Context, query string, args []driver.Value, colNames []string) (map[string]any, bool, error) {
+// cachedQueryRow executes a query returning a single row via the stmt cache.
+// Returns (rowMap, found, error). A nil rowMap with found=false means no
+// matching row (sql.ErrNoRows).
+func (s *Snapshot) cachedQueryRow(ctx context.Context, query string, args []any, colNames []string) (map[string]any, bool, error) {
 	st, err := s.getStmt(ctx, query)
 	if err != nil {
 		return nil, false, err
 	}
-	rows, err := st.Query(args)
-	if err != nil {
-		return nil, false, err
-	}
-	defer rows.Close()
-	dest := make([]driver.Value, len(colNames))
-	err = rows.Next(dest)
-	if err == io.EOF {
+	row := st.QueryRowContext(ctx, args...)
+	raw, err := scanRawRow(row, colNames)
+	if err == sql.ErrNoRows {
 		return nil, false, nil
 	}
 	if err != nil {
 		return nil, false, err
 	}
-	raw := make(map[string]any, len(colNames))
-	for i, c := range colNames {
-		raw[c] = dest[i]
-	}
 	return raw, true, nil
 }
 
-// rawQueryRows executes a query returning multiple rows via the raw conn's
-// stmt cache. Returns a slice of row maps.
-func (s *Snapshot) rawQueryRows(ctx context.Context, query string, args []driver.Value, colNames []string) ([]map[string]any, error) {
+// cachedQueryRows executes a query returning multiple rows via the stmt cache.
+func (s *Snapshot) cachedQueryRows(ctx context.Context, query string, args []any, colNames []string) ([]map[string]any, error) {
 	st, err := s.getStmt(ctx, query)
 	if err != nil {
 		return nil, err
 	}
-	rows, err := st.Query(args)
+	rows, err := st.QueryContext(ctx, args...)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	var out []map[string]any
-	dest := make([]driver.Value, len(colNames))
-	for {
-		err = rows.Next(dest)
-		if err == io.EOF {
-			break
-		}
+	for rows.Next() {
+		raw, err := scanRawRow(rows, colNames)
 		if err != nil {
 			return nil, err
 		}
-		raw := make(map[string]any, len(colNames))
-		for i, c := range colNames {
-			raw[c] = dest[i]
-		}
 		out = append(out, raw)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
 	}
 	return out, nil
 }
 
-// rawQueryInt executes a query returning a single integer value via the
-// stmt cache.
-func (s *Snapshot) rawQueryInt(ctx context.Context, query string, args []driver.Value) (int, error) {
+// cachedQueryInt executes a query returning a single integer via the stmt cache.
+func (s *Snapshot) cachedQueryInt(ctx context.Context, query string, args ...any) (int, error) {
 	st, err := s.getStmt(ctx, query)
 	if err != nil {
 		return 0, err
 	}
-	rows, err := st.Query(args)
+	var count int
+	err = st.QueryRowContext(ctx, args...).Scan(&count)
 	if err != nil {
 		return 0, err
 	}
-	defer rows.Close()
-	dest := make([]driver.Value, 1)
-	if err := rows.Next(dest); err != nil {
-		return 0, fmt.Errorf("snapshotter: count row: %w", err)
-	}
-	switch v := dest[0].(type) {
-	case int64:
-		return int(v), nil
-	case float64:
-		return int(v), nil
-	default:
-		return 0, fmt.Errorf("snapshotter: count has unexpected type %T", dest[0])
-	}
+	return count, nil
 }
+
+// rowScanner abstracts *sql.Row and *sql.Rows for scanRawRow.
+type rowScanner interface {
+	Scan(dest ...any) error
+}
+
+// scanRawRow scans the current row into a name→value map using Go-native
+// SQLite scan types (string/int64/float64/[]byte/nil). selectColList wraps
+// every column in the unary-+ no-op, which strips the declared type and so
+// disables mattn/go-sqlite3's decltype conversions — a nullable temporal
+// column arrives as its raw int64 epoch-ms (never time.Time), exactly what
+// TS's better-sqlite3 yields. coerceRow → sqlite.FromSQLiteType applies the
+// logical-type coercion at emit; FromSQLiteType panics if a time.Time ever
+// reaches it (a SELECT site missing the wrap).
+func scanRawRow(sc rowScanner, cols []string) (map[string]any, error) {
+	dest := make([]any, len(cols))
+	ptrs := make([]any, len(cols))
+	for i := range dest {
+		ptrs[i] = &dest[i]
+	}
+	if err := sc.Scan(ptrs...); err != nil {
+		return nil, err
+	}
+	raw := make(map[string]any, len(cols))
+	for i, c := range cols {
+		raw[c] = dest[i]
+	}
+	return raw, nil
+}
+
+var _ = io.EOF
