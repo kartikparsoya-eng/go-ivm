@@ -2,7 +2,7 @@ package snapshotter
 
 import (
 	"context"
-	"database/sql"
+	"database/sql/driver"
 	"fmt"
 	"strings"
 )
@@ -19,17 +19,12 @@ type changeLogEntry struct {
 }
 
 // NumChangesSince counts change-log entries with stateVersion > prevVersion.
-// Mirrors numChangesSince() (318-324).
+// Mirrors numChangesSince() (318-324). Uses the raw conn's stmt cache.
 func (s *Snapshot) NumChangesSince(prevVersion string) (int, error) {
 	ctx := context.Background()
-	var count int
-	err := s.conn.QueryRowContext(ctx,
+	return s.rawQueryInt(ctx,
 		`SELECT COUNT(*) FROM "_zero.changeLog2" WHERE stateVersion > ?`,
-		prevVersion).Scan(&count)
-	if err != nil {
-		return 0, fmt.Errorf("snapshotter: numChangesSince: %w", err)
-	}
-	return count, nil
+		[]driver.Value{prevVersion})
 }
 
 // ChangesSince returns the change-log entries in (prevVersion, head], ordered
@@ -44,27 +39,36 @@ func (s *Snapshot) NumChangesSince(prevVersion string) (int, error) {
 // number of change-log entries (each a few hundred bytes), not by row data.
 // The change log holds at most one entry per row (UNIQUE(table,rowKey)), so the
 // buffer is bounded by the catch-up size exactly as TS's cursor is.
+//
+// With the raw conn, GetRow/GetRows use a separate conn from ChangesSince,
+// so a streaming cursor would be possible — but the buffer is small and the
+// current contract is well-tested, so we keep it.
 func (s *Snapshot) ChangesSince(prevVersion string) ([]changeLogEntry, error) {
 	ctx := context.Background()
-	rows, err := s.conn.QueryContext(ctx,
+	colNames := []string{"stateVersion", "table", "rowKey", "op"}
+	rows, err := s.rawQueryRows(ctx,
 		`SELECT "stateVersion", "table", "rowKey", "op" FROM "_zero.changeLog2"
 		   WHERE "stateVersion" > ? ORDER BY "stateVersion" ASC, "pos" ASC`,
-		prevVersion)
+		[]driver.Value{prevVersion}, colNames)
 	if err != nil {
 		return nil, fmt.Errorf("snapshotter: changesSince: %w", err)
 	}
-	defer rows.Close()
-
-	var out []changeLogEntry
-	for rows.Next() {
+	out := make([]changeLogEntry, 0, len(rows))
+	for _, r := range rows {
 		var e changeLogEntry
-		if err := rows.Scan(&e.stateVersion, &e.table, &e.rowKey, &e.op); err != nil {
-			return nil, fmt.Errorf("snapshotter: changesSince scan: %w", err)
+		if v, ok := r["stateVersion"]; ok {
+			e.stateVersion, _ = v.(string)
+		}
+		if v, ok := r["table"]; ok {
+			e.table, _ = v.(string)
+		}
+		if v, ok := r["rowKey"]; ok {
+			e.rowKey, _ = v.(string)
+		}
+		if v, ok := r["op"]; ok {
+			e.op, _ = v.(string)
 		}
 		out = append(out, e)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("snapshotter: changesSince rows: %w", err)
 	}
 	return out, nil
 }
@@ -76,10 +80,13 @@ func (s *Snapshot) ChangesSince(prevVersion string) ([]changeLogEntry, error) {
 // NOT yet coerced via FromSQLiteType. The Diff runs its version + permissions
 // checks on raw values (matching TS, which reads them off the better-sqlite3
 // row before fromSQLiteTypes) and coerces only at emit time.
+//
+// Uses the raw conn's prepared-statement cache (eliminates
+// sqlite3_prepare_v2 overhead) and bypasses database/sql.withLock.
 func (s *Snapshot) GetRow(spec *TableSpec, rowKey map[string]any) (map[string]any, bool, error) {
 	keyCols := sortedKeys(rowKey)
 	conds := make([]string, len(keyCols))
-	binds := make([]any, len(keyCols))
+	binds := make([]driver.Value, len(keyCols))
 	for i, c := range keyCols {
 		conds[i] = quoteIdent(c) + "=?"
 		binds[i] = rowKey[c]
@@ -88,15 +95,12 @@ func (s *Snapshot) GetRow(spec *TableSpec, rowKey map[string]any) (map[string]an
 		" FROM " + quoteIdent(spec.Name) +
 		" WHERE " + strings.Join(conds, " AND ")
 
-	row := s.conn.QueryRowContext(context.Background(), q, binds...)
-	raw, err := scanRawRow(row, spec.cols())
-	if err == sql.ErrNoRows {
-		return nil, false, nil
-	}
+	colNames := spec.cols()
+	raw, found, err := s.rawQueryRow(context.Background(), q, binds, colNames)
 	if err != nil {
 		return nil, false, fmt.Errorf("snapshotter: getRow %s: %w", spec.Name, err)
 	}
-	return raw, true, nil
+	return raw, found, nil
 }
 
 // GetRows reads all rows that conflict on ANY unique key with the given row —
@@ -105,6 +109,8 @@ func (s *Snapshot) GetRow(spec *TableSpec, rowKey map[string]any) (map[string]an
 // Unique keys with any NULL/absent column are filtered out: NULL can't violate
 // uniqueness (NULL != NULL in SQL) AND SQLite's MULTI-INDEX-OR optimization
 // collapses to a full table scan when any OR branch binds NULL.
+//
+// Uses the raw conn's prepared-statement cache and bypasses database/sql.
 func (s *Snapshot) GetRows(spec *TableSpec, uniqueKeys [][]string, row map[string]any) ([]map[string]any, error) {
 	var validKeys [][]string
 	for _, key := range uniqueKeys {
@@ -124,7 +130,7 @@ func (s *Snapshot) GetRows(spec *TableSpec, uniqueKeys [][]string, row map[strin
 	}
 
 	orConds := make([]string, len(validKeys))
-	var binds []any
+	var binds []driver.Value
 	for i, key := range validKeys {
 		andConds := make([]string, len(key))
 		for j, c := range key {
@@ -137,52 +143,10 @@ func (s *Snapshot) GetRows(spec *TableSpec, uniqueKeys [][]string, row map[strin
 		" FROM " + quoteIdent(spec.Name) +
 		" WHERE " + strings.Join(orConds, " OR ")
 
-	rows, err := s.conn.QueryContext(context.Background(), q, binds...)
+	colNames := spec.cols()
+	out, err := s.rawQueryRows(context.Background(), q, binds, colNames)
 	if err != nil {
 		return nil, fmt.Errorf("snapshotter: getRows %s: %w", spec.Name, err)
 	}
-	defer rows.Close()
-
-	cols := spec.cols()
-	var out []map[string]any
-	for rows.Next() {
-		raw, err := scanRawRow(rows, cols)
-		if err != nil {
-			return nil, fmt.Errorf("snapshotter: getRows %s scan: %w", spec.Name, err)
-		}
-		out = append(out, raw)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("snapshotter: getRows %s rows: %w", spec.Name, err)
-	}
 	return out, nil
-}
-
-// rowScanner abstracts *sql.Row and *sql.Rows for scanRawRow.
-type rowScanner interface {
-	Scan(dest ...any) error
-}
-
-// scanRawRow scans the current row into a name→value map using Go-native
-// SQLite scan types (string/int64/float64/[]byte/nil). selectColList wraps
-// every column in the unary-+ no-op, which strips the declared type and so
-// disables mattn/go-sqlite3's decltype conversions — a nullable temporal
-// column arrives as its raw int64 epoch-ms (never time.Time), exactly what
-// TS's better-sqlite3 yields. coerceRow → sqlite.FromSQLiteType applies the
-// logical-type coercion at emit; FromSQLiteType panics if a time.Time ever
-// reaches it (a SELECT site missing the wrap).
-func scanRawRow(sc rowScanner, cols []string) (map[string]any, error) {
-	dest := make([]any, len(cols))
-	ptrs := make([]any, len(cols))
-	for i := range dest {
-		ptrs[i] = &dest[i]
-	}
-	if err := sc.Scan(ptrs...); err != nil {
-		return nil, err
-	}
-	raw := make(map[string]any, len(cols))
-	for i, c := range cols {
-		raw[c] = dest[i]
-	}
-	return raw, nil
 }

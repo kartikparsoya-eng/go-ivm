@@ -8,6 +8,7 @@ import (
 
 	_ "github.com/mattn/go-sqlite3"
 
+	"github.com/kartikparsoya-eng/go-ivm/internal/tablesource"
 	"github.com/kartikparsoya-eng/go-ivm/ivm"
 	"github.com/kartikparsoya-eng/go-ivm/sqlite"
 )
@@ -38,6 +39,15 @@ func newFixture(t *testing.T) *fixture {
 		t.Fatalf("open: %v", err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
+
+	// Register the DSN so the snapshotter's raw driver conn (which bypasses
+	// database/sql) can open with the same DSN. The goivm driver must also
+	// be registered — rawOpenSnapshotConn does this, but RegisterDSN must
+	// be called for DBs opened outside tablesource.Open/OpenWritable.
+	if _, err := tablesource.RegisterGoivmDriver(); err != nil {
+		t.Fatalf("register goivm driver: %v", err)
+	}
+	tablesource.RegisterDSN(db, dsn)
 
 	f := &fixture{t: t, db: db}
 

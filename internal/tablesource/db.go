@@ -72,11 +72,32 @@ var registerGoivmDriver = sync.OnceValues(func() (string, error) {
 	return goivmDriverName, nil
 })
 
+// RegisterGoivmDriver ensures the goivm driver is registered and returns
+// its driver name. Exported for the snapshotter package (which opens raw
+// driver conns and needs the driver registered first).
+func RegisterGoivmDriver() (string, error) {
+	return registerGoivmDriver()
+}
+
 // readPoolDSNs maps each pool opened by Open/OpenWritable to the DSN it was
 // opened with, so rawOpenReaderConn can mint raw driver conns with the exact
 // same per-conn pragmas + ConnectHook. Keyed by the *sql.DB pointer (like
 // probedTables): entries are a string each, bounded by pool count.
 var readPoolDSNs sync.Map // *sql.DB → string (DSN)
+
+// RawOpenReaderConn is the exported form of rawOpenReaderConn for use by
+// the snapshotter package (which needs raw driver conns for the advance
+// read path — same bypass rationale as the reader pool).
+func RawOpenReaderConn(db *sql.DB) (driver.Conn, error) {
+	return rawOpenReaderConn(db)
+}
+
+// RegisterDSN registers a DSN for a *sql.DB so that RawOpenReaderConn can
+// open raw driver conns against it. Used by tests that open their DB via
+// sql.Open directly (instead of tablesource.Open/OpenWritable).
+func RegisterDSN(db *sql.DB, dsn string) {
+	readPoolDSNs.Store(db, dsn)
+}
 
 // rawOpenReaderConn opens ONE raw driver connection configured identically
 // to db's pooled connections (same DSN → same pragmas + lower() hook), but

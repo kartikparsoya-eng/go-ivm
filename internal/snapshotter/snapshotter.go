@@ -28,6 +28,7 @@ package snapshotter
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"fmt"
 	"sync"
 	"time"
@@ -245,9 +246,18 @@ func (s *Snapshotter) newSnapshot() (*Snapshot, error) {
 	if err != nil {
 		return nil, fmt.Errorf("snapshotter: acquire conn (30s timeout): %w", err)
 	}
-	snap := &Snapshot{conn: conn}
+	// Open a raw driver conn for reads (bypasses database/sql.withLock).
+	// Same DSN as the writable pool — carries the same pragmas + lower() hook.
+	// Does not count against MaxOpenConns (raw driver open, not database/sql).
+	rawConn, err := rawOpenSnapshotConn(s.db)
+	if err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("snapshotter: acquire raw conn: %w", err)
+	}
+	snap := &Snapshot{conn: conn, rawConn: rawConn}
 	if err := s.beginAndPin(snap); err != nil {
 		_ = conn.Close()
+		_ = rawConn.Close()
 		return nil, err
 	}
 	return snap, nil
@@ -265,19 +275,19 @@ func (s *Snapshotter) beginAndPin(snap *Snapshot) error {
 	if s.beginStmt == "" {
 		// First-ever tx: try CONCURRENT (rocicorp's wal2 patch), fall back
 		// to plain BEGIN (mattn-bundled test builds lack the patch).
-		if _, err := snap.conn.ExecContext(ctx, "BEGIN CONCURRENT"); err == nil {
+		if err := snap.rawExec(ctx, "BEGIN CONCURRENT"); err == nil {
 			s.beginStmt = "BEGIN CONCURRENT"
-		} else if _, err2 := snap.conn.ExecContext(ctx, "BEGIN"); err2 == nil {
+		} else if err2 := snap.rawExec(ctx, "BEGIN"); err2 == nil {
 			s.beginStmt = "BEGIN"
 		} else {
 			return fmt.Errorf("snapshotter: BEGIN: %w", err2)
 		}
 	} else {
-		if _, err := snap.conn.ExecContext(ctx, s.beginStmt); err != nil {
+		if err := snap.rawExec(ctx, s.beginStmt); err != nil {
 			return fmt.Errorf("snapshotter: %s: %w", s.beginStmt, err)
 		}
 	}
-	version, err := selectStateVersion(ctx, snap.conn)
+	version, err := snap.rawStateVersion(ctx)
 	if err != nil {
 		return err
 	}
@@ -286,10 +296,22 @@ func (s *Snapshotter) beginAndPin(snap *Snapshot) error {
 }
 
 // Snapshot is a single pinned frame plus its stateVersion. Mirrors the TS
-// Snapshot class (275-396). It owns a dedicated *sql.Conn holding an open
-// BEGIN [CONCURRENT] read tx for the snapshot's lifetime.
+// Snapshot class (275-396). It owns two connections:
+//
+//   - conn: a *sql.Conn (from database/sql) holding an open BEGIN [CONCURRENT]
+//     read tx, used for source binding (BindTableSourcesToConn) so sources
+//     can writeChange and fetchSerial through database/sql.
+//   - rawConn: a raw driver.Conn (bypassing database/sql) used for all
+//     snapshot reads (GetRow, GetRows, NumChangesSince, ChangesSince) and
+//     tx control (BEGIN, ROLLBACK, stateVersion). The raw conn eliminates
+//     database/sql.withLock overhead (19.9% of advance CPU in pprof) and
+//     sqlite3_prepare_v2 overhead (10%) via a per-snapshot stmt cache.
+//     This matches TS's behavior: better-sqlite3 has no mutex and caches
+//     prepared statements natively.
 type Snapshot struct {
 	conn    *sql.Conn
+	rawConn driver.Conn
+	stmts   map[string]*snapshotStmt
 	version string
 }
 
@@ -307,13 +329,13 @@ func (s *Snapshot) Conn() *sql.Conn { return s.conn }
 // place (same conn, new version) and returned to the caller as the next curr.
 func (s *Snapshot) resetToHead(beginStmt string) error {
 	ctx := context.Background()
-	if _, err := s.conn.ExecContext(ctx, "ROLLBACK"); err != nil {
+	if err := s.rawExec(ctx, "ROLLBACK"); err != nil {
 		return fmt.Errorf("snapshotter: resetToHead ROLLBACK: %w", err)
 	}
-	if _, err := s.conn.ExecContext(ctx, beginStmt); err != nil {
+	if err := s.rawExec(ctx, beginStmt); err != nil {
 		return fmt.Errorf("snapshotter: resetToHead %s: %w", beginStmt, err)
 	}
-	version, err := selectStateVersion(ctx, s.conn)
+	version, err := s.rawStateVersion(ctx)
 	if err != nil {
 		return err
 	}
@@ -324,13 +346,19 @@ func (s *Snapshot) resetToHead(beginStmt string) error {
 // close rolls back the open tx and releases the connection. Idempotent:
 // safe to call once per Snapshot.
 func (s *Snapshot) close() {
-	if s.conn == nil {
-		return
+	if s.rawConn != nil {
+		ctx := context.Background()
+		_ = s.rawExec(ctx, "ROLLBACK")
+		s.finalizeStmts()
+		_ = s.rawConn.Close()
+		s.rawConn = nil
 	}
-	ctx := context.Background()
-	_, _ = s.conn.ExecContext(ctx, "ROLLBACK")
-	_ = s.conn.Close()
-	s.conn = nil
+	if s.conn != nil {
+		ctx := context.Background()
+		_, _ = s.conn.ExecContext(ctx, "ROLLBACK")
+		_ = s.conn.Close()
+		s.conn = nil
+	}
 }
 
 // selectStateVersion reads `_zero.replicationState.stateVersion` — TS's
