@@ -71,8 +71,8 @@ func TestAdvanceParallelismFromEnv(t *testing.T) {
 
 	t.Run("default", func(t *testing.T) {
 		clearEnv(t)
-		if got := advanceParallelismFromEnv(); got != 4 {
-			t.Fatalf("advanceParallelismFromEnv() = %d, want 4", got)
+		if got := advanceParallelismFromEnv(); got != 1 {
+			t.Fatalf("advanceParallelismFromEnv() = %d, want 1", got)
 		}
 	})
 
@@ -84,22 +84,14 @@ func TestAdvanceParallelismFromEnv(t *testing.T) {
 		}
 	})
 
-	t.Run("legacy fallback", func(t *testing.T) {
+	t.Run("GO_IVM_PARALLELISM does not affect advance", func(t *testing.T) {
 		clearEnv(t)
 		t.Setenv("GO_IVM_PARALLELISM", "5")
-		if got := advanceParallelismFromEnv(); got != 5 {
-			t.Fatalf("advanceParallelismFromEnv() = %d, want 5", got)
+		if got := advanceParallelismFromEnv(); got != 1 {
+			t.Fatalf("advanceParallelismFromEnv() = %d, want 1 (decoupled from GO_IVM_PARALLELISM)", got)
 		}
 	})
 
-	t.Run("advance-specific wins over legacy", func(t *testing.T) {
-		clearEnv(t)
-		t.Setenv("GO_IVM_PARALLELISM", "5")
-		t.Setenv("GO_IVM_ADVANCE_PARALLELISM", "7")
-		if got := advanceParallelismFromEnv(); got != 7 {
-			t.Fatalf("advanceParallelismFromEnv() = %d, want 7", got)
-		}
-	})
 }
 
 // Groups run concurrently (rendezvous proves overlap) and same-group conns

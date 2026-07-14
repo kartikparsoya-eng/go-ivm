@@ -64,28 +64,29 @@ import (
 )
 
 // ParallelAdvance gates the per-query parallel fanout. Production default is
-// ON — controlled by GO_IVM_ADVANCE_PARALLELISM (workers, default 4). Set
-// GO_IVM_ADVANCE_PARALLELISM=1 for serial fanout (TS-faithful cross-query
-// emission order). GO_IVM_PARALLEL_ADVANCE=false explicitly disables the
-// parallel path regardless of worker count.
-var ParallelAdvance = os.Getenv("GO_IVM_PARALLEL_ADVANCE") != "false"
+// OFF — advance fanout cannot provide I/O parallelism because all sources in
+// a CG share one SQLite connection (BindTableSourcesToConn). The parallel
+// goroutines contend on s.mu and SQLite's C-level connection mutex, making
+// PAR>1 counterproductive for fetch-heavy workloads. Set
+// GO_IVM_PARALLEL_ADVANCE=true to enable the parallel path (useful only when
+// Go-side operator compute dominates over fetch I/O).
+var ParallelAdvance = os.Getenv("GO_IVM_PARALLEL_ADVANCE") == "true"
 
 // ParallelAdvanceWorkers bounds how many query groups push concurrently per
-// source-change. GO_IVM_ADVANCE_PARALLELISM is the advance-specific knob;
-// legacy GO_IVM_PARALLELISM remains a fallback. 1 disables. Fetch I/O on the
-// shared prev-tx conn serializes inside SQLite regardless, so workers beyond
-// GOMAXPROCS buy nothing — this bounds Go-side operator compute.
+// source-change. GO_IVM_ADVANCE_PARALLELISM is the advance-specific knob
+// (default 1 = serial). This is intentionally decoupled from
+// GO_IVM_PARALLELISM (which controls hydrate parallelism) because advance
+// fetch I/O serializes on the single prev-tx conn while hydrate uses the
+// reader pool with multiple connections.
 var ParallelAdvanceWorkers = advanceParallelismFromEnv()
 
 func advanceParallelismFromEnv() int {
-	for _, name := range []string{"GO_IVM_ADVANCE_PARALLELISM", "GO_IVM_PARALLELISM"} {
-		if v := os.Getenv(name); v != "" {
-			if n, err := strconv.Atoi(v); err == nil && n > 0 {
-				return n
-			}
+	if v := os.Getenv("GO_IVM_ADVANCE_PARALLELISM"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
 		}
 	}
-	return 4
+	return 1
 }
 
 // SetNextConnectGroup tags the next Connect call's connection with a
