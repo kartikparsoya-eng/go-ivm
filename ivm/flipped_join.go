@@ -137,6 +137,13 @@ func SetMultiConstraintChunkSizeForTest(size int) func() {
 	return func() { multiConstraintChunkSize.Store(prev) }
 }
 
+// GetMultiConstraintChunkSize returns the current multi-constraint chunk size.
+// The planner uses this to estimate flipped-join cost (startup cost is paid
+// once per chunk, not once per child row).
+func GetMultiConstraintChunkSize() int {
+	return int(multiConstraintChunkSize.Load())
+}
+
 // Fetch fetches child nodes first (eager — small filtered set), then fetches
 // the matching parents in BATCHED calls using FetchRequest.MultiConstraints
 // (TS #fetchBatched, zero 1.7.0 #5928): the deduped child→parent key tuples

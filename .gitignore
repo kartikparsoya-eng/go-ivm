@@ -34,3 +34,18 @@ yarn-error.log*
 .idea/
 *.swp
 *.swo
+
+# Compiled binaries (additional)
+/go-ivm-sidecar-linux
+/go-ivm-sidecar-linux.bak
+
+# Build artifacts
+/build/
+/build-wal2.sh
+
+# TLA+ and Lean spec artifacts
+/specs/tla/states/
+/specs/tla/*.bin
+/specs/tla/*.jar
+/specs/lean/.lake/
+/specs/lean/build/

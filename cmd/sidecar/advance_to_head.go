@@ -849,6 +849,9 @@ func (s *Server) handleAdvanceToHeadStream(req RPCRequest, streamW streamWriter)
 			// DELIVERY count, not a chunk count — record it as rows so the
 			// advance-chunks histogram isn't polluted.
 			metrics.recordAdvanceRows(r.ChunkIndex + 1)
+			for _, t := range r.Timings {
+				metrics.recordAdvanceTableTime(t.Table, int(t.Ms))
+			}
 		}
 	})
 	rebindCurr()

@@ -251,6 +251,16 @@ type Engine struct {
 	// The bump is a no-op in steady state (minRowVersion unset or rows already
 	// at/above it), so it only activates in the rare post-RESET window.
 	minRowVersions map[string]string
+
+	// onConflictRow is an optional callback invoked once per prev row that
+	// conflicts with an added row during advance — the Go twin of TS's
+	// #conflictRowsDeleted counter (pipeline-driver.ts:173-177, 756). A
+	// conflict is a Remove derived from a SnapshotChange whose NextValue is
+	// non-nil but whose PK differs from the prev row's PK (the prev row is
+	// evicted to make room for the new row). Set by the sidecar to increment
+	// its perfMetrics.conflictRowsDeleted counter. nil = no telemetry
+	// (feature-flagged off).
+	onConflictRow func()
 }
 
 // zeroVersionColumn is the row-version bookkeeping column (TS
@@ -265,6 +275,15 @@ func (e *Engine) SetMinRowVersions(m map[string]string) {
 	e.mu.Lock()
 	e.minRowVersions = m
 	e.mu.Unlock()
+}
+
+// SetOnConflictRow installs the per-conflict-row callback. Called by the
+// sidecar to wire its perfMetrics.conflictRowsDeleted counter to the engine's
+// advance path. Pass nil to disable. Safe to call before any advance; the
+// callback is read lock-free on the advance hot path (set once at init,
+// never mutated mid-flight).
+func (e *Engine) SetOnConflictRow(fn func()) {
+	e.onConflictRow = fn
 }
 
 // bumpRowVersions applies the TS streamNodes minRowVersion bump
@@ -1563,6 +1582,14 @@ func (e *Engine) Advance(changes []SnapshotChange) *AdvanceResult {
 				continue
 			}
 
+			if e.onConflictRow != nil && change.NextValue != nil {
+				for _, sc := range sourceChanges {
+					if sc.Type == ivm.ChangeTypeRemove {
+						e.onConflictRow()
+					}
+				}
+			}
+
 			start := time.Now()
 			for _, sc := range sourceChanges {
 				source.Push(sc)
@@ -1942,6 +1969,14 @@ func (e *Engine) advanceStreamChunkedSeq(
 			sourceChanges := snapshotToSourceChanges(change, source)
 			if len(sourceChanges) == 0 {
 				continue
+			}
+
+			if e.onConflictRow != nil && change.NextValue != nil {
+				for _, sc := range sourceChanges {
+					if sc.Type == ivm.ChangeTypeRemove {
+						e.onConflictRow()
+					}
+				}
 			}
 
 			start := time.Now()

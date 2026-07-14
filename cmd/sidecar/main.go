@@ -318,6 +318,9 @@ type perfMetrics struct {
 	napiDeliverTimeouts atomic.Int64
 	napiStagedRecords   atomic.Int64
 	napiBatchFlushes    atomic.Int64
+
+	advanceTableTimes   map[string][]int
+	conflictRowsDeleted atomic.Int64
 }
 
 var metrics = &perfMetrics{}
@@ -362,6 +365,37 @@ func (m *perfMetrics) recordAdvanceRows(n int) {
 	m.mu.Lock()
 	m.advanceRowCounts = append(m.advanceRowCounts, n)
 	m.mu.Unlock()
+}
+
+var slowHydrateThreshold = envPositiveInt("GO_IVM_SLOW_HYDRATE_MS", 500)
+
+func (m *perfMetrics) recordAdvanceTableTime(table string, ms int) {
+	m.mu.Lock()
+	if m.advanceTableTimes == nil {
+		m.advanceTableTimes = make(map[string][]int)
+	}
+	m.advanceTableTimes[table] = append(m.advanceTableTimes[table], ms)
+	m.mu.Unlock()
+}
+
+func logSlowHydrate(queryID string, timingMs float64, changes []engine.RowChange) {
+	if timingMs <= float64(slowHydrateThreshold) {
+		return
+	}
+	tableRows := make(map[string]int)
+	for _, rc := range changes {
+		tableRows[rc.Table]++
+	}
+	var totalRows int
+	for table, count := range tableRows {
+		totalRows += count
+		fmt.Fprintf(os.Stderr,
+			"[GO-IVM][SLOW-HYDRATE] queryID=%s hydrationMs=%.1f table=%s vended=%d\n",
+			queryID, timingMs, table, count)
+	}
+	fmt.Fprintf(os.Stderr,
+		"[GO-IVM][SLOW-HYDRATE] queryID=%s hydrationMs=%.1f totalRowsConsidered=%d\n",
+		queryID, timingMs, totalRows)
 }
 
 // startPprofServer opens the pprof + block/mutex profiling endpoint when
@@ -619,6 +653,23 @@ func (m *perfMetrics) reportAndReset() {
 		fmt.Fprintf(os.Stderr,
 			"[GO-IVM][PERF-NAPI] 10s window: deliver queue-full stalls=%d timeouts=%d staged=%d batchFlushes=%d\n",
 			deliverStalls, deliverTimeouts, stagedRecords, batchFlushes)
+	}
+
+	conflictRows := m.conflictRowsDeleted.Swap(0)
+	m.mu.Lock()
+	tableTimes := m.advanceTableTimes
+	m.advanceTableTimes = nil
+	m.mu.Unlock()
+	for table, times := range tableTimes {
+		p50, p95, max := chunkStats(times)
+		fmt.Fprintf(os.Stderr,
+			"[GO-IVM][PERF-ADVANCE-TABLE] 10s window: table=%s advance-time (p50=%dms p95=%dms max=%dms n=%d)\n",
+			table, p50, p95, max, len(times))
+	}
+	if conflictRows > 0 {
+		fmt.Fprintf(os.Stderr,
+			"[GO-IVM][PERF-CONFLICT] 10s window: conflict-rows-deleted=%d\n",
+			conflictRows)
 	}
 }
 
@@ -2056,6 +2107,7 @@ func (s *Server) handleInit(req RPCRequest) RPCResponse {
 	// Install the per-table minRowVersion map for the streamNodes bump
 	// (audit item K). Empty map is fine — bumpRowVersions is a no-op then.
 	eng.SetMinRowVersions(minRowVersions)
+	eng.SetOnConflictRow(func() { metrics.conflictRowsDeleted.Add(1) })
 
 	// Build the per-CG Snapshotter — the advanceToHeadStream drive path's
 	// leapfrog. Pinned at the current replica head, which is the same frame
@@ -2260,6 +2312,7 @@ func (s *Server) handleAddQueriesStream(req RPCRequest, streamW streamWriter) RP
 		}
 		if r.Final {
 			metrics.recordHydrateChunks(r.ChunkIndex + 1)
+			logSlowHydrate(r.QueryID, r.TimingMs, r.Changes)
 		}
 		return true
 	})
