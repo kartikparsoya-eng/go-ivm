@@ -6,23 +6,7 @@ import (
 	"database/sql/driver"
 	"fmt"
 	"io"
-
-	"github.com/kartikparsoya-eng/go-ivm/internal/tablesource"
 )
-
-// rawOpenSnapshotConn opens a raw driver conn for the snapshotter's read
-// path. Delegates to tablesource.RawOpenReaderConn which uses the same DSN
-// registry — the writable pool's DSN has no query_only=1, exactly what the
-// snapshotter needs for BEGIN CONCURRENT. The returned conn does not count
-// against MaxOpenConns (it's a raw driver open, not a database/sql checkout).
-// Falls back to registering the goivm driver if not yet registered (test
-// paths that open via sql.Open directly need this).
-func rawOpenSnapshotConn(db *sql.DB) (driver.Conn, error) {
-	if _, err := tablesource.RegisterGoivmDriver(); err != nil {
-		return nil, fmt.Errorf("snapshotter: register goivm driver: %w", err)
-	}
-	return tablesource.RawOpenReaderConn(db)
-}
 
 // snapshotStmt is a cached prepared statement on the snapshot's raw conn.
 type snapshotStmt struct {
@@ -35,6 +19,23 @@ type snapshotStmt struct {
 // ChangesSince (1 shape), and stateVersion (1 shape). With ~40 tables, the
 // upper bound is ~160 entries.
 const stmtCacheCap = 512
+
+// initRawConn extracts the underlying driver.Conn from the *sql.Conn via
+// Raw(). This gives us direct access to the mattn driver's conn (bypassing
+// database/sql.withLock) WITHOUT opening a second connection — critical
+// because a second BEGIN CONCURRENT on a separate conn would create a
+// second WAL2 snapshot, blocking the write-worker's commits under load
+// (SQLITE_BUSY_SNAPSHOT).
+func (s *Snapshot) initRawConn() error {
+	return s.conn.Raw(func(raw any) error {
+		dc, ok := raw.(driver.Conn)
+		if !ok {
+			return fmt.Errorf("snapshotter: underlying conn is not a driver.Conn (got %T)", raw)
+		}
+		s.rawConn = dc
+		return nil
+	})
+}
 
 // rawExec runs a no-result statement (BEGIN/ROLLBACK) on the raw conn.
 func (s *Snapshot) rawExec(ctx context.Context, query string) error {
@@ -209,17 +210,4 @@ func (s *Snapshot) rawQueryInt(ctx context.Context, query string, args []driver.
 	default:
 		return 0, fmt.Errorf("snapshotter: count has unexpected type %T", dest[0])
 	}
-}
-
-// toDriverValues converts []any to []driver.Value. Since driver.Value is
-// interface{}, this is a shallow copy to satisfy Go's type system.
-func toDriverValues(args []any) []driver.Value {
-	if len(args) == 0 {
-		return nil
-	}
-	out := make([]driver.Value, len(args))
-	for i, a := range args {
-		out[i] = a
-	}
-	return out
 }
