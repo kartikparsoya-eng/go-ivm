@@ -162,8 +162,15 @@ func (s *Snapshotter) Advance(
 	// resetToHead re-pins the reused prev conn even if we later fail — safe:
 	// a Diff is only valid until the next Advance, so nothing reads prev's
 	// old frame after this point, and a retry simply re-pins again.
+	//
+	// freshConn also covers the case where a previous resetToHead FAILED and
+	// closed s.prev.conn (set to nil). Without this, the next Advance would
+	// call resetToHead on a nil conn → nil pointer dereference → panic → CG
+	// teardown loop. Treating a nil-conn prev as fresh creates a new snapshot
+	// instead, self-healing from a transient ROLLBACK/BEGIN/selectStateVersion
+	// failure.
 	var next *Snapshot
-	freshConn := s.prev == nil
+	freshConn := s.prev == nil || s.prev.conn == nil
 	if !freshConn {
 		if err := s.prev.resetToHead(s.beginStmt); err != nil {
 			return nil, err
@@ -326,7 +333,16 @@ func (s *Snapshot) resetToHead(beginStmt string) error {
 	}
 	version, err := selectStateVersion(ctx, s.conn)
 	if err != nil {
-		return err
+		// BEGIN succeeded but the pin-establishing read failed — the conn
+		// has an open tx with no valid version. Close it so the next call
+		// re-acquires a fresh conn (matching the ROLLBACK/BEGIN error paths
+		// above). Without this, the orphaned BEGIN leaks a writable pool conn
+		// and the next resetToHead's ROLLBACK would silently clean it up —
+		// but only if called; Destroy would also ROLLBACK, so this is defense-
+		// in-depth for the conn's lifetime, not a correctness fix.
+		_ = s.conn.Close()
+		s.conn = nil
+		return fmt.Errorf("snapshotter: resetToHead selectStateVersion (conn closed): %w", err)
 	}
 	s.version = version
 	return nil

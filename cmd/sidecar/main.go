@@ -1126,12 +1126,16 @@ func (s *Server) getReplicaDB() (*sql.DB, error) {
 	// channel rather than blocking on the mutex during retries.
 	probe := make(chan struct{})
 	s.replicaMu.Lock()
-	s.replicaDB = rdb
-	s.replicaWritableDB = wdb
+	s.replicaProbe = probe
 	s.replicaErr = nil
-	s.replicaProbe = nil
 	s.replicaMu.Unlock()
-	close(probe)
+	defer func() {
+		s.replicaMu.Lock()
+		if s.replicaProbe == probe {
+			s.replicaProbe = nil
+		}
+		s.replicaMu.Unlock()
+		close(probe)
 	}()
 
 	openTimeout := replicaOpenTimeout
@@ -1219,6 +1223,10 @@ func (s *Server) getReplicaDB() (*sql.DB, error) {
 	// Phase 3: publish result under mu, signal waiters, and clear the
 	// probe registration so future callers can probe again (e.g., the
 	// next caller after a deadline-expiration retry).
+	//
+	// NOTE: close(probe) is NOT here — the defer in Phase 2 handles it.
+	// Having both would double-close the channel (panic). The defer runs
+	// when this function returns, after Phase 3 stores results.
 	s.replicaMu.Lock()
 	if db != nil && writableDB != nil {
 		s.replicaDB = db
@@ -1231,7 +1239,6 @@ func (s *Server) getReplicaDB() (*sql.DB, error) {
 	}
 	s.replicaProbe = nil
 	s.replicaMu.Unlock()
-	close(probe)
 
 	if db != nil {
 		return db, nil

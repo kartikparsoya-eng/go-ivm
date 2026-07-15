@@ -82,10 +82,19 @@ func advanceDeadline() (time.Time, bool) {
 // never reset) and NOT a plain string (→ -32000 'unclassified', which since
 // the follow-TS failure model RETHROWS into a CG teardown — a time-bound
 // overrun is an economics decision, not a bug).
-// idleTimeoutError is panicked by the advance sink when acquirePullCredit
-// returns false due to an idle-timeout cancel (not a client cancel). The
-// handleStreamWithRecover recover maps it to RPCResponse{Result: "done"}
-// — a clean close — so the JS iterator ends gracefully without throwing.
+// idleTimeoutError was originally panicked by the advance sink when
+// acquirePullCredit returned false due to an idle-timeout cancel. After
+// BUG-2 (advance idle timeout must return rpcCodeAdvanceAborted, not clean
+// "done" — a half-applied diff must reset, not clean-close), the advance
+// path now panics advanceAbortedError instead. The hydrate path surfaces
+// cancellation through the returned ErrStreamCancelled error (main.go's
+// handleAddQueriesStream checks errors.Is(err, engine.ErrStreamCancelled)).
+//
+// The type and its handling in handleStreamWithRecover / panicErrorCode
+// are kept as defense-in-depth: if a future code path panics
+// idleTimeoutError, it maps to a clean close (Result: "done") instead of
+// a generic -32000 error frame. The panicErrorCode sentinel (return 0)
+// and the handleStreamWithRecover special case ensure this behavior.
 type idleTimeoutError struct {
 	cgID  string
 	phase string
