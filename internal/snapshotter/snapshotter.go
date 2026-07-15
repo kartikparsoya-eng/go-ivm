@@ -241,10 +241,16 @@ func (s *Snapshotter) newSnapshot() (*Snapshot, error) {
 		return nil, fmt.Errorf("snapshotter: acquire conn (30s timeout): %w", err)
 	}
 	snap := &Snapshot{conn: conn}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = conn.Close()
+		}
+	}()
 	if err := s.beginAndPin(snap); err != nil {
-		_ = conn.Close()
 		return nil, err
 	}
+	committed = true
 	return snap, nil
 }
 
@@ -305,10 +311,18 @@ func (s *Snapshot) Conn() *sql.Conn { return s.conn }
 func (s *Snapshot) resetToHead(beginStmt string) error {
 	ctx := context.Background()
 	if _, err := s.conn.ExecContext(ctx, "ROLLBACK"); err != nil {
-		return fmt.Errorf("snapshotter: resetToHead ROLLBACK: %w", err)
+		// Conn is in unknown state — close it so close()/Destroy() cleans up.
+		// The Snapshot is now unusable; the caller must Destroy and re-create.
+		_ = s.conn.Close()
+		s.conn = nil
+		return fmt.Errorf("snapshotter: resetToHead ROLLBACK (conn closed): %w", err)
 	}
 	if _, err := s.conn.ExecContext(ctx, beginStmt); err != nil {
-		return fmt.Errorf("snapshotter: resetToHead %s: %w", beginStmt, err)
+		// ROLLBACK succeeded but BEGIN failed — conn has no open tx.
+		// Close it so the next call re-acquires a fresh conn.
+		_ = s.conn.Close()
+		s.conn = nil
+		return fmt.Errorf("snapshotter: resetToHead %s (conn closed): %w", beginStmt, err)
 	}
 	version, err := selectStateVersion(ctx, s.conn)
 	if err != nil {

@@ -791,11 +791,12 @@ func (s *Source) ensurePrevTxLocked() error {
 		}
 	}
 	// Warm-up read to actually acquire the snapshot. BEGIN CONCURRENT
-	// is deferred-style: no lock is taken until first access. Without
-	// this, sqlite3_snapshot_get-equivalent semantics don't kick in
-	// until the first Fetch — which would race with a concurrent
-	// writer commit. Matches snapshotter.ts:308-311.
+	// has already succeeded; if this read fails the conn has an open
+	// transaction that must be rolled back so the next ensurePrevTx
+	// can retry cleanly (otherwise BEGIN-within-BEGIN loops forever).
 	if _, err := s.prevConn.ExecContext(ctx, "SELECT 1"); err != nil {
+		_, _ = s.prevConn.ExecContext(context.Background(), "ROLLBACK")
+		s.beginStmt = "" // force re-probe on next call
 		return fmt.Errorf("ensurePrevTx %s: warm-up: %w", s.tableName, err)
 	}
 	s.prevTxStarted = true

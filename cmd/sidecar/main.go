@@ -1125,9 +1125,14 @@ func (s *Server) getReplicaDB() (*sql.DB, error) {
 	// before doing the slow open so concurrent callers can wait on the
 	// channel rather than blocking on the mutex during retries.
 	probe := make(chan struct{})
-	s.replicaProbe = probe
+	s.replicaMu.Lock()
+	s.replicaDB = rdb
+	s.replicaWritableDB = wdb
 	s.replicaErr = nil
+	s.replicaProbe = nil
 	s.replicaMu.Unlock()
+	close(probe)
+	}()
 
 	openTimeout := replicaOpenTimeout
 	deadline := time.Now().Add(openTimeout)
@@ -1955,6 +1960,9 @@ func (s *Server) handleStreamWithRecover(
 	defer func() {
 		if r := recover(); r != nil {
 			if e, ok := r.(idleTimeoutError); ok {
+				// idleTimeoutError is only panicked from the HYDRATE path now.
+				// The advance path panics advanceAbortedError instead (data
+				// safety: a half-applied advance must reset, not clean-close).
 				fmt.Fprintf(os.Stderr,
 					"[GO-IVM] %s IDLE-TIMEOUT cg=%s: clean close (no credit for > %v)\n",
 					e.phase, e.cgID, pullIdleTimeout())
@@ -2330,10 +2338,21 @@ func (s *Server) handleAddQueriesStream(req RPCRequest, streamW streamWriter) RP
 		return true
 	})
 	if err != nil {
-		if gate != nil && gate.isIdleTimeout() {
-			fmt.Fprintf(os.Stderr,
-				"[GO-IVM] addQueriesStream(pullMode) IDLE-TIMEOUT cg=%s: clean close (no credit for > %v)\n",
-				cgID, pullIdleTimeout())
+		// ErrStreamCancelled is CLIENT-INITIATED (tab close, RPC timeout) or
+		// IDLE-TIMEOUT (client went idle, no credit for >60s). Both are
+		// transient and the engine state is CONSISTENT (removeBuiltQueriesLocked
+		// already ran). Return clean "done" so the JS iterator ends gracefully
+		// without triggering a false CG teardown.
+		if errors.Is(err, engine.ErrStreamCancelled) {
+			if gate != nil && gate.isIdleTimeout() {
+				fmt.Fprintf(os.Stderr,
+					"[GO-IVM] addQueriesStream(pullMode) IDLE-TIMEOUT cg=%s: clean close (no credit for > %v)\n",
+					cgID, pullIdleTimeout())
+			} else {
+				fmt.Fprintf(os.Stderr,
+					"[GO-IVM] addQueriesStream(pullMode) CANCELLED cg=%s: clean close (client cancelled)\n",
+					cgID)
+			}
 			return RPCResponse{JSONRPC: "2.0", Result: "done", ID: req.ID}
 		}
 		fmt.Fprintf(os.Stderr, "[GO-IVM] addQueriesStream(pullMode) ERROR cg=%s: %v\n", cgID, err)

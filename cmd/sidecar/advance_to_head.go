@@ -843,10 +843,13 @@ func (s *Server) handleAdvanceToHeadStream(req RPCRequest, streamW streamWriter)
 			panic(aerr)
 		}
 		if len(r.Changes) > 0 && !acquirePullCredit(gate, rp) {
-			if gate.isIdleTimeout() {
-				panic(idleTimeoutError{cgID: cgID, phase: "advance"})
-			}
-			panic(fmt.Errorf("advanceToHeadStream cg=%s: stream cancelled while waiting for pull credit", cgID))
+			// Advance is MUTATING — a clean close (Result: "done") would commit
+			// a half-applied diff as complete, losing the un-applied suffix.
+			// Both idle timeout and client cancel must surface as
+			// rpcCodeAdvanceAborted (-32103) so TS resets and re-advances from
+			// the correct position. This is the SAME code as an economic abort.
+			panic(&advanceAbortedError{msg: fmt.Sprintf(
+				"advanceToHeadStream cg=%s: stream cancelled while waiting for pull credit (idle-timeout or client cancel) — re-advance required", cgID)})
 		}
 		emittedPartial = true
 		if !rp.emitAdvanceToHeadPartial(r, version, numChanges) {
