@@ -3,6 +3,7 @@ package ivm
 import (
 	"fmt"
 	"iter"
+	"runtime"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -260,6 +261,16 @@ func (e *Exists) fetchExists(node Node) bool {
 }
 
 // fetchSize — counts nodes in the relationship.
+//
+// TS's fetchSize is a generator that yields 'yield' between rows to return
+// control to the event loop (exists.ts:254). Go dropped the yield signal
+// (operator.go:6) assuming the preemptive scheduler handles it, but the
+// tight loop bounces in and out of CGO (SQLite Next) — the scheduler can
+// preempt between CGO calls but the goroutine immediately re-enters CGO,
+// holding the reader connection for the entire N+1 loop. Periodic
+// runtime.Gosched() is the Go equivalent of TS's yield 'yield': it gives
+// other goroutines a chance to run, preventing the N+1 Exists from
+// monopolizing the shared SQLite connection.
 func (e *Exists) fetchSize(node Node) int {
 	relationship := node.Relationships[e.relationshipName]
 	if relationship == nil {
@@ -269,6 +280,9 @@ func (e *Exists) fetchSize(node Node) int {
 	if seq := relationship(); seq != nil {
 		for range seq {
 			count++
+			if count%256 == 0 {
+				runtime.Gosched()
+			}
 		}
 	}
 	return count
