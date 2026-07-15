@@ -73,6 +73,17 @@ func BuildPipeline(ast AST, delegate Delegate) *Pipeline {
 // builder.ts:262): the csq-conditions loop passes true, ast.related and
 // flipped-CSQ children pass false.
 func buildPipelineInternal(ast AST, delegate Delegate, p *Pipeline, partitionKey []string, isNonFlippedExistsChild bool) ivm.Input {
+	// autoFlipExists: when the TS planner doesn't annotate flip (the JSON
+	// omits the field), Go deserializes Flip as false — the same as an
+	// explicit "don't flip". TS treats missing flip as "planner can decide",
+	// and the planner flips when beneficial. When the planner fails or
+	// decides not to flip, Go gets the N+1 Exists path, which wedges on
+	// large datasets (each parent row runs a separate SQLite query through
+	// the shared connection, blocking all other CGs on the worker).
+	// FlippedJoin is result-equivalent for EXISTS (not NOT EXISTS) and
+	// batches child→parent lookups into one IN-clause query per chunk.
+	autoFlipExists(ast.Where)
+
 	name := ast.Table
 	if ast.Alias != "" {
 		name = ast.Alias
@@ -584,6 +595,41 @@ func applyCorrelatedSubqueryCondition(input ivm.FilterInput, cond *Condition, p 
 	exists := ivm.NewExists(input, relName, cond.Related.Correlation.ParentField, existsType)
 	p.Edges = append(p.Edges, [2]ivm.InputBase{input, exists})
 	return exists
+}
+
+// autoFlipExists recursively walks the condition tree and sets Flip = true
+// on EXISTS (not NOT EXISTS, not scalar) conditions that were not explicitly
+// marked flip: false. This prevents the N+1 Exists path from wedging the
+// shared SQLite connection when the TS planner fails or decides not to flip.
+//
+// FlippedJoin is result-equivalent to Exists for EXISTS (both are semi-joins
+// that keep parents with matching children). NOT EXISTS cannot be flipped
+// (correctness: the complement set changes). Scalar EXISTS is pre-resolved
+// by TS's resolveSimpleScalarSubqueries and typically doesn't reach the
+// builder; when it does, we leave it for the Exists path since scalar
+// resolution expects it.
+func autoFlipExists(cond *Condition) {
+	if cond == nil {
+		return
+	}
+	switch cond.Type {
+	case "correlatedSubquery":
+		// Only flip client-system EXISTS. Permissions-system EXISTS uses Cap
+		// with limit 1 (always small, never wedges). NOT EXISTS cannot be
+		// flipped (correctness). Scalar EXISTS is pre-resolved by TS.
+		if cond.Op == "EXISTS" && !cond.Flip && !cond.Scalar &&
+			cond.Related != nil && cond.Related.System != "permissions" {
+			cond.Flip = true
+		}
+		// Recurse into the subquery's WHERE
+		if cond.Related != nil {
+			autoFlipExists(cond.Related.Subquery.Where)
+		}
+	case "and", "or":
+		for i := range cond.Conditions {
+			autoFlipExists(&cond.Conditions[i])
+		}
+	}
 }
 
 // applyWhere is the Input→Input bridge that routes a WHERE clause through
