@@ -258,9 +258,11 @@ func TestPullMode_LockstepDemandGate(t *testing.T) {
 }
 
 // TestPullMode_CancelUnwindsAndRejects verifies that mid-stream cancel
-// produces a plain -32000 terminal error frame while credit is zero
-// (error frames ride free), stops all row production, unregisters the
-// gate, and leaves the group fully usable for the next hydrate.
+// produces a clean "done" terminal frame (not an error frame), stops
+// all row production, unregisters the gate, and leaves the group fully
+// usable for the next hydrate. Returning "done" instead of a -32000
+// error frame prevents false CG teardown on the TS side when a client
+// cancels mid-stream (e.g. tab close, RPC timeout).
 func TestPullMode_CancelUnwindsAndRejects(t *testing.T) {
 	const nRows = 30
 	srv, col, _, send := startPullHost(t, nRows)
@@ -274,26 +276,21 @@ func TestPullMode_CancelUnwindsAndRejects(t *testing.T) {
 	// Cancel with zero credit outstanding — the producer is parked.
 	srv.streamGates.cancel(3)
 
-	// Terminal error frame arrives ungated; plain -32000, and the
-	// message names the consumer-cancel (never the data-error class).
+	// Terminal frame is a clean "done" (not an error frame) so the TS
+	// client resolves the call promise without triggering CG teardown.
 	deadline := time.Now().Add(5 * time.Second)
-	var errResp RPCResponse
 	for {
-		var found bool
-		errResp, found = frameFor(col, t, 3, func(r RPCResponse) bool { return r.Error != nil })
-		if found {
+		if resp, found := frameFor(col, t, 3, func(r RPCResponse) bool {
+			s, ok := r.Result.(string)
+			return ok && s == "done"
+		}); found {
+			_ = resp
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("no terminal error frame after cancel")
+			t.Fatal("no terminal \"done\" frame after cancel")
 		}
 		time.Sleep(2 * time.Millisecond)
-	}
-	if errResp.Error.Code != -32000 {
-		t.Fatalf("cancel error code = %d, want -32000 (never reset/data classes)", errResp.Error.Code)
-	}
-	if !strings.Contains(errResp.Error.Message, "cancelled by consumer") {
-		t.Fatalf("cancel error message %q does not name the consumer cancel", errResp.Error.Message)
 	}
 
 	// No further rows; gate unregistered.
