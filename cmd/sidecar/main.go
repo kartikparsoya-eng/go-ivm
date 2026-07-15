@@ -1124,8 +1124,12 @@ func (s *Server) getReplicaDB() (*sql.DB, error) {
 	// Phase 2: I'm the prober. Register intent under mu, then release
 	// before doing the slow open so concurrent callers can wait on the
 	// channel rather than blocking on the mutex during retries.
+	//
+	// NOTE: Phase 1's replicaMu.Lock() is STILL HELD here (none of the
+	// three conditions matched, so we fell through without unlocking).
+	// Do NOT re-lock — that would self-deadlock. Set fields under Phase 1's
+	// lock, then Unlock. The defer handles probe cleanup on all exit paths.
 	probe := make(chan struct{})
-	s.replicaMu.Lock()
 	s.replicaProbe = probe
 	s.replicaErr = nil
 	s.replicaMu.Unlock()
