@@ -43,6 +43,12 @@ type streamGate struct {
 	cond      *sync.Cond
 	credit    int64
 	cancelled bool
+	// idleTimeout is set by cancelIdle() before cancel() so callers can
+	// distinguish a liveness sweep (client went idle) from a client-initiated
+	// cancel (.return()/.throw()/group teardown). An idle-timeout cancel is
+	// a CLEAN CLOSE: the handler returns RPCResponse{Result: "done"} instead
+	// of an error frame, so the JS iterator ends gracefully without throwing.
+	idleTimeout bool
 	// lastGrant is the creation/last-grant instant; the idle sweeper
 	// auto-cancels a gate whose producers have been parked with no grant
 	// for longer than the pull idle timeout (bounds the WAL-frame pin and
@@ -127,6 +133,26 @@ func (g *streamGate) cancel() {
 	g.cancelled = true
 	g.cond.Broadcast()
 	g.mu.Unlock()
+}
+
+// cancelIdle marks the gate as idle-timed-out then cancels. The idleTimeout
+// flag lets callers distinguish a liveness sweep from a client cancel and
+// close the stream cleanly (Result: "done") instead of erroring.
+func (g *streamGate) cancelIdle() {
+	g.mu.Lock()
+	g.idleTimeout = true
+	g.cancelled = true
+	g.cond.Broadcast()
+	g.mu.Unlock()
+}
+
+// isIdleTimeout reports whether the gate was cancelled by the idle sweeper
+// (as opposed to a client .return()/.throw() or group teardown). Callers
+// use this to decide between a clean close and an error frame.
+func (g *streamGate) isIdleTimeout() bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.idleTimeout
 }
 
 // isCancelled reports the gate's cancelled flag. The row plane polls it
@@ -280,7 +306,7 @@ func (r *streamGateRegistry) sweepIdle(now time.Time, idle time.Duration) int {
 	}
 	r.mu.Unlock()
 	for _, g := range toCancel {
-		g.cancel()
+		g.cancelIdle()
 	}
 	return len(toCancel)
 }

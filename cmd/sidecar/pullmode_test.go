@@ -336,8 +336,11 @@ func TestPullMode_CancelUnwindsAndRejects(t *testing.T) {
 }
 
 // TestPullMode_IdleSweepCancelsParked verifies that a stream parked past
-// the idle window with no grants is auto-cancelled by the sweeper — the
-// same unwind as a client cancel, terminal error frame included.
+// the idle window with no grants is auto-cancelled by the sweeper — a
+// CLEAN CLOSE (Result: "done") instead of a terminal error frame. The
+// idle timeout is a liveness mechanism, not an error: the client went
+// idle (background tab, stopped consuming) and the server reclaims the
+// WAL-frame pin. The JS iterator ends gracefully without throwing.
 func TestPullMode_IdleSweepCancelsParked(t *testing.T) {
 	srv, col, _, send := startPullHost(t, 10)
 
@@ -355,11 +358,14 @@ func TestPullMode_IdleSweepCancelsParked(t *testing.T) {
 
 	deadline := time.Now().Add(5 * time.Second)
 	for {
-		if _, found := frameFor(col, t, 3, func(r RPCResponse) bool { return r.Error != nil }); found {
+		if r, found := frameFor(col, t, 3, func(r RPCResponse) bool { return r.Result != nil }); found {
+			if r.Result != "done" {
+				t.Fatalf("idle-swept stream result = %v, want \"done\" (clean close)", r.Result)
+			}
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("no terminal error frame after idle sweep")
+			t.Fatal("no terminal \"done\" frame after idle sweep")
 		}
 		time.Sleep(2 * time.Millisecond)
 	}

@@ -1901,6 +1901,9 @@ func panicErrorCode(r any) int {
 	if _, ok := r.(*engine.ScalarResetError); ok {
 		return rpcCodeScalarReset
 	}
+	if _, ok := r.(idleTimeoutError); ok {
+		return 0 // sentinel: handleStreamWithRecover maps to clean close
+	}
 	return -32000
 }
 
@@ -1914,6 +1917,9 @@ func panicErrorMessage(r any) string {
 		return e.Error()
 	}
 	if e, ok := r.(*engine.ScalarResetError); ok {
+		return e.Error()
+	}
+	if e, ok := r.(idleTimeoutError); ok {
 		return e.Error()
 	}
 	return fmt.Sprintf("panic: %v", r)
@@ -1948,6 +1954,13 @@ func (s *Server) handleStreamWithRecover(
 ) (resp RPCResponse) {
 	defer func() {
 		if r := recover(); r != nil {
+			if e, ok := r.(idleTimeoutError); ok {
+				fmt.Fprintf(os.Stderr,
+					"[GO-IVM] %s IDLE-TIMEOUT cg=%s: clean close (no credit for > %v)\n",
+					e.phase, e.cgID, pullIdleTimeout())
+				resp = RPCResponse{JSONRPC: "2.0", Result: "done", ID: req.ID}
+				return
+			}
 			stack := make([]byte, 4096)
 			n := runtime.Stack(stack, false)
 			fmt.Fprintf(os.Stderr, "[GO-IVM] PANIC in %s (stream): %v\n%s\n", req.Method, r, stack[:n])
@@ -2317,6 +2330,12 @@ func (s *Server) handleAddQueriesStream(req RPCRequest, streamW streamWriter) RP
 		return true
 	})
 	if err != nil {
+		if gate != nil && gate.isIdleTimeout() {
+			fmt.Fprintf(os.Stderr,
+				"[GO-IVM] addQueriesStream(pullMode) IDLE-TIMEOUT cg=%s: clean close (no credit for > %v)\n",
+				cgID, pullIdleTimeout())
+			return RPCResponse{JSONRPC: "2.0", Result: "done", ID: req.ID}
+		}
 		fmt.Fprintf(os.Stderr, "[GO-IVM] addQueriesStream(pullMode) ERROR cg=%s: %v\n", cgID, err)
 		return hydrateErrorResponse(req.ID, "addQueriesStream: ", err)
 	}

@@ -82,6 +82,19 @@ func advanceDeadline() (time.Time, bool) {
 // never reset) and NOT a plain string (→ -32000 'unclassified', which since
 // the follow-TS failure model RETHROWS into a CG teardown — a time-bound
 // overrun is an economics decision, not a bug).
+// idleTimeoutError is panicked by the advance sink when acquirePullCredit
+// returns false due to an idle-timeout cancel (not a client cancel). The
+// handleStreamWithRecover recover maps it to RPCResponse{Result: "done"}
+// — a clean close — so the JS iterator ends gracefully without throwing.
+type idleTimeoutError struct {
+	cgID  string
+	phase string
+}
+
+func (e idleTimeoutError) Error() string {
+	return fmt.Sprintf("%s cg=%s: stream idle-timed out (no credit for > pull idle timeout)", e.phase, e.cgID)
+}
+
 func checkAdvanceBudget(deadline time.Time, on bool, phase, cgID string) {
 	if on && time.Now().After(deadline) {
 		panic(&advanceAbortedError{msg: fmt.Sprintf(
@@ -830,6 +843,9 @@ func (s *Server) handleAdvanceToHeadStream(req RPCRequest, streamW streamWriter)
 			panic(aerr)
 		}
 		if len(r.Changes) > 0 && !acquirePullCredit(gate, rp) {
+			if gate.isIdleTimeout() {
+				panic(idleTimeoutError{cgID: cgID, phase: "advance"})
+			}
 			panic(fmt.Errorf("advanceToHeadStream cg=%s: stream cancelled while waiting for pull credit", cgID))
 		}
 		emittedPartial = true
