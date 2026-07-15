@@ -551,7 +551,7 @@ func (ms *MemorySource) NormalizeRow(row Row) {
 			// wire value is ALREADY parsed (TS coerce-once model), so re-running
 			// the converter's strict JSON.parse on a json scalar string would
 			// panic. The converter (FromSQLiteType) stays strict for the
-			// SQLite-read boundary. Memory mode is non-prod; this keeps the two
+			// SQLite-read boundary. Memory mode is for testing; this keeps the two
 			// NormalizeRow impls behaviorally identical.
 			if colType == "json" {
 				continue

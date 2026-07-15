@@ -644,14 +644,14 @@ func FromSQLiteType(v interface{}, colType string) ivm.Value {
 		case float64:
 			return val != 0
 		case string:
-			// MED-1 (types): TS coerces booleans with `!!v` (table-source.ts:618),
+			// TS coerces booleans with `!!v` (table-source.ts:618),
 			// i.e. pure JS truthiness of the RAW value — so ANY non-empty string is
 			// true, including "0", "0.0" and "false". The old literal-list +
 			// ParseFloat check gave the opposite answer for those ("0"→false), a
 			// silent TS/Go divergence. Match JS exactly: empty string → false,
 			// everything else → true. (Boolean columns are stored as 0/1 INTEGER in
 			// the replica so this string branch is defensive, but it must still
-			// agree with TS to keep init-vs-advance shape parity — CRIT-6.)
+			// agree with TS to keep init-vs-advance shape parity.)
 			return val != ""
 		case []byte:
 			// A SQLite blob in a boolean column never happens in practice, but JS
@@ -789,7 +789,7 @@ func FromSQLiteType(v interface{}, colType string) ivm.Value {
 }
 
 // SelfCheckCoercion validates the init-vs-advance shape-convergence contract
-// (CRIT-6) at sidecar startup. TS's init path sends raw SQLite values (bool as
+// at sidecar startup. TS's init path sends raw SQLite values (bool as
 // 0/1 int, etc.) while the advance path sends pre-coerced JS shapes (bool,
 // number); both land in the same source and only stay consistent because
 // FromSQLiteType maps BOTH shapes to the same canonical value for every

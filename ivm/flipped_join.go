@@ -131,7 +131,7 @@ var multiConstraintChunkSize atomic.Int32
 func init() { multiConstraintChunkSize.Store(256) }
 
 // SetMultiConstraintChunkSizeForTest overrides the chunk size and returns a
-// restore function. Test only (TS setMultiConstraintChunkSizeForTest).
+// restore function. Only used by tests (TS setMultiConstraintChunkSizeForTest).
 func SetMultiConstraintChunkSizeForTest(size int) func() {
 	prev := multiConstraintChunkSize.Swap(int32(size))
 	return func() { multiConstraintChunkSize.Store(prev) }

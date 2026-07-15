@@ -363,12 +363,19 @@ func startABIHostWithServer(server *Server, deliver func(kind int32, payload []b
 // deliverPumpFrame delivers one control-plane frame off the pump, parking
 // while the TSFN queue is full. Control frames (RPC responses, "done"
 // sentinels) must never be DROPPED — a missing frame orphans its RPC into
-// the TS timeout — so unlike the row plane there is no deadline here: the
-// park IS the transport backpressure the pipe chain propagates (and it
-// wedges nothing — the pump is its own goroutine; CG workers hand frames
-// off via respCh and move on). The park wakes EVENT-DRIVEN on the addon's
-// drain signal (ABI v5) and stays escapable: host teardown (markClosed →
-// h.closed, checked each pass) or a dying TSFN (deliverClosed) breaks it.
+// the TS timeout — so unlike the row plane the park IS the transport
+// backpressure the pipe chain propagates (and it wedges nothing — the pump
+// is its own goroutine; CG workers hand frames off via respCh and move on).
+// The park wakes EVENT-DRIVEN on the addon's drain signal (ABI v5) and stays
+// escapable: host teardown (markClosed → h.closed, checked each pass) or a
+// dying TSFN (deliverClosed) breaks it.
+//
+// A 2× deliverTimeout deadline is a defense-in-depth backstop: if the JS
+// event loop is permanently dead while the TSFN stays technically alive
+// (no deliverClosed), the park would otherwise run forever. The deadline
+// is well above any expected recoverable stall (55s ceiling) so it only
+// fires on genuine host death — at which point the death watcher delivers
+// a kind-4 record and the process exits regardless.
 func (h *abiHost) deliverPumpFrame(kind int32, payload []byte) bool {
 	switch h.deliver(kind, payload) {
 	case deliverOK:
@@ -377,6 +384,7 @@ func (h *abiHost) deliverPumpFrame(kind int32, payload []byte) bool {
 		return false
 	}
 	metrics.napiDeliverStalls.Add(1)
+	deadline := time.Now().Add(2 * deliverTimeoutDur())
 	t := time.NewTimer(deliverCancelTick)
 	defer t.Stop()
 	for {
@@ -388,6 +396,12 @@ func (h *abiHost) deliverPumpFrame(kind int32, payload []byte) bool {
 			return false
 		}
 		if h.isClosed() {
+			return false
+		}
+		if time.Now().After(deadline) {
+			fmt.Fprintf(os.Stderr,
+				"[GO-IVM] pump deliver timed out after %v (TSFN queue full, JS loop unresponsive) — abandoning frame\n",
+				2*deliverTimeoutDur())
 			return false
 		}
 		// Event-driven park (ABI v5): woken instantly by the addon's drain

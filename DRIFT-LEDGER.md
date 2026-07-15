@@ -64,6 +64,111 @@ Required follow-up: align TS with an explicit runtime rejection or move the
 shared validation to AST ingress so Go and TS classify malformed condition types
 identically.
 
+## M1: Boolean Coercion from String Values
+
+Status: Intentional Go fix, not yet ported back to TS.
+
+Go coerces string values to boolean using JS-identical truthiness: empty
+string → false, any non-empty string → true (including `"0"`, `"0.0"`,
+`"false"`). See `sqlite/query_builder.go:647-655`.
+
+Current TS coerces booleans with `!!v` (`table-source.ts:618`) — pure JS
+truthiness of the raw value. The Go port matches this exactly, but the old Go
+implementation used a literal-list + `ParseFloat` check that gave the opposite
+answer for `"0"` (→false), a silent TS/Go divergence.
+
+Reason: Boolean columns are stored as 0/1 INTEGER in the replica, so the
+string branch is defensive. However, both implementations must agree to keep
+init-vs-advance shape parity (CRIT-6).
+
+Required follow-up: ensure TS's `!!v` coercion is documented as the canonical
+behavior and add a cross-implementation test for string-to-boolean edge cases.
+
+## M2: Engine Teardown — Awaited Destroy RPC
+
+Status: Intentional Go hardening, not yet ported back to TS.
+
+Go's `shutdownGroup` (called from the destroy RPC and the reaper) performs a
+synchronous teardown: closes the engine, destroys the snapshotter, and waits
+for the worker goroutine to exit. The TS `PipelineDriver` awaits the Go engine
+teardown via `this.#goBackend?.destroy()` rather than fire-and-forget. See
+`cmd/sidecar/main.go:1770-1795` and
+`mono/.../pipeline-driver.ts:1198-1205`.
+
+On a shared sidecar a rapid recycle — a new ViewSyncer for the SAME client
+group starting before this one's teardown lands — could otherwise race this
+group's destroy RPC against the new engine's init, tearing down freshly-
+initialised state. Awaiting serialises destroy before any recreate.
+
+Reason: TS-native fire-and-forgets the destroy because its engine is in-process
+and single-threaded. The Go sidecar is multi-CG with per-CG workers, so a
+destroy must complete before the same cgID's re-init to prevent the worker
+from processing stale requests.
+
+Required follow-up: none. The await is the correct behavior for the shared-
+sidecar model.
+
+## M3: Dispatch Invariant — Go Re-init Callback Runs Outside ViewSyncer Lock
+
+Status: Intentional Go divergence, documented as safe.
+
+The Go backend's (re-)init callback can run from the restart handler OUTSIDE
+the ViewSyncer lock. This is safe ONLY because the method is fully synchronous
+— the snapshot reference captured is read consistently through to the end of
+the call. See `mono/.../pipeline-driver.ts:827-830`.
+
+TS-native never calls re-init outside the lock because its engine is single-
+threaded. The Go backend's restart handler is async and may fire between
+ViewSyncer lock acquisitions.
+
+Reason: The Go sidecar's destroy→re-init cycle is async (destroy RPC → await →
+re-init RPC). The ViewSyncer cannot hold its lock across this cycle without
+deadlocking. The synchronous snapshot read inside the callback is the
+invariant that makes this safe.
+
+Required follow-up: document this invariant in the ViewSyncer's restart
+handler so future refactors don't break the synchronicity assumption.
+
+## M4: Cost-Model Planning Is Optimisation, Not Correctness
+
+Status: Intentional Go divergence in error handling.
+
+Go's cost-model planner is treated as an optimisation layer: if the planner
+throws on a skewed or edge-case schema, the planned AST (already correctness-
+checked) is used directly. A planner fault does NOT kill the hydrate/advance.
+See `mono/.../pipeline-driver.ts:1173-1176`.
+
+TS-native's planner runs inline and a throw propagates to the caller,
+aborting the operation. Go wraps the planner in a try-catch and falls back to
+the pre-planned AST.
+
+Reason: The Go planner is a port that may not cover every TS edge case. A
+planner bug should not cause a CG teardown when the un-planned query is
+correct. The ordering-completed AST already runs correctly on Go.
+
+Required follow-up: align the planner's error handling between TS and Go so
+both degrade gracefully, or move the planner to a shared pre-validation step.
+
+## M5: PostgreSQL Type Mapping — `pgToZqlTypeMap` Alignment
+
+Status: Intentional Go fix, not yet ported back to TS.
+
+Go's `pgToZqlTypeMap` is a copy of TS's `formatTypeForLookup` in
+`types/pg-data-type.ts`. The previous Go implementation used a hand-rolled
+list that dropped TIME/TIMETZ, bare INT, the SERIAL family, bare FLOAT, and
+never stripped `(N)` (so `varchar(255)` fell through to the unknown→string
+warn path). See `mono/.../pipeline-driver.ts:3186-3189`.
+
+The Go mapping is now byte-for-byte aligned with the canonical TS list. Both
+strip array delimiters (`[]` suffix), strip any `(N)` args, and lowercase.
+
+Reason: A divergent type map caused Go to emit `"string"` for columns TS
+classified as `"varchar"`, producing false schema-mismatch warnings and
+occasionally wrong coercion behavior.
+
+Required follow-up: extract the type map into a shared protocol-level constant
+so both implementations reference one source of truth.
+
 ## M6: Partition-Key Column Deduplication (same as D1)
 
 Status: Intentional Go fix, not yet ported back to TS.

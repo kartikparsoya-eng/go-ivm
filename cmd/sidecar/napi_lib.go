@@ -32,7 +32,7 @@ package main
 //     (deadlock risk via the pipe backpressure chain). Pre-v4 the callback
 //     was allowed to block — "backpressure like a slow socket" — which
 //     parked Go goroutines in an uninterruptible cgo call for as long as
-//     the JS event loop stayed starved (the G13 CG wedge).
+//     the JS event loop stayed starved (the CG wedge watchdog).
 //   - (data,len) passed to the callback are valid ONLY for the duration of
 //     the call; the receiver must copy before returning 0. This satisfies
 //     the cgo pointer rules: the Go-owned buffer is never retained by C.
@@ -102,7 +102,7 @@ import (
 //	    full, 2=closing) and the addon enqueues with napi_tsfn_nonblocking;
 //	    the Go side owns the retry, which makes a delivery parked on a
 //	    starved JS event loop CANCELLABLE (pull-gate cancel / group
-//	    teardown / GO_IVM_DELIVER_TIMEOUT) — the G13 CG-wedge fix. The
+//	    teardown / GO_IVM_DELIVER_TIMEOUT) — the CG-wedge fix. The
 //	    version gates the SIGNATURE: a v4 library reading a return value
 //	    from a v3 addon's void callback would consume a garbage register
 //	    (a phantom "queue full" retries an enqueue that SUCCEEDED —

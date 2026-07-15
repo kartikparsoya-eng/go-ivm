@@ -1796,7 +1796,7 @@ func (s *Server) removeGroup(id string) {
 // id/reason are observability-only (teardown-window measurement): every
 // teardown logs one [GO-IVM][TEARDOWN] line with per-phase timings so the
 // TS zombie-window (view-syncer stop → ServiceRunner delete, which awaits
-// this via the destroy RPC — pipeline-driver.ts:1147 MED-5) can be
+// this via the destroy RPC — pipeline-driver.ts:1147) can be
 // classified into mu-wait vs actual cleanup cost.
 //
 // Does NOT close reqC — closing the data channel would race with concurrent
