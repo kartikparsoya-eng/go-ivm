@@ -14,6 +14,7 @@ package builder
 
 import (
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/kartikparsoya-eng/go-ivm/ivm"
@@ -143,8 +144,8 @@ func hydrate(t *testing.T, p *Pipeline) []ivm.Node {
 	return slices.Collect(p.Input.Fetch(ivm.FetchRequest{}))
 }
 
-// Client EXISTS auto-flips to FlippedJoin (no Cap, ordered connect).
-// The pipeline still hydrates the right parents.
+// Non-flipped EXISTS child: Cap storage created, source connected UNORDERED
+// (nil sort), and the pipeline still hydrates the right parents.
 func TestBuilder_ExistsChildUsesCapAndUnorderedConnect(t *testing.T) {
 	d := newCapRecordDelegate(issueCommentTables())
 	where := existsCond("comment", "comments", []string{"id"}, []string{"issueID"}, "", nil)
@@ -156,19 +157,26 @@ func TestBuilder_ExistsChildUsesCapAndUnorderedConnect(t *testing.T) {
 	if len(nodes) != 1 || nodes[0].Row["id"] != "i1" {
 		t.Fatalf("hydrate = %v, want [i1]", nodes)
 	}
-	// Auto-flipped: no Cap storage (FlippedJoin path).
-	if len(d.capNames) != 0 {
-		t.Fatalf("capNames = %v, want none (auto-flipped to FlippedJoin)", d.capNames)
+	if want := []string{"comments:cap"}; !slices.Equal(d.capNames, want) {
+		t.Fatalf("capNames = %v, want %v", d.capNames, want)
 	}
-	// The child connects ORDERED (FlippedJoin depends on ordering).
+	if len(d.takeNames) != 0 {
+		t.Fatalf("takeNames = %v, want none", d.takeNames)
+	}
+	// The comment source's single connect must be UNORDERED (builder.ts:310-313).
 	commentSorts := d.sortsOf("comment")
-	if len(commentSorts) != 1 || commentSorts[0] == nil {
-		t.Fatalf("comment connect sorts = %v, want one non-nil (ordered for FlippedJoin)", commentSorts)
+	if len(commentSorts) != 1 || commentSorts[0] != nil {
+		t.Fatalf("comment connect sorts = %v, want one nil (unordered)", commentSorts)
 	}
 	// The parent connect stays ordered.
 	issueSorts := d.sortsOf("issue")
 	if len(issueSorts) != 1 || issueSorts[0] == nil {
 		t.Fatalf("issue connect sorts = %v, want one non-nil", issueSorts)
+	}
+	// EXISTS_LIMIT=3: all 3 matching comments tracked.
+	st := d.capStorages["comments:cap"].States()[`["cap","i1"]`]
+	if st.Size != 3 {
+		t.Fatalf("cap state = %+v, want size 3 (EXISTS_LIMIT)", st)
 	}
 }
 
@@ -207,8 +215,9 @@ func TestBuilder_FlippedExistsChildNotCap(t *testing.T) {
 }
 
 // TS: 'non-flipped EXISTS child with flipped OR branch falls back to Take'.
-// With auto-flip, the outer client EXISTS is also flipped, so both go
-// through the FlippedJoin path (no Cap, no Take fallback needed).
+// Without the fallback this AST cannot even build: the unordered connect
+// would flow into UnionFanIn, whose constructor panics
+// "UnionFanIn requires sorted input".
 func TestBuilder_ExistsChildWithFlippedOrBranchFallsBackToTake(t *testing.T) {
 	d := newCapRecordDelegate(issueCommentTables())
 	flippedAuthor := existsCond("author", "author", []string{"authorID"}, []string{"id"}, "", nil)
@@ -232,19 +241,22 @@ func TestBuilder_ExistsChildWithFlippedOrBranchFallsBackToTake(t *testing.T) {
 		t.Fatalf("hydrate = %v, want 1 parent", nodes)
 	}
 
-	// Auto-flipped: no cap storage.
+	// No cap storage — the EXISTS child took the Take path.
 	if len(d.capNames) != 0 {
-		t.Fatalf("capNames = %v, want none (auto-flipped)", d.capNames)
+		t.Fatalf("capNames = %v, want none (fallback to Take)", d.capNames)
 	}
-	// The comment child connect is ORDERED (FlippedJoin depends on ordering).
+	if len(d.takeNames) != 1 || !strings.HasSuffix(d.takeNames[0], ":take") {
+		t.Fatalf("takeNames = %v, want one :take", d.takeNames)
+	}
+	// The comment child connect is ORDERED under the fallback.
 	commentSorts := d.sortsOf("comment")
 	if len(commentSorts) != 1 || commentSorts[0] == nil {
-		t.Fatalf("comment connect sorts = %v, want one non-nil (ordered for FlippedJoin)", commentSorts)
+		t.Fatalf("comment connect sorts = %v, want one non-nil (ordered fallback)", commentSorts)
 	}
 }
 
-// With auto-flip, both outer and inner client EXISTS auto-flip to
-// FlippedJoin — no Cap storage at any level.
+// TS: 'non-flipped EXISTS child with OR(simple, non-flipped EXISTS) still
+// uses Cap' — flips gate the fallback, plain subqueries in an OR do not.
 func TestBuilder_ExistsChildWithNonFlippedOrExistsKeepsCap(t *testing.T) {
 	d := newCapRecordDelegate(issueCommentTables())
 	innerExists := existsCond("author", "author", []string{"authorID"}, []string{"id"}, "", nil)
@@ -263,14 +275,20 @@ func TestBuilder_ExistsChildWithNonFlippedOrExistsKeepsCap(t *testing.T) {
 
 	BuildPipeline(ast, d)
 
-	// Auto-flipped: no Cap storage.
-	if len(d.capNames) != 0 {
-		t.Fatalf("capNames = %v, want none (auto-flipped)", d.capNames)
+	// Outer EXISTS child keeps Cap; the inner non-flipped EXISTS inside the
+	// OR gets its own Cap (alias uniquified to author_0).
+	got := slices.Clone(d.capNames)
+	slices.Sort(got)
+	want := []string{"author_0:cap", "comments:cap"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("capNames = %v, want %v", got, want)
+	}
+	if len(d.takeNames) != 0 {
+		t.Fatalf("takeNames = %v, want none", d.takeNames)
 	}
 }
 
-// With auto-flip, both levels of nested client EXISTS auto-flip to
-// FlippedJoin — no Cap storage at any level.
+// TS: 'nested EXISTS produces a Cap at every level'
 func TestBuilder_NestedExistsCapAtEveryLevel(t *testing.T) {
 	d := newCapRecordDelegate(issueCommentTables())
 	innerWhere := existsCond("revision", "revisions", []string{"id"}, []string{"commentID"}, "", nil)
@@ -280,25 +298,41 @@ func TestBuilder_NestedExistsCapAtEveryLevel(t *testing.T) {
 
 	BuildPipeline(ast, d)
 
-	// Auto-flipped: no Cap storage.
-	if len(d.capNames) != 0 {
-		t.Fatalf("capNames = %v, want none (auto-flipped)", d.capNames)
+	got := slices.Clone(d.capNames)
+	slices.Sort(got)
+	want := []string{"comments:cap", "revisions:cap"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("capNames = %v, want %v", got, want)
+	}
+	// Both EXISTS children connect unordered.
+	for _, table := range []string{"comment", "revision"} {
+		sorts := d.sortsOf(table)
+		if len(sorts) != 1 || sorts[0] != nil {
+			t.Fatalf("%s connect sorts = %v, want one nil", table, sorts)
+		}
 	}
 }
 
-// With auto-flip, client EXISTS children are flipped (isNonFlippedExistsChild=false),
-// so start/related are valid (TS allows them for flipped EXISTS). No panic.
+// TS: 'EXISTS subquery with start throws' (builder.ts:294)
 func TestBuilder_ExistsChildWithStartPanics(t *testing.T) {
 	d := newCapRecordDelegate(issueCommentTables())
 	where := existsCond("comment", "comments", []string{"id"}, []string{"issueID"}, "",
 		&AST{Start: &Bound{Row: ivm.Row{"id": "c0"}, Exclusive: false}})
 	ast := AST{Table: "issue", OrderBy: ivm.Ordering{{"id", "asc"}}, Where: &where}
 
-	// Should NOT panic — auto-flipped EXISTS allows start.
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("expected panic")
+		}
+		if s, _ := r.(string); s != "EXISTS subqueries must not have start" {
+			t.Fatalf("panic = %v, want TS message", r)
+		}
+	}()
 	BuildPipeline(ast, d)
 }
 
-// With auto-flip, client EXISTS children are flipped, so related is valid.
+// TS: 'EXISTS subquery with related throws' (builder.ts:297)
 func TestBuilder_ExistsChildWithRelatedPanics(t *testing.T) {
 	d := newCapRecordDelegate(issueCommentTables())
 	where := existsCond("comment", "comments", []string{"id"}, []string{"issueID"}, "",
@@ -308,7 +342,15 @@ func TestBuilder_ExistsChildWithRelatedPanics(t *testing.T) {
 		}}})
 	ast := AST{Table: "issue", OrderBy: ivm.Ordering{{"id", "asc"}}, Where: &where}
 
-	// Should NOT panic — auto-flipped EXISTS allows related.
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("expected panic")
+		}
+		if s, _ := r.(string); s != "EXISTS subqueries must not have related" {
+			t.Fatalf("panic = %v, want TS message", r)
+		}
+	}()
 	BuildPipeline(ast, d)
 }
 
