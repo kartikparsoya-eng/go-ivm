@@ -41,6 +41,17 @@ import (
 	"time"
 )
 
+// numericReqIDOrZero extracts the float64 reqID from an opaque interface{}
+// request ID, returning 0 for non-numeric IDs. Used by the watchdog to
+// cancel the pull-stream gate.
+func numericReqIDOrZero(id interface{}) float64 {
+	f, ok := numericReqID(id)
+	if !ok {
+		return 0
+	}
+	return f
+}
+
 // activeReq describes the request a CG worker is currently executing —
 // stamped at dequeue, cleared after the respCh send (see worker()). The
 // pointer lives in ClientGroup.curReq (atomic: written only by the worker
@@ -57,6 +68,10 @@ type activeReq struct {
 	// picked it up (zero when the enqueue stamp is missing — direct
 	// trySendReq callers in tests).
 	queueWait time.Duration
+	// reqIDFloat is the numeric reqID for pull-stream gates. Zero for
+	// non-pull requests (advance, etc.). Set by the worker at dequeue so
+	// the watchdog can cancel the gate without parsing the opaque reqID.
+	reqIDFloat float64
 }
 
 // wedgeLogW is the watchdog's output sink. A package var (not a Server
@@ -133,6 +148,39 @@ func (s *Server) scanWedgedGroups(now time.Time) int {
 			len(g.reqC), info.queueWait.Round(time.Microsecond), info.reqID)
 		if g.wedgeDumped.CompareAndSwap(false, true) {
 			dumpAllStacks(info, elapsed)
+		}
+
+		// Escalation ladder (C5 reframing): the progress handler makes
+		// gate.cancel's flag-set the normal cancel path. The ladder's
+		// rungs are for the orphan case — an RPC nobody cancelled that's
+		// stuck. Rungs:
+		//   1x threshold (90s):  log + stack dump (above)
+		//   2x threshold (180s): force-cancel the stream gate (sets bound
+		//     conns' cancel flags via onCancel — the progress handler
+		//     aborts the SQLite step within ~4096 opcodes)
+		//   6x threshold (540s): fatalExit — process-fatal, TS-parity
+		//     (blocked-loop → probe-kill → supervised restart). With the
+		//     progress handler this should never fire; it exists as the
+		//     liveness probe of last resort.
+		if info.reqIDFloat != 0 && elapsed >= 2*s.wedgeThreshold {
+			if g.wedgeCancelled.CompareAndSwap(false, true) {
+				fmt.Fprintf(wedgeLogW,
+					"[GO-IVM][WEDGE-ESCALATE] cg=%s method=%s elapsed=%v action=gate-cancel reqID=%v\n",
+					info.cgID, info.method, elapsed.Round(time.Millisecond), info.reqID)
+				s.streamGates.cancel(info.reqIDFloat)
+			}
+		}
+		if info.reqIDFloat != 0 && elapsed >= 6*s.wedgeThreshold {
+			// Only fatalExit if we actually attempted to cancel and it
+			// didn't work after 3x more thresholds. If reqIDFloat is 0
+			// (non-pull request), skip — advance/init handlers are
+			// bounded by their own budget timers.
+			fmt.Fprintf(wedgeLogW,
+				"[GO-IVM][WEDGE-FATAL] cg=%s method=%s elapsed=%v action=fatalExit — "+
+					"handler stuck past 6x threshold; progress handler cancel failed. "+
+					"Killing process (TS-parity: blocked-loop → probe-kill → restart).\n",
+				info.cgID, info.method, elapsed.Round(time.Millisecond))
+			os.Exit(1)
 		}
 	}
 	return wedged

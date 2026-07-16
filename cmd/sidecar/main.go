@@ -894,6 +894,11 @@ type ClientGroup struct {
 	// many scan ticks it spans.
 	wedgeDumped atomic.Bool
 
+	// wedgeCancelled latches the watchdog's force-cancel (2x threshold).
+	// Prevents repeated gate.cancel calls on the same wedge. Re-armed by
+	// the worker when the handler completes.
+	wedgeCancelled atomic.Bool
+
 	// sendMu closes the orphaned-respCh race between trySendReq and the
 	// worker's post-done drain. trySendReq
 	// holds RLock across its done pre-check AND the reqC send; the exiting
@@ -1608,11 +1613,12 @@ func (g *ClientGroup) worker(s *Server) {
 		// (nothing logs until it returns, and a successful return logged
 		// nothing at all).
 		g.curReq.Store(&activeReq{
-			method:    method,
-			cgID:      cg,
-			reqID:     req.req.ID,
-			start:     dequeued,
-			queueWait: qWait,
+			method:     method,
+			cgID:       cg,
+			reqID:      req.req.ID,
+			start:      dequeued,
+			queueWait:  qWait,
+			reqIDFloat: numericReqIDOrZero(req.req.ID),
 		})
 
 		// Teardown-window measurement: the destroy RPC's FIFO queue-wait is
@@ -1697,6 +1703,7 @@ func (g *ClientGroup) worker(s *Server) {
 		}
 		g.curReq.Store(nil)
 		g.wedgeDumped.Store(false) // re-arm the once-per-wedge dump latch
+		g.wedgeCancelled.Store(false) // re-arm the force-cancel latch
 		// Completion stamp BEFORE clearing inFlight (see the field comment):
 		// without it, a handler that ran longer than the idle window left
 		// lastUsedNs at its DEQUEUE time — instantly reap-eligible the
