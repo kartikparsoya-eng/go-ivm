@@ -598,9 +598,13 @@ func namedDriverArgs(params []any) ([]driver.NamedValue, error) {
 	return out, nil
 }
 
-// queryStmt runs a checked-out driver.Stmt with params. mattn implements
-// driver.StmtQueryContext, so ctx cancellation (CG teardown) interrupts a
-// blocked step exactly as the database/sql path did.
+// queryStmt runs a checked-out driver.Stmt with params. Callers pass
+// context.Background() so the mattn driver takes its synchronous Next()
+// path (no goroutine-per-row). Cancellation is handled by the
+// sqlite3_progress_handler cancel flag registered on the conn — see
+// cancel_flag.go. Do NOT pass a cancellable context here: it re-enables
+// the goroutine-per-Next overhead that caused the 17-minute production
+// wedge (see goroutine_overhead_test.go).
 func queryStmt(ctx context.Context, st driver.Stmt, params []any) (driver.Rows, error) {
 	args, err := namedDriverArgs(params)
 	if err != nil {

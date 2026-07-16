@@ -399,9 +399,13 @@ func (h *abiHost) deliverPumpFrame(kind int32, payload []byte) bool {
 			return false
 		}
 		if time.Now().After(deadline) {
-			fmt.Fprintf(os.Stderr,
-				"[GO-IVM] pump deliver timed out after %v (TSFN queue full, JS loop unresponsive) — abandoning frame\n",
+			// W6: a dropped pump frame on a pull stream is a silently missing
+			// row. Make this stream-fatal with a specific error so the client
+			// gets an error frame, not a silent truncation.
+			err := fmt.Errorf("pump deliver timed out after %v (TSFN queue full, JS loop unresponsive) — stream fatally errored",
 				2*deliverTimeoutDur())
+			fmt.Fprintln(os.Stderr, "[GO-IVM] "+err.Error())
+			h.setDeathCause(err)
 			return false
 		}
 		// Event-driven park (ABI v5): woken instantly by the addon's drain

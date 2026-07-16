@@ -119,13 +119,10 @@ type Source struct {
 	// atomic.Pointer lets fanOut read it without s.mu).
 	advanceClock atomic.Pointer[procclock.Accumulator]
 
-	// advanceCtx, when non-nil, is a context with the advance's wall-clock
-	// budget deadline. SQL queries on the advance path (fetchSerial,
-	// fetchDuringPushStream) use this instead of s.ctx so that a query
-	// blocking on WAL contention is interrupted by the budget deadline via
-	// sqlite3_interrupt (the go-sqlite3 driver honors context cancellation).
-	// Installed/cleared by the engine alongside advanceClock. nil during
-	// hydrate (falls back to s.ctx, the CG lifetime context).
+	// advanceCtx is vestigial — advanceQueryCtx() now returns
+	// context.Background() and cancellation is handled by the progress
+	// handler cancel flag (see cancel_flag.go). Kept for API compatibility
+	// with the engine's SetAdvanceCtx call; the value is no longer read.
 	advanceCtx atomic.Pointer[context.Context]
 
 	// advanceAbortCheck, when non-nil, is the advance's per-fetch abort
@@ -1797,9 +1794,10 @@ func (s *Source) fetchSerial(req ivm.FetchRequest, conn *connection) []ivm.Node 
 // bumped before its filterPush. The checked-out stmt makes the cursor
 // private (see checkoutSelectLocked).
 //
-// Uses s.ctx (CG lifetime) per the Source ctx contract — a teardown mid-
-// cursor surfaces as a panic that the engine's advance recovery converts to
-// a clean terminal frame.
+// Uses context.Background() (via advanceQueryCtx) so the mattn driver
+// takes its synchronous Next() path. Cancellation is handled by the
+// sqlite3_progress_handler cancel flag (see cancel_flag.go). The advance
+// budget timer sets the flag via time.AfterFunc.
 func (s *Source) fetchDuringPushStream(req ivm.FetchRequest, conn *connection) iter.Seq[ivm.Node] {
 	return func(yield func(ivm.Node) bool) {
 		// Per-fetch abort checkpoint (TS parity — see SetAdvanceAbortCheck).
@@ -2103,9 +2101,11 @@ func (s *Source) driverRowToIVM(dest []driver.Value, colNames []string) ivm.Row 
 // is bound only in the advance-free window, so no Push is in flight
 // (invariant asserted by the engine's bind/unbind discipline).
 //
-// Uses s.ctx (CG lifetime) per the Source ctx contract — a teardown mid-
-// cursor surfaces as a panic that the engine's hydrate recovery converts to
-// a clean error frame.
+// Uses context.Background() so the mattn driver takes its synchronous
+// Next() path (no goroutine-per-row). An explicit s.ctx.Err() check before
+// the fetch preserves the teardown panic invariant. Cancellation is
+// handled by the sqlite3_progress_handler cancel flag (see cancel_flag.go).
+// Do NOT restore s.ctx here — see cancel_flag.go and goroutine_overhead_test.go.
 func (s *Source) fetchViaBoundReaderStream(req ivm.FetchRequest, conn *connection, r *poolReader) iter.Seq[ivm.Node] {
 	return func(yield func(ivm.Node) bool) {
 		// Unordered connections issue NO ORDER BY — see fetchForConn.

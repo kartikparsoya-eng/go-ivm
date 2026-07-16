@@ -319,6 +319,13 @@ type perfMetrics struct {
 	napiStagedRecords   atomic.Int64
 	napiBatchFlushes    atomic.Int64
 
+	// pullIdleTimeouts counts how many pull streams were auto-cancelled
+	// by the idle sweeper (no credit for > pullIdleTimeout). Repeated
+	// timeouts on the same CG indicate a stuck consumer or a pathological
+	// query — the damper (runPullIdleSweeper) logs a WARNING when a CG
+	// hits >3 idle timeouts within a 5-minute window.
+	pullIdleTimeouts atomic.Int64
+
 	advanceTableTimes   map[string][]int
 	conflictRowsDeleted atomic.Int64
 }
@@ -555,13 +562,15 @@ func (m *perfMetrics) reportAndReset() {
 	deliverTimeouts := m.napiDeliverTimeouts.Swap(0)
 	stagedRecords := m.napiStagedRecords.Swap(0)
 	batchFlushes := m.napiBatchFlushes.Swap(0)
+	pullIdleTimeouts := m.pullIdleTimeouts.Swap(0)
 	cacheHits, cacheMisses := tablesource.ReaderShellCacheCounters()
 	dHits, dMisses := cacheHits-m.lastReaderCacheHits, cacheMisses-m.lastReaderCacheMisses
 	m.lastReaderCacheHits, m.lastReaderCacheMisses = cacheHits, cacheMisses
 
 	if advCount == 0 && hydCount == 0 && bindCoread == 0 && bindConverge == 0 &&
 		bindSerial == 0 && warmCoread == 0 && warmSerial == 0 && dHits == 0 && dMisses == 0 &&
-		deliverStalls == 0 && deliverTimeouts == 0 && stagedRecords == 0 && batchFlushes == 0 {
+		deliverStalls == 0 && deliverTimeouts == 0 && stagedRecords == 0 && batchFlushes == 0 &&
+		pullIdleTimeouts == 0 {
 		return
 	}
 
@@ -653,6 +662,11 @@ func (m *perfMetrics) reportAndReset() {
 		fmt.Fprintf(os.Stderr,
 			"[GO-IVM][PERF-NAPI] 10s window: deliver queue-full stalls=%d timeouts=%d staged=%d batchFlushes=%d\n",
 			deliverStalls, deliverTimeouts, stagedRecords, batchFlushes)
+	}
+	if pullIdleTimeouts > 0 {
+		fmt.Fprintf(os.Stderr,
+			"[GO-IVM][PERF-PULL] 10s window: pull idle-timeouts=%d\n",
+			pullIdleTimeouts)
 	}
 
 	conflictRows := m.conflictRowsDeleted.Swap(0)
@@ -1391,15 +1405,36 @@ func (s *Server) runPullIdleSweeper(ctx context.Context) {
 	}
 	ticker := time.NewTicker(tick)
 	defer ticker.Stop()
+	// W8: damper for repeated idle timeouts. >3 in 5 minutes logs a
+	// WARNING — repeated timeouts indicate a stuck consumer or
+	// pathological query, not transient backpressure.
+	windowTimeouts := 0
+	windowStart := time.Now()
+	const damperWindow = 5 * time.Minute
+	const damperThreshold = 3
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case now := <-ticker.C:
-			if n := s.streamGates.sweepIdle(now, idle); n > 0 {
+			if now.Sub(windowStart) >= damperWindow {
+				windowTimeouts = 0
+				windowStart = now
+			}
+			n := s.streamGates.sweepIdle(now, idle)
+			if n > 0 {
+				metrics.pullIdleTimeouts.Add(int64(n))
+				windowTimeouts += n
 				fmt.Fprintf(os.Stderr,
 					"[GO-IVM] pull idle-timeout: cancelled %d parked stream(s) (no credit for > %v)\n",
 					n, idle)
+				if windowTimeouts >= damperThreshold {
+					fmt.Fprintf(os.Stderr,
+						"[GO-IVM][IDLE-DAMPER] %d pull idle-timeouts in the last %v — repeated consumer stalls (possible stuck consumer or pathological query)\n",
+						windowTimeouts, damperWindow)
+					windowTimeouts = 0
+					windowStart = now
+				}
 			}
 		}
 	}

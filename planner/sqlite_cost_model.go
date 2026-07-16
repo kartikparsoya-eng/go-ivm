@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 	"math"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -221,7 +222,16 @@ func (cm *sqliteCostModel) estimateRowsFromDetail(
 	detail = strings.TrimSpace(detail)
 
 	if strings.HasPrefix(detail, "SCAN") {
-		return cm.getTotalRows(tableName)
+		// D3: early scan detection. A full table scan on a non-trivial
+		// table is a red flag — the query will wedge under load. Log
+		// with the table name so it's visible before any hydrate fires.
+		totalRows := cm.getTotalRows(tableName)
+		if totalRows > 1000 {
+			fmt.Fprintf(os.Stderr,
+				"[GO-IVM][SCAN-WARN] table=%s rows=%.0f — full table scan detected in query plan (EXPLAIN QUERY PLAN: %s). Consider adding an index.\n",
+				tableName, totalRows, detail)
+		}
+		return totalRows
 	}
 
 	if strings.HasPrefix(detail, "SEARCH") {

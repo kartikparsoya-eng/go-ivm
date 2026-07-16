@@ -113,12 +113,10 @@ func (s *Source) SetAdvanceClock(clk *procclock.Accumulator) {
 	s.advanceClock.Store(clk)
 }
 
-// SetAdvanceCtx installs (nil: clears) the advance's wall-clock budget
-// context. When set, SQL queries on the advance path use this context
-// instead of s.ctx (the CG lifetime context) so that a query blocking on
-// WAL contention is interrupted by the budget deadline — the go-sqlite3
-// driver calls sqlite3_interrupt() when ctx.Done() fires. Cleared on
-// advance completion (via defer, same as the clock).
+// SetAdvanceCtx is vestigial — the advance budget is now handled by the
+// progress handler cancel flag (see cancel_flag.go). Kept for API
+// compatibility with the engine's advance clock setup; the value is
+// stored but never read by advanceQueryCtx().
 func (s *Source) SetAdvanceCtx(ctx context.Context) {
 	if ctx == nil {
 		s.advanceCtx.Store(nil)
