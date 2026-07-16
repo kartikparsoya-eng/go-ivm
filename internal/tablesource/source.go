@@ -701,6 +701,12 @@ func (s *Source) closePrevConnLocked() {
 	if s.prevTxStarted {
 		_, _ = s.prevConn.ExecContext(context.Background(), "ROLLBACK")
 	}
+	// Detach and free the progress handler BEFORE closing the conn —
+	// sqlite3_progress_handler on a closed db handle is a use-after-free.
+	if s.prevCancelFlag != nil {
+		s.prevCancelFlag.Free()
+		s.prevCancelFlag = nil
+	}
 	_ = s.prevConn.Close()
 	s.prevConn = nil
 	s.prevTxStarted = false

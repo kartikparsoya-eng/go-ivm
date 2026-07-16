@@ -224,11 +224,14 @@ func (r *poolReader) closeConn() {
 		_ = e.st.Close()
 	}
 	r.stmts = nil
-	_ = r.dc.Close()
+	// Detach the progress handler and free the cancel flag BEFORE
+	// closing the conn — sqlite3_progress_handler on a closed db handle
+	// is a use-after-free (the CI wal2 build hangs in the syscall).
 	if r.cancelFlag != nil {
 		r.cancelFlag.Free()
 		r.cancelFlag = nil
 	}
+	_ = r.dc.Close()
 }
 
 func (r *poolReader) close(ctx context.Context) {
