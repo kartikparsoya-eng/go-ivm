@@ -389,6 +389,8 @@ func (s *Server) tearDownWarmReaderPool(group *ClientGroup, pool *tablesource.Re
 	if pool == nil {
 		return
 	}
+	// Cancel any in-flight SQLite operations before closing.
+	pool.CancelAll(tablesource.CancelTeardown)
 	if group.eng != nil {
 		group.eng.UnbindTableSourcesReaderPool()
 	}
