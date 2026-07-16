@@ -10,7 +10,7 @@ typedef struct sqlite3 sqlite3;
 // in C memory (C.malloc'd) to satisfy cgo pointer rules.
 typedef struct {
 	volatile int cancel;  // set to 1 by Go to request cancellation
-	int budget;            // remaining opcode budget (-1 = unlimited)
+	volatile int budget;  // remaining opcode budget (-1 = unlimited)
 } goivm_cancel_flag;
 
 // goivm_progress_cb is the C-side progress handler callback registered
