@@ -103,9 +103,10 @@ var PoolAcquireTimeout = 5 * time.Second
 // the slot was re-filled first). Eviction can never close a checked-out
 // stmt: checked-out stmts are not in the map.
 type poolReader struct {
-	dc    driver.Conn
-	stmts map[string]*poolStmt
-	tick  uint64
+	dc        driver.Conn
+	stmts     map[string]*poolStmt
+	tick      uint64
+	cancelFlag *connCancelFlag // per-conn C progress handler flag
 }
 
 // poolStmt pairs a prepared statement with its last-use tick for the
@@ -224,6 +225,10 @@ func (r *poolReader) closeConn() {
 	}
 	r.stmts = nil
 	_ = r.dc.Close()
+	if r.cancelFlag != nil {
+		r.cancelFlag.Free()
+		r.cancelFlag = nil
+	}
 }
 
 func (r *poolReader) close(ctx context.Context) {
@@ -293,7 +298,13 @@ func provisionReader(
 	if err != nil {
 		return nil, "", err
 	}
-	r := &poolReader{dc: dc, stmts: map[string]*poolStmt{}}
+	r := &poolReader{dc: dc, stmts: map[string]*poolStmt{}, cancelFlag: newConnCancelFlag()}
+	// Register the progress handler on the raw conn so SQLite checks
+	// the cancel flag every progressN opcodes. This makes any statement
+	// running on this conn interruptible without per-Next goroutine overhead.
+	if rawDB, rErr := rawSQLiteHandle(dc); rErr == nil {
+		r.cancelFlag.registerProgressHandler(rawDB, progressN)
+	}
 	ver, err := begin(ctx, r)
 	if err != nil {
 		r.close(closeCtx)
@@ -455,6 +466,14 @@ func (p *ReaderPool) AcquireForPipeline(queryID string, wait time.Duration) (rel
 		panic(fmt.Sprintf("ReaderPool.AcquireForPipeline: group %q already holds a reader", queryID))
 	}
 	p.bound.Store(queryID, r)
+	// Clear the cancel flag at acquire so the new pipeline starts fresh.
+	// Per-conn flag + reset-at-acquire is race-free because conn use is
+	// serialized — the only statement that can observe this conn's flag
+	// is this pipeline's (C1).
+	if r.cancelFlag != nil {
+		r.cancelFlag.clearCancel()
+		r.cancelFlag.setBudget(defaultBudget)
+	}
 	return func() {
 		p.bound.Delete(queryID)
 		// Bump BEFORE returning the reader so a waiter woken by the free
@@ -482,6 +501,35 @@ func (p *ReaderPool) readerFor(group string) *poolReader {
 	}
 	r, _ := v.(*poolReader)
 	return r
+}
+
+// CancelPipeline sets the cancel flag on the reader bound to the given
+// pipeline group, causing any in-flight sqlite3_step to abort (SQLITE_INTERRUPT)
+// via the progress handler. Also calls sqlite3_interrupt for busy-wait
+// coverage (C2). This is the normal cancel path — gate.cancel calls this
+// immediately, not as a watchdog rung (C5).
+func (p *ReaderPool) CancelPipeline(queryID string, reason CancelReason) {
+	if queryID == "" {
+		return
+	}
+	v, ok := p.bound.Load(queryID)
+	if !ok {
+		return
+	}
+	if r, _ := v.(*poolReader); r != nil && r.cancelFlag != nil {
+		r.cancelFlag.setCancel(reason)
+	}
+}
+
+// CancelAll sets the cancel flag on every reader in the pool. Called by
+// CG teardown — after this, no in-flight SQLite operation on any reader
+// can survive. The pool should be closed immediately after.
+func (p *ReaderPool) CancelAll(reason CancelReason) {
+	for _, r := range p.all {
+		if r.cancelFlag != nil {
+			r.cancelFlag.setCancel(reason)
+		}
+	}
 }
 
 // Version is the stateVersion every reader in the pool is pinned at.

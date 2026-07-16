@@ -257,6 +257,10 @@ func (s *Server) tearDownReaderPool(group *ClientGroup) {
 	if group.readerPool == nil {
 		return
 	}
+	// Cancel all in-flight SQLite operations before closing the pool.
+	// This ensures any producer stuck inside sqlite3_step gets
+	// SQLITE_INTERRUPT via the progress handler before the conns close.
+	group.readerPool.CancelAll(tablesource.CancelTeardown)
 	if group.eng != nil {
 		group.eng.UnbindTableSourcesReaderPool()
 	}

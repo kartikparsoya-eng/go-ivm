@@ -2323,6 +2323,23 @@ func (s *Server) handleAddQueriesStream(req RPCRequest, streamW streamWriter) RP
 		return rpcError(req.ID, -32000,
 			"addQueriesStream: pull gate registration failed")
 	}
+	// Wire the gate's cancel to abort any in-flight SQLite operations on
+	// the pipeline's reader conns via the progress handler (C5). This is
+	// the normal cancel path — gate.cancel sets the bound conns' cancel
+	// flags immediately, so a producer stuck inside sqlite3_step gets
+	// SQLITE_INTERRUPT within ~4096 opcodes (microseconds), not
+	// O(remaining scan) (W4).
+	if group.readerPool != nil {
+		queryIDs := make([]string, len(specs))
+		for i, sp := range specs {
+			queryIDs[i] = sp.QueryID
+		}
+		gate.onCancel = func() {
+			for _, qid := range queryIDs {
+				group.readerPool.CancelPipeline(qid, tablesource.CancelStream)
+			}
+		}
+	}
 	// The gate's cancel must also unpark a delivery stuck on a full TSFN
 	// queue; fold it into the plane's cancellation check.
 	rp.setPullGate(gate)

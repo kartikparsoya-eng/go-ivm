@@ -64,6 +64,15 @@ type streamGate struct {
 	// group reaper never collects a CG whose client is actively pulling.
 	// Called WITHOUT gate.mu held (it's an atomic store on the group).
 	touch func()
+	// onCancel, when non-nil, is invoked from cancel() to abort any
+	// in-flight SQLite operation on the pipeline's reader conns. Set by
+	// handleAddQueriesStream with a closure that calls the reader pool's
+	// CancelPipeline. This is the normal cancel path (C5): gate.cancel
+	// sets the bound conns' cancel flags immediately, so a producer stuck
+	// inside sqlite3_step gets SQLITE_INTERRUPT via the progress handler
+	// within ~4096 opcodes (microseconds), not O(remaining scan) (W4).
+	// Called WITHOUT gate.mu held (it sets atomic flags on pool readers).
+	onCancel func()
 }
 
 func newStreamGate(touch func()) *streamGate {
@@ -128,11 +137,17 @@ func (g *streamGate) grant(n int64) {
 }
 
 // cancel marks the gate cancelled and unparks every producer. Idempotent.
+// Also invokes onCancel to abort any in-flight SQLite operation on the
+// pipeline's reader conns via the progress handler (C5).
 func (g *streamGate) cancel() {
 	g.mu.Lock()
 	g.cancelled = true
+	onCancel := g.onCancel
 	g.cond.Broadcast()
 	g.mu.Unlock()
+	if onCancel != nil {
+		onCancel()
+	}
 }
 
 // cancelIdle marks the gate as idle-timed-out then cancels. The idleTimeout

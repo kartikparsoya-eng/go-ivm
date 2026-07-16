@@ -154,6 +154,12 @@ type Source struct {
 	prevTxStarted bool
 	beginStmt     string
 
+	// prevCancelFlag is the per-conn cancel flag for prevConn. Registered
+	// when prevConn is first acquired in ensurePrevTxLocked. The progress
+	// handler makes advance-path reads and DML writes interruptible without
+	// per-Next goroutine overhead. Cleared/detached before cleanup SQL (C3).
+	prevCancelFlag *connCancelFlag
+
 	// externalConn, when non-nil, redirects ALL prev-tx reads/writes to a
 	// connection owned by something else (the Snapshotter's `prev` Snapshot —
 	// frame coordination). While bound, ensurePrevTx/OnAdvanceEnd are
@@ -665,7 +671,7 @@ func (s *Source) execPushStmtLocked(conn *sql.Conn, query string, args ...interf
 	if err != nil {
 		return err
 	}
-	_, err = st.ExecContext(s.ctx, args...)
+	_, err = st.ExecContext(context.Background(), args...)
 	return err
 }
 
@@ -769,6 +775,14 @@ func (s *Source) ensurePrevTxLocked() error {
 			_ = conn.Close()
 		} else {
 			s.prevConn = conn
+			// Register the progress handler on the writer conn.
+			s.prevCancelFlag = newConnCancelFlag()
+			conn.Raw(func(driverConn any) error {
+				if rawDB, rErr := rawSQLiteHandle(driverConn); rErr == nil {
+					s.prevCancelFlag.registerProgressHandler(rawDB, progressN)
+				}
+				return nil
+			})
 		}
 	}
 	if s.prevTxStarted {
@@ -828,7 +842,12 @@ func (s *Source) OnAdvanceEnd() {
 	if s.prevConn == nil || !s.prevTxStarted {
 		return
 	}
-	ctx := s.ctx
+	// C3 invariant: detach the progress handler before cleanup SQL so
+	// a still-armed flag can't abort the ROLLBACK/BEGIN recovery itself.
+	if s.prevCancelFlag != nil {
+		s.prevCancelFlag.clearCancel()
+	}
+	ctx := context.Background()
 	if _, err := s.prevConn.ExecContext(ctx, "ROLLBACK"); err != nil {
 		// If ROLLBACK fails the conn is in an unknown state; close it
 		// so the next ensurePrevTx will reacquire a fresh one. Drop the

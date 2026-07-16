@@ -127,15 +127,14 @@ func (s *Source) SetAdvanceCtx(ctx context.Context) {
 	}
 }
 
-// advanceQueryCtx returns the advance budget context if installed,
-// otherwise s.ctx. Used by advance-path SQL queries (fetchSerial,
-// fetchDuringPushStream) so the budget deadline can interrupt a
-// blocked query.
+// advanceQueryCtx returns the context for advance-path SQL queries.
+// Returns context.Background() — the progress handler on the prev conn
+// handles cancellation via the cancel flag, not the mattn driver's
+// goroutine-per-Next ctx watcher. The budget timer sets the flag via
+// time.AfterFunc (no goroutine until it fires), and sqlite3_interrupt
+// covers busy-wait sleeps (C2).
 func (s *Source) advanceQueryCtx() context.Context {
-	if ctx := s.advanceCtx.Load(); ctx != nil {
-		return *ctx
-	}
-	return s.ctx
+	return context.Background()
 }
 
 // SetAdvanceAbortCheck installs (nil: clears) the advance's per-fetch abort
