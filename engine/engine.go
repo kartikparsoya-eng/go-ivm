@@ -594,10 +594,9 @@ func (e *Engine) UnbindTableSources() {
 // CancelAllSourceConns sets the cancel flag on every source's active conn.
 // Called by the watchdog's 2x escalation for non-pull RPCs (advance, init)
 // where no stream gate exists. The progress handler aborts any in-flight
-// sqlite3_step within ~4096 opcodes.
+// sqlite3_step within ~4096 opcodes. Lock-free on both engine and source
+// sides (R1) — must never block on a lock the wedged goroutine holds.
 func (e *Engine) CancelAllSourceConns(reason int32) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
 	for _, src := range e.sourcesView() {
 		if c, ok := src.(connCanceller); ok {
 			c.CancelConns(reason)

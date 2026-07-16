@@ -220,3 +220,49 @@ but NOT prod-ready yet: three blockers.
 Full go test ./... green; -race green (tablesource, cmd/sidecar); napilib
 c-shared build OK. W0 resolved (working tree clean). Flag lifecycle,
 detach-before-close ordering, and teardown cancel coverage all correct.
+
+---
+
+# Verification of 16ac9ca (B1/B2/B3/C4 + should-fixes)
+
+All four land as claimed; build clean, full suite green, -race green
+(tablesource, cmd/sidecar). B3's C decrement has a proper underflow guard;
+C4 pool-path mapping covers both the query-error and mid-scan sites with
+r.cancelFlag.Reason(); rows.Err() is checked on every scan loop (no silent
+truncation possible); watchdog fatal rung is now universal.
+
+Three follow-ups, one shared root cause:
+
+- **R1 (HIGH) — the cancel path can block on locks the wedged goroutine
+  holds.** CancelAllSourceConns takes e.mu → CancelConns takes s.mu; the
+  budget AfterFunc takes s.mu. fetchSerial drains its cursor UNDER s.mu and
+  advances run under the engine mu — so for exactly the stuck-statement case
+  these mechanisms exist for: (a) the budget timer parks on s.mu and cannot
+  set the flag until the statement ends (gas meter becomes the only real
+  bound), and (b) the watchdog's single scan goroutine blocks inside the 2x
+  rung — stalling scans for ALL groups and this CG's own 6x fatal. A non-SQL
+  wedge (mutex, non-SQL cgo) never releases → watchdog permanently dead =
+  W3's blind spot rebuilt inside its own fix.
+- **R2 (MED) — use-after-free window**: checkInterruptPanic at the lazy
+  fetch site (:1967) runs OUTSIDE s.mu (post-F7 streaming section) despite
+  its "MUST hold s.mu" contract; races BindConn/UnbindConn's Free of
+  externalCancelFlag (drive mode rebinds every advance) → read of freed C
+  memory.
+- **Shared fix for R1+R2**: make flag access lock-free and lifetime-stable —
+  atomic.Pointer[connCancelFlag] on Source/poolReader, allocate ONCE per
+  slot, clearCancel+setBudget on rebind instead of Free+realloc, Free only
+  at Source.Close/pool close. Then AfterFunc/CancelConns/checkInterruptPanic
+  read without s.mu and CancelAllSourceConns drops e.mu.
+- **R3 (MED) — classification gap at the likeliest abort site**: scanRows
+  and the lazy loop's rows.Err() panics are generic — a budget abort
+  surfacing MID-SCAN (the common case for a long scan) maps to -32000
+  'unclassified' → the transient breaker bucket (6/60s) instead of
+  rpcCodeAdvanceAborted → economic bucket. Repeated lawful budget aborts
+  could trip the breaker → CG teardown (the exact reason-blind-breaker
+  regression the tiered breaker fixed). Add the reason mapping to the two
+  rows.Err() sites + scanRows.
+
+LOW: C #define GOIVM_PROGRESS_N / Go progressN dual-maintained (add a test
+assert); BindConn budget is cumulative per bind (per-advance in drive —
+fine, watch in soak); AfterFunc re-resolves the ACTIVE flag at fire time
+(may hit the successor conn on a mid-advance rebind — same advance, benign).

@@ -122,19 +122,17 @@ func (s *Source) SetAdvanceClock(clk *procclock.Accumulator) {
 // (prevConn not yet acquired and no external conn bound); the per-fetch
 // abort checkpoint still bounds the advance in that case.
 func (s *Source) SetAdvanceBudget(d time.Duration) func() {
-	s.mu.Lock()
-	flag := s.cancelFlagForActiveConnLocked()
-	s.mu.Unlock()
+	flag := s.activeCancelFlag.Load()
 	if flag == nil {
 		return nil
 	}
 	flag.clearCancel()
 	flag.setBudget(defaultBudget)
 	timer := time.AfterFunc(d, func() {
-		s.mu.Lock()
-		f := s.cancelFlagForActiveConnLocked()
-		s.mu.Unlock()
-		if f != nil {
+		// Lock-free read — never blocks on s.mu (R1). The flag is stable
+		// (never freed during a fetch — R2), so this is safe even if a
+		// rebind happened between arm and fire.
+		if f := s.activeCancelFlag.Load(); f != nil {
 			f.setCancel(CancelBudget)
 		}
 	})
@@ -177,14 +175,12 @@ func (s *Source) checkAdvanceAbort() {
 	}
 }
 
-// CancelConns sets the cancel flag on the active conn (prevConn or
-// externalConn) with the given reason. Called by the engine's
+// CancelConns sets the cancel flag on the active conn with the given
+// reason. Lock-free — reads the atomic cancel flag (R1: must not block
+// on s.mu which the wedged goroutine may hold). Called by the engine's
 // CancelAllSourceConns — the watchdog's 2x escalation for non-pull RPCs.
 func (s *Source) CancelConns(reason int32) {
-	s.mu.Lock()
-	flag := s.cancelFlagForActiveConnLocked()
-	s.mu.Unlock()
-	if flag != nil {
+	if flag := s.activeCancelFlag.Load(); flag != nil {
 		flag.setCancel(CancelReason(reason))
 	}
 }

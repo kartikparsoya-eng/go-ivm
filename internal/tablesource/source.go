@@ -145,18 +145,16 @@ type Source struct {
 	prevTxStarted bool
 	beginStmt     string
 
-	// prevCancelFlag is the per-conn cancel flag for prevConn. Registered
-	// when prevConn is first acquired in ensurePrevTxLocked. The progress
-	// handler makes advance-path reads and DML writes interruptible without
-	// per-Next goroutine overhead. Cleared/detached before cleanup SQL (C3).
-	prevCancelFlag *connCancelFlag
-
-	// externalCancelFlag is the per-conn cancel flag for externalConn (B2).
-	// Created in BindConn when the snapshotter's frame conn is bound, so
-	// advance-path reads on the drive path (activeConn → externalConn) are
-	// interruptible by the progress handler — same as prevConn. Freed in
-	// UnbindConn.
-	externalCancelFlag *connCancelFlag
+	// activeCancelFlag is the per-conn cancel flag for the conn that
+	// activeConn() returns. Stored as an atomic.Pointer so that the
+	// watchdog (CancelConns), the budget timer (AfterFunc), and
+	// checkInterruptPanic can read it lock-free — they never block on
+	// s.mu, which the wedged goroutine may hold (R1). The flag is
+	// allocated once per Source and reused across rebinds: BindConn and
+	// ensurePrevTxLocked detach from the old conn and re-register on
+	// the new conn, but the flag struct itself is stable — Free only
+	// runs at Source.Close (R2: no use-after-free on rebind overlap).
+	activeCancelFlag atomic.Pointer[connCancelFlag]
 
 	// externalConn, when non-nil, redirects ALL prev-tx reads/writes to a
 	// connection owned by something else (the Snapshotter's `prev` Snapshot —
@@ -497,6 +495,12 @@ func (s *Source) Close() error {
 	defer s.mu.Unlock()
 	s.closeAllCachedStmtsLocked()
 	s.closePrevConnLocked()
+	// If an external conn was bound (prevConn nil), closePrevConnLocked
+	// returned early — free the flag here.
+	if flag := s.activeCancelFlag.Load(); flag != nil {
+		flag.Free()
+		s.activeCancelFlag.Store(nil)
+	}
 	return nil
 }
 
@@ -509,19 +513,19 @@ func (s *Source) Close() error {
 func (s *Source) BindConn(conn *sql.Conn) {
 	s.mu.Lock()
 	s.externalConn = conn
-	// Register a progress handler on the snapshotter's frame conn so
-	// advance-path reads on the drive path (activeConn → externalConn)
-	// are interruptible by the cancel flag — same as prevConn (B2).
-	// Without this, the drive path runs Background()-ctx queries with
-	// no handler: uninterruptible.
-	if s.externalCancelFlag != nil {
-		s.externalCancelFlag.Free()
+	// Reuse the active cancel flag: detach from the old conn (if any)
+	// and re-register on the new conn. The flag struct is stable —
+	// Free only at Source.Close (R1/R2).
+	flag := s.activeCancelFlag.Load()
+	if flag == nil {
+		flag = newConnCancelFlag()
+		s.activeCancelFlag.Store(flag)
 	}
-	s.externalCancelFlag = newConnCancelFlag()
-	s.externalCancelFlag.setBudget(defaultBudget)
+	flag.clearCancel()
+	flag.setBudget(defaultBudget)
 	conn.Raw(func(driverConn any) error {
 		if rawDB, rErr := rawSQLiteHandle(driverConn); rErr == nil {
-			s.externalCancelFlag.registerProgressHandler(rawDB, progressN)
+			flag.registerProgressHandler(rawDB, progressN)
 		} else {
 			fmt.Fprintf(os.Stderr,
 				"[GO-IVM][CANCEL] BindConn: failed to get raw SQLite handle for external conn: %v\n", rErr)
@@ -536,9 +540,11 @@ func (s *Source) BindConn(conn *sql.Conn) {
 func (s *Source) UnbindConn() {
 	s.mu.Lock()
 	s.externalConn = nil
-	if s.externalCancelFlag != nil {
-		s.externalCancelFlag.Free()
-		s.externalCancelFlag = nil
+	// Detach the progress handler from the external conn, but keep the
+	// flag alive — it will be re-registered on the next BindConn or
+	// ensurePrevTxLocked. Free only at Source.Close (R1/R2).
+	if flag := s.activeCancelFlag.Load(); flag != nil {
+		flag.detachProgressHandler()
 	}
 	s.mu.Unlock()
 }
@@ -553,13 +559,11 @@ func (s *Source) activeConn() *sql.Conn {
 	return s.prevConn
 }
 
-// cancelFlagForActiveConnLocked returns the cancel flag for the conn that
-// activeConn() would return. MUST be called with s.mu held.
-func (s *Source) cancelFlagForActiveConnLocked() *connCancelFlag {
-	if s.externalConn != nil {
-		return s.externalCancelFlag
-	}
-	return s.prevCancelFlag
+// cancelFlagForActiveConn returns the active cancel flag. Lock-free —
+// reads the atomic pointer. Safe to call from any goroutine (AfterFunc,
+// watchdog, checkInterruptPanic) without holding s.mu (R1).
+func (s *Source) cancelFlagForActiveConn() *connCancelFlag {
+	return s.activeCancelFlag.Load()
 }
 
 // checkInterruptPanic checks if err is an SQLITE_INTERRUPT and, if so,
@@ -567,12 +571,14 @@ func (s *Source) cancelFlagForActiveConnLocked() *connCancelFlag {
 // progress-handler aborts to the right RPC code instead of a generic
 // -32000: Stream/Teardown → ErrStreamCancelledByFlag (clean close),
 // Budget/Watchdog → ErrBudgetCancelled (→ rpcCodeAdvanceAborted → TS reset).
-// MUST be called with s.mu held (reads the cancel flag).
+// Lock-free — reads the atomic cancel flag (R1: must not block on s.mu
+// which the wedged goroutine may hold; R2: flag is stable, never freed
+// during a fetch).
 func (s *Source) checkInterruptPanic(err error) {
 	if !IsInterruptError(err) {
 		return
 	}
-	flag := s.cancelFlagForActiveConnLocked()
+	flag := s.cancelFlagForActiveConn()
 	if flag == nil {
 		return
 	}
@@ -758,9 +764,9 @@ func (s *Source) closePrevConnLocked() {
 	}
 	// Detach and free the progress handler BEFORE closing the conn —
 	// sqlite3_progress_handler on a closed db handle is a use-after-free.
-	if s.prevCancelFlag != nil {
-		s.prevCancelFlag.Free()
-		s.prevCancelFlag = nil
+	if flag := s.activeCancelFlag.Load(); flag != nil {
+		flag.Free()
+		s.activeCancelFlag.Store(nil)
 	}
 	_ = s.prevConn.Close()
 	s.prevConn = nil
@@ -833,12 +839,14 @@ func (s *Source) ensurePrevTxLocked() error {
 			_ = conn.Close()
 		} else {
 			s.prevConn = conn
-			// Register the progress handler on the writer conn.
-			s.prevCancelFlag = newConnCancelFlag()
-			s.prevCancelFlag.setBudget(defaultBudget)
+			// Allocate the cancel flag once and store it atomically.
+			// Reused across rebinds — Free only at Source.Close (R1/R2).
+			flag := newConnCancelFlag()
+			flag.setBudget(defaultBudget)
+			s.activeCancelFlag.Store(flag)
 			conn.Raw(func(driverConn any) error {
 				if rawDB, rErr := rawSQLiteHandle(driverConn); rErr == nil {
-					s.prevCancelFlag.registerProgressHandler(rawDB, progressN)
+					flag.registerProgressHandler(rawDB, progressN)
 				} else {
 					fmt.Fprintf(os.Stderr,
 						"[GO-IVM][CANCEL] ensurePrevTx: failed to get raw SQLite handle for prevConn: %v\n", rErr)
@@ -906,8 +914,8 @@ func (s *Source) OnAdvanceEnd() {
 	}
 	// C3 invariant: detach the progress handler before cleanup SQL so
 	// a still-armed flag can't abort the ROLLBACK/BEGIN recovery itself.
-	if s.prevCancelFlag != nil {
-		s.prevCancelFlag.clearCancel()
+	if flag := s.activeCancelFlag.Load(); flag != nil {
+		flag.clearCancel()
 	}
 	ctx := context.Background()
 	if _, err := s.prevConn.ExecContext(ctx, "ROLLBACK"); err != nil {
@@ -2033,6 +2041,7 @@ func (s *Source) fetchDuringPushStream(req ivm.FetchRequest, conn *connection) i
 			}
 		}
 		if err := rows.Err(); err != nil {
+			s.checkInterruptPanic(err)
 			panic(fmt.Sprintf("tablesource.Source.Fetch %s: rows: %v",
 				s.tableName, err))
 		}
@@ -2103,6 +2112,7 @@ func (s *Source) scanRows(
 		out = append(out, ivm.Node{Row: row})
 	}
 	if err := rows.Err(); err != nil {
+		s.checkInterruptPanic(err)
 		panic(fmt.Sprintf("tablesource.Source.Fetch %s: rows: %v",
 			s.tableName, err))
 	}
