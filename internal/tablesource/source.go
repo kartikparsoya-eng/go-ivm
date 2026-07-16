@@ -2101,7 +2101,22 @@ func (s *Source) fetchViaBoundReaderStream(req ivm.FetchRequest, conn *connectio
 			req.Start,
 			req.MultiConstraints,
 		)
-		stmt, err := r.checkoutStmt(s.ctx, q.SQL)
+		// Use context.Background() so the mattn driver takes its synchronous
+		// path (nextSyncLocked — direct CGO, no goroutine-per-row). s.ctx has
+		// a Done() channel which forces the driver to spawn a helper goroutine
+		// + channel for EVERY Next() call — millions of goroutine creations
+		// through the N+1 EXISTS pattern, each with stack alloc + CGO enter/
+		// exit + channel sync. TS's better-sqlite3 calls sqlite3_step
+		// synchronously with zero per-row overhead; this matches that.
+		// Cancellation is handled at the engine level (cancelled atomic) and
+		// by pool reader cleanup (closing the connection returns EOF). An
+		// explicit s.ctx.Err() check before the fetch preserves the teardown
+		// panic invariant (a dead source must not be silently read).
+		if err := s.ctx.Err(); err != nil {
+			panic(fmt.Sprintf("tablesource.Source.Fetch %s: source context cancelled: %v",
+				s.tableName, err))
+		}
+		stmt, err := r.checkoutStmt(context.Background(), q.SQL)
 		if err != nil {
 			panic(fmt.Sprintf("tablesource.Source.Fetch %s: reader prepare: %v\nSQL: %s",
 				s.tableName, err, q.SQL))
@@ -2111,7 +2126,7 @@ func (s *Source) fetchViaBoundReaderStream(req ivm.FetchRequest, conn *connectio
 		// (registered below) resets the stmt BEFORE returnStmt caches it.
 		healthy := true
 		defer func() { r.returnStmt(q.SQL, stmt, healthy) }()
-		rows, err := queryStmt(s.ctx, stmt, q.Params)
+		rows, err := queryStmt(context.Background(), stmt, q.Params)
 		if err != nil {
 			healthy = false
 			panic(fmt.Sprintf("tablesource.Source.Fetch %s: reader query: %v\nSQL: %s",
