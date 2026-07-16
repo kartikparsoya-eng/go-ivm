@@ -119,19 +119,13 @@ type Source struct {
 	// atomic.Pointer lets fanOut read it without s.mu).
 	advanceClock atomic.Pointer[procclock.Accumulator]
 
-	// advanceCtx is vestigial — advanceQueryCtx() now returns
-	// context.Background() and cancellation is handled by the progress
-	// handler cancel flag (see cancel_flag.go). Kept for API compatibility
-	// with the engine's SetAdvanceCtx call; the value is no longer read.
-	advanceCtx atomic.Pointer[context.Context]
-
 	// advanceAbortCheck, when non-nil, is the advance's per-fetch abort
 	// checkpoint (TS parity: #shouldAdvanceYieldMaybeAbortAdvance runs on
 	// every row fetched during push processing). Called at the top of every
 	// advance-path fetch and every scanned-row batch; panics a typed abort
 	// (recognized by the sidecar's recover → rpcCodeAdvanceAborted → TS
 	// reset) when the economic or wall budget is exceeded. Installed/cleared
-	// by the engine alongside advanceClock/advanceCtx; nil during hydrate.
+	// by the engine alongside advanceClock; nil during hydrate.
 	advanceAbortCheck atomic.Pointer[func()]
 
 	// Prev-tx state.
@@ -156,6 +150,13 @@ type Source struct {
 	// handler makes advance-path reads and DML writes interruptible without
 	// per-Next goroutine overhead. Cleared/detached before cleanup SQL (C3).
 	prevCancelFlag *connCancelFlag
+
+	// externalCancelFlag is the per-conn cancel flag for externalConn (B2).
+	// Created in BindConn when the snapshotter's frame conn is bound, so
+	// advance-path reads on the drive path (activeConn → externalConn) are
+	// interruptible by the progress handler — same as prevConn. Freed in
+	// UnbindConn.
+	externalCancelFlag *connCancelFlag
 
 	// externalConn, when non-nil, redirects ALL prev-tx reads/writes to a
 	// connection owned by something else (the Snapshotter's `prev` Snapshot —
@@ -508,6 +509,25 @@ func (s *Source) Close() error {
 func (s *Source) BindConn(conn *sql.Conn) {
 	s.mu.Lock()
 	s.externalConn = conn
+	// Register a progress handler on the snapshotter's frame conn so
+	// advance-path reads on the drive path (activeConn → externalConn)
+	// are interruptible by the cancel flag — same as prevConn (B2).
+	// Without this, the drive path runs Background()-ctx queries with
+	// no handler: uninterruptible.
+	if s.externalCancelFlag != nil {
+		s.externalCancelFlag.Free()
+	}
+	s.externalCancelFlag = newConnCancelFlag()
+	s.externalCancelFlag.setBudget(defaultBudget)
+	conn.Raw(func(driverConn any) error {
+		if rawDB, rErr := rawSQLiteHandle(driverConn); rErr == nil {
+			s.externalCancelFlag.registerProgressHandler(rawDB, progressN)
+		} else {
+			fmt.Fprintf(os.Stderr,
+				"[GO-IVM][CANCEL] BindConn: failed to get raw SQLite handle for external conn: %v\n", rErr)
+		}
+		return nil
+	})
 	s.mu.Unlock()
 }
 
@@ -516,6 +536,10 @@ func (s *Source) BindConn(conn *sql.Conn) {
 func (s *Source) UnbindConn() {
 	s.mu.Lock()
 	s.externalConn = nil
+	if s.externalCancelFlag != nil {
+		s.externalCancelFlag.Free()
+		s.externalCancelFlag = nil
+	}
 	s.mu.Unlock()
 }
 
@@ -527,6 +551,37 @@ func (s *Source) activeConn() *sql.Conn {
 		return s.externalConn
 	}
 	return s.prevConn
+}
+
+// cancelFlagForActiveConnLocked returns the cancel flag for the conn that
+// activeConn() would return. MUST be called with s.mu held.
+func (s *Source) cancelFlagForActiveConnLocked() *connCancelFlag {
+	if s.externalConn != nil {
+		return s.externalCancelFlag
+	}
+	return s.prevCancelFlag
+}
+
+// checkInterruptPanic checks if err is an SQLITE_INTERRUPT and, if so,
+// panics with the typed error matching the cancel reason (C4). This maps
+// progress-handler aborts to the right RPC code instead of a generic
+// -32000: Stream/Teardown → ErrStreamCancelledByFlag (clean close),
+// Budget/Watchdog → ErrBudgetCancelled (→ rpcCodeAdvanceAborted → TS reset).
+// MUST be called with s.mu held (reads the cancel flag).
+func (s *Source) checkInterruptPanic(err error) {
+	if !IsInterruptError(err) {
+		return
+	}
+	flag := s.cancelFlagForActiveConnLocked()
+	if flag == nil {
+		return
+	}
+	switch flag.Reason() {
+	case CancelStream, CancelTeardown:
+		panic(ErrStreamCancelledByFlag)
+	case CancelBudget, CancelWatchdog:
+		panic(ErrBudgetCancelled)
+	}
 }
 
 // checkoutSelectLocked returns a prepared statement for query bound to conn,
@@ -780,9 +835,13 @@ func (s *Source) ensurePrevTxLocked() error {
 			s.prevConn = conn
 			// Register the progress handler on the writer conn.
 			s.prevCancelFlag = newConnCancelFlag()
+			s.prevCancelFlag.setBudget(defaultBudget)
 			conn.Raw(func(driverConn any) error {
 				if rawDB, rErr := rawSQLiteHandle(driverConn); rErr == nil {
 					s.prevCancelFlag.registerProgressHandler(rawDB, progressN)
+				} else {
+					fmt.Fprintf(os.Stderr,
+						"[GO-IVM][CANCEL] ensurePrevTx: failed to get raw SQLite handle for prevConn: %v\n", rErr)
 				}
 				return nil
 			})
@@ -1672,6 +1731,7 @@ func (s *Source) fetchSerial(req ivm.FetchRequest, conn *connection) []ivm.Node 
 	defer s.returnSelectStmtLocked(dbConn, q.SQL, stmt)
 	rows, err := stmt.QueryContext(ctx, q.Params...)
 	if err != nil {
+		s.checkInterruptPanic(err)
 		panic(fmt.Sprintf("tablesource.Source.Fetch %s: query: %v\nSQL: %s",
 			s.tableName, err, q.SQL))
 	}
@@ -1904,6 +1964,7 @@ func (s *Source) fetchDuringPushStream(req ivm.FetchRequest, conn *connection) i
 		defer s.returnSelectStmt(dbConn, qSQL, stmt)
 		rows, err := stmt.QueryContext(s.advanceQueryCtx(), qParams...)
 		if err != nil {
+			s.checkInterruptPanic(err)
 			panic(fmt.Sprintf("tablesource.Source.Fetch %s: query: %v\nSQL: %s",
 				s.tableName, err, qSQL))
 		}
@@ -2153,6 +2214,15 @@ func (s *Source) fetchViaBoundReaderStream(req ivm.FetchRequest, conn *connectio
 		defer func() { r.returnStmt(q.SQL, stmt, healthy) }()
 		rows, err := queryStmt(context.Background(), stmt, q.Params)
 		if err != nil {
+			if r.cancelFlag != nil && r.cancelFlag.IsCancelled() {
+				reason := r.cancelFlag.Reason()
+				if reason == CancelStream || reason == CancelTeardown {
+					panic(ErrStreamCancelledByFlag)
+				}
+				if reason == CancelBudget || reason == CancelWatchdog {
+					panic(ErrBudgetCancelled)
+				}
+			}
 			healthy = false
 			panic(fmt.Sprintf("tablesource.Source.Fetch %s: reader query: %v\nSQL: %s",
 				s.tableName, err, q.SQL))
@@ -2167,6 +2237,15 @@ func (s *Source) fetchViaBoundReaderStream(req ivm.FetchRequest, conn *connectio
 			}
 			if err != nil {
 				healthy = false
+				if r.cancelFlag != nil && r.cancelFlag.IsCancelled() {
+					reason := r.cancelFlag.Reason()
+					if reason == CancelStream || reason == CancelTeardown {
+						panic(ErrStreamCancelledByFlag)
+					}
+					if reason == CancelBudget || reason == CancelWatchdog {
+						panic(ErrBudgetCancelled)
+					}
+				}
 				panic(fmt.Sprintf("tablesource.Source.Fetch %s: reader rows: %v",
 					s.tableName, err))
 			}

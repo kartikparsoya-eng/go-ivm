@@ -556,6 +556,14 @@ type connBinder interface {
 	UnbindConn()
 }
 
+// connCanceller is implemented by sources that own interruptible SQLite
+// conns (tablesource.Source). The watchdog calls CancelConns to break
+// out of a stuck sqlite3_step on advance/init paths where no stream gate
+// exists (non-pull RPCs).
+type connCanceller interface {
+	CancelConns(reason int32)
+}
+
 // BindTableSourcesToConn binds every connBinder leaf to conn — the Snapshotter's
 // pinned BEGIN CONCURRENT frame — so a Snapshotter-derived diff is applied into
 // the exact frame it was derived against (no independent per-Source re-pin, no
@@ -579,6 +587,20 @@ func (e *Engine) UnbindTableSources() {
 	for _, src := range e.sourcesView() {
 		if b, ok := src.(connBinder); ok {
 			b.UnbindConn()
+		}
+	}
+}
+
+// CancelAllSourceConns sets the cancel flag on every source's active conn.
+// Called by the watchdog's 2x escalation for non-pull RPCs (advance, init)
+// where no stream gate exists. The progress handler aborts any in-flight
+// sqlite3_step within ~4096 opcodes.
+func (e *Engine) CancelAllSourceConns(reason int32) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for _, src := range e.sourcesView() {
+		if c, ok := src.(connCanceller); ok {
+			c.CancelConns(reason)
 		}
 	}
 }
@@ -1714,7 +1736,7 @@ func (e *Engine) AdvanceStreamChunkedSeq(
 // fixture, not on the production path) deliberately does not implement it.
 type advanceClockCarrier interface {
 	SetAdvanceClock(*procclock.Accumulator)
-	SetAdvanceCtx(context.Context)
+	SetAdvanceBudget(time.Duration) func()
 	SetAdvanceAbortCheck(func())
 }
 
@@ -1796,23 +1818,24 @@ func (e *Engine) advanceStreamChunkedSeq(
 			}
 		}()
 	}
-	// Install the advance's wall-clock budget context on sources so
-	// advance-path SQL queries can be interrupted by the budget deadline
-	// (sqlite3_interrupt via go-sqlite3 context cancellation). Cleared on
-	// ALL exits via defer (same lifecycle as the clock above).
+	// Arm the advance's wall-clock budget timer on sources. When the
+	// budget expires, the timer sets the active conn's cancel flag
+	// (CancelBudget), which the progress handler reads inside
+	// sqlite3_step to abort the running statement within ~4096 opcodes.
+	// Cleared on ALL exits via defer (same lifecycle as the clock above).
 	if advCtx != nil {
-		for _, src := range sources {
-			if c, ok := src.(advanceClockCarrier); ok {
-				c.SetAdvanceCtx(advCtx)
-			}
-		}
-		defer func() {
-			for _, src := range sources {
-				if c, ok := src.(advanceClockCarrier); ok {
-					c.SetAdvanceCtx(nil)
+		if deadline, ok := advCtx.Deadline(); ok {
+			budget := time.Until(deadline)
+			if budget > 0 {
+				for _, src := range sources {
+					if c, ok := src.(advanceClockCarrier); ok {
+						if stop := c.SetAdvanceBudget(budget); stop != nil {
+							defer stop()
+						}
+					}
 				}
 			}
-		}()
+		}
 	}
 	// Install the per-fetch abort checkpoint on sources so advance-path
 	// fetch loops themselves can abort (TS's per-row-fetch check — see

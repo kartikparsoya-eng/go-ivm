@@ -6,6 +6,12 @@ package tablesource
 
 typedef struct sqlite3 sqlite3;
 
+// GOIVM_PROGRESS_N is the opcode interval between progress handler
+// invocations. Must match the Go progressN constant. Used in the C
+// callback to correctly decrement the budget by the number of opcodes
+// actually consumed between callbacks (D1 gas meter fix).
+#define GOIVM_PROGRESS_N 4096
+
 // goivm_cancel_flag is the C-allocated per-conn cancel state. It lives
 // in C memory (C.malloc'd) to satisfy cgo pointer rules.
 typedef struct {
@@ -40,10 +46,13 @@ int goivm_progress_cb(void *p) {
 	goivm_cancel_flag *f = (goivm_cancel_flag*)p;
 	// Check cancel flag (volatile read — set by Go via atomic store)
 	if (f->cancel) return 1;
-	// Check opcode budget (gas meter — D1)
+	// Check opcode budget (gas meter — D1). The callback fires every
+	// GOIVM_PROGRESS_N opcodes, so decrement by that amount to keep the
+	// budget in opcode units (not callback-count units). Without this,
+	// defaultBudget=50M would bound ~200B opcodes (hours, not ~50s).
 	if (f->budget >= 0) {
-		if (f->budget == 0) return 1;
-		f->budget--;
+		if (f->budget < GOIVM_PROGRESS_N) return 1;
+		f->budget -= GOIVM_PROGRESS_N;
 	}
 	return 0;
 }
@@ -54,8 +63,11 @@ extern void sqlite3_interrupt(sqlite3*);
 import "C"
 
 import (
+	"errors"
 	"sync/atomic"
 	"unsafe"
+
+	"github.com/mattn/go-sqlite3"
 )
 
 // cancelReason classifies WHO set the cancel flag, so the Go-side error
@@ -186,11 +198,38 @@ func (f *connCancelFlag) detachProgressHandler() {
 
 // progressN is the opcode interval between progress handler invocations.
 // 4096 balances overhead (~250ns per 1M opcodes) against cancel latency
-// (~4096 opcodes = microseconds).
+// (~4096 opcodes = microseconds). MUST match the C #define GOIVM_PROGRESS_N.
 const progressN = 4096
 
 // defaultBudget is the generous default opcode budget for hydrate-path
 // queries. Calibrated to ~30-60s of compute on production hardware.
+// The C callback decrements by GOIVM_PROGRESS_N per invocation, so this
+// value is in true opcode units: 50M opcodes ≈ 50s at ~1M opcodes/sec.
 // -1 means unlimited (only for cleanup/admin queries that must not be
 // interrupted).
-const defaultBudget int32 = 50_000_000 // ~50M opcodes ≈ 30-60s
+const defaultBudget int32 = 50_000_000
+
+// IsInterruptError checks if the error is an SQLITE_INTERRUPT error
+// (code 9). Used at fetch panic sites to map the cancel reason to the
+// appropriate typed error (C4) instead of a generic -32000 panic.
+func IsInterruptError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if sqliteErr, ok := err.(sqlite3.Error); ok {
+		return sqliteErr.Code == sqlite3.ErrInterrupt || sqliteErr.Code == 9
+	}
+	return false
+}
+
+// ErrBudgetCancelled is panicked by fetch sites when the progress handler
+// aborts a query due to a CancelBudget reason. The sidecar maps this to
+// rpcCodeAdvanceAborted (→ TS ResetPipelinesSignal('advancement-timeout'))
+// — the same recovery as the economic advancement-abort.
+var ErrBudgetCancelled = errors.New("advance budget cancelled via progress handler")
+
+// ErrStreamCancelledByFlag is panicked by fetch sites when the progress
+// handler aborts a query due to CancelStream or CancelTeardown. The
+// sidecar maps this to engine.ErrStreamCancelled (→ clean close, no
+// teardown).
+var ErrStreamCancelledByFlag = errors.New("stream cancelled via progress handler")

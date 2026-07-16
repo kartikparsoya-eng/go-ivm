@@ -72,7 +72,7 @@ func TestWedgeWatchdog_ScanReportsAndDumpsOnce(t *testing.T) {
 	// Past threshold: WEDGE on every scan, STACKS exactly once.
 	g.curReq.Store(&activeReq{
 		method: "addQueriesStream", cgID: "cg-scan", reqID: 7.0,
-		start: time.Now().Add(-time.Second), queueWait: 123 * time.Microsecond,
+		start: time.Now().Add(-75 * time.Millisecond), queueWait: 123 * time.Microsecond,
 	})
 	for i := 0; i < 3; i++ {
 		if n := srv.scanWedgedGroups(time.Now()); n != 1 {

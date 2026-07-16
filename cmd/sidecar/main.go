@@ -1962,6 +1962,15 @@ func panicErrorCode(r any) int {
 	if _, ok := r.(idleTimeoutError); ok {
 		return 0 // sentinel: handleStreamWithRecover maps to clean close
 	}
+	// C4: progress-handler aborts from tablesource fetch sites.
+	if err, ok := r.(error); ok {
+		if errors.Is(err, tablesource.ErrStreamCancelledByFlag) {
+			return 0 // clean close, same as engine.ErrStreamCancelled
+		}
+		if errors.Is(err, tablesource.ErrBudgetCancelled) {
+			return rpcCodeAdvanceAborted
+		}
+	}
 	return -32000
 }
 
@@ -1980,6 +1989,15 @@ func panicErrorMessage(r any) string {
 	if e, ok := r.(idleTimeoutError); ok {
 		return e.Error()
 	}
+	// C4: progress-handler aborts use their own message.
+	if e, ok := r.(error); ok {
+		if errors.Is(e, tablesource.ErrStreamCancelledByFlag) {
+			return e.Error()
+		}
+		if errors.Is(e, tablesource.ErrBudgetCancelled) {
+			return e.Error()
+		}
+	}
 	return fmt.Sprintf("panic: %v", r)
 }
 
@@ -1995,6 +2013,13 @@ func hydrateErrorResponse(reqID interface{}, prefix string, err error) RPCRespon
 	var de *ivm.DataError
 	if errors.As(err, &de) {
 		return rpcError(reqID, rpcCodeDataError, prefix+err.Error())
+	}
+	// C4: progress-handler aborts from tablesource fetch sites.
+	if errors.Is(err, tablesource.ErrStreamCancelledByFlag) {
+		return RPCResponse{JSONRPC: "2.0", Result: "done", ID: reqID}
+	}
+	if errors.Is(err, tablesource.ErrBudgetCancelled) {
+		return rpcError(reqID, rpcCodeAdvanceAborted, prefix+err.Error())
 	}
 	return rpcError(reqID, -32000, prefix+err.Error())
 }
@@ -2019,6 +2044,14 @@ func (s *Server) handleStreamWithRecover(
 				fmt.Fprintf(os.Stderr,
 					"[GO-IVM] %s IDLE-TIMEOUT cg=%s: clean close (no credit for > %v)\n",
 					e.phase, e.cgID, pullIdleTimeout())
+				resp = RPCResponse{JSONRPC: "2.0", Result: "done", ID: req.ID}
+				return
+			}
+			// C4: stream cancel from progress handler → clean close.
+			if err, ok := r.(error); ok && errors.Is(err, tablesource.ErrStreamCancelledByFlag) {
+				fmt.Fprintf(os.Stderr,
+					"[GO-IVM] %s CANCELLED-BY-FLAG: clean close (progress handler abort)\n",
+					req.Method)
 				resp = RPCResponse{JSONRPC: "2.0", Result: "done", ID: req.ID}
 				return
 			}

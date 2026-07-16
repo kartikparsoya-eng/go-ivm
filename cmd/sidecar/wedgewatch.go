@@ -39,6 +39,8 @@ import (
 	"runtime"
 	"strconv"
 	"time"
+
+	"github.com/kartikparsoya-eng/go-ivm/internal/tablesource"
 )
 
 // numericReqIDOrZero extracts the float64 reqID from an opaque interface{}
@@ -155,26 +157,38 @@ func (s *Server) scanWedgedGroups(now time.Time) int {
 		// rungs are for the orphan case — an RPC nobody cancelled that's
 		// stuck. Rungs:
 		//   1x threshold (90s):  log + stack dump (above)
-		//   2x threshold (180s): force-cancel the stream gate (sets bound
-		//     conns' cancel flags via onCancel — the progress handler
-		//     aborts the SQLite step within ~4096 opcodes)
+		//   2x threshold (180s): force-cancel all conns — pull RPCs via
+		//     stream gate (sets bound reader conns' cancel flags),
+		//     non-pull RPCs via engine.CancelAllSourceConns (sets
+		//     prevConn/externalConn cancel flags). The progress handler
+		//     aborts the SQLite step within ~4096 opcodes.
 		//   6x threshold (540s): fatalExit — process-fatal, TS-parity
 		//     (blocked-loop → probe-kill → supervised restart). With the
 		//     progress handler this should never fire; it exists as the
 		//     liveness probe of last resort.
-		if info.reqIDFloat != 0 && elapsed >= 2*s.wedgeThreshold {
+		if elapsed >= 2*s.wedgeThreshold {
 			if g.wedgeCancelled.CompareAndSwap(false, true) {
-				fmt.Fprintf(wedgeLogW,
-					"[GO-IVM][WEDGE-ESCALATE] cg=%s method=%s elapsed=%v action=gate-cancel reqID=%v\n",
-					info.cgID, info.method, elapsed.Round(time.Millisecond), info.reqID)
-				s.streamGates.cancel(info.reqIDFloat)
+				if info.reqIDFloat != 0 {
+					fmt.Fprintf(wedgeLogW,
+						"[GO-IVM][WEDGE-ESCALATE] cg=%s method=%s elapsed=%v action=gate-cancel reqID=%v\n",
+						info.cgID, info.method, elapsed.Round(time.Millisecond), info.reqID)
+					s.streamGates.cancel(info.reqIDFloat)
+				}
+				// Non-pull RPCs (advance, init) have no stream gate.
+				// Cancel all source conns directly via the engine.
+				if g.eng != nil {
+					fmt.Fprintf(wedgeLogW,
+						"[GO-IVM][WEDGE-ESCALATE] cg=%s method=%s elapsed=%v action=cancel-source-conns\n",
+						info.cgID, info.method, elapsed.Round(time.Millisecond))
+					g.eng.CancelAllSourceConns(int32(tablesource.CancelWatchdog))
+				}
+				// Also cancel reader pool if one exists (hydrate path).
+				if g.readerPool != nil {
+					g.readerPool.CancelAll(tablesource.CancelWatchdog)
+				}
 			}
 		}
-		if info.reqIDFloat != 0 && elapsed >= 6*s.wedgeThreshold {
-			// Only fatalExit if we actually attempted to cancel and it
-			// didn't work after 3x more thresholds. If reqIDFloat is 0
-			// (non-pull request), skip — advance/init handlers are
-			// bounded by their own budget timers.
+		if elapsed >= 6*s.wedgeThreshold {
 			fmt.Fprintf(wedgeLogW,
 				"[GO-IVM][WEDGE-FATAL] cg=%s method=%s elapsed=%v action=fatalExit — "+
 					"handler stuck past 6x threshold; progress handler cancel failed. "+

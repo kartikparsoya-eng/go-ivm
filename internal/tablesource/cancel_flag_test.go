@@ -282,22 +282,12 @@ func TestProgressHandler_DetachBeforeCleanup(t *testing.T) {
 	_, err = conn.ExecContext(context.Background(), "ROLLBACK")
 	// ROLLBACK may fail with "no transaction" if nothing was open — that's fine.
 	// The key is it doesn't fail with SQLITE_INTERRUPT.
-	if err != nil && !isInterruptError(err) {
+	if err != nil && !IsInterruptError(err) {
 		t.Logf("ROLLBACK returned non-interrupt error (expected if no tx): %v", err)
 	}
-	if err != nil && isInterruptError(err) {
+	if err != nil && IsInterruptError(err) {
 		t.Fatal("ROLLBACK was aborted by progress handler — detach failed (C3 invariant violated)")
 	}
 	t.Log("C3 invariant verified — cleanup SQL succeeds after detach")
 }
 
-// isInterruptError checks if the error is an SQLITE_INTERRUPT error.
-func isInterruptError(err error) bool {
-	if err == nil {
-		return false
-	}
-	if sqliteErr, ok := err.(sqlite3.Error); ok {
-		return sqliteErr.Code == sqlite3.ErrInterrupt || sqliteErr.Code == 9
-	}
-	return false
-}

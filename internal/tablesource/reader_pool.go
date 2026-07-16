@@ -302,11 +302,15 @@ func provisionReader(
 		return nil, "", err
 	}
 	r := &poolReader{dc: dc, stmts: map[string]*poolStmt{}, cancelFlag: newConnCancelFlag()}
+	r.cancelFlag.setBudget(defaultBudget)
 	// Register the progress handler on the raw conn so SQLite checks
 	// the cancel flag every progressN opcodes. This makes any statement
 	// running on this conn interruptible without per-Next goroutine overhead.
 	if rawDB, rErr := rawSQLiteHandle(dc); rErr == nil {
 		r.cancelFlag.registerProgressHandler(rawDB, progressN)
+	} else {
+		fmt.Fprintf(os.Stderr,
+			"[GO-IVM][CANCEL] provisionReader: failed to get raw SQLite handle: %v\n", rErr)
 	}
 	ver, err := begin(ctx, r)
 	if err != nil {

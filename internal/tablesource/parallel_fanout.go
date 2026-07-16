@@ -58,6 +58,7 @@ import (
 	"os"
 	"strconv"
 	"sync"
+	"time"
 
 	"github.com/kartikparsoya-eng/go-ivm/internal/procclock"
 	"github.com/kartikparsoya-eng/go-ivm/ivm"
@@ -113,20 +114,35 @@ func (s *Source) SetAdvanceClock(clk *procclock.Accumulator) {
 	s.advanceClock.Store(clk)
 }
 
-// SetAdvanceCtx is vestigial — the advance budget is now handled by the
-// progress handler cancel flag (see cancel_flag.go). Kept for API
-// compatibility with the engine's advance clock setup; the value is
-// stored but never read by advanceQueryCtx().
-func (s *Source) SetAdvanceCtx(ctx context.Context) {
-	if ctx == nil {
-		s.advanceCtx.Store(nil)
-	} else {
-		s.advanceCtx.Store(&ctx)
+// SetAdvanceBudget arms a wall-clock budget timer that sets the active
+// conn's cancel flag (CancelBudget) when the advance budget expires. The
+// progress handler reads the flag inside sqlite3_step and aborts the
+// running statement within ~4096 opcodes. Returns a stop function that
+// cancels the timer (call via defer). nil return = no flag available
+// (prevConn not yet acquired and no external conn bound); the per-fetch
+// abort checkpoint still bounds the advance in that case.
+func (s *Source) SetAdvanceBudget(d time.Duration) func() {
+	s.mu.Lock()
+	flag := s.cancelFlagForActiveConnLocked()
+	s.mu.Unlock()
+	if flag == nil {
+		return nil
 	}
+	flag.clearCancel()
+	flag.setBudget(defaultBudget)
+	timer := time.AfterFunc(d, func() {
+		s.mu.Lock()
+		f := s.cancelFlagForActiveConnLocked()
+		s.mu.Unlock()
+		if f != nil {
+			f.setCancel(CancelBudget)
+		}
+	})
+	return func() { timer.Stop() }
 }
 
 // advanceQueryCtx returns the context for advance-path SQL queries.
-// Returns context.Background() — the progress handler on the prev conn
+// Returns context.Background() — the progress handler on the active conn
 // handles cancellation via the cancel flag, not the mattn driver's
 // goroutine-per-Next ctx watcher. The budget timer sets the flag via
 // time.AfterFunc (no goroutine until it fires), and sqlite3_interrupt
@@ -158,6 +174,18 @@ func (s *Source) SetAdvanceAbortCheck(check func()) {
 func (s *Source) checkAdvanceAbort() {
 	if check := s.advanceAbortCheck.Load(); check != nil {
 		(*check)()
+	}
+}
+
+// CancelConns sets the cancel flag on the active conn (prevConn or
+// externalConn) with the given reason. Called by the engine's
+// CancelAllSourceConns — the watchdog's 2x escalation for non-pull RPCs.
+func (s *Source) CancelConns(reason int32) {
+	s.mu.Lock()
+	flag := s.cancelFlagForActiveConnLocked()
+	s.mu.Unlock()
+	if flag != nil {
+		flag.setCancel(CancelReason(reason))
 	}
 }
 
