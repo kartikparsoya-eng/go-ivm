@@ -257,6 +257,7 @@ func (s *Snapshotter) newSnapshot() (*Snapshot, error) {
 	committed := false
 	defer func() {
 		if !committed {
+			snap.cancelFlag.Free()
 			_ = conn.Close()
 		}
 	}()
