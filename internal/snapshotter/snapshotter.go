@@ -29,6 +29,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"os"
 	"sync"
 	"time"
 )
@@ -247,7 +248,12 @@ func (s *Snapshotter) newSnapshot() (*Snapshot, error) {
 	if err != nil {
 		return nil, fmt.Errorf("snapshotter: acquire conn (30s timeout): %w", err)
 	}
-	snap := &Snapshot{conn: conn}
+	snap := &Snapshot{conn: conn, cancelFlag: newSnapCancelFlag()}
+	snap.cancelFlag.setBudget(defaultSnapBudget)
+	if rErr := snap.cancelFlag.registerOn(conn); rErr != nil {
+		fmt.Fprintf(os.Stderr,
+			"[GO-IVM][CANCEL] snapshotter: failed to register progress handler: %v\n", rErr)
+	}
 	committed := false
 	defer func() {
 		if !committed {
@@ -298,9 +304,10 @@ func (s *Snapshotter) beginAndPin(snap *Snapshot) error {
 // across GetRow/GetRows calls — matching TS's better-sqlite3 which caches
 // prepared statements natively.
 type Snapshot struct {
-	conn    *sql.Conn
-	stmts   map[string]*snapshotStmt
-	version string
+	conn      *sql.Conn
+	stmts     map[string]*snapshotStmt
+	version   string
+	cancelFlag *snapCancelFlag
 }
 
 // Version returns the stateVersion this frame is pinned at.
@@ -351,6 +358,12 @@ func (s *Snapshot) resetToHead(beginStmt string) error {
 // close rolls back the open tx and releases the connection. Idempotent:
 // safe to call once per Snapshot.
 func (s *Snapshot) close() {
+	if s.cancelFlag != nil {
+		// Detach the progress handler before closing the conn so
+		// a stale callback can't read freed memory.
+		s.cancelFlag.Free()
+		s.cancelFlag = nil
+	}
 	if s.conn != nil {
 		ctx := context.Background()
 		_, _ = s.conn.ExecContext(ctx, "ROLLBACK")

@@ -1279,6 +1279,9 @@ func (s *Source) driftCheckLocked(change ivm.SourceChange) (driftErr error, prob
 // MUST be called with s.mu held (queries prevConn). ensurePrevTxLocked has
 // already run by the time genPushAndWrite reaches the drift check.
 func (s *Source) existsLocked(row ivm.Row) (bool, error) {
+	if err := s.ctx.Err(); err != nil {
+		return false, fmt.Errorf("checkExists: source context cancelled: %w", err)
+	}
 	args := s.rowToPKArgs(row)
 	conn := s.activeConn()
 	st, err := s.pushStmtLocked(conn, s.checkExistsSQL)
@@ -1286,7 +1289,7 @@ func (s *Source) existsLocked(row ivm.Row) (bool, error) {
 		return false, fmt.Errorf("checkExists prepare: %w", err)
 	}
 	var one int
-	err = st.QueryRowContext(s.ctx, args...).Scan(&one)
+	err = st.QueryRowContext(context.Background(), args...).Scan(&one)
 	switch {
 	case err == nil:
 		return one == 1, nil
