@@ -858,6 +858,12 @@ func (s *Source) ensurePrevTxLocked() error {
 	if s.prevTxStarted {
 		return nil
 	}
+	// L4 fix: reset the opcode budget per-operation on the self-managed path.
+	// Without this, the budget is lifetime-cumulative — after 50M opcodes
+	// across multiple advances, every query on this conn aborts.
+	if flag := s.activeCancelFlag.Load(); flag != nil {
+		flag.setBudget(defaultBudget)
+	}
 	if s.beginStmt == "" {
 		// First-ever tx: try CONCURRENT, fall back to plain BEGIN.
 		// CONCURRENT requires rocicorp's wal2 patch — present in the
@@ -913,9 +919,13 @@ func (s *Source) OnAdvanceEnd() {
 		return
 	}
 	// C3 invariant: detach the progress handler before cleanup SQL so
-	// a still-armed flag can't abort the ROLLBACK/BEGIN recovery itself.
+	// a still-armed flag or near-depleted budget can't abort the
+	// ROLLBACK/BEGIN recovery itself. L3 fix: set budget to unlimited
+	// (not just clearCancel) — a near-depleted budget from the advance
+	// could gas-abort the recovery ROLLBACK/BEGIN itself.
 	if flag := s.activeCancelFlag.Load(); flag != nil {
 		flag.clearCancel()
+		flag.setBudget(-1)
 	}
 	ctx := context.Background()
 	if _, err := s.prevConn.ExecContext(ctx, "ROLLBACK"); err != nil {
