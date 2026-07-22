@@ -46,23 +46,31 @@ typedef struct {
 
 // goivm_step_rows steps up to nrows_req rows from stmt, extracting all
 // columns into colbuf and copying TEXT/BLOB data into strbuf.
-// Returns a result with nrows (rows stepped), done (1 if SQLITE_DONE),
+// Returns a result with nrows (rows extracted), done (1 if SQLITE_DONE),
 // and errcode (non-zero on error).
 //
-// If strbuf is too small, returns with nrows < nrows_req, done=0,
-// errcode=0, and *strbuflen set to the required size. The caller should
-// grow strbuf and retry.
+// If resume is non-zero, the first row is extracted WITHOUT stepping —
+// the cursor is already positioned on a row from a previous overflow.
+// Subsequent rows step normally.
+//
+// If strbuf is too small for a row, returns with nrows = rows extracted
+// so far, done=0, errcode=0, and *strbuflen set to the required size.
+// The caller should deliver the extracted rows, grow strbuf, and retry
+// with resume=1 to extract the pending row without losing it.
 static goivm_step_result
 goivm_step_rows(sqlite3_stmt *stmt, goivm_col *colbuf, int ncol,
-                int nrows_req, char *strbuf, int *strbuflen)
+                int nrows_req, char *strbuf, int *strbuflen,
+                int resume)
 {
 	goivm_step_result res = {0, 0, 0};
 	int stroff = 0;
 	int strcap = *strbuflen;
 	for (int r = 0; r < nrows_req; r++) {
-		int rc = sqlite3_step(stmt);
-		if (rc == GOIVM_SQLITE_DONE) { res.done = 1; break; }
-		if (rc != GOIVM_SQLITE_ROW) { res.errcode = rc; break; }
+		if (!(resume && r == 0)) {
+			int rc = sqlite3_step(stmt);
+			if (rc == GOIVM_SQLITE_DONE) { res.done = 1; break; }
+			if (rc != GOIVM_SQLITE_ROW) { res.errcode = rc; break; }
+		}
 		goivm_col *row = &colbuf[r * ncol];
 		for (int c = 0; c < ncol; c++) {
 			goivm_col *col = &row[c];
@@ -128,6 +136,38 @@ var shimBufPool = sync.Pool{
 type shimBufs struct {
 	colbuf []C.goivm_col
 	strbuf []byte
+}
+
+// decodeRow decodes row r from colbuf into a []any and calls onRow.
+// rowVals is allocated per call — consumers that retain values must copy.
+func decodeRow(colbuf []C.goivm_col, r, ncol int, strbuf []byte, colNames []string, onRow func([]string, []any) bool) {
+	rowVals := make([]any, ncol)
+	for c := 0; c < ncol; c++ {
+		col := &colbuf[r*ncol+c]
+		switch col.typ {
+		case 1:
+			rowVals[c] = int64(col.i64)
+		case 2:
+			rowVals[c] = float64(col.f64)
+		case 3:
+			if col.n > 0 {
+				rowVals[c] = string(strbuf[col.stroff : int(col.stroff)+int(col.n)])
+			} else {
+				rowVals[c] = ""
+			}
+		case 4:
+			if col.n > 0 {
+				b := make([]byte, col.n)
+				copy(b, strbuf[col.stroff:int(col.stroff)+int(col.n)])
+				rowVals[c] = b
+			} else {
+				rowVals[c] = []byte{}
+			}
+		default:
+			rowVals[c] = nil
+		}
+	}
+	onRow(colNames, rowVals)
 }
 
 func stepRowsShimAvailable() bool { return true }
@@ -205,7 +245,7 @@ func stepRowsShim(
 		strbuf := bufs.strbuf
 
 		// Batch-step using the C shim
-
+		resume := 0
 		for {
 			strLen := C.int(len(strbuf))
 			res := C.goivm_step_rows(
@@ -215,83 +255,30 @@ func stepRowsShim(
 				C.int(shimBatchSize),
 				(*C.char)(unsafe.Pointer(&strbuf[0])),
 				&strLen,
+				C.int(resume),
 			)
 			stepped := int(res.nrows)
 			done := res.done != 0
 			errcode := int(res.errcode)
 
-			// If strbuf overflowed, deliver the rows we have, then grow and continue
-			if stepped > 0 && !done && errcode == 0 && int(strLen) > len(strbuf) {
-				// Decode and deliver partial rows first
-				partialVals := make([]any, ncol)
+			// If strbuf overflowed, deliver extracted rows, grow, and retry with resume=1
+			if !done && errcode == 0 && int(strLen) > len(strbuf) {
 				for r := 0; r < stepped; r++ {
-					for c := 0; c < ncol; c++ {
-						col := &colbuf[r*ncol+c]
-						switch col.typ {
-						case 1:
-							partialVals[c] = int64(col.i64)
-						case 2:
-							partialVals[c] = float64(col.f64)
-						case 3:
-							if col.n > 0 {
-								partialVals[c] = string(strbuf[col.stroff : int(col.stroff)+int(col.n)])
-							} else {
-								partialVals[c] = ""
-							}
-						case 4:
-							if col.n > 0 {
-								b := make([]byte, col.n)
-								copy(b, strbuf[col.stroff:int(col.stroff)+int(col.n)])
-								partialVals[c] = b
-							} else {
-								partialVals[c] = []byte{}
-							}
-						default:
-							partialVals[c] = nil
-						}
-					}
-					if !onRow(colNames, partialVals) {
-						return nil
-					}
+					decodeRow(colbuf, r, ncol, strbuf, colNames, onRow)
 				}
-				strbuf = make([]byte, int(strLen)*2)
+				bufs.strbuf = make([]byte, int(strLen)*2)
+				strbuf = bufs.strbuf
+				resume = 1
 				continue
 			}
+			resume = 0
 			if errcode != 0 {
 				return fmt.Errorf("stepRowsShim: step error rc=%d", errcode)
 			}
 
-			// Decode rows
-			rowVals := make([]any, ncol)
+			// Decode and deliver rows
 			for r := 0; r < stepped; r++ {
-				for c := 0; c < ncol; c++ {
-					col := &colbuf[r*ncol+c]
-					switch col.typ {
-					case 1:
-						rowVals[c] = int64(col.i64)
-					case 2:
-						rowVals[c] = float64(col.f64)
-					case 3:
-						if col.n > 0 {
-							rowVals[c] = string(strbuf[col.stroff : int(col.stroff)+int(col.n)])
-						} else {
-							rowVals[c] = ""
-						}
-					case 4:
-						if col.n > 0 {
-							b := make([]byte, col.n)
-							copy(b, strbuf[col.stroff:int(col.stroff)+int(col.n)])
-							rowVals[c] = b
-						} else {
-							rowVals[c] = []byte{}
-						}
-					default:
-						rowVals[c] = nil
-					}
-				}
-				if !onRow(colNames, rowVals) {
-					return nil
-				}
+				decodeRow(colbuf, r, ncol, strbuf, colNames, onRow)
 			}
 
 			if done {
