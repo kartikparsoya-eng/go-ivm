@@ -31,6 +31,7 @@ import (
 	"fmt"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -56,6 +57,12 @@ type Snapshotter struct {
 
 	curr *Snapshot
 	prev *Snapshot
+
+	// currCancelFlag and prevCancelFlag are atomic snapshots of curr/prev's
+	// cancel flags, so the watchdog can call setCancel without taking mu
+	// (which may be held by a wedged Advance). L2 fix.
+	currCancelFlag atomic.Pointer[snapCancelFlag]
+	prevCancelFlag atomic.Pointer[snapCancelFlag]
 
 	// destroyed is set by Destroy. Callers that can race teardown
 	// (e.g. a fire-and-forget reset re-read) check Destroyed() to bail
@@ -93,6 +100,7 @@ func (s *Snapshotter) Init() error {
 		return err
 	}
 	s.curr = snap
+	s.currCancelFlag.Store(snap.cancelFlag)
 	return nil
 }
 
@@ -196,6 +204,8 @@ func (s *Snapshotter) Advance(
 	}
 	s.prev = s.curr
 	s.curr = next
+	s.prevCancelFlag.Store(s.currCancelFlag.Load())
+	s.currCancelFlag.Store(next.cancelFlag)
 	return diff, nil
 }
 
@@ -230,12 +240,34 @@ func (s *Snapshotter) Destroy() {
 	defer s.mu.Unlock()
 	s.destroyed = true
 	if s.curr != nil {
+		if s.curr.cancelFlag != nil {
+			s.curr.cancelFlag.setCancel()
+		}
 		s.curr.close()
 		s.curr = nil
+		s.currCancelFlag.Store(nil)
 	}
 	if s.prev != nil {
+		if s.prev.cancelFlag != nil {
+			s.prev.cancelFlag.setCancel()
+		}
 		s.prev.close()
 		s.prev = nil
+		s.prevCancelFlag.Store(nil)
+	}
+}
+
+// CancelConns interrupts any in-flight SQLite operations on both snapshot
+// conns. Called by the watchdog's 2x escalation (L2 fix: snapCancelFlag
+// was dead code — the engine's CancelAllSourceConns only reaches
+// tablesource Sources, never the Snapshotter). Lock-free — must never
+// block on mu (which may be held by a wedged Advance).
+func (s *Snapshotter) CancelConns() {
+	if f := s.currCancelFlag.Load(); f != nil {
+		f.setCancel()
+	}
+	if f := s.prevCancelFlag.Load(); f != nil {
+		f.setCancel()
 	}
 }
 

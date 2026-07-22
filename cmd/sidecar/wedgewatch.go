@@ -186,6 +186,11 @@ func (s *Server) scanWedgedGroups(now time.Time) int {
 				if g.readerPool != nil {
 					g.readerPool.CancelAll(tablesource.CancelWatchdog)
 				}
+				// L2 fix: cancel snapshotter conns — snapCancelFlag.setCancel was
+				// dead code (engine.CancelAllSourceConns only reaches Sources).
+				if g.snap != nil {
+					g.snap.CancelConns()
+				}
 			}
 		}
 		if elapsed >= 6*s.wedgeThreshold {
