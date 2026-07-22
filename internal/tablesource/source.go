@@ -1738,7 +1738,7 @@ func (s *Source) fetchSerial(req ivm.FetchRequest, conn *connection) []ivm.Node 
 
 	var out []ivm.Node
 	if UseStepRowsShim {
-		out = s.scanRowsShim(ctx, dbConn, q.SQL, q.Params, conn, req)
+		out = s.scanRowsShim(dbConn, q.SQL, q.Params, conn, req)
 	} else {
 		stmt, err := s.checkoutSelectLocked(dbConn, q.SQL)
 		if err != nil {
@@ -2068,7 +2068,6 @@ func (s *Source) fetchDuringPushStream(req ivm.FetchRequest, conn *connection) i
 // not mattn's declared-type conversions). Applies the same filterPredicate
 // and Take limit-pushdown as scanRows.
 func (s *Source) scanRowsShim(
-	ctx context.Context,
 	conn *sql.Conn,
 	sqlText string,
 	params []any,
@@ -2077,6 +2076,10 @@ func (s *Source) scanRowsShim(
 ) []ivm.Node {
 	var out []ivm.Node
 	scanned := 0
+	// Note: abort checkpoint fires during row delivery, but the shim steps
+	// up to 1024 rows in one C crossing before delivering any. The gas meter
+	// (progress handler) still bounds opcodes mid-batch, so the wall-clock
+	// economic abort is just coarser, not absent.
 	err := StepRowsShim(conn, sqlText, params, func(colNames []string, rowVals []any) bool {
 		if scanned++; scanned&1023 == 0 {
 			s.checkAdvanceAbort()
