@@ -68,6 +68,14 @@ type Diff struct {
 	prev             *Snapshot
 	curr             *Snapshot
 
+	// owner and gen implement the deterministic stale-diff guard. gen is the
+	// snapshotter generation at this diff's creation; Each/Collect reject the
+	// diff if owner.gen has since moved (a later Advance re-pinned the reused
+	// prev connection, or Init/Destroy ran). owner is nil for diffs built
+	// outside a Snapshotter (tests) — the guard then no-ops.
+	owner *Snapshotter
+	gen   uint64
+
 	// Changes is the number of change-log entries between the snapshots (not
 	// necessarily the number of emitted Changes — a TRUNCATE is one entry).
 	Changes int
@@ -108,6 +116,16 @@ func (d *Diff) Curr() *Snapshot { return d.curr }
 //
 // Mirrors the Diff[Symbol.iterator] body (421-554) step for step.
 func (d *Diff) Each(emit func(Change) error) error {
+	// Deterministic stale-diff guard: reject before touching any row if the
+	// snapshotter has advanced/reset/destroyed since this diff was built. The
+	// reused prev connection would otherwise read a re-pinned frame, silently
+	// producing a diff against the wrong snapshot. Complements the per-row
+	// checkValid version checks below (which only fire on an actual mismatch).
+	if d.owner != nil && d.owner.gen.Load() != d.gen {
+		return &InvalidDiffError{Msg: fmt.Sprintf(
+			"Diff is no longer valid: snapshotter advanced past this diff (stamp gen %d, current gen %d).",
+			d.gen, d.owner.gen.Load())}
+	}
 	entries, err := d.curr.ChangesSince(d.prev.version)
 	if err != nil {
 		return err

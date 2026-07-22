@@ -58,6 +58,17 @@ type Snapshotter struct {
 	curr *Snapshot
 	prev *Snapshot
 
+	// gen is a monotonic generation counter bumped on every Init, successful
+	// Advance swap, and Destroy. Each Diff is stamped with the gen current at
+	// its creation; Diff.Each/Collect reject a diff whose stamp no longer
+	// matches (the snapshotter has advanced/reset/destroyed underneath it).
+	// This makes the "a Diff is valid only until the next Advance" contract —
+	// load-bearing because Advance reuses the prev connection and re-pins it —
+	// a deterministic O(1) guard at iteration entry, complementing the
+	// per-row value checks in Diff.checkValid. Atomic: Diff.Each may read it
+	// without holding mu.
+	gen atomic.Uint64
+
 	// currCancelFlag and prevCancelFlag are atomic snapshots of curr/prev's
 	// cancel flags, so the watchdog can call setCancel without taking mu
 	// (which may be held by a wedged Advance). L2 fix.
@@ -101,6 +112,7 @@ func (s *Snapshotter) Init() error {
 	}
 	s.curr = snap
 	s.currCancelFlag.Store(snap.cancelFlag)
+	s.gen.Add(1)
 	return nil
 }
 
@@ -206,6 +218,12 @@ func (s *Snapshotter) Advance(
 	s.curr = next
 	s.prevCancelFlag.Store(s.currCancelFlag.Load())
 	s.currCancelFlag.Store(next.cancelFlag)
+	// Stamp the diff with the generation established by THIS swap. The next
+	// Advance (or Init/Destroy) bumps s.gen again, at which point this diff's
+	// reused prev connection has been re-pinned and iterating it would read a
+	// different frame — Diff.Each rejects it via the stamp mismatch.
+	diff.owner = s
+	diff.gen = s.gen.Add(1)
 	return diff, nil
 }
 
@@ -239,6 +257,8 @@ func (s *Snapshotter) Destroy() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.destroyed = true
+	// Invalidate any outstanding diff: its snapshots are about to be closed.
+	s.gen.Add(1)
 	if s.curr != nil {
 		if s.curr.cancelFlag != nil {
 			s.curr.cancelFlag.setCancel()
