@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"io"
+
+	"github.com/kartikparsoya-eng/go-ivm/internal/tablesource"
 )
 
 // snapshotStmt is a cached prepared statement on the snapshot's *sql.Conn.
@@ -73,6 +75,9 @@ func (s *Snapshot) finalizeStmts() {
 // Returns (rowMap, found, error). A nil rowMap with found=false means no
 // matching row (sql.ErrNoRows).
 func (s *Snapshot) cachedQueryRow(ctx context.Context, query string, args []any, colNames []string) (map[string]any, bool, error) {
+	if tablesource.UseStepRowsShim {
+		return s.shimQueryRow(ctx, query, args, colNames)
+	}
 	st, err := s.getStmt(ctx, query)
 	if err != nil {
 		return nil, false, err
@@ -90,6 +95,9 @@ func (s *Snapshot) cachedQueryRow(ctx context.Context, query string, args []any,
 
 // cachedQueryRows executes a query returning multiple rows via the stmt cache.
 func (s *Snapshot) cachedQueryRows(ctx context.Context, query string, args []any, colNames []string) ([]map[string]any, error) {
+	if tablesource.UseStepRowsShim {
+		return s.shimQueryRows(ctx, query, args, colNames)
+	}
 	st, err := s.getStmt(ctx, query)
 	if err != nil {
 		return nil, err
@@ -157,3 +165,41 @@ func scanRawRow(sc rowScanner, cols []string) (map[string]any, error) {
 }
 
 var _ = io.EOF
+
+// shimQueryRow is the C-shim path for single-row queries.
+// Values are raw SQLite storage classes — no FromSQLiteType needed here
+// because selectColList wraps columns in +"col" AS "col", stripping
+// declared types so mattn doesn't convert to time.Time.
+func (s *Snapshot) shimQueryRow(ctx context.Context, query string, args []any, colNames []string) (map[string]any, bool, error) {
+	var result map[string]any
+	found := false
+	err := tablesource.StepRowsShim(s.conn, query, args, func(cols []string, vals []any) bool {
+		result = make(map[string]any, len(cols))
+		for i, c := range cols {
+			result[c] = vals[i]
+		}
+		found = true
+		return false // stop after first row
+	})
+	if err != nil {
+		return nil, false, err
+	}
+	return result, found, nil
+}
+
+// shimQueryRows is the C-shim path for multi-row queries.
+func (s *Snapshot) shimQueryRows(ctx context.Context, query string, args []any, colNames []string) ([]map[string]any, error) {
+	var out []map[string]any
+	err := tablesource.StepRowsShim(s.conn, query, args, func(cols []string, vals []any) bool {
+		row := make(map[string]any, len(cols))
+		for i, c := range cols {
+			row[c] = vals[i]
+		}
+		out = append(out, row)
+		return true
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}

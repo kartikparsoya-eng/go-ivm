@@ -1734,37 +1734,32 @@ func (s *Source) fetchSerial(req ivm.FetchRequest, conn *connection) []ivm.Node 
 		req.MultiConstraints,
 	)
 	ctx := s.advanceQueryCtx()
-	// Reuse a prepared statement for this (conn, SQL) instead of letting
-	// database/sql re-compile via sqlite3_prepare_v2 on every QueryContext
-	// (14.6% of cgo time in the live read-path profile). activeConn is a
-	// stable, single-flight conn (this Source's prevConn, or a Snapshotter
-	// frame conn bound via BindConn), so the cached Conn-bound stmt stays valid
-	// across advances and re-reads the new frame after each leapfrog.
 	dbConn := s.activeConn()
-	stmt, err := s.checkoutSelectLocked(dbConn, q.SQL)
-	if err != nil {
-		panic(fmt.Sprintf("tablesource.Source.Fetch %s: prepare: %v\nSQL: %s",
-			s.tableName, err, q.SQL))
-	}
-	// Hand the stmt back before s.mu releases (defers run LIFO; the Unlock
-	// defer above runs after this). The eager scan below fully drains the
-	// cursor under the lock, so the stmt is idle again by then.
-	defer s.returnSelectStmtLocked(dbConn, q.SQL, stmt)
-	rows, err := stmt.QueryContext(ctx, q.Params...)
-	if err != nil {
-		s.checkInterruptPanic(err)
-		panic(fmt.Sprintf("tablesource.Source.Fetch %s: query: %v\nSQL: %s",
-			s.tableName, err, q.SQL))
-	}
-	defer rows.Close()
 
-	colNames, err := rows.Columns()
-	if err != nil {
-		panic(fmt.Sprintf("tablesource.Source.Fetch %s: columns: %v",
-			s.tableName, err))
+	var out []ivm.Node
+	if UseStepRowsShim {
+		out = s.scanRowsShim(ctx, dbConn, q.SQL, q.Params, conn, req)
+	} else {
+		stmt, err := s.checkoutSelectLocked(dbConn, q.SQL)
+		if err != nil {
+			panic(fmt.Sprintf("tablesource.Source.Fetch %s: prepare: %v\nSQL: %s",
+				s.tableName, err, q.SQL))
+		}
+		defer s.returnSelectStmtLocked(dbConn, q.SQL, stmt)
+		rows, err := stmt.QueryContext(ctx, q.Params...)
+		if err != nil {
+			s.checkInterruptPanic(err)
+			panic(fmt.Sprintf("tablesource.Source.Fetch %s: query: %v\nSQL: %s",
+				s.tableName, err, q.SQL))
+		}
+		defer rows.Close()
+		colNames, err := rows.Columns()
+		if err != nil {
+			panic(fmt.Sprintf("tablesource.Source.Fetch %s: columns: %v",
+				s.tableName, err))
+		}
+		out = s.scanRows(rows, colNames, conn, req, s.overlay != nil)
 	}
-
-	out := s.scanRows(rows, colNames, conn, req, s.overlay != nil)
 
 	// Apply in-flight overlay (the push currently fanning out, whose
 	// writeChange hasn't run yet against the prev tx).
@@ -2065,6 +2060,47 @@ func (s *Source) fetchDuringPushStream(req ivm.FetchRequest, conn *connection) i
 			}
 		}
 	}
+}
+
+// scanRowsShim is the C-shim path for fetchSerial. It uses StepRowsShim to
+// batch step+extract in 1 CGO crossing per 1024 rows, then applies
+// FromSQLiteType per column (S3: the shim returns raw storage classes,
+// not mattn's declared-type conversions). Applies the same filterPredicate
+// and Take limit-pushdown as scanRows.
+func (s *Source) scanRowsShim(
+	ctx context.Context,
+	conn *sql.Conn,
+	sqlText string,
+	params []any,
+	c *connection,
+	req ivm.FetchRequest,
+) []ivm.Node {
+	var out []ivm.Node
+	scanned := 0
+	err := StepRowsShim(conn, sqlText, params, func(colNames []string, rowVals []any) bool {
+		if scanned++; scanned&1023 == 0 {
+			s.checkAdvanceAbort()
+		}
+		row := make(ivm.Row, len(colNames))
+		for i, c := range colNames {
+			cs, ok := s.columns[c]
+			if !ok {
+				s.invalidColumnPanic(c)
+			}
+			row[c] = sqlite.FromSQLiteType(rowVals[i], cs.Type)
+		}
+		if c.filterPredicate != nil && !c.filterPredicate(row) {
+			return true // continue scanning
+		}
+		out = append(out, ivm.Node{Row: row})
+		return true
+	})
+	if err != nil {
+		s.checkInterruptPanic(err)
+		panic(fmt.Sprintf("tablesource.Source.Fetch %s: shim: %v\nSQL: %s",
+			s.tableName, err, sqlText))
+	}
+	return out
 }
 
 // scanRows materialises rows into Nodes, applying the connection's residual

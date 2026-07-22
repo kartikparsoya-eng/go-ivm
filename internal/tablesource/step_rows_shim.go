@@ -173,7 +173,7 @@ func decodeRow(colbuf []C.goivm_col, r, ncol int, strbuf []byte, colNames []stri
 
 func stepRowsShimAvailable() bool { return true }
 
-// stepRowsShim executes a query via the mattn driver interface (which handles
+// StepRowsShim executes a query via the mattn driver interface (which handles
 // prepare + bind correctly), then takes over the step loop using a C shim
 // that batches up to 1024 rows per CGO crossing.
 //
@@ -184,6 +184,19 @@ func stepRowsShimAvailable() bool { return true }
 // Callers MUST apply FromSQLiteType in the onRow callback to match the
 // type normalization that database/sql + mattn provide (e.g. declared-type
 // timestamp → time.Time, nullable column handling).
+//
+// Exported so the snapshotter package can use it without importing
+// tablesource's internal types.
+func StepRowsShim(
+	conn *sql.Conn,
+	sqlText string,
+	args []any,
+	onRow func(colNames []string, rowVals []any) bool,
+) error {
+	return stepRowsShim(conn, sqlText, args, onRow)
+}
+
+// stepRowsShim is the internal implementation.
 func stepRowsShim(
 	conn *sql.Conn,
 	sqlText string,
