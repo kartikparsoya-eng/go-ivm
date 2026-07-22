@@ -1,3 +1,9 @@
+// Package tablesource's cancel_flag.go uses unsafe.Pointer to convert
+// atomic.Uintptr values back to C pointers (sqlite3* handles). go vet's
+// unsafeptr analyzer warns on these conversions because it can't verify
+// the pointer isn't Go-heap-derived. All pointers here are C-allocated
+// (C.malloc) or extracted from mattn's driver via RawDB()/RawStmt() — they
+// are not tracked by Go's GC and the conversions are safe.
 package tablesource
 
 /*
