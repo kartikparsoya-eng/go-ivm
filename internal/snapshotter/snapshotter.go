@@ -33,6 +33,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	sqlite3 "github.com/mattn/go-sqlite3"
 )
 
 const (
@@ -357,9 +359,10 @@ func (s *Snapshotter) beginAndPin(snap *Snapshot) error {
 // across GetRow/GetRows calls — matching TS's better-sqlite3 which caches
 // prepared statements natively.
 type Snapshot struct {
-	conn      *sql.Conn
-	stmts     map[string]*snapshotStmt
-	version   string
+	conn       *sql.Conn
+	stmts      map[string]*snapshotStmt
+	rawStmts   map[string]*sqlite3.SQLiteStmt
+	version    string
 	cancelFlag *snapCancelFlag
 }
 
@@ -380,6 +383,7 @@ func (s *Snapshot) resetToHead(beginStmt string) error {
 	if _, err := s.conn.ExecContext(ctx, "ROLLBACK"); err != nil {
 		// Conn is in unknown state — close it so close()/Destroy() cleans up.
 		// The Snapshot is now unusable; the caller must Destroy and re-create.
+		s.finalizeAllStmts()
 		_ = s.conn.Close()
 		s.conn = nil
 		return fmt.Errorf("snapshotter: resetToHead ROLLBACK (conn closed): %w", err)
@@ -387,6 +391,7 @@ func (s *Snapshot) resetToHead(beginStmt string) error {
 	if _, err := s.conn.ExecContext(ctx, beginStmt); err != nil {
 		// ROLLBACK succeeded but BEGIN failed — conn has no open tx.
 		// Close it so the next call re-acquires a fresh conn.
+		s.finalizeAllStmts()
 		_ = s.conn.Close()
 		s.conn = nil
 		return fmt.Errorf("snapshotter: resetToHead %s (conn closed): %w", beginStmt, err)
@@ -400,6 +405,7 @@ func (s *Snapshot) resetToHead(beginStmt string) error {
 		// and the next resetToHead's ROLLBACK would silently clean it up —
 		// but only if called; Destroy would also ROLLBACK, so this is defense-
 		// in-depth for the conn's lifetime, not a correctness fix.
+		s.finalizeAllStmts()
 		_ = s.conn.Close()
 		s.conn = nil
 		return fmt.Errorf("snapshotter: resetToHead selectStateVersion (conn closed): %w", err)
@@ -420,7 +426,7 @@ func (s *Snapshot) close() {
 	if s.conn != nil {
 		ctx := context.Background()
 		_, _ = s.conn.ExecContext(ctx, "ROLLBACK")
-		s.finalizeStmts()
+		s.finalizeAllStmts()
 		_ = s.conn.Close()
 		s.conn = nil
 	}

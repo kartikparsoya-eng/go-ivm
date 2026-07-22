@@ -71,6 +71,22 @@ func (s *Snapshot) finalizeStmts() {
 	}
 }
 
+// finalizeRawStmts closes all cached raw driver statements (shim path).
+// Must run before conn.Close() — finalizing a stmt after its conn is gone is UAF.
+func (s *Snapshot) finalizeRawStmts() {
+	for k, st := range s.rawStmts {
+		_ = st.Close()
+		delete(s.rawStmts, k)
+	}
+}
+
+// finalizeAllStmts closes both the *sql.Stmt cache and the raw driver stmt cache.
+// Called on close() and resetToHead error paths where the conn is being closed.
+func (s *Snapshot) finalizeAllStmts() {
+	s.finalizeStmts()
+	s.finalizeRawStmts()
+}
+
 // cachedQueryRow executes a query returning a single row via the stmt cache.
 // Returns (rowMap, found, error). A nil rowMap with found=false means no
 // matching row (sql.ErrNoRows).
@@ -167,13 +183,14 @@ func scanRawRow(sc rowScanner, cols []string) (map[string]any, error) {
 var _ = io.EOF
 
 // shimQueryRow is the C-shim path for single-row queries.
-// Values are raw SQLite storage classes — no FromSQLiteType needed here
-// because selectColList wraps columns in +"col" AS "col", stripping
-// declared types so mattn doesn't convert to time.Time.
+// Uses the Snapshot's raw-stmt cache to avoid sqlite3_prepare_v2 on every call
+// (16.8% of advance CPU before this cache). Values are raw SQLite storage
+// classes — no FromSQLiteType needed here because selectColList wraps columns
+// in +"col" AS "col", stripping declared types so mattn doesn't convert to time.Time.
 func (s *Snapshot) shimQueryRow(ctx context.Context, query string, args []any, colNames []string) (map[string]any, bool, error) {
 	var result map[string]any
 	found := false
-	err := tablesource.StepRowsShim(s.conn, query, args, func(cols []string, vals []any) bool {
+	err := tablesource.StepRowsShimCached(s.conn, &s.rawStmts, query, args, func(cols []string, vals []any) bool {
 		result = make(map[string]any, len(cols))
 		for i, c := range cols {
 			result[c] = vals[i]
@@ -190,7 +207,7 @@ func (s *Snapshot) shimQueryRow(ctx context.Context, query string, args []any, c
 // shimQueryRows is the C-shim path for multi-row queries.
 func (s *Snapshot) shimQueryRows(ctx context.Context, query string, args []any, colNames []string) ([]map[string]any, error) {
 	var out []map[string]any
-	err := tablesource.StepRowsShim(s.conn, query, args, func(cols []string, vals []any) bool {
+	err := tablesource.StepRowsShimCached(s.conn, &s.rawStmts, query, args, func(cols []string, vals []any) bool {
 		row := make(map[string]any, len(cols))
 		for i, c := range cols {
 			row[c] = vals[i]

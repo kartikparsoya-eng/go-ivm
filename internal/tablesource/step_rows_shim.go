@@ -310,3 +310,149 @@ func stepRowsShim(
 		}
 	})
 }
+
+// StepRowsShimCached is the snapshotter variant that caches the prepared
+// *sqlite3.SQLiteStmt on the Snapshot's rawStmts map, keyed by query string.
+// This eliminates sqlite3_prepare_v2 on every GetRow/GetRows call (16.8% of
+// advance CPU before this cache). The cache lives for the Snapshot's lifetime;
+// the conn is stable (resetToHead re-pins the same conn), so a stmt prepared
+// in one Raw call is valid inside the next.
+//
+// On a cache hit, the stmt is reused WITHOUT Close (sqlite3_reset + clear
+// bindings already ran when the previous driverRows.Close() was called). The
+// stmt is only finalized at cache teardown (finalizeRawStmts).
+//
+// DO NOT use this for the tablesource scanRowsShim path — that path runs on
+// s.activeConn() which rebinds per advance, so a query-keyed cache would hand
+// back a stmt bound to a previous conn after a rebind (UAF). Snapshotter-only.
+func StepRowsShimCached(
+	conn *sql.Conn,
+	cache *map[string]*sqlite3.SQLiteStmt,
+	sqlText string,
+	args []any,
+	onRow func(colNames []string, rowVals []any) bool,
+) error {
+	return conn.Raw(func(driverConn any) error {
+		c, ok := driverConn.(*sqlite3.SQLiteConn)
+		if !ok {
+			return fmt.Errorf("stepRowsShimCached: not a mattn *SQLiteConn (got %T)", driverConn)
+		}
+
+		// Cache lookup / prepare
+		if *cache == nil {
+			*cache = make(map[string]*sqlite3.SQLiteStmt, 64)
+		}
+		ss, ok := (*cache)[sqlText]
+		if !ok {
+			driverStmt, err := c.Prepare(sqlText)
+			if err != nil {
+				return fmt.Errorf("stepRowsShimCached: prepare: %w", err)
+			}
+			ss, ok = driverStmt.(*sqlite3.SQLiteStmt)
+			if !ok {
+				_ = driverStmt.Close()
+				return fmt.Errorf("stepRowsShimCached: not a *SQLiteStmt (got %T)", driverStmt)
+			}
+			(*cache)[sqlText] = ss
+			if len(*cache) > stmtCacheCapRaw {
+				// Evict oldest (map iteration order — same as snapshotter's evictOldestStmt)
+				for k, v := range *cache {
+					_ = v.Close()
+					delete(*cache, k)
+					break
+				}
+			}
+		}
+		// On cache hit: do NOT Close the stmt. The previous driverRows.Close()
+		// already ran sqlite3_reset + cleared bindings, leaving it ready for reuse.
+
+		// Use mattn's Query to bind args correctly (handles all Go types)
+		dArgs := make([]driver.Value, len(args))
+		for i, a := range args {
+			switch v := a.(type) {
+			case int:
+				dArgs[i] = int64(v)
+			default:
+				dArgs[i] = a
+			}
+		}
+		driverRows, err := ss.Query(dArgs)
+		if err != nil {
+			return fmt.Errorf("stepRowsShimCached: query: %w", err)
+		}
+		defer driverRows.Close()
+
+		sr, ok := driverRows.(*sqlite3.SQLiteRows)
+		if !ok {
+			return fmt.Errorf("stepRowsShimCached: not *SQLiteRows (got %T)", driverRows)
+		}
+		cstmt := (*C.sqlite3_stmt)(unsafe.Pointer(sr.RawStmt()))
+		if cstmt == nil {
+			return fmt.Errorf("stepRowsShimCached: SQLiteRows has nil stmt")
+		}
+
+		// Get column count and names from the stmt
+		ncol := int(C.sqlite3_column_count(cstmt))
+		colNames := make([]string, ncol)
+		for i := 0; i < ncol; i++ {
+			colNames[i] = C.GoString(C.sqlite3_column_name(cstmt, C.int(i)))
+		}
+
+		// Get reusable buffers from pool
+		bufs := shimBufPool.Get().(*shimBufs)
+		defer shimBufPool.Put(bufs)
+		if len(bufs.colbuf) < ncol*shimBatchSize {
+			bufs.colbuf = make([]C.goivm_col, ncol*shimBatchSize)
+		}
+		colbuf := bufs.colbuf
+		strbuf := bufs.strbuf
+
+		// Batch-step using the C shim
+		resume := 0
+		for {
+			strLen := C.int(len(strbuf))
+			res := C.goivm_step_rows(
+				cstmt,
+				(*C.goivm_col)(unsafe.Pointer(&colbuf[0])),
+				C.int(ncol),
+				C.int(shimBatchSize),
+				(*C.char)(unsafe.Pointer(&strbuf[0])),
+				&strLen,
+				C.int(resume),
+			)
+			stepped := int(res.nrows)
+			done := res.done != 0
+			errcode := int(res.errcode)
+
+			if !done && errcode == 0 && int(strLen) > len(strbuf) {
+				for r := 0; r < stepped; r++ {
+					if !decodeRow(colbuf, r, ncol, strbuf, colNames, onRow) {
+						return nil
+					}
+				}
+				bufs.strbuf = make([]byte, int(strLen)*2)
+				strbuf = bufs.strbuf
+				resume = 1
+				continue
+			}
+			resume = 0
+			if errcode != 0 {
+				return fmt.Errorf("stepRowsShimCached: step error rc=%d", errcode)
+			}
+
+			for r := 0; r < stepped; r++ {
+				if !decodeRow(colbuf, r, ncol, strbuf, colNames, onRow) {
+					return nil
+				}
+			}
+
+			if done {
+				return nil
+			}
+		}
+	})
+}
+
+// stmtCacheCapRaw bounds the per-snapshot raw driver stmt cache.
+// Mirrors stmtCacheCap in snapshot_raw.go.
+const stmtCacheCapRaw = 512
