@@ -60,7 +60,8 @@ import (
 // pointer rules.
 type snapCancelFlag struct {
 	cflag *C.snap_cancel_flag
-	db    unsafe.Pointer
+	// L1 fix: atomic to prevent race between setCancel and registerOn/Free.
+	db atomic.Uintptr
 }
 
 // newSnapCancelFlag allocates a C cancel flag. Must be freed via Free.
@@ -79,8 +80,8 @@ func (f *snapCancelFlag) Free() {
 	if f.cflag == nil {
 		return
 	}
-	if f.db != nil {
-		C.sqlite3_progress_handler((*C.sqlite3)(f.db), 0, nil, nil)
+	if dbPtr := f.db.Load(); dbPtr != 0 {
+		C.sqlite3_progress_handler((*C.sqlite3)(unsafe.Pointer(dbPtr)), 0, nil, nil)
 	}
 	C.free(unsafe.Pointer(f.cflag))
 	f.cflag = nil
@@ -92,8 +93,8 @@ func (f *snapCancelFlag) setCancel() {
 		return
 	}
 	atomic.StoreInt32((*int32)(unsafe.Pointer(&f.cflag.cancel)), 1)
-	if f.db != nil {
-		C.sqlite3_interrupt((*C.sqlite3)(f.db))
+	if dbPtr := f.db.Load(); dbPtr != 0 {
+		C.sqlite3_interrupt((*C.sqlite3)(unsafe.Pointer(dbPtr)))
 	}
 }
 
@@ -122,7 +123,7 @@ func (f *snapCancelFlag) registerOn(conn *sql.Conn) error {
 			return fmt.Errorf("snapCancelFlag: not a mattn *SQLiteConn (got %T)", driverConn)
 		}
 		db := (*C.sqlite3)(unsafe.Pointer(c.RawDB()))
-		f.db = unsafe.Pointer(db)
+		f.db.Store(uintptr(unsafe.Pointer(db)))
 		C.sqlite3_progress_handler(db, C.int(C.SNAP_PROGRESS_N),
 			(*[0]byte)(C.snap_progress_cb), unsafe.Pointer(f.cflag))
 		return nil

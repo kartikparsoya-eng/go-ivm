@@ -95,10 +95,12 @@ type connCancelFlag struct {
 	// Written atomically alongside the cancel flag.
 	reason atomic.Int32
 
-	// db, when non-nil, holds the raw *C.sqlite3 for this conn, used
-	// to call sqlite3_interrupt on cancel (covers busy-wait sleeps
-	// that the progress handler can't reach — C2).
-	db unsafe.Pointer
+	// db holds the raw *C.sqlite3 for this conn as a uintptr, accessed
+	// atomically. Used to call sqlite3_interrupt on cancel (covers
+	// busy-wait sleeps that the progress handler can't reach — C2).
+	// L1 fix: atomic to prevent race between setCancel (lock-free) and
+	// registerProgressHandler/detachProgressHandler (under s.mu).
+	db atomic.Uintptr
 }
 
 // newConnCancelFlag allocates a C cancel flag. Must be freed via Free.
@@ -118,8 +120,8 @@ func (f *connCancelFlag) Free() {
 	if f.cflag != nil {
 		// Detach the progress handler before freeing so a stale
 		// callback can't read freed memory.
-		if f.db != nil {
-			C.sqlite3_progress_handler((*C.sqlite3)(f.db), 0, nil, nil)
+		if dbPtr := f.db.Load(); dbPtr != 0 {
+			C.sqlite3_progress_handler((*C.sqlite3)(unsafe.Pointer(dbPtr)), 0, nil, nil)
 		}
 		C.free(unsafe.Pointer(f.cflag))
 		f.cflag = nil
@@ -135,8 +137,8 @@ func (f *connCancelFlag) setCancel(reason CancelReason) {
 	}
 	f.reason.Store(int32(reason))
 	atomic.StoreInt32((*int32)(unsafe.Pointer(&f.cflag.cancel)), 1)
-	if f.db != nil {
-		C.sqlite3_interrupt((*C.sqlite3)(f.db))
+	if dbPtr := f.db.Load(); dbPtr != 0 {
+		C.sqlite3_interrupt((*C.sqlite3)(unsafe.Pointer(dbPtr)))
 	}
 }
 
@@ -181,7 +183,7 @@ func (f *connCancelFlag) registerProgressHandler(db *C.sqlite3, progressN int) {
 	if f.cflag == nil || db == nil {
 		return
 	}
-	f.db = unsafe.Pointer(db)
+	f.db.Store(uintptr(unsafe.Pointer(db)))
 	C.sqlite3_progress_handler(db, C.int(progressN),
 		(*[0]byte)(C.goivm_progress_cb), unsafe.Pointer(f.cflag))
 }
@@ -189,11 +191,13 @@ func (f *connCancelFlag) registerProgressHandler(db *C.sqlite3, progressN int) {
 // detachProgressHandler removes the progress handler. Called before
 // cleanup/recovery SQL so the handler can't abort the cleanup itself (C3).
 func (f *connCancelFlag) detachProgressHandler() {
-	if f.cflag == nil || f.db == nil {
+	if f.cflag == nil {
 		return
 	}
-	C.sqlite3_progress_handler((*C.sqlite3)(f.db), 0, nil, nil)
-	f.db = nil
+	if dbPtr := f.db.Load(); dbPtr != 0 {
+		C.sqlite3_progress_handler((*C.sqlite3)(unsafe.Pointer(dbPtr)), 0, nil, nil)
+	}
+	f.db.Store(0)
 }
 
 // progressN is the opcode interval between progress handler invocations.
