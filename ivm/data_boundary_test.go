@@ -272,3 +272,40 @@ func TestRowDecodeMsgpack_NilMapAndSafeInteger(t *testing.T) {
 		t.Fatalf("2^53-1 round-trip broken: %T %v", row2["v"], row2["v"])
 	}
 }
+
+// L1: the wire-decode int coercion must reject an integer beyond ±2^53 with a
+// DataError, symmetric with FromSQLiteType's SQLite-read guard — a native
+// >2^53 msgpack integer cannot round-trip through float64 without aliasing.
+func TestNormalizeDecodedValue_RejectsUnsafeInteger(t *testing.T) {
+	unsafe := []any{
+		int64(1)<<53 + 1,
+		-(int64(1)<<53 + 1),
+		uint64(1)<<53 + 1,
+		int(1)<<53 + 1,
+	}
+	for _, v := range unsafe {
+		func() {
+			defer func() {
+				r := recover()
+				if r == nil {
+					t.Errorf("normalizeDecodedValue(%v) did not panic on >2^53 value", v)
+					return
+				}
+				if _, ok := r.(*DataError); !ok {
+					t.Errorf("normalizeDecodedValue(%v): panic type = %T, want *DataError", v, r)
+				}
+			}()
+			normalizeDecodedValue(v)
+		}()
+	}
+}
+
+// The boundary value (exactly ±(2^53-1)) must still pass and coerce to float64.
+func TestNormalizeDecodedValue_AcceptsMaxSafe(t *testing.T) {
+	for _, v := range []any{maxSafeInteger, -maxSafeInteger, uint64(maxSafeInteger)} {
+		got := normalizeDecodedValue(v)
+		if _, ok := got.(float64); !ok {
+			t.Errorf("normalizeDecodedValue(%v) = %T, want float64", v, got)
+		}
+	}
+}

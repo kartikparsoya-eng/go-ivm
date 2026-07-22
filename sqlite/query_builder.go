@@ -580,6 +580,34 @@ func ToSQLiteType(v ivm.Value, colType string) interface{} {
 			}
 			return 0
 		}
+		// L4: TS applies JS truthiness to ANY non-null value (`v ? 1 : 0`), not
+		// just booleans. bool is the fast path above; coerce a non-bool residual
+		// by the same truthiness FromSQLiteType's boolean READ arm uses, so a
+		// boolean-typed constraint/cursor whose value arrives as a number/string
+		// binds 1/0 the way TS does (kept symmetric with the read path). Latent
+		// today — boolean columns yield Go bool — but removes the divergence.
+		switch val := v.(type) {
+		case float64:
+			if val != 0 {
+				return 1
+			}
+			return 0
+		case int64:
+			if val != 0 {
+				return 1
+			}
+			return 0
+		case string:
+			if val != "" {
+				return 1
+			}
+			return 0
+		case []byte:
+			if len(val) != 0 {
+				return 1
+			}
+			return 0
+		}
 		return v
 	case "json":
 		// ALWAYS marshal — never passthrough, and NO nil short-circuit. TS's

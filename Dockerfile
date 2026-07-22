@@ -42,7 +42,10 @@ ARG GO_IVM_BUILD_REF
 WORKDIR /src
 
 # Cache module deps separately so source-only edits don't re-download.
+# The replace directive points to ./internal/go-sqlite3 (our mattn fork),
+# so it must be present before go mod download can resolve dependencies.
 COPY go.mod go.sum ./
+COPY internal/go-sqlite3/ internal/go-sqlite3/
 RUN go mod download
 
 COPY . .

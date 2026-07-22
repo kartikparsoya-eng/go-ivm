@@ -122,6 +122,14 @@ func (r *Row) DecodeMsgpack(dec *msgpack.Decoder) error {
 //
 // Recursion handles JSON-typed column values (e.g., tickets.metadata) that
 // decode to map[string]interface{} / []interface{} on the wire.
+// maxSafeInteger is JS Number.MAX_SAFE_INTEGER (2^53 - 1). Mirrors the same
+// const in the sqlite package: an integer beyond ±2^53 cannot round-trip
+// through float64 without silently aliasing to an adjacent value (corrupting
+// PKs / join keys). FromSQLiteType panics a DataError on the SQLite-read path;
+// L1 makes the wire-decode path symmetric so a native >2^53 msgpack integer
+// fails loud here instead of drifting silently.
+const maxSafeInteger = int64(1)<<53 - 1
+
 func normalizeDecodedValue(v interface{}) interface{} {
 	switch x := v.(type) {
 	case int8:
@@ -131,8 +139,14 @@ func normalizeDecodedValue(v interface{}) interface{} {
 	case int32:
 		return BoxFloat64(float64(x))
 	case int64:
+		if x > maxSafeInteger || x < -maxSafeInteger {
+			panic(NewDataError("normalizeDecodedValue: int64 %d exceeds JS MAX_SAFE_INTEGER (±2^53-1); float64 coercion loses precision", x))
+		}
 		return BoxFloat64(float64(x))
 	case int:
+		if int64(x) > maxSafeInteger || int64(x) < -maxSafeInteger {
+			panic(NewDataError("normalizeDecodedValue: int %d exceeds JS MAX_SAFE_INTEGER (±2^53-1); float64 coercion loses precision", x))
+		}
 		return BoxFloat64(float64(x))
 	case uint8:
 		return BoxFloat64(float64(x))
@@ -141,8 +155,14 @@ func normalizeDecodedValue(v interface{}) interface{} {
 	case uint32:
 		return BoxFloat64(float64(x))
 	case uint64:
+		if x > uint64(maxSafeInteger) {
+			panic(NewDataError("normalizeDecodedValue: uint64 %d exceeds JS MAX_SAFE_INTEGER (2^53-1); float64 coercion loses precision", x))
+		}
 		return BoxFloat64(float64(x))
 	case uint:
+		if uint64(x) > uint64(maxSafeInteger) {
+			panic(NewDataError("normalizeDecodedValue: uint %d exceeds JS MAX_SAFE_INTEGER (2^53-1); float64 coercion loses precision", x))
+		}
 		return BoxFloat64(float64(x))
 	case float32:
 		return BoxFloat64(float64(x))

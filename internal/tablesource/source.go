@@ -839,6 +839,15 @@ func (s *Source) ensurePrevTxLocked() error {
 			_ = conn.Close()
 		} else {
 			s.prevConn = conn
+			// L3: free any orphaned flag before overwriting the pointer. The
+			// normal teardown (closePrevConnLocked) frees + nils the flag, but
+			// OnAdvanceEnd's ROLLBACK-failure branch closes prevConn without
+			// freeing — leaking one C.malloc'd flag per reacquire. Free-old-
+			// before-new makes "never overwrite a live flag pointer" a local
+			// invariant. No double-free: closePrevConnLocked already stored nil.
+			if old := s.activeCancelFlag.Load(); old != nil {
+				old.Free()
+			}
 			// Allocate the cancel flag once and store it atomically.
 			// Reused across rebinds — Free only at Source.Close (R1/R2).
 			flag := newConnCancelFlag()
@@ -2076,11 +2085,28 @@ func (s *Source) scanRowsShim(
 ) []ivm.Node {
 	var out []ivm.Node
 	scanned := 0
+	// rowPanic captures a panic raised inside the onRow body (the typed
+	// advance-abort from checkAdvanceAbort, or a DataError from FromSQLiteType /
+	// invalidColumnPanic). M2: the onRow closure runs inside StepRowsShim's
+	// conn.Raw — if a panic escaped it, database/sql would mark the driver conn
+	// ErrBadConn and DISCARD it, silently closing the Source's prev/external
+	// conn (in drive mode that is the snapshotter's leapfrog conn). The
+	// non-shim scanRows path leaves the conn healthy on the same panics. So we
+	// recover here, stop the scan cleanly (Raw releases the conn as good), and
+	// re-raise the ORIGINAL panic from scanRowsShim — preserving the abort/
+	// data-error semantics without destroying the connection.
+	var rowPanic any
 	// Note: abort checkpoint fires during row delivery, but the shim steps
 	// up to 1024 rows in one C crossing before delivering any. The gas meter
 	// (progress handler) still bounds opcodes mid-batch, so the wall-clock
 	// economic abort is just coarser, not absent.
-	err := StepRowsShim(conn, sqlText, params, func(colNames []string, rowVals []any) bool {
+	err := StepRowsShim(conn, sqlText, params, func(colNames []string, rowVals []any) (keepGoing bool) {
+		defer func() {
+			if r := recover(); r != nil {
+				rowPanic = r
+				keepGoing = false // stop; Raw then releases the conn healthy
+			}
+		}()
 		if scanned++; scanned&1023 == 0 {
 			s.checkAdvanceAbort()
 		}
@@ -2098,6 +2124,11 @@ func (s *Source) scanRowsShim(
 		out = append(out, ivm.Node{Row: row})
 		return true
 	})
+	if rowPanic != nil {
+		// Re-raise the original typed panic; the conn was already released
+		// healthy because onRow returned (didn't panic through Raw).
+		panic(rowPanic)
+	}
 	if err != nil {
 		s.checkInterruptPanic(err)
 		panic(fmt.Sprintf("tablesource.Source.Fetch %s: shim: %v\nSQL: %s",

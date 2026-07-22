@@ -106,6 +106,9 @@ func newServerFromEnv() (*Server, error) {
 	if !tablesource.ParallelAdvance {
 		nonDefault("GO_IVM_PARALLEL_ADVANCE=false (serial advance fanout)")
 	}
+	if tablesource.UseStepRowsShim {
+		nonDefault("GO_IVM_STEP_ROWS_SHIM=1 (C step-rows shim leaf-read path)")
+	}
 	return server, nil
 }
 
