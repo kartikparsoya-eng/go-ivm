@@ -49,6 +49,7 @@ import "C"
 import (
 	"database/sql"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"unsafe"
 
@@ -62,6 +63,8 @@ type snapCancelFlag struct {
 	cflag *C.snap_cancel_flag
 	// L1 fix: atomic to prevent race between setCancel and registerOn/Free.
 	db atomic.Uintptr
+	// N2 fix: RWMutex synchronizes setCancel/clearCancel/setBudget with Free.
+	mu sync.RWMutex
 }
 
 // newSnapCancelFlag allocates a C cancel flag. Must be freed via Free.
@@ -76,7 +79,10 @@ func newSnapCancelFlag() *snapCancelFlag {
 }
 
 // Free releases the C memory and detaches the progress handler.
+// N2 fix: takes Lock so concurrent setCancel callers see cflag=nil.
 func (f *snapCancelFlag) Free() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if f.cflag == nil {
 		return
 	}
@@ -88,7 +94,10 @@ func (f *snapCancelFlag) Free() {
 }
 
 // setCancel sets the cancel flag and calls sqlite3_interrupt.
+// N2 fix: RLock synchronizes with Free.
 func (f *snapCancelFlag) setCancel() {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
 	if f.cflag == nil {
 		return
 	}
@@ -100,6 +109,8 @@ func (f *snapCancelFlag) setCancel() {
 
 // clearCancel resets the flag for a new operation.
 func (f *snapCancelFlag) clearCancel() {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
 	if f.cflag == nil {
 		return
 	}
@@ -108,6 +119,8 @@ func (f *snapCancelFlag) clearCancel() {
 
 // setBudget sets the opcode budget. -1 = unlimited.
 func (f *snapCancelFlag) setBudget(opcodes int32) {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
 	if f.cflag == nil {
 		return
 	}

@@ -64,6 +64,7 @@ import "C"
 
 import (
 	"errors"
+	"sync"
 	"sync/atomic"
 	"unsafe"
 
@@ -101,6 +102,12 @@ type connCancelFlag struct {
 	// L1 fix: atomic to prevent race between setCancel (lock-free) and
 	// registerProgressHandler/detachProgressHandler (under s.mu).
 	db atomic.Uintptr
+
+	// mu guards the cflag pointer lifetime. setCancel/clearCancel/
+	// setBudget/IsCancelled take RLock; Free takes Lock. This prevents
+	// the UAF where setCancel reads cflag non-nil, then Free frees it,
+	// then setCancel writes to freed C memory (N2 fix).
+	mu sync.RWMutex
 }
 
 // newConnCancelFlag allocates a C cancel flag. Must be freed via Free.
@@ -115,8 +122,11 @@ func newConnCancelFlag() *connCancelFlag {
 }
 
 // Free releases the C memory. Safe to call once; caller must ensure no
-// in-flight sqlite3_step is using the flag.
+// in-flight sqlite3_step is using the flag. N2 fix: takes Lock so
+// concurrent setCancel/clearCancel/setBudget callers see cflag=nil.
 func (f *connCancelFlag) Free() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if f.cflag != nil {
 		// Detach the progress handler before freeing so a stale
 		// callback can't read freed memory.
@@ -130,8 +140,10 @@ func (f *connCancelFlag) Free() {
 
 // setCancel marks the flag as cancelled with the given reason, and
 // calls sqlite3_interrupt to break out of busy-wait sleeps (C2).
-// Safe to call from any goroutine.
+// Safe to call from any goroutine. N2 fix: RLock synchronizes with Free.
 func (f *connCancelFlag) setCancel(reason CancelReason) {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
 	if f.cflag == nil {
 		return
 	}
@@ -145,6 +157,8 @@ func (f *connCancelFlag) setCancel(reason CancelReason) {
 // clearCancel resets the flag for a new operation on this conn.
 // Called at acquire time when the conn is bound to a new pipeline.
 func (f *connCancelFlag) clearCancel() {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
 	if f.cflag == nil {
 		return
 	}
@@ -154,6 +168,8 @@ func (f *connCancelFlag) clearCancel() {
 
 // setBudget sets the opcode budget (D1 — gas meter). -1 = unlimited.
 func (f *connCancelFlag) setBudget(opcodes int32) {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
 	if f.cflag == nil {
 		return
 	}
@@ -167,6 +183,8 @@ func (f *connCancelFlag) Reason() CancelReason {
 
 // IsCancelled returns true if the flag is set.
 func (f *connCancelFlag) IsCancelled() bool {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
 	if f.cflag == nil {
 		return false
 	}

@@ -139,8 +139,9 @@ type shimBufs struct {
 }
 
 // decodeRow decodes row r from colbuf into a []any and calls onRow.
-// rowVals is allocated per call — consumers that retain values must copy.
-func decodeRow(colbuf []C.goivm_col, r, ncol int, strbuf []byte, colNames []string, onRow func([]string, []any) bool) {
+// Returns onRow's bool (false = stop scanning). rowVals is allocated
+// per call — consumers that retain values must copy.
+func decodeRow(colbuf []C.goivm_col, r, ncol int, strbuf []byte, colNames []string, onRow func([]string, []any) bool) bool {
 	rowVals := make([]any, ncol)
 	for c := 0; c < ncol; c++ {
 		col := &colbuf[r*ncol+c]
@@ -167,7 +168,7 @@ func decodeRow(colbuf []C.goivm_col, r, ncol int, strbuf []byte, colNames []stri
 			rowVals[c] = nil
 		}
 	}
-	onRow(colNames, rowVals)
+	return onRow(colNames, rowVals)
 }
 
 func stepRowsShimAvailable() bool { return true }
@@ -269,7 +270,9 @@ func stepRowsShim(
 			// If strbuf overflowed, deliver extracted rows, grow, and retry with resume=1
 			if !done && errcode == 0 && int(strLen) > len(strbuf) {
 				for r := 0; r < stepped; r++ {
-					decodeRow(colbuf, r, ncol, strbuf, colNames, onRow)
+					if !decodeRow(colbuf, r, ncol, strbuf, colNames, onRow) {
+						return nil
+					}
 				}
 				bufs.strbuf = make([]byte, int(strLen)*2)
 				strbuf = bufs.strbuf
@@ -283,7 +286,9 @@ func stepRowsShim(
 
 			// Decode and deliver rows
 			for r := 0; r < stepped; r++ {
-				decodeRow(colbuf, r, ncol, strbuf, colNames, onRow)
+				if !decodeRow(colbuf, r, ncol, strbuf, colNames, onRow) {
+					return nil
+				}
 			}
 
 			if done {
