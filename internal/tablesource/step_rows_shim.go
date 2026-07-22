@@ -178,6 +178,11 @@ func stepRowsShimAvailable() bool { return true }
 //
 // The entire operation runs inside conn.Raw so the conn lock is held
 // throughout — no other goroutine can use this conn while we're stepping.
+//
+// S3: Values are raw SQLite storage classes (int64/float64/string/[]byte/nil).
+// Callers MUST apply FromSQLiteType in the onRow callback to match the
+// type normalization that database/sql + mattn provide (e.g. declared-type
+// timestamp → time.Time, nullable column handling).
 func stepRowsShim(
 	conn *sql.Conn,
 	sqlText string,
