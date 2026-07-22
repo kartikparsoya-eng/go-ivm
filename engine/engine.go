@@ -1641,6 +1641,14 @@ type AdvanceStreamPartial struct {
 	ChunkIndex int           `json:"chunkIndex"`
 	Final      bool          `json:"final"`
 	Timings    []TableTiming `json:"timings,omitempty"`
+	// GoWallMs is the engine-internal end-to-end wall time of the whole
+	// advance (entry → terminal flush): lazy diff derivation + all pushes +
+	// fanout fetches + chunk serialization. Populated only on the Final frame.
+	// Unlike Σ Timings (per-table push windows only), this INCLUDES the
+	// drive-mode diff-derivation phase (the lazy iter.Seq pull over the
+	// changelog), so TS can attribute (advance-go-rpc-time − GoWallMs) to true
+	// wire latency and (GoWallMs − Σ Timings) to the uncounted diff/fetch work.
+	GoWallMs float64 `json:"goWallMs,omitempty"`
 }
 
 // advanceChunkSize is the max number of RowChanges per partial frame in
@@ -1797,6 +1805,12 @@ func (e *Engine) advanceStreamChunkedSeq(
 		return ErrEngineClosed
 	}
 
+	// Engine-internal end-to-end wall clock. Started HERE (before the lazy
+	// diff-derivation loop) so it captures the whole advance, including the
+	// changelog-cursor pulls that Σ Timings omits. Stamped onto the Final
+	// frame's GoWallMs just before the terminal flush.
+	advanceStart := time.Now()
+
 	// Snapshot sources once — COW + atomic.Pointer keeps the map consistent
 	// for the whole advance. Hand the processing clock to sources whose
 	// fan-out spawns worker goroutines, and clear it on ALL exits (defer
@@ -1871,16 +1885,20 @@ func (e *Engine) advanceStreamChunkedSeq(
 	// `rows` is consumed synchronously — the sidecar's streamW → mpMarshal
 	// encodes it into a separate byte buffer before onResult returns, so
 	// callers may reuse the backing array after onResult returns.
+	var advanceWallMs float64
 	emitLocked := func(rows []RowChange, final bool) {
 		var t []TableTiming
+		var wallMs float64
 		if final {
 			t = timings
+			wallMs = advanceWallMs
 		}
 		onResult(AdvanceStreamPartial{
 			Changes:    bumpRowVersions(rows, e.minRowVersions),
 			ChunkIndex: chunkIndex,
 			Final:      final,
 			Timings:    t,
+			GoWallMs:   wallMs,
 		})
 		chunkIndex++
 	}
@@ -2041,6 +2059,12 @@ func (e *Engine) advanceStreamChunkedSeq(
 	if seqErr != nil {
 		return seqErr
 	}
+
+	// Stamp the engine-internal end-to-end wall onto the Final frame. Measured
+	// up to (not including) the terminal flush's own serialization — that's one
+	// frame and it can't measure itself. Captures everything else: diff
+	// derivation, pushes, fanout, prior-chunk serialization, signalAdvanceEnd.
+	advanceWallMs = float64(time.Since(advanceStart).Microseconds()) / 1000.0
 
 	// Always emit a terminal Final frame. Carries cumulative timings on
 	// success; carries empty Changes on a captured panic (the caller's

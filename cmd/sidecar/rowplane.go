@@ -667,6 +667,7 @@ func (rp *rowPlane) emitAdvanceToHeadPartial(r engine.AdvanceStreamPartial, vers
 		ChunkIndex: r.ChunkIndex,
 		Final:      r.Final,
 		Timings:    r.Timings,
+		GoWallMs:   r.GoWallMs,
 	}
 	if r.Final {
 		part.Version = version

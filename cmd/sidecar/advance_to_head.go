@@ -559,6 +559,7 @@ type advanceToHeadStreamPartial struct {
 	Final      bool                 `json:"final"`
 	Header     bool                 `json:"header,omitempty"`
 	Timings    []engine.TableTiming `json:"timings,omitempty"`
+	GoWallMs   float64              `json:"goWallMs,omitempty"`
 	// Header + Final metadata (omitted on row-bearing non-final partials):
 	Version    string            `json:"version,omitempty"`
 	NumChanges int               `json:"numChanges,omitempty"`
