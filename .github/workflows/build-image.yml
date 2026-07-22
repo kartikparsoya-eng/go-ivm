@@ -84,7 +84,14 @@ jobs:
       # in testharness/ that needs Node + npm deps we don't install
       # here. Add a separate test job if/when that's wired up.
       - name: go vet
-        run: go vet ./...
+        # Disable ONLY the unsafeptr analyzer (all others stay on). The
+        # cancel-flag machinery stores raw *C.sqlite3 handles as atomic.Uintptr
+        # and the mattn fork accessors return uintptr — converting those back
+        # via unsafe.Pointer trips vet's unsafeptr check, which can't tell a
+        # C-allocated pointer (never GC-moved) from a Go-heap one. These are
+        # C pointers by construction and safe; see internal/tablesource/
+        # cancel_flag.go + the accessor doc (commit documenting the pattern).
+        run: go vet -unsafeptr=false ./...
 
       # NAPI ABI build guard (REVIEW-napi-transport T1): the in-process
       # transport shims in napi_lib.go compile ONLY under -tags napilib, so
