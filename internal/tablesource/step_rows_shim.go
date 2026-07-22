@@ -105,7 +105,6 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"fmt"
-	"reflect"
 	"sync"
 	"unsafe"
 
@@ -179,23 +178,15 @@ func stepRowsShim(
 		}
 		defer driverRows.Close()
 
-		// Extract the *C.sqlite3_stmt from SQLiteRows.s.s via reflect.
-		// SQLiteRows has unexported field s (*SQLiteStmt), which has
-		// unexported field s (*C.sqlite3_stmt). We read via unsafe pointer
-		// because reflect.Value.Interface() panics on unexported fields.
-		srVal := reflect.ValueOf(driverRows).Elem()
-		sField := srVal.FieldByName("s")
-		if !sField.IsValid() {
-			return fmt.Errorf("stepRowsShim: SQLiteRows.s field not found")
+		// Extract the *C.sqlite3_stmt from SQLiteRows via the exported accessor.
+		sr, ok := driverRows.(*sqlite3.SQLiteRows)
+		if !ok {
+			return fmt.Errorf("stepRowsShim: not *SQLiteRows (got %T)", driverRows)
 		}
-		ssPtr := *(**sqlite3.SQLiteStmt)(unsafe.Pointer(sField.UnsafeAddr()))
-
-		stmtVal := reflect.ValueOf(ssPtr).Elem()
-		stmtField := stmtVal.FieldByName("s")
-		if !stmtField.IsValid() {
-			return fmt.Errorf("stepRowsShim: SQLiteStmt.s field not found")
+		cstmt := (*C.sqlite3_stmt)(unsafe.Pointer(sr.RawStmt()))
+		if cstmt == nil {
+			return fmt.Errorf("stepRowsShim: SQLiteRows has nil stmt")
 		}
-		cstmt := *(**C.sqlite3_stmt)(unsafe.Pointer(stmtField.UnsafeAddr()))
 
 		// Get column count and names from the stmt
 		ncol := int(C.sqlite3_column_count(cstmt))

@@ -49,7 +49,6 @@ import "C"
 import (
 	"database/sql"
 	"fmt"
-	"reflect"
 	"sync/atomic"
 	"unsafe"
 
@@ -122,11 +121,7 @@ func (f *snapCancelFlag) registerOn(conn *sql.Conn) error {
 		if !ok {
 			return fmt.Errorf("snapCancelFlag: not a mattn *SQLiteConn (got %T)", driverConn)
 		}
-		v := reflect.ValueOf(c).Elem().FieldByName("db")
-		if !v.IsValid() {
-			return fmt.Errorf("snapCancelFlag: SQLiteConn.db field not found")
-		}
-		db := (*C.sqlite3)(unsafe.Pointer(v.Pointer()))
+		db := (*C.sqlite3)(unsafe.Pointer(c.RawDB()))
 		f.db = unsafe.Pointer(db)
 		C.sqlite3_progress_handler(db, C.int(C.SNAP_PROGRESS_N),
 			(*[0]byte)(C.snap_progress_cb), unsafe.Pointer(f.cflag))

@@ -2,6 +2,8 @@ module github.com/kartikparsoya-eng/go-ivm
 
 go 1.25.0
 
+replace github.com/mattn/go-sqlite3 => ./internal/go-sqlite3
+
 require (
 	github.com/mattn/go-sqlite3 v1.14.44
 	github.com/vmihailenco/msgpack/v5 v5.4.1

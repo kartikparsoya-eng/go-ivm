@@ -45,7 +45,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"reflect"
 	"sync"
 	"unsafe"
 
@@ -206,25 +205,12 @@ func (s *Snapshot) Free() {
 	}
 }
 
-// rawSQLiteHandle reads mattn's unexported SQLiteConn.db field. mattn
-// doesn't export its raw *C.sqlite3 because they want to discourage
-// reaching past the driver API; we have to because we need a SQLite C
-// API (snapshot_open) that database/sql can't model. Pinned mattn version
-// in go.mod keeps the field layout stable across upgrades.
-//
-// Returns an error rather than panicking if the field isn't there so a
-// future mattn breaking-change surfaces as a clean Open failure with a
-// diagnostic message, not a runtime crash.
+// rawSQLiteHandle returns the raw *C.sqlite3 from a mattn SQLiteConn
+// via the exported accessor on our mattn fork.
 func rawSQLiteHandle(driverConn any) (*C.sqlite3, error) {
 	c, ok := driverConn.(*sqlite3.SQLiteConn)
 	if !ok {
 		return nil, fmt.Errorf("rawSQLiteHandle: not a mattn *SQLiteConn (got %T)", driverConn)
 	}
-	v := reflect.ValueOf(c).Elem().FieldByName("db")
-	if !v.IsValid() {
-		return nil, errors.New("rawSQLiteHandle: SQLiteConn.db field not found (mattn struct changed?)")
-	}
-	// v is a *C.sqlite3 (unexported). Read its pointer value via
-	// unsafe; reflect.Value.Pointer() works for pointer-kind values.
-	return (*C.sqlite3)(unsafe.Pointer(v.Pointer())), nil
+	return (*C.sqlite3)(unsafe.Pointer(c.RawDB())), nil
 }
