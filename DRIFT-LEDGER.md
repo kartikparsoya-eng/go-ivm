@@ -26,43 +26,39 @@ Take.
 
 ## D2: SQL Operator Whitelist
 
-Status: Intentional Go hardening, not yet ported back to TS.
+Status: ALIGNED (2026-07-22). TS now matches Go's fail-closed policy.
 
 Go rejects operators outside its explicit SQL operator whitelist with
 `*ivm.DataError` before SQL formatting. See `sqlite/query_builder.go:277-306`.
 
-Current TS zqlite compiles `filter.op` with `sql.__dangerous__rawValue` on the
-generic condition path, after special-casing `IN` and LIKE-family operators.
-See `mono/packages/zqlite/src/query-builder.ts:194-223`. The protocol schema
-defines the supported operator set at `mono/packages/zero-protocol/src/ast.ts:37-50`.
+TS zqlite now carries the SAME `allowedOps` whitelist and throws before the
+`sql.__dangerous__rawValue` interpolation in `simpleConditionToSQL`
+(`mono/packages/zqlite/src/query-builder.ts`, parity tests in
+`query-builder.test.ts`). Both engines reject the same operator set; the whole
+column of previously-divergent behavior is closed.
 
-Reason: Go's sidecar accepts ASTs over the client boundary; whitelisting avoids
-raw SQL operator interpolation from untrusted input. The error classification is
-deliberate: an unsupported query shape is deterministic and should tear down the
-client group rather than silently producing an empty result.
-
-Required follow-up: align TS with the same whitelist/error policy, or move the
-shared validation to AST ingress so both implementations reject the same op set
-with the same typed error.
+Reason (retained for history): Go's sidecar accepts ASTs over the client
+boundary; whitelisting avoids raw SQL operator interpolation from untrusted
+input. An unsupported query shape is deterministic and tears down the client
+group rather than silently producing an empty result.
 
 ## D3: Malformed Condition-Type Rejection
 
-Status: Intentional Go hardening, not yet ported back to TS.
+Status: ALIGNED (2026-07-22). TS now matches Go's fail-closed policy.
 
 Go rejects condition trees whose `type` is not `simple`, `and`, or `or` with
 `*ivm.DataError`. See `sqlite/query_builder.go:241-275`.
 
-Current TS zqlite relies on the typed AST union and has no runtime `default`
-branch in `filtersToSQL`. See
-`mono/packages/zqlite/src/query-builder.ts:169-191`.
-
-Reason: Go receives decoded client AST data at runtime. Treating an unknown type
-as `TRUE` widened malformed queries; rejecting it preserves fail-closed behavior
-without letting invalid input reach SQL generation.
-
-Required follow-up: align TS with an explicit runtime rejection or move the
-shared validation to AST ingress so Go and TS classify malformed condition types
+TS zqlite `filtersToSQL` now has a `default` branch that throws on an unknown
+condition type instead of falling through / widening to nothing
+(`mono/packages/zqlite/src/query-builder.ts`, parity test in
+`query-builder.test.ts`). Both engines classify a malformed condition type
 identically.
+
+Reason (retained for history): Go receives decoded client AST data at runtime;
+treating an unknown type as `TRUE` widened malformed queries, so rejecting it
+preserves fail-closed behavior without letting invalid input reach SQL
+generation.
 
 ## M1: Boolean Coercion from String Values
 

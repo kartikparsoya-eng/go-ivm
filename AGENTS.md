@@ -86,7 +86,8 @@ pnpm --filter zero-cache run check-types
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `GO_IVM_HYDRATE_PARALLELISM` | 4 | Hydrate lane count (readers = 2× lanes) |
-| `GO_IVM_ADVANCE_PARALLELISM` | 4 | Advance fanout workers (default ON; `false` disables) |
+| `GO_IVM_PARALLEL_ADVANCE` | false | Advance-fanout master switch — SERIAL by default (code `== "true"`; `Dockerfile.go-ivm` bakes `false`). Advance push is TS-faithful serial in prod; the parallel `fanOut` path is shadow-only. |
+| `GO_IVM_ADVANCE_PARALLELISM` | 1 | Advance fanout worker count. NO-OP while `GO_IVM_PARALLEL_ADVANCE=false` (the master switch gates it). Code default 1. |
 | `GO_IVM_MAX_OPEN_CONNS` | 1024 | Per-worker SQLite connection pool ceiling |
 | `GO_IVM_MAX_IDLE_CONNS` | 1024 | Idle connection cap (self-clamps to MAX_OPEN) |
 | `GO_IVM_CONN_CACHE_KB` | 1024 | Per-conn SQLite page cache (C-side malloc) |
@@ -112,7 +113,7 @@ pnpm --filter zero-cache run check-types
 The local sandbox uses reduced settings for 125 CGs / 4 workers / 8GB:
 - `GO_IVM_MAX_OPEN_CONNS=128` (32 per worker)
 - `GO_IVM_HYDRATE_PARALLELISM=2` (4 readers)
-- `GO_IVM_ADVANCE_PARALLELISM=4`
+- `GO_IVM_ADVANCE_PARALLELISM=4` (worker count only — inert unless `GO_IVM_PARALLEL_ADVANCE=true`; advance is serial by default)
 - `GO_IVM_GOMEMLIMIT_PERCENT=75`
 
 ## Local Sandbox
@@ -146,7 +147,8 @@ git push --no-verify origin feat/napi-transport
 ## Current State (as of 2026-07-11)
 
 - Go-primary mode active via NAPI in-process transport
-- Parallel advance fanout enabled by default
+- Advance push SERIAL (`GO_IVM_PARALLEL_ADVANCE=false`, TS-faithful); parallel fanout is shadow-only
+- Advance leaf fetch is lazy (`fetchDuringPushStream`, `iter.Seq` — TS `statement.iterate()` semantics, unconditional)
 - Tiered reset circuit breaker (view-syncer.ts): economic-class resets
   (advancement-timeout) never trip the breaker; deterministic, transient,
   and lawful classes have per-class thresholds

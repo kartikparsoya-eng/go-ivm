@@ -47,9 +47,9 @@ deployments).
 |---|---|---|
 | `GO_IVM_SOURCE_MODE` | DELETED | table mode is the only mode; env knob removed |
 | `GO_IVM_LAZY_ADVANCE` | DELETED | The lazy leaf (`fetchDuringPushStream`) is the unconditional advance-time dispatch; the eager escape hatch was removed together with `FetchRequest.Limit` — early termination is propagated pull-stop, exactly TS's lazy-generator semantics |
-| `GO_IVM_PARALLEL_ADVANCE` | true (default ON) | PROD parallel fanout; `os.Getenv("GO_IVM_PARALLEL_ADVANCE") != "false"` — default ON, explicit disable only |
+| `GO_IVM_PARALLEL_ADVANCE` | **false (SERIAL)** | Advance push is SERIAL in prod: `Dockerfile.go-ivm` bakes `ENV GO_IVM_PARALLEL_ADVANCE=false`, and the code default is off (`os.Getenv(...) == "true"`). Per-source-change fanout across pipeline groups all fetch on the ONE prev-tx conn, so PAR>1 only contends on `s.mu` + SQLite's conn mutex — counterproductive for fetch-heavy advances. The parallel `fanOut` path is shadow/experiment only. This matches TS (single-threaded advance). |
 | `GO_IVM_LAZY_HYDRATE` | DELETED | Gated only the dead `computeCmax` (never called); the operator tree streams lazily end-to-end and pool sizing always used `ConservativeHydrateCmax` |
-| `GO_IVM_HYDRATE_PARALLELISM` / `GO_IVM_ADVANCE_PARALLELISM` | 4 / 4 | Split PROD parallelism knobs; legacy `GO_IVM_PARALLELISM` remains fallback for both |
+| `GO_IVM_HYDRATE_PARALLELISM` / `GO_IVM_ADVANCE_PARALLELISM` | 4 / (moot) | Split parallelism knobs; legacy `GO_IVM_PARALLELISM` is the fallback. Only HYDRATE is live: hydrate uses the reader pool (multiple conns) so lanes scale. `GO_IVM_ADVANCE_PARALLELISM` is a NO-OP while `GO_IVM_PARALLEL_ADVANCE=false` (the fanout master switch gates it) — advance stays serial regardless of the worker count. Code default for the worker count is 1. |
 | `GO_IVM_HYDRATE_LANES` / `GO_IVM_HYDRATE_READERS` | 4 / 8 | Hydrate facet overrides; readers default to `2×GO_IVM_HYDRATE_PARALLELISM` |
 | `GO_IVM_HYDRATE_CHUNK_SIZE` / `ADVANCE_CHUNK_SIZE` / `CHUNK_SIZE` | 100 (Docker: 10000) | PROD tuning |
 | `GO_IVM_WARM_HYDRATE_POOL` | true | PROD |
@@ -82,8 +82,9 @@ deployments).
 ## Faithfulness-review scoping
 
 Review = PROD rows only, under the declared divergence budget: parallel
-compute (hydrate lanes, parallel advance fanout, pull-window pipelining) is
+compute (hydrate lanes, pull-window pipelining) is
 the ONLY intended behavioral divergence from TS; everything else —
+including SERIAL advance push (`GO_IVM_PARALLEL_ADVANCE=false`, TS-faithful) —
 values, ordering per query, coercions, failure dispositions, abort
 economics — is required to be TS-identical and is pinned by parity tests
 (realtext/coercion fuzz, overlay contract, abort message byte-shape,
