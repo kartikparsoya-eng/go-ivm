@@ -179,7 +179,7 @@ var (
 // and 5s under the 60s budget. Env-tunable via GO_IVM_DELIVER_TIMEOUT_SEC
 // (read lazily — the env sync from the embedder happens at goivm_start,
 // after package init).
-const deliverTimeoutDefault = 45 * time.Second
+const deliverTimeoutDefault = 46 * time.Second
 
 var deliverTimeoutOnce sync.Once
 var deliverTimeoutVal = deliverTimeoutDefault
