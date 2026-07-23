@@ -162,10 +162,12 @@ func (s *Server) scanWedgedGroups(now time.Time) int {
 		//     non-pull RPCs via engine.CancelAllSourceConns (sets
 		//     prevConn/externalConn cancel flags). The progress handler
 		//     aborts the SQLite step within ~4096 opcodes.
-		//   6x threshold (540s): fatalExit — process-fatal, TS-parity
+		//   3x threshold (270s): fatalExit — process-fatal, TS-parity
 		//     (blocked-loop → probe-kill → supervised restart). With the
 		//     progress handler this should never fire; it exists as the
-		//     liveness probe of last resort.
+		//     liveness probe of last resort. Reduced from 6x (540s) to
+		//     3x (270s): a stuck shared sidecar drops ALL client groups,
+		//     so the blast radius of waiting 540s is too high.
 		if elapsed >= 2*s.wedgeThreshold {
 			if g.wedgeCancelled.CompareAndSwap(false, true) {
 				if info.reqIDFloat != 0 {
@@ -193,12 +195,12 @@ func (s *Server) scanWedgedGroups(now time.Time) int {
 				}
 			}
 		}
-		if elapsed >= 6*s.wedgeThreshold {
+		if elapsed >= 3*s.wedgeThreshold {
 			fmt.Fprintf(wedgeLogW,
 				"[GO-IVM][WEDGE-FATAL] cg=%s method=%s elapsed=%v action=fatalExit — "+
-					"handler stuck past 6x threshold; progress handler cancel failed. "+
+					"handler stuck past 3x threshold (%v); progress handler cancel failed. "+
 					"Killing process (TS-parity: blocked-loop → probe-kill → restart).\n",
-				info.cgID, info.method, elapsed.Round(time.Millisecond))
+				info.cgID, info.method, elapsed.Round(time.Millisecond), s.wedgeThreshold)
 			os.Exit(1)
 		}
 	}

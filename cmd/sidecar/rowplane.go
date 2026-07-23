@@ -179,7 +179,7 @@ var (
 // and 5s under the 60s budget. Env-tunable via GO_IVM_DELIVER_TIMEOUT_SEC
 // (read lazily — the env sync from the embedder happens at goivm_start,
 // after package init).
-const deliverTimeoutDefault = 55 * time.Second
+const deliverTimeoutDefault = 45 * time.Second
 
 var deliverTimeoutOnce sync.Once
 var deliverTimeoutVal = deliverTimeoutDefault
@@ -223,6 +223,13 @@ type rowPlane struct {
 	// timeout bounds one payload's (or the stage's) wait against a full
 	// queue (deliverTimeoutDur in production; tests shrink it directly).
 	timeout time.Duration
+	// advanceBudgetDeadline, when non-zero, is the advance's wall-clock
+	// budget deadline. retryDeliver and flushStageLocked check it alongside
+	// the deliver timeout and return false (stream dead) if the advance
+	// budget is exhausted during a park — a parked advance producer holds
+	// its prev-tx WAL pin, which must not exceed the advance budget
+	// (GO_IVM_ADVANCE_BUDGET_MS). Zero = no advance budget (hydrate path).
+	advanceBudgetDeadline time.Time
 
 	// stage holds framed records ([u8 kind][u32le len][bytes], kinds 2/3)
 	// that found the queue FULL, awaiting a whole-stage kind-5 batch flush.
@@ -291,6 +298,28 @@ func (rp *rowPlane) setPullGate(gate *streamGate) {
 	}
 }
 
+// setAdvanceBudget arms the advance's wall-clock budget deadline so that
+// retryDeliver and flushStageLocked abort the stream when the budget is
+// exhausted during a park. A parked advance producer holds its prev-tx
+// WAL pin; without this check the pin can outlive the advance budget
+// (GO_IVM_ADVANCE_BUDGET_MS, default 60s), preventing WAL checkpoint and
+// growing the replica file without bound. Zero-value = no budget check
+// (the hydrate path, which holds no WAL pin).
+func (rp *rowPlane) setAdvanceBudget(deadline time.Time) {
+	rp.advanceBudgetDeadline = deadline
+}
+
+// deliverDeadline returns the EARLIER of the deliver timeout and the
+// advance budget deadline (when set). Used by retryDeliver and
+// flushStageLocked to bound the park.
+func (rp *rowPlane) deliverDeadline() time.Time {
+	td := time.Now().Add(rp.timeout)
+	if rp.advanceBudgetDeadline.IsZero() || rp.advanceBudgetDeadline.After(td) {
+		return td
+	}
+	return rp.advanceBudgetDeadline
+}
+
 // noteDeliverTimeout emits the marker and bumps the counter.
 func (rp *rowPlane) noteDeliverTimeout(kind int32, payloadLen int) {
 	metrics.napiDeliverTimeouts.Add(1)
@@ -323,7 +352,7 @@ func parkSlice(ch <-chan struct{}, t *time.Timer) {
 // dead (closed / cancelled / deadline).
 func (rp *rowPlane) retryDeliver(kind int32, payload []byte) bool {
 	metrics.napiDeliverStalls.Add(1)
-	deadline := time.Now().Add(rp.timeout)
+	deadline := rp.deliverDeadline()
 	t := time.NewTimer(deliverCancelTick)
 	defer t.Stop()
 	for {
@@ -414,7 +443,7 @@ func (rp *rowPlane) flushStageLocked() bool {
 		}
 		if deadline.IsZero() {
 			metrics.napiDeliverStalls.Add(1)
-			deadline = time.Now().Add(rp.timeout)
+			deadline = rp.deliverDeadline()
 		}
 		if rp.cancelled != nil && rp.cancelled() {
 			return false

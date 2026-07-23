@@ -252,6 +252,14 @@ type Engine struct {
 	// at/above it), so it only activates in the rare post-RESET window.
 	minRowVersions map[string]string
 
+	// advanceWallStart, when non-zero, is used as the start instant for the
+	// Final frame's GoWallMs instead of time.Now() inside advanceStreamChunkedSeq.
+	// Set by the sidecar BEFORE the snapshotter leapfrog (snap.Advance) so
+	// GoWallMs captures the full advance wall — diff derivation + apply + emit —
+	// not just the engine-apply phase. Cleared after each advance. Zero = the
+	// engine sets it itself (legacy callers / tests).
+	advanceWallStart time.Time
+
 	// onConflictRow is an optional callback invoked once per prev row that
 	// conflicts with an added row during advance — the Go twin of TS's
 	// #conflictRowsDeleted counter (pipeline-driver.ts:173-177, 756). A
@@ -284,6 +292,14 @@ func (e *Engine) SetMinRowVersions(m map[string]string) {
 // never mutated mid-flight).
 func (e *Engine) SetOnConflictRow(fn func()) {
 	e.onConflictRow = fn
+}
+
+// SetAdvanceWallStart sets the start instant for the next advance's GoWallMs
+// measurement. The sidecar calls this BEFORE the snapshotter leapfrog so the
+// Final frame's GoWallMs captures the full advance (leapfrog + diff + apply +
+// emit) rather than just the engine-apply phase. Cleared after each advance.
+func (e *Engine) SetAdvanceWallStart(t time.Time) {
+	e.advanceWallStart = t
 }
 
 // bumpRowVersions applies the TS streamNodes minRowVersion bump
@@ -1805,11 +1821,16 @@ func (e *Engine) advanceStreamChunkedSeq(
 		return ErrEngineClosed
 	}
 
-	// Engine-internal end-to-end wall clock. Started HERE (before the lazy
-	// diff-derivation loop) so it captures the whole advance, including the
-	// changelog-cursor pulls that Σ Timings omits. Stamped onto the Final
-	// frame's GoWallMs just before the terminal flush.
-	advanceStart := time.Now()
+	// Engine-internal end-to-end wall clock. If the caller set
+	// advanceWallStart (via SetAdvanceWallStart) BEFORE the snapshotter
+	// leapfrog, use it so GoWallMs captures the full advance — leapfrog +
+	// diff derivation + apply + emit — not just the engine-apply phase.
+	// Clear after use so a stale value can't leak into the next advance.
+	advanceStart := e.advanceWallStart
+	if advanceStart.IsZero() {
+		advanceStart = time.Now()
+	}
+	e.advanceWallStart = time.Time{}
 
 	// Snapshot sources once — COW + atomic.Pointer keeps the map consistent
 	// for the whole advance. Hand the processing clock to sources whose

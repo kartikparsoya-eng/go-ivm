@@ -661,6 +661,13 @@ func (s *Server) handleAdvanceToHeadStream(req RPCRequest, streamW streamWriter)
 	// before curr rotates off its pinned frame.
 	s.tearDownReaderPool(group)
 
+	// Stamp the advance wall start BEFORE the leapfrog so GoWallMs on the
+	// Final frame captures the full advance (leapfrog + diff + apply + emit),
+	// not just the engine-apply phase. Without this the ivm.advance-go-internal-time
+	// histogram undercounts by the leapfrog duration, mislabeling Go compute
+	// as wire overhead under WAL contention.
+	group.eng.SetAdvanceWallStart(time.Now())
+
 	diff, err := group.snap.Advance(group.snapSpecs, group.snapAllNames)
 	if err != nil {
 		// CLEAN failure: snapshotter.Advance is failure-atomic (the prev/curr
@@ -840,6 +847,9 @@ func (s *Server) handleAdvanceToHeadStream(req RPCRequest, streamW streamWriter)
 			"advanceToHeadStream: pull gate registration failed")
 	}
 	rp.setPullGate(gate)
+	if budgetOn {
+		rp.setAdvanceBudget(budgetDeadline)
+	}
 	defer s.streamGates.unregister(rid)
 	if !rp.deliverFrame(headerPartial) {
 		return rpcError(req.ID, -32000,

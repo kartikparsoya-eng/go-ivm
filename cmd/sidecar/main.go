@@ -422,6 +422,16 @@ func startPprofServer() *http.Server {
 	if addr == "" {
 		return nil
 	}
+	// Reject non-loopback addresses unless explicitly allowed. pprof is
+	// an RCE-grade surface (reads heap, dumps goroutines, triggers GC);
+	// a misconfigured `0.0.0.0:port` must fail loud, not silently bind.
+	if !strings.HasPrefix(addr, "127.0.0.1") && !strings.HasPrefix(addr, "localhost") &&
+		!strings.HasPrefix(addr, "[::1]") &&
+		os.Getenv("GO_IVM_PPROF_ALLOW_REMOTE") != "true" {
+		fmt.Fprintf(os.Stderr,
+			"[GO-IVM] pprof addr %q is non-loopback — set GO_IVM_PPROF_ALLOW_REMOTE=true to override (RCE-grade surface).\n", addr)
+		return nil
+	}
 	if strings.HasPrefix(addr, ":") {
 		if p, err := strconv.Atoi(strings.TrimPrefix(addr, ":")); err == nil {
 			// Spread workers across a small band off the base port.
@@ -1316,6 +1326,19 @@ func (s *Server) getGroup(id string, createIfMissing bool) *ClientGroup {
 	g.initEpoch.Store(s.lastEpochs[id])
 	g.lastUsedNs.Store(time.Now().UnixNano())
 	s.groups[id] = g
+	// Warn if the connection pool may be undersized for the concurrent
+	// CG count. The safe rule is GO_IVM_MAX_OPEN_CONNS >= 3x concurrent CGs
+	// in drive mode. Pool exhaustion shows up as indefinite Conn() blocking
+	// -> RPC timeouts -> reset storms. Warn once at the 10th group so the
+	// message fires for real deployments, not tests.
+	if len(s.groups) == 10 {
+		maxOpen := envPositiveInt("GO_IVM_MAX_OPEN_CONNS", 0)
+		if maxOpen > 0 && maxOpen < 30 {
+			fmt.Fprintf(os.Stderr,
+				"[GO-IVM] WARNING: GO_IVM_MAX_OPEN_CONNS=%d may be too low for %d+ concurrent CGs (rule of thumb: >= 3x CGs in drive mode).\n",
+				maxOpen, len(s.groups))
+		}
+	}
 	// Start a worker goroutine that processes requests in order.
 	g.wg.Add(1)
 	go g.worker(s)
