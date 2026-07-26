@@ -179,7 +179,7 @@ var (
 // and 5s under the 60s budget. Env-tunable via GO_IVM_DELIVER_TIMEOUT_SEC
 // (read lazily — the env sync from the embedder happens at goivm_start,
 // after package init).
-const deliverTimeoutDefault = 46 * time.Second
+const deliverTimeoutDefault = 53 * time.Second
 
 var deliverTimeoutOnce sync.Once
 var deliverTimeoutVal = deliverTimeoutDefault
@@ -656,11 +656,24 @@ func (rp *rowPlane) deliverFrame(partial interface{}) bool {
 	if err != nil {
 		data, _ = mpMarshal(rpcError(rp.reqID, -32603, "encode row-mode partial: "+err.Error()))
 	}
-	if capped, over := capFrameBytes(rp.reqID, data, maxFrameSize); over {
-		fmt.Fprintf(os.Stderr,
-			"[GO-IVM] row-mode partial frame too large: %d > %d (id=%v) — sending error\n",
-			len(data), maxFrameSize, rp.reqID)
-		data = capped
+	if _, over := capFrameBytes(rp.reqID, data, maxFrameSize); over {
+		// Distinguish a single-row oversize (permanent data condition —
+		// no chunk adjustment can fix it, every reconnect hits the same
+		// row) from a multi-row frame oversize (retryable with smaller
+		// chunks). The single-row case uses errCodeRowTooLarge so the TS
+		// side classifies it as 'data-error' and attributes it correctly.
+		errCode := errCodeFrameTooLarge
+		if part, ok := partial.(advanceToHeadStreamPartial); ok && len(part.Rows) == 1 {
+			errCode = errCodeRowTooLarge
+			fmt.Fprintf(os.Stderr,
+				"[GO-IVM] single row exceeds %d-byte frame cap (id=%v, cg=%s) — permanent data condition, sending data-error\n",
+				maxFrameSize, rp.reqID, rp.cgID)
+		} else {
+			fmt.Fprintf(os.Stderr,
+				"[GO-IVM] row-mode partial frame too large: %d > %d (id=%v) — sending error\n",
+				len(data), maxFrameSize, rp.reqID)
+		}
+		data = capFrameBytesWithCode(rp.reqID, data, maxFrameSize, errCode)
 	}
 	switch rp.deliver(abiKindFrame, data) {
 	case deliverOK:

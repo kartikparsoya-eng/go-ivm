@@ -209,3 +209,30 @@ failure-atomic ordering to keep the engine consistent across retries.
 
 Required follow-up: align TS with the same failure-atomic ordering, or document
 that TS's reset-on-failure model makes the ordering difference unobservable.
+
+## D4: Exclusive Partial-Cursor Boundary Tie
+
+Status: DIVERGENT — Go drops, TS forwards. Oracle-gated alignment required.
+
+When a pushed row's sort key ties the cursor prefix boundary in an exclusive
+(`<` / `>`) direction, Go's `skip` operator drops the row while TS's `skip.ts`
+forwards it. The difference is in how each engine interprets the exclusive
+boundary against the partial cursor's retained prefix: Go treats the tie as
+outside the range; TS treats it as inside.
+
+See Go `ivm/skip.go` + `skip_partial_bound_parity_test.go:116-145` vs TS
+`skip.ts:84-86`.
+
+Impact: a row present on a TS-served client may be absent on a Go-served
+client for the same query at the same version. This is a content-level
+divergence, invisible to the row-set signature detector (which is
+identity-only, not content-inclusive).
+
+Reason: The partial-cursor boundary semantics were never formally specified;
+each implementation made an independent choice. This divergence was
+discovered in a test comment but absent from this ledger.
+
+Required follow-up: align one side to the other under the differential oracle.
+The TS behavior (forward the tie) is likely the intended semantics (an
+exclusive boundary on the cursor prefix should not exclude rows that match
+the prefix itself), but this must be oracle-gated before changing either side.

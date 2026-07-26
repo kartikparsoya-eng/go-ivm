@@ -204,6 +204,11 @@ func goivm_start(cb C.goivm_deliver_cb, ctx unsafe.Pointer) C.int32_t {
 
 //export goivm_send
 func goivm_send(data unsafe.Pointer, length C.int32_t) C.int32_t {
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Fprintf(os.Stderr, "[GO-IVM][napi] panic in goivm_send: %v\n", r)
+		}
+	}()
 	abiMu.Lock()
 	h := abiHst
 	abiMu.Unlock()
@@ -251,6 +256,11 @@ func goivm_shutdown() {
 //
 //export goivm_stream_credit
 func goivm_stream_credit(reqID C.double, n C.int32_t) {
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Fprintf(os.Stderr, "[GO-IVM][napi] panic in goivm_stream_credit: %v\n", r)
+		}
+	}()
 	abiMu.Lock()
 	h := abiHst
 	abiMu.Unlock()
@@ -270,6 +280,11 @@ func goivm_stream_credit(reqID C.double, n C.int32_t) {
 //
 //export goivm_stream_cancel
 func goivm_stream_cancel(reqID C.double) {
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Fprintf(os.Stderr, "[GO-IVM][napi] panic in goivm_stream_cancel: %v\n", r)
+		}
+	}()
 	abiMu.Lock()
 	h := abiHst
 	abiMu.Unlock()
@@ -293,5 +308,10 @@ func goivm_stream_cancel(reqID C.double) {
 //
 //export goivm_queue_drained
 func goivm_queue_drained() {
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Fprintf(os.Stderr, "[GO-IVM][napi] panic in goivm_queue_drained: %v\n", r)
+		}
+	}()
 	tsfnDrain.broadcast()
 }

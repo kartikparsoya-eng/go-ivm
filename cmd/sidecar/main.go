@@ -235,6 +235,14 @@ func writeFrame(w io.Writer, data []byte) error {
 // through (e.g. a single node whose subtree exceeds softChunkBytes).
 const errCodeFrameTooLarge = -32011
 
+// errCodeRowTooLarge: a single RowChange's encoded form exceeds maxFrameSize.
+// Unlike errCodeFrameTooLarge (an entire RESPONSE frame that exceeded the cap
+// and can be retried with smaller chunks), a single row > 64MB is a permanent
+// data condition — no chunk size adjustment can fix it, and every reconnect
+// will hit the same row. Classified as 'data-error' on the TS side so it's
+// attributed correctly (not a protocol bug) and counted separately.
+const errCodeRowTooLarge = -32012
+
 // capFrameBytes returns the bytes to actually write for a response. If the
 // marshaled frame exceeds maxFrameSize it returns a marshaled RPC error for the
 // SAME request id (a small, valid frame the reader will accept and route as a
@@ -248,6 +256,16 @@ func capFrameBytes(id interface{}, data []byte, maxFrameSize int) ([]byte, bool)
 		fmt.Sprintf("response too large: %d bytes exceeds %d-byte frame cap; "+
 			"this query must use a streaming RPC", len(data), maxFrameSize)))
 	return errData, true
+}
+
+// capFrameBytesWithCode is like capFrameBytes but uses the given error code.
+// Used for errCodeRowTooLarge (single row > frame cap — permanent data
+// condition, not a chunkable response).
+func capFrameBytesWithCode(id interface{}, data []byte, maxFrameSize int, errCode int) []byte {
+	errData, _ := mpMarshal(rpcError(id, errCode,
+		fmt.Sprintf("single row too large: %d bytes exceeds %d-byte frame cap; "+
+			"this row cannot be delivered via the streaming protocol", len(data), maxFrameSize)))
+	return errData
 }
 
 // --- Performance metrics ---
@@ -2443,13 +2461,16 @@ func (s *Server) handleAddQueriesStream(req RPCRequest, streamW streamWriter) RP
 	rp.setPullGate(gate)
 	defer s.streamGates.unregister(rid)
 	err := group.eng.AddQueriesStreamPull(specs, 1, func(r engine.QueryResult) bool {
-		// Acquire one credit per row record that will be emitted, not one
-		// per QueryResult: a single fetched node flattens into parent plus
-		// relationship rows (streamNodes), so len(r.Changes) can exceed 1.
-		// The TS consumer decrements one credit per row entry it consumes,
-		// so acquiring only one credit per QueryResult lets Go run
-		// unboundedly ahead of the pullWindow on nested hydrates.
-		for range r.Changes {
+		// Acquire one credit per delivered frame (QueryResult) that carries
+		// rows, matching how the TS consumer counts (it decrements one
+		// credit per entry/frame consumed, not per row). Acquiring per-change
+		// caused over-acquire when streamNodes flattened a node into multiple
+		// rows: N credits taken, TS refunds 1 → credit leak → grants stop →
+		// 60s stall → re-hydrate loop. In production rowMode (chunkSize=1)
+		// each QueryResult carries exactly 1 change, so this is equivalent.
+		// Skip credit acquisition for 0-change frames (Final/completion
+		// signals) — they don't consume a row slot.
+		if len(r.Changes) > 0 {
 			if !acquirePullCredit(gate, rp) {
 				return false
 			}
