@@ -376,7 +376,7 @@ func startABIHostWithServer(server *Server, deliver func(kind int32, payload []b
 // A 2× deliverTimeout deadline is a defense-in-depth backstop: if the JS
 // event loop is permanently dead while the TSFN stays technically alive
 // (no deliverClosed), the park would otherwise run forever. The deadline
-// is well above any expected recoverable stall (55s ceiling) so it only
+// is well above any expected recoverable stall (53s ceiling) so it only
 // fires on genuine host death — at which point the death watcher delivers
 // a kind-4 record and the process exits regardless.
 func (h *abiHost) deliverPumpFrame(kind int32, payload []byte) bool {

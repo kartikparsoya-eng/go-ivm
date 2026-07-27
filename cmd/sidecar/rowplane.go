@@ -78,10 +78,10 @@ package main
 // push: the stage hard bound + park is the backpressure, now event-woken.
 //
 // WAL-pin note: an ADVANCE producer parked here holds its prev-tx WAL pin
-// for up to the deliver timeout (55s), which exceeds the 60s advance-budget
-// promise — budget checks are pre-emit only. The park is cancellable (group
-// teardown) and the deadline bounds it; folding the park into the budget
-// clock is future work if soaks show it matters.
+// for up to the deliver timeout (53s), which is within the 60s advance-budget
+// promise — the deliver deadline returns the earlier of the deliver timeout
+// and the advance budget deadline. The park is cancellable (group teardown)
+// and the deadline bounds it.
 //
 // emit* return false when the stream is DEAD — the delivery was refused
 // (TSFN closing), cancelled (client gone / group teardown), or timed out
@@ -175,8 +175,8 @@ var (
 // above the longest expected recoverable JS-loop stall (43-46s synchronous
 // materializations have been observed) but below the advance budget
 // (advanceBudgetMs, default 60s) so a parked advance producer can't hold a
-// WAL pin past the budget. 55s gives a 9s buffer past the 46s stall ceiling
-// and 5s under the 60s budget. Env-tunable via GO_IVM_DELIVER_TIMEOUT_SEC
+// WAL pin past the budget. 53s gives a 7s buffer past the 46s stall ceiling
+// and 7s under the 60s budget. Env-tunable via GO_IVM_DELIVER_TIMEOUT_SEC
 // (read lazily — the env sync from the embedder happens at goivm_start,
 // after package init).
 const deliverTimeoutDefault = 53 * time.Second

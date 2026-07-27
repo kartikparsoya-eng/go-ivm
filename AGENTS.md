@@ -91,9 +91,9 @@ pnpm --filter zero-cache run check-types
 | `GO_IVM_MAX_OPEN_CONNS` | 1024 | Per-worker SQLite connection pool ceiling |
 | `GO_IVM_MAX_IDLE_CONNS` | 1024 | Idle connection cap (self-clamps to MAX_OPEN) |
 | `GO_IVM_CONN_CACHE_KB` | 1024 | Per-conn SQLite page cache (C-side malloc) |
-| `GO_IVM_GOMEMLIMIT_PERCENT` | 40 | Soft Go heap ceiling as % of container memory |
+| `GO_IVM_GOMEMLIMIT_PERCENT` | 11 | Soft Go heap ceiling as % of container memory (divided by worker count to avoid oversubscription) |
 | `GO_IVM_ADVANCE_BUDGET_MS` | 60000 | Wall-clock advance backstop (CPU abort is separate) |
-| `GO_IVM_DELIVER_TIMEOUT_SEC` | 55 | Row-plane park deadline (M5 fix: was 150s) |
+| `GO_IVM_DELIVER_TIMEOUT_SEC` | 53 | Row-plane park deadline (M5 fix: was 150s) |
 | `GO_IVM_WEDGE_WATCHDOG_SEC` | 90 | CG handler wedge detection threshold |
 | `GO_IVM_CHUNK_SOFT_BYTES` | 8388608 | Soft byte budget per streamed partial frame |
 | `GO_IVM_REAPER_IDLE_SEC` | 900 (15 min) | Idle CG reaping timeout |
